@@ -1,0 +1,203 @@
+import { useEffect, useState } from "react";
+import type { Session } from "../types";
+
+export type SessionMenuAction = "pin" | "unpin" | "mark_unread" | "mute" | "unmute" | "delete";
+
+interface SessionListProps {
+  sessions: Session[];
+  activeWxid?: string | null;
+  onSelectChat: (wxid: string) => void;
+  onSessionAction: (action: SessionMenuAction, session: Session) => void;
+}
+
+/**
+ * Session avatar — keyed by wxid to prevent React state reuse across items.
+ * If no URL or load error → letter fallback (never inherits previous avatar).
+ */
+function Avatar({ session }: { session: Session }) {
+  const [imgError, setImgError] = useState(false);
+  const avatarUrl = session.avatar || "";
+
+  if (avatarUrl && !imgError) {
+    return (
+      <img
+        src={avatarUrl}
+        alt=""
+        className="w-[42px] h-[42px] rounded-[5px] object-cover shrink-0"
+        onError={() => setImgError(true)}
+        loading="lazy"
+      />
+    );
+  }
+
+  // Letter fallback
+  const initial = session.nickname?.[0] || session.wxid?.[0] || "?";
+  return (
+    <div
+      className={`w-[42px] h-[42px] rounded-[5px] flex items-center justify-center text-white text-[16px] font-medium shrink-0 ${
+        session.is_group ? "bg-[#576b95]" : "bg-[#60b044]"
+      }`}
+    >
+      {initial}
+    </div>
+  );
+}
+
+/** Mute icon (small speaker-off) */
+function MuteIcon() {
+  return (
+    <svg className="w-[14px] h-[14px] text-[#666] shrink-0" fill="currentColor" viewBox="0 0 24 24">
+      <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 003.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z" />
+    </svg>
+  );
+}
+
+export default function SessionList({ sessions, activeWxid, onSelectChat, onSessionAction }: SessionListProps) {
+  const [menu, setMenu] = useState<{ x: number; y: number; session: Session } | null>(null);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [menu]);
+
+  const openContextMenu = (e: React.MouseEvent, session: Session) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenu({
+      x: Math.min(e.clientX, window.innerWidth - 188),
+      y: Math.min(e.clientY, window.innerHeight - 220),
+      session,
+    });
+  };
+
+  const runAction = (action: SessionMenuAction) => {
+    if (!menu) return;
+    onSessionAction(action, menu.session);
+    setMenu(null);
+  };
+
+  return (
+    <div className="h-full w-full bg-[#191919] flex flex-col no-select">
+      {/* Search bar */}
+      <div className="px-[8px] pt-[8px] pb-[6px] shrink-0">
+        <div className="bg-[#262626] rounded-[6px] flex items-center pr-[8px] h-[34px] sessionlist-searchbar">
+          <span aria-hidden style={{ width: 5 }} className="shrink-0" />
+          <svg className="w-[14px] h-[14px] text-[#5c5c5c] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+          <input
+            type="text"
+            placeholder="搜索"
+            className="bg-transparent border-none outline-none text-[14px] text-[#999] placeholder-[#5c5c5c] ml-[6px] w-full min-w-0"
+          />
+        </div>
+      </div>
+
+      {/* Session list */}
+      <div className="flex-1 overflow-y-auto">
+        {sessions.length === 0 && (
+          <div className="text-center text-[#5c5c5c] text-[14px] mt-20">暂无会话</div>
+        )}
+        {sessions.map((session) => {
+          const isActive = session.wxid === activeWxid;
+          return (
+            <div
+              key={session.wxid}
+              onClick={() => onSelectChat(session.wxid)}
+              onContextMenu={(e) => openContextMenu(e, session)}
+              className={`flex items-center px-0 py-0 cursor-pointer transition-colors ${
+                isActive ? "bg-[#2f2f2f] hover:bg-[#2f2f2f]" : "hover:bg-[#242424] active:bg-[#2a2a2a]"
+              }`}
+            >
+              {/* Avatar — keyed to prevent React reuse issues */}
+              <div
+                key={session.wxid + "_avatar"}
+                style={{ padding: "8px" }}
+              >
+                <Avatar session={session} />
+              </div>
+
+              {/* Info */}
+              <div className="flex-1 min-w-0 ml-[4px] pb-[10px] pr-[4px]">
+                <div className="flex justify-between items-baseline">
+                  <span className="text-[16px] text-[#e5e5e5] truncate font-normal leading-[21px]" style={{ paddingLeft: '3px' }}>
+                    {session.nickname || session.wxid}
+                  </span>
+                  <span className="flex items-center gap-[4px] shrink-0 ml-[8px]">
+                    {/* Mute icon (before time) */}
+                    {session.muted && <MuteIcon />}
+                    <span className="text-[13px] text-[#666666] leading-[21px] mr-[3px]">
+                      {session.lastTime || ""}
+                    </span>
+                  </span>
+                </div>
+                <div className="flex justify-between items-center mt-[3px]">
+                  <span className="text-[14px] text-[#666666] truncate leading-[18px]" style={{ paddingLeft: '3px' }}>
+                    {session.lastMsg || ""}
+                  </span>
+                  {/* Unread badge — only if NOT muted */}
+                  {!session.muted && session.unread && session.unread > 0 ? (
+                    <span className="min-w-[18px] h-[18px] rounded-full bg-[#f04040] text-white text-[11px] flex items-center justify-center shrink-0 px-[5px] ml-[6px]">
+                      {session.unread > 99 ? "99+" : session.unread}
+                    </span>
+                  ) : null}
+                  {/* Muted indicator dot (tiny gray dot instead of red badge) */}
+                  {session.muted && session.unread && session.unread > 0 ? (
+                    <span className="w-[8px] h-[8px] rounded-full bg-[#666] shrink-0 ml-[6px]" />
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {menu && (
+        <div
+          className="fixed z-[9999] w-[180px] bg-[#f8f8f8] text-[#111] border border-[#cfcfcf] shadow-xl py-[4px] text-[14px]"
+          style={{ left: menu.x, top: menu.y }}
+          onClick={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <ContextMenuItem onClick={() => runAction(menu.session.pinned ? "unpin" : "pin")}>
+            {menu.session.pinned ? "取消置顶" : "置顶"}
+          </ContextMenuItem>
+          <ContextMenuItem onClick={() => runAction("mark_unread")}>标记未读</ContextMenuItem>
+          <ContextMenuItem onClick={() => runAction(menu.session.muted ? "unmute" : "mute")}>
+            {menu.session.muted ? "开启新消息提醒" : "消息免打扰"}
+          </ContextMenuItem>
+          <div className="h-px bg-[#e2e2e2] my-[4px]" />
+          <ContextMenuItem danger onClick={() => runAction("delete")}>删除聊天</ContextMenuItem>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ContextMenuItem({
+  children,
+  danger,
+  onClick,
+}: {
+  children: React.ReactNode;
+  danger?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`block w-full h-[36px] px-[18px] text-left hover:bg-[#e5e5e5] active:bg-[#dadada] ${
+        danger ? "text-[#222]" : "text-[#111]"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
