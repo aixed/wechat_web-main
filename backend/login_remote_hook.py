@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     HOOK_HOST, HOOK_PORT, MGR_PORT,
     PUBLIC_IP, RDV, CALLBACK_PORT, CALLBACK_PATH,
+    RECV_TYPE,
     RESTART_ON_BUTTON_LOGIN_FAIL, MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL,
 )
 
@@ -375,7 +376,7 @@ def start_wechat() -> dict | None:
         "StartPort": str(HOOK_PORT),
         "CallBackURL": CALLBACK_URL,
         "RDV": RDV,
-        "RecvType": "2",  # 2=接收原始protobuf，自行解析（避免Hook内部解析崩溃）
+        "RecvType": str(RECV_TYPE),
     }
     try:
         r = _post(url, body, timeout=TIMEOUT)

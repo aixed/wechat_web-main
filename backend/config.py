@@ -87,6 +87,10 @@ SERVER_PORT = int(_cfg.get("server_port", 5000))
 CALLBACK_PORT = int(_cfg.get("callback_port", SERVER_PORT))
 CALLBACK_PATH = str(_cfg.get("callback_path", "/api/callback"))
 CALLBACK_URL = f"http://{PUBLIC_IP}:{CALLBACK_PORT}{CALLBACK_PATH}"
+RECV_TYPE = int(_cfg.get("recv_type", 2))
+if RECV_TYPE not in (1, 2):
+    print(f"[CONFIG] ⚠ invalid recv_type={RECV_TYPE!r}, using 2", flush=True)
+    RECV_TYPE = 2
 
 # Login flow behavior flags (used by backend/login_remote_hook.py)
 RESTART_ON_BUTTON_LOGIN_FAIL = _to_bool(_cfg.get("restart_on_button_login_fail", True), True)
@@ -97,6 +101,7 @@ MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL = int(_cfg.get("max_restarts_after_button_l
 print(f"[CONFIG] mode={LOGIN_MODE}  host={HOOK_HOST}  "
       f"api_port={HOOK_PORT}  mgr_port={MGR_PORT}  "
       f"server_port={SERVER_PORT}  callback={CALLBACK_URL}  "
+      f"recv_type={RECV_TYPE}  "
       f"ip={PUBLIC_IP}  RDV={RDV}  "
       f"restart_on_button_fail={RESTART_ON_BUTTON_LOGIN_FAIL}  "
       f"max_restart_button_fail={MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL}", flush=True)

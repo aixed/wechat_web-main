@@ -37,6 +37,10 @@ server_port: 5000
 # callback_port: 远程 Hook 发回调用的端口，需要能被远程服务访问
 callback_port: 30003
 callback_path: "/api/callback"
+# 消息接收类型：
+#   2 = protobuf/raw pb_msg（当前推荐，后端会解析 pb_msg）
+#   1 = Hook 直接返回 msglist（后端也兼容，但字段完整性可能依赖 Hook 输出）
+recv_type: 2
 
 # --- 登录流程行为开关 ---
 restart_on_button_login_fail: true
