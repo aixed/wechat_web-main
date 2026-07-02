@@ -988,13 +988,13 @@ async def get_chatroom_member_detail_info(gid: str, wxid: str) -> dict:
 
 # ─── Callback Config ───────────────────────────────────────────────
 
-async def configure_msg_receive(enable: bool, url: str) -> dict:
+async def configure_msg_receive(enable: bool, url: str, recv_type: int = 2) -> dict:
     """Enable/disable message callback."""
     if IS_HOOK:
         if not enable:
             return {}
         r = await _post("/ConfigureMsgReciveFullURL", json={
-            "RecvType": 2,
+            "RecvType": recv_type,
             "CallBackURL": url,
         })
         return safe_json(r)

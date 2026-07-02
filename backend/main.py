@@ -410,8 +410,8 @@ async def lifespan(app: FastAPI):
         _log(f"[INIT 1/7] ✗ self info failed: {e}")
 
     try:
-        _log("[INIT 1/7] Configuring callback...")
-        await wechat_api.configure_msg_receive(True, config.CALLBACK_URL)
+        _log(f"[INIT 1/7] Configuring callback... recv_type={config.RECV_TYPE}")
+        await wechat_api.configure_msg_receive(True, config.CALLBACK_URL, config.RECV_TYPE)
         _log("[INIT 1/7] ✓ Callback configured")
     except Exception as e:
         _log(f"[INIT 1/7] ✗ callback config failed: {e}")
@@ -561,7 +561,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     _log("[SHUTDOWN] Disabling message callback...")
     try:
-        await wechat_api.configure_msg_receive(False, "")
+        await wechat_api.configure_msg_receive(False, "", config.RECV_TYPE)
     except Exception:
         pass
     await wechat_api.client.aclose()
