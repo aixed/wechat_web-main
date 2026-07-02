@@ -1,0 +1,11 @@
+启动后端
+cd backend
+pip install -r requirements.txt
+python login_remote_hook.py
+python main.py
+
+
+启动前端
+cd frontend
+npm install
+npm run dev

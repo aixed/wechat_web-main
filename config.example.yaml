@@ -1,0 +1,43 @@
+# ==============================
+# WeChat Web Client 配置示例
+# 复制为 config.yaml 后按实际环境修改
+# ==============================
+
+# 公网 IP 或可被远程 Hook 服务访问的地址
+ip: "127.0.0.1"
+
+# 远程服务所需的 RDV/鉴权标识，按实际服务填写
+RDV: "your-rdv-token"
+
+# 登录模式（三选一）
+#   local_hook       = 本地 Hook（DLL 注入本地微信，127.0.0.1）
+#   remote_hook      = 远程 Hook（服务器上运行的 Hook 微信）
+#   remote_protocol  = 远程协议（服务器上运行的微信协议）
+login: local_hook
+
+# --- local_hook 本地 Hook ---
+local_hook_host: "127.0.0.1"
+local_hook_api_port: 30001
+local_hook_mgr_port: 29998
+
+# --- remote_hook 远程 Hook ---
+remote_hook_host: "your-hook-host.example.com"
+remote_hook_api_port: 30001
+remote_hook_mgr_port: 29998
+
+# --- remote_protocol 远程协议 ---
+remote_protocol_host: "your-protocol-host.example.com"
+remote_protocol_api_port: 30001
+remote_protocol_mgr_port: 29999
+
+# --- 后端服务 ---
+server_port: 5000
+
+# --- 回调 ---
+# callback_port: 远程 Hook 发回调用的端口，需要能被远程服务访问
+callback_port: 30003
+callback_path: "/api/callback"
+
+# --- 登录流程行为开关 ---
+restart_on_button_login_fail: true
+max_restarts_after_button_login_fail: 1
