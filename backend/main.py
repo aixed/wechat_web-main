@@ -275,6 +275,29 @@ def _normalize_callback_message(msg: dict, sendorrecv: str, self_wxid: str) -> t
     return chat_id, normalized
 
 
+def _is_callback_status_echo(msg: dict, sendorrecv: str, self_wxid: str) -> bool:
+    """Filter Hook status callbacks that are not user-visible messages."""
+    if not isinstance(msg, dict):
+        return False
+
+    msgtype = str(msg.get("msgtype", "") or "")
+    content = str(msg.get("msg", "") or "").strip()
+    from_id = str(msg.get("fromid", "") or "")
+    from_gid = str(msg.get("fromgid", "") or "")
+    is_self_echo = (
+        str(sendorrecv) == "1"
+        or (self_wxid and from_id == self_wxid and not from_gid)
+    )
+    if not is_self_echo:
+        return False
+
+    if msgtype == "1" and not content:
+        return True
+    if msgtype == "3" and content in {"PC发图片消息成功", "发图片消息成功"}:
+        return True
+    return False
+
+
 def _store_message_and_session(chat_id: str, msg: dict) -> dict:
     message_store.add_message(chat_id, msg)
     preview = _format_preview(str(msg.get("msgtype", "")), str(msg.get("msg", "") or ""))
@@ -722,6 +745,9 @@ async def wechat_callback(request: Request):
         _log(f"[MSG] type={msgtype} from={source} to={toid_dbg} self={self_wxid} sendorrecv={sendorrecv} | {content}")
 
         if msgtype == "9994":
+            continue
+        if _is_callback_status_echo(msg, sendorrecv, self_wxid):
+            _log(f"[CALLBACK] Skip status echo type={msgtype} content={content!r}")
             continue
         chat_id, normalized = _normalize_callback_message(msg, sendorrecv, self_wxid)
         if not chat_id or not normalized:
