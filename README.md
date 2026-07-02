@@ -81,13 +81,13 @@ npm run lint
 
 主要配置项：
 
-- `login`：连接模式，可选 `local_hook`、`remote_hook`、`remote_protocol`。
+- `wechat_mode`：微信使用方式，`1`=本地 Hook，`2`=远程服务器 Hook，`3`=远程服务器协议。旧配置 `login` 仍兼容，可选 `local_hook`、`remote_hook`、`remote_protocol`。
 - `*_host` / `*_api_port` / `*_mgr_port`：不同模式下的服务地址和端口。
 - `ip`：远程 Hook 回调可访问到的公网地址。
 - `RDV`：远程服务所需的连接或鉴权标识。
 - `server_port`：后端主服务端口。
 - `callback_port` / `callback_path`：远程 Hook 回调地址配置。
-- `recv_type`：Hook 消息接收类型，默认 `2`；`2` 为 protobuf/raw `pb_msg`，`1` 为 Hook 直接返回 `msglist`。当前推荐使用 `2`。
+- `recvtype`：Hook 消息接收类型，默认 `1`；`1` 为 Hook 直接返回 `msglist`，`2` 为 protobuf/raw `pb_msg`。旧配置 `recv_type` 仍兼容。
 - `WECHAT_FILES_BASE`：可选环境变量，用于指定本机微信文件目录；不设置时会按 `APPDATA/WxDirDataPath/<RDV>/WeChat Files` 推导。
 
 ## 开源前注意事项

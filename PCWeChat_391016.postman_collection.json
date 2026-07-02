@@ -1,6 +1,6 @@
 {
 	"info": {
-		"_postman_id": "cfa9a1a7-9f05-410b-b0a4-040346107b20",
+		"_postman_id": "60101e09-e91f-44c1-aa97-d3ade497e975",
 		"name": "PCWeChat_391016",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
 	},
@@ -603,7 +603,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"picpath\": \"C:\\\\Y.jpg\"\r\n }",
+									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"picpath\": \"C:\\\\Y.jpg\",\r\n    \"fileData\": \"\"\r\n }",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -687,7 +687,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"filepath\": \"C:\\\\Jetbrains全家桶授权.exe\"\r\n}",
+									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"filepath\": \"C:\\\\Jetbrains全家桶授权.exe\",\r\n    \"fileData\": \"\"\r\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -715,7 +715,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "  {\r\n    \"wxid\": \"filehelper\",\r\n    \"videopath\": \"D:\\\\微信研究\\\\微信研究2\\\\微信研究\\\\duilib找call备忘.mp4\"\r\n  }",
+									"raw": "  {\r\n    \"wxid\": \"filehelper\",\r\n    \"videopath\": \"D:\\\\微信研究\\\\微信研究2\\\\微信研究\\\\duilib找call备忘.mp4\",\r\n    \"fileData\": \"\"\r\n  }",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -743,7 +743,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "{\r\n    \"wxid\": \"filehelper\",\r\n    \"gifpath\": \"C:\\\\1.GIF\"\r\n}",
+									"raw": "{\r\n    \"wxid\": \"filehelper\",\r\n    \"gifpath\": \"C:\\\\1.GIF\",\r\n    \"fileData\": \"\"\r\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -909,7 +909,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "{\r\n    \"wxid\": \"wxid_zxvungc18ryk21\",\r\n    \"voice_file\": \"C:\\\\time\\\\12_00.silk\",\r\n    \"time_ms\": 60000\r\n}",
+									"raw": "{\r\n    \"wxid\": \"wxid_zxvungc18ryk21\",\r\n    \"voice_file\": \"C:\\\\time\\\\12_00.silk\",\r\n    \"fileData\": \"\",\r\n    \"time_ms\": 60000\r\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -1077,7 +1077,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "{\r\n    \"towxid\": \"filehelper\",\r\n    \"imgpath\": \"C:\\\\1.jpg\",\r\n    \"title\": \"测试音乐\",\r\n    \"desc\": \"测试描述\",\r\n    \"url\": \"http://music.163.com/#/song?id=409060875\",\r\n    \"dataurl\": \"http://m10.music.126.net/20220324122135/6fc5ea93e8fa60bb2a385f112f6c8827/ymusic/2ff2/3c7f/85a0/099e067ecb7661c53ed76d841abb3562.mp3\"\r\n}",
+									"raw": "{\r\n    \"towxid\": \"filehelper\",\r\n    \"imgpath\": \"C:\\\\1.jpg\",\r\n    \"fileData\": \"\",\r\n    \"title\": \"测试音乐\",\r\n    \"desc\": \"测试描述\",\r\n    \"url\": \"http://music.163.com/#/song?id=409060875\",\r\n    \"dataurl\": \"http://m10.music.126.net/20220324122135/6fc5ea93e8fa60bb2a385f112f6c8827/ymusic/2ff2/3c7f/85a0/099e067ecb7661c53ed76d841abb3562.mp3\"\r\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -1357,7 +1357,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "{\r\n    \"towxid\": \"filehelper\",\r\n    \"imgpath\": \"C:\\\\1.jpg\",\r\n    \"xml\": \"<msg><fromusername>wxid_kqism2ws8r7s12</fromusername><scene>0</scene><commenturl></commenturl><appmsg appid=\\\"wxbc86871987208aba\\\" sdkver=\\\"0\\\"><title>太震惊了</title><des>没有什么好说的</des><action>view</action><type>5</type><showtype>0</showtype><content></content><url>so.com</url><dataurl></dataurl><lowurl></lowurl><lowdataurl></lowdataurl><recorditem>(null)</recorditem><thumburl></thumburl><messageaction></messageaction><extinfo></extinfo><sourceusername></sourceusername><sourcedisplayname></sourcedisplayname><commenturl></commenturl><appattach><totallen>0</totallen><attachid></attachid><emoticonmd5></emoticonmd5><fileext></fileext><cdnthumburl>3057020100044b30490201000204442ca62502032f53a10204aedb7b76020462774a68042433393262363331342d663937312d343162342d383263382d6437313732626136393739340204011800030201000405004c51e500</cdnthumburl><aeskey>1927407aa8e60b69c992ca551950abf3</aeskey><cdnthumbaeskey>1927407aa8e60b69c992ca551950abf3</cdnthumbaeskey><encryver>0</encryver><cdnthumblength>35799</cdnthumblength><cdnthumbheight>160</cdnthumbheight><cdnthumbwidth>160</cdnthumbwidth></appattach><weappinfo><pagepath></pagepath><username></username><appid></appid><appservicetype>0</appservicetype><weappiconurl>http://mmbiz.qpic.cn/mmbiz_png/h3Hkru3Cpqibo4G3PIkb4tEfDs6DicBpnXQzo1DoMXPJTP6VpbfGIXhDKvx6Qv5UpEwADQ0Wp9MY2IDMU96cLRWg/640?wx_fmt=png&amp;wxfrom=200</weappiconurl></weappinfo><websearch /></appmsg><appinfo><version>1</version><appname>哔哩哔哩</appname></appinfo></msg>\"\r\n}",
+									"raw": "{\r\n    \"towxid\": \"filehelper\",\r\n    \"imgpath\": \"C:\\\\1.jpg\",\r\n    \"fileData\": \"\",\r\n    \"xml\": \"<msg><fromusername>wxid_kqism2ws8r7s12</fromusername><scene>0</scene><commenturl></commenturl><appmsg appid=\\\"wxbc86871987208aba\\\" sdkver=\\\"0\\\"><title>太震惊了</title><des>没有什么好说的</des><action>view</action><type>5</type><showtype>0</showtype><content></content><url>so.com</url><dataurl></dataurl><lowurl></lowurl><lowdataurl></lowdataurl><recorditem>(null)</recorditem><thumburl></thumburl><messageaction></messageaction><extinfo></extinfo><sourceusername></sourceusername><sourcedisplayname></sourcedisplayname><commenturl></commenturl><appattach><totallen>0</totallen><attachid></attachid><emoticonmd5></emoticonmd5><fileext></fileext><cdnthumburl>3057020100044b30490201000204442ca62502032f53a10204aedb7b76020462774a68042433393262363331342d663937312d343162342d383263382d6437313732626136393739340204011800030201000405004c51e500</cdnthumburl><aeskey>1927407aa8e60b69c992ca551950abf3</aeskey><cdnthumbaeskey>1927407aa8e60b69c992ca551950abf3</cdnthumbaeskey><encryver>0</encryver><cdnthumblength>35799</cdnthumblength><cdnthumbheight>160</cdnthumbheight><cdnthumbwidth>160</cdnthumbwidth></appattach><weappinfo><pagepath></pagepath><username></username><appid></appid><appservicetype>0</appservicetype><weappiconurl>http://mmbiz.qpic.cn/mmbiz_png/h3Hkru3Cpqibo4G3PIkb4tEfDs6DicBpnXQzo1DoMXPJTP6VpbfGIXhDKvx6Qv5UpEwADQ0Wp9MY2IDMU96cLRWg/640?wx_fmt=png&amp;wxfrom=200</weappiconurl></weappinfo><websearch /></appmsg><appinfo><version>1</version><appname>哔哩哔哩</appname></appinfo></msg>\"\r\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -1881,7 +1881,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "{\r\n    \"oripath\": \"C:\\\\1.dat\",\r\n    \"savepath\": \"C:\\\\o.jpg\"\r\n}",
+									"raw": "{\r\n    \"oripath\": \"C:\\\\1.dat\",\r\n    \"fileData\": \"\",\r\n    \"savepath\": \"C:\\\\o.jpg\"\r\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -2077,7 +2077,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "{\r\n  \"qrfilepath\": \"C:\\\\qr\\\\1.jpg\"\r\n}",
+									"raw": "{\r\n  \"qrfilepath\": \"C:\\\\qr\\\\1.jpg\",\r\n  \"fileData\": \"\"\r\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -4707,7 +4707,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "{\r\n    \"PicPath\":\"C:\\\\y.jpg\"\r\n}",
+							"raw": "{\r\n    \"PicPath\":\"C:\\\\y.jpg\",\r\n    \"fileData\":\"\"\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -10332,7 +10332,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "{\r\n    \"fileType\": 2,\r\n    \"aeskey\": \"edfa1964dc0e96d3780c8a8ff5d444be\",\r\n    \"filePath\": \"C:\\\\up.jpg\",\r\n    \"userName\": \"filehelper\",\r\n    \"chatType\": 0\r\n}",
+							"raw": "{\r\n    \"fileType\": 2,\r\n    \"aeskey\": \"edfa1964dc0e96d3780c8a8ff5d444be\",\r\n    \"filePath\": \"C:\\\\up.jpg\",\r\n    \"fileData\": \"\",\r\n    \"userName\": \"filehelper\",\r\n    \"chatType\": 0\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -10448,7 +10448,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "{\r\n    \"fileType\": 2,\r\n    \"aeskey\": \"edfa1964dc0e96d3780c8a8ff5d444bc\",\r\n    \"filePath\": \"C:\\\\up.jpg\"\r\n}",
+							"raw": "{\r\n    \"fileType\": 2,\r\n    \"aeskey\": \"edfa1964dc0e96d3780c8a8ff5d444bc\",\r\n    \"filePath\": \"C:\\\\up.jpg\",\r\n    \"fileData\": \"\"\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -10506,7 +10506,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "{\r\n    \"fileType\": 2,\r\n    \"aeskey\": \"\",\r\n    \"filePath\": \"C:\\\\up.jpg\",\r\n    \"chatType\": 0,\r\n    \"useNativeImgAsThumb\": true,\r\n    \"cover\": \"\"\r\n}",
+							"raw": "{\r\n    \"fileType\": 2,\r\n    \"aeskey\": \"\",\r\n    \"filePath\": \"C:\\\\up.jpg\",\r\n    \"fileData\": \"\",\r\n    \"chatType\": 0,\r\n    \"useNativeImgAsThumb\": true,\r\n    \"cover\": \"\"\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -11049,7 +11049,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "  {\r\n      \"filepath\": \"C:\\\\1.JPG\"\r\n  }\r\n\r\n\r\n",
+							"raw": "  {\r\n      \"filepath\": \"C:\\\\1.JPG\",\r\n      \"fileData\": \"\"\r\n  }\r\n\r\n\r\n",
 							"options": {
 								"raw": {
 									"language": "json"
