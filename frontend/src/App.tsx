@@ -305,13 +305,42 @@ function isSyntheticMatch(synthetic: ChatMessage, real: ChatMessage): boolean {
   return true;
 }
 
+function isSelfSentMessage(msg: ChatMessage): boolean {
+  return String(msg.sendorrecv) === "1" || msg.isSender === 1;
+}
+
+function isHookStatusEchoMessage(msg: ChatMessage): boolean {
+  if (!isSelfSentMessage(msg)) return false;
+  const msgType = String(msg.msgtype || "");
+  const content = String(msg.msg || "").trim();
+  if (msgType === "1" && !content) return true;
+  if (msgType === "3" && ["PC发图片消息成功", "发图片消息成功"].includes(content)) return true;
+  return false;
+}
+
+function isBareImageHashMessage(msg: ChatMessage): boolean {
+  return (
+    String(msg.msgtype || "") === "3"
+    && /^[a-f0-9]{32}$/i.test(String(msg.msg || "").trim())
+    && !msg.img_path
+    && !msg.bytesExtraHex
+  );
+}
+
+function closeInTime(a: ChatMessage, b: ChatMessage, seconds: number): boolean {
+  const at = Number(a.timestamp || 0);
+  const bt = Number(b.timestamp || 0);
+  if (!at || !bt) return false;
+  return Math.abs(at - bt) <= seconds;
+}
+
 /**
  * Given a list of messages, remove synthetic ``send_...`` placeholders that
  * have a corresponding real message (same type, similar timestamp, same content for text).
  */
 function removeDuplicateSynthetics(msgs: ChatMessage[]): ChatMessage[] {
   const realSelfMsgs = msgs.filter(
-    (m) => !String(m.id).startsWith("send_") && (String(m.sendorrecv) === "1" || m.isSender === 1),
+    (m) => !String(m.id).startsWith("send_") && isSelfSentMessage(m),
   );
   if (realSelfMsgs.length === 0) return msgs;
 
@@ -326,16 +355,48 @@ function removeDuplicateSynthetics(msgs: ChatMessage[]): ChatMessage[] {
   return msgs.filter((m) => !syntheticIdsToRemove.has(m.id));
 }
 
+function removeCallbackEchoes(msgs: ChatMessage[]): ChatMessage[] {
+  return msgs.filter((msg) => {
+    const id = String(msg.id || "");
+    if (!id.startsWith("cb_") && !isBareImageHashMessage(msg)) return true;
+
+    const msgType = String(msg.msgtype || "");
+    const hasRealCompanion = msgs.some((other) => {
+      if (other === msg) return false;
+      if (String(other.id || "").startsWith("cb_")) return false;
+      if (String(other.msgtype || "") !== msgType) return false;
+      if (String(other.sendorrecv || "") !== String(msg.sendorrecv || "")) return false;
+      if (!closeInTime(msg, other, 2)) return false;
+
+      if (msgType === "1") {
+        return String(other.msg || "") === String(msg.msg || "");
+      }
+      if (msgType === "3") {
+        return Boolean(other.img_path || other.bytesExtraHex || String(other.msg || "").includes("<img"));
+      }
+      return false;
+    });
+
+    return !hasRealCompanion;
+  });
+}
+
+function dedupeMessagesForDisplay(msgs: ChatMessage[]): ChatMessage[] {
+  const visible = msgs.filter((msg) => !isHookStatusEchoMessage(msg));
+  return removeDuplicateSynthetics(removeCallbackEchoes(visible));
+}
+
 function mergeMessagesById(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
   const merged = [...existing];
   const seen = new Set(existing.map((m) => String(m.id)));
   for (const msg of incoming) {
+    if (isHookStatusEchoMessage(msg)) continue;
     const id = String(msg.id || "");
     if (id && seen.has(id)) continue;
     if (id) seen.add(id);
     merged.push(msg);
   }
-  return sortByTimestamp(removeDuplicateSynthetics(merged));
+  return sortByTimestamp(dedupeMessagesForDisplay(merged));
 }
 
 function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessage | null {
@@ -748,6 +809,7 @@ export default function App() {
         if (!chatMsg) continue;
         const chatId = extractChatId(chatMsg, myWxid || selfWxid);
         if (!chatId) continue;
+        if (isHookStatusEchoMessage(chatMsg)) continue;
 
         const isIncoming = String(chatMsg.sendorrecv) === "2";
         const isCurrentlyViewing = activeChat === chatId;
@@ -770,16 +832,19 @@ export default function App() {
           // If this is a real self-sent message, replace the matching synthetic
           // "send_..." placeholder instead of appending a duplicate.
           const isSelfSent = String(chatMsg.sendorrecv) === "1" || chatMsg.isSender === 1;
+          if (isSelfSent && String(chatMsg.msgtype) === "1" && !String(chatMsg.msg || "").trim()) {
+            return prev;
+          }
           if (isSelfSent && chatMsg.id && !String(chatMsg.id).startsWith("send_")) {
             const matchIdx = existing.findIndex((m) => isSyntheticMatch(m, chatMsg));
             if (matchIdx >= 0) {
               const updated = [...existing];
               updated[matchIdx] = chatMsg;
-              return { ...prev, [chatId]: sortByTimestamp(updated) };
+              return { ...prev, [chatId]: sortByTimestamp(dedupeMessagesForDisplay(updated)) };
             }
           }
 
-          return { ...prev, [chatId]: sortByTimestamp([...existing, chatMsg]) };
+          return { ...prev, [chatId]: sortByTimestamp(dedupeMessagesForDisplay([...existing, chatMsg])) };
         });
 
         // Update session list — move chat to top, update preview
@@ -854,7 +919,10 @@ export default function App() {
       setChatMessages((prev) => {
         const existing = prev[chatId] || [];
         if (chatMsg.id && existing.some((m) => m.id === chatMsg.id)) return prev;
-        return { ...prev, [chatId]: sortByTimestamp([...existing, chatMsg]) };
+        if (String(chatMsg.id || "").startsWith("send_") && existing.some((m) => isSyntheticMatch(chatMsg, m))) {
+          return prev;
+        }
+        return { ...prev, [chatId]: sortByTimestamp(dedupeMessagesForDisplay([...existing, chatMsg])) };
       });
       let preview = formatMsgTypePreview(chatMsg.msgtype, chatMsg.msg);
       // For group chats, prefix sent messages with "我:"
@@ -1089,27 +1157,28 @@ export default function App() {
   }, []);
 
   const handleNewMessages = (wxid: string, msgs: ChatMessage[]) => {
+    const displayMsgs = msgs.filter((msg) => !isHookStatusEchoMessage(msg));
     setChatMessages((prev) => {
       const existing = prev[wxid] || [];
       // DB history is authoritative — replace any existing messages with the same ID
       // (callback versions may have wrong sender/timestamp)
-      const incomingById = new Map(msgs.map((m) => [m.id, m]));
+      const incomingById = new Map(displayMsgs.map((m) => [m.id, m]));
       let merged = existing.map((m) => incomingById.get(m.id) || m);
       // Add any incoming messages that weren't already present
       const existingIds = new Set(existing.map((m) => m.id));
-      for (const m of msgs) {
+      for (const m of displayMsgs) {
         if (!existingIds.has(m.id)) merged.push(m);
       }
       // Remove synthetic send_... placeholders that now have a real counterpart
-      merged = removeDuplicateSynthetics(merged);
+      merged = dedupeMessagesForDisplay(merged);
       return { ...prev, [wxid]: sortByTimestamp(merged) };
     });
 
     // Update session list preview based on the latest message from loaded history.
     // This ensures that even if a real-time callback was missed (e.g. mobile-sent
     // messages), the session list updates when the chat is opened.
-    if (msgs.length > 0) {
-      const latest = msgs.reduce((a, b) => ((a.timestamp || 0) >= (b.timestamp || 0) ? a : b));
+    if (displayMsgs.length > 0) {
+      const latest = displayMsgs.reduce((a, b) => ((a.timestamp || 0) >= (b.timestamp || 0) ? a : b));
       let preview = formatMsgTypePreview(latest.msgtype, latest.msg) || "[消息]";
       if (wxid.includes("@chatroom")) {
         if (String(latest.sendorrecv) === "1" || latest.isSender === 1) {
@@ -1139,7 +1208,7 @@ export default function App() {
     // For group chats, resolve brief info only for senders that appear in loaded messages.
     if (wxid.includes("@chatroom")) {
       const senderWxids = new Set<string>();
-      for (const m of msgs) {
+      for (const m of displayMsgs) {
         const from = m.fromid || "";
         if (!from) continue;
         if (from === selfWxid) continue;

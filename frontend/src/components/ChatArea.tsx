@@ -21,13 +21,20 @@ interface ChatAreaProps {
 const TEXTAREA_BASE_HEIGHT = 86;
 const TEXTAREA_MAX_HEIGHT = 124;
 
-function imageFileFromClipboardData(data: DataTransfer | null): File | null {
-  const fileFromFiles = Array.from(data?.files || []).find((file) => file.type.startsWith("image/"));
-  if (fileFromFiles) return fileFromFiles;
+interface PendingImage {
+  id: string;
+  file: File;
+  url: string;
+}
 
-  const imageItem = Array.from(data?.items || [])
-    .find((item) => item.kind === "file" && item.type.startsWith("image/"));
-  return imageItem?.getAsFile() || null;
+function imageFilesFromClipboardData(data: DataTransfer | null): File[] {
+  const files = Array.from(data?.files || []).filter((file) => file.type.startsWith("image/"));
+  if (files.length > 0) return files;
+
+  return Array.from(data?.items || [])
+    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file));
 }
 
 export default function ChatArea({
@@ -44,6 +51,7 @@ export default function ChatArea({
   const [profileWxid, setProfileWxid] = useState<string | null>(null);
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileError, setProfileError] = useState("");
+  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -54,6 +62,8 @@ export default function ChatArea({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isInitialScroll = useRef(true);
   const loadingOlderRef = useRef(false);
+  const pendingImagesRef = useRef<PendingImage[]>([]);
+  const lastPasteRef = useRef<{ key: string; at: number }>({ key: "", at: 0 });
   // When true, suppress all auto-scroll-to-bottom behaviors (used during "load older" flow)
   const suppressAutoScrollRef = useRef(false);
   const prevScrollHeightRef = useRef(0);
@@ -63,6 +73,25 @@ export default function ChatArea({
   const initialSettlingRef = useRef(true);
 
   const isGroup = session.is_group;
+  const canSend = input.trim().length > 0 || pendingImages.length > 0;
+
+  useEffect(() => {
+    pendingImagesRef.current = pendingImages;
+  }, [pendingImages]);
+
+  useEffect(() => {
+    return () => {
+      pendingImagesRef.current.forEach((image) => URL.revokeObjectURL(image.url));
+    };
+  }, []);
+
+  useEffect(() => {
+    setPendingImages((prev) => {
+      prev.forEach((image) => URL.revokeObjectURL(image.url));
+      return [];
+    });
+    onInputChange?.(input.trim().length > 0);
+  }, [session.wxid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleAvatarClick = useCallback(async (wxid: string) => {
     if (!wxid) return;
@@ -352,9 +381,11 @@ export default function ChatArea({
 
   // ─── Send message ───────────────────────────────────────────────
   const handleSend = async () => {
-    if (!input.trim() || sending) return;
+    const imagesToSend = pendingImages;
+    if ((!input.trim() && imagesToSend.length === 0) || sending) return;
     const msg = input.trim();
     setInput("");
+    setPendingImages([]);
     onInputChange?.(false);
     setSending(true);
 
@@ -363,10 +394,16 @@ export default function ChatArea({
     }
 
     try {
-      await sendText(session.wxid, msg);
+      if (msg) {
+        await sendText(session.wxid, msg);
+      }
+      for (const image of imagesToSend) {
+        await sendImageUpload(session.wxid, image.file);
+      }
     } catch (err) {
       console.error("[SEND]", err);
     } finally {
+      imagesToSend.forEach((image) => URL.revokeObjectURL(image.url));
       setSending(false);
       // Re-focus textarea so mobile keyboard stays open after sending
       requestAnimationFrame(() => {
@@ -385,11 +422,51 @@ export default function ChatArea({
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     setInput(val);
-    onInputChange?.(val.trim().length > 0);
+    onInputChange?.(val.trim().length > 0 || pendingImages.length > 0);
     const el = e.target;
     el.style.height = `${TEXTAREA_BASE_HEIGHT}px`;
     el.style.height = Math.min(Math.max(el.scrollHeight, TEXTAREA_BASE_HEIGHT), TEXTAREA_MAX_HEIGHT) + "px";
   };
+
+  const addPendingImages = useCallback((files: File[]) => {
+    const imageFiles = files.filter((file) => file.type.startsWith("image/"));
+    if (imageFiles.length === 0) return false;
+
+    const key = imageFiles
+      .map((file) => `${file.name}:${file.size}:${file.lastModified}:${file.type}`)
+      .join("|");
+    const now = Date.now();
+    if (lastPasteRef.current.key === key && now - lastPasteRef.current.at < 500) {
+      return true;
+    }
+    lastPasteRef.current = { key, at: now };
+
+    setInputMode("text");
+    setShowPlusMenu(false);
+    setPendingImages((prev) => [
+      ...prev,
+      ...imageFiles.map((file, index) => ({
+        id: `pending_img_${now}_${index}_${Math.random().toString(36).slice(2)}`,
+        file,
+        url: URL.createObjectURL(file),
+      })),
+    ]);
+    onInputChange?.(true);
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
+    return true;
+  }, [onInputChange]);
+
+  const removePendingImage = useCallback((id: string) => {
+    setPendingImages((prev) => {
+      const target = prev.find((image) => image.id === id);
+      if (target) URL.revokeObjectURL(target.url);
+      const next = prev.filter((image) => image.id !== id);
+      onInputChange?.(input.trim().length > 0 || next.length > 0);
+      return next;
+    });
+  }, [input, onInputChange]);
 
   // ─── Plus-menu file handlers ──────────────────────────────────
   const sendImageFile = useCallback(async (file: File) => {
@@ -415,17 +492,16 @@ export default function ChatArea({
     await sendImageFile(file);
   };
 
-  const handleImagePaste = useCallback(async (data: DataTransfer | null) => {
-    const file = imageFileFromClipboardData(data);
-    if (!file) return;
-    await sendImageFile(file);
-  }, [sendImageFile]);
+  const handleImagePaste = useCallback((data: DataTransfer | null) => {
+    const files = imageFilesFromClipboardData(data);
+    return addPendingImages(files);
+  }, [addPendingImages]);
 
   useEffect(() => {
     const handleWindowPaste = (e: ClipboardEvent) => {
       if (profileWxid) return;
-      const file = imageFileFromClipboardData(e.clipboardData);
-      if (!file) return;
+      const files = imageFilesFromClipboardData(e.clipboardData);
+      if (files.length === 0) return;
 
       e.preventDefault();
       handleImagePaste(e.clipboardData);
@@ -593,6 +669,28 @@ export default function ChatArea({
           </button>
         </div>
 
+        {pendingImages.length > 0 && (
+          <div className="mt-[8px] flex gap-[8px] overflow-x-auto pb-[2px]">
+            {pendingImages.map((image) => (
+              <div key={image.id} className="relative w-[74px] h-[74px] shrink-0 rounded-[4px] overflow-hidden bg-[#111] border border-[#333]">
+                <img
+                  src={image.url}
+                  alt=""
+                  className="w-full h-full object-cover"
+                  draggable={false}
+                />
+                <button
+                  type="button"
+                  onClick={() => removePendingImage(image.id)}
+                  className="absolute top-[3px] right-[3px] w-[20px] h-[20px] rounded-full bg-black/70 text-white text-[16px] leading-[18px] flex items-center justify-center"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Input area */}
         {inputMode === "text" ? (
           <textarea
@@ -616,9 +714,9 @@ export default function ChatArea({
           <button
             onMouseDown={(e) => e.preventDefault()}
             onClick={handleSend}
-            disabled={sending || !input.trim()}
+            disabled={sending || !canSend}
             className={`min-w-[92px] h-[32px] px-[18px] rounded-[4px] text-[14px] transition-colors ${
-              input.trim() && !sending
+              canSend && !sending
                 ? "bg-[#07c160] text-white active:bg-[#06ad56]"
                 : "bg-[#2a2a2a] text-[#666]"
             }`}
