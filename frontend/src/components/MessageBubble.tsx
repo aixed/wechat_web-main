@@ -337,6 +337,16 @@ export default function MessageBubble({
         );
 
       case "47":
+        if (message.gif_path) {
+          return (
+            <img
+              src={getImageUrl(message.gif_path)}
+              alt="GIF"
+              className="max-w-[120px] max-h-[120px] rounded-[4px]"
+              loading="lazy"
+            />
+          );
+        }
         return <EmojiSticker msgXml={message.msg} />;
 
       case "48": {

@@ -11,6 +11,8 @@ import asyncio
 import time
 import sys
 import os
+import hashlib
+import zlib
 import json as _json
 from config import HOOK_BASE_URL, IS_HOOK, IS_PROTOCOL, LOGIN_MODE
 
@@ -97,6 +99,45 @@ def _log(msg: str):
     print(msg, flush=True)
 
 
+def _read_file_hex(filepath: str) -> str:
+    with open(filepath, "rb") as f:
+        return f.read().hex()
+
+
+def _attach_file_data(body: dict, path_key: str, file_data: str | None = None) -> dict:
+    """Attach hex fileData for Hook file-send APIs while keeping the path field."""
+    body["fileData"] = file_data or ""
+    if body["fileData"]:
+        return body
+
+    filepath = str(body.get(path_key) or "")
+    if not filepath or filepath.lower().startswith(("http://", "https://")):
+        return body
+
+    try:
+        if os.path.isfile(filepath):
+            body["fileData"] = _read_file_hex(filepath)
+        else:
+            _log(f"[API] fileData skipped: file not found: {filepath}")
+    except Exception as e:
+        _log(f"[API] fileData read failed: {filepath}: {type(e).__name__}: {e}")
+    return body
+
+
+def _scrub_payload_for_log(obj):
+    if isinstance(obj, dict):
+        scrubbed = {}
+        for key, value in obj.items():
+            if str(key).lower() == "filedata":
+                scrubbed[key] = f"<hex len={len(str(value or ''))}>"
+            else:
+                scrubbed[key] = _scrub_payload_for_log(value)
+        return scrubbed
+    if isinstance(obj, list):
+        return [_scrub_payload_for_log(item) for item in obj]
+    return obj
+
+
 def _circuit_open() -> bool:
     """Check if circuit breaker is open (should skip request)."""
     if _consecutive_failures == 0:
@@ -125,10 +166,11 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
 
     if not bypass_circuit_breaker and _circuit_open():
         backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
+        log_json = _scrub_payload_for_log(json or {})
         _log(f"[API] ⏸ Circuit breaker OPEN — skipping {endpoint} (failures={_consecutive_failures}, backoff={backoff}s)")
         await _append_main_log(
             f"[{_ts()}]POST {full_url}\n"
-            f"{_indent_multiline(_truncate(_pretty_json(json or {})), '          << ')}\n"
+            f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
             f"{_indent_multiline(f'ERROR Circuit breaker open (failures={_consecutive_failures}, backoff={backoff}s)', '          >> ')}\n"
             f"          error=circuit_open\n"
         )
@@ -137,7 +179,8 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
     async with _hook_lock:
         _req_id += 1
         rid = _req_id
-        body_str = str(json)[:200]
+        log_json = _scrub_payload_for_log(json or {})
+        body_str = str(log_json)[:200]
         _log(f"[API #{rid}] → POST {endpoint}  body={body_str}")
         t0 = time.time()
         try:
@@ -147,7 +190,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
             _log(f"[API #{rid}] ← {r.status_code} in {ms}ms  len={len(r.text)}  body={body_preview}")
             await _append_main_log(
                 f"[{_ts()}]POST {full_url}\n"
-                f"{_indent_multiline(_truncate(_pretty_json(json or {})), '          << ')}\n"
+                f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
                 f"{_indent_multiline(_truncate(r.text), '          >> ')}\n"
                 f"          time_used={ms}ms\n"
             )
@@ -165,7 +208,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
             _log(f"[API] ⚠ Consecutive failures: {_consecutive_failures} — next backoff: {backoff}s")
             await _append_main_log(
                 f"[{_ts()}]POST {full_url}\n"
-                f"{_indent_multiline(_truncate(_pretty_json(json or {})), '          << ')}\n"
+                f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
                 f"{_indent_multiline(_truncate(f'{type(e).__name__}: {e}', 2000), '          >> ')}\n"
                 f"          error={type(e).__name__} time_used={ms}ms\n"
             )
@@ -292,13 +335,22 @@ async def send_text(wxid: str, msg: str) -> dict:
     return safe_json(r)
 
 
-async def send_image(wxid: str, picpath: str, diyfilename: str = "") -> dict:
-    """Send image (local path or URL)."""
+async def send_text_no_src(wxidorgid: str, msg: str) -> dict:
+    """Send text through the lower-level no-source Hook endpoint."""
+    if IS_HOOK:
+        r = await _post("/SendTextMsg_NoSrc", json={"wxidorgid": wxidorgid, "msg": msg})
+        return safe_json(r)
+    return await send_text(wxidorgid, msg)
+
+
+async def send_image(wxid: str, picpath: str, diyfilename: str = "", file_data: str | None = None) -> dict:
+    """Send image (local path, URL, or hex fileData)."""
     if IS_HOOK:
         body = {"wxid": wxid, "picpath": picpath}
         if diyfilename:
             body["diyfilename"] = diyfilename
-        r = await _post("/SendPicMsg", json=body)
+        body = _attach_file_data(body, "picpath", file_data)
+        r = await _post("/SendPicMsg", json=body, timeout=90.0 if IS_LOCAL_HOOK else 180.0)
     else:
         # Remote: uploadmsgimg requires CDN pre-upload params.
         # For simple cases, we try sending as-is; the server handles upload.
@@ -309,10 +361,96 @@ async def send_image(wxid: str, picpath: str, diyfilename: str = "") -> dict:
     return safe_json(r)
 
 
-async def send_file(wxid: str, filepath: str) -> dict:
+def _first_nested_dict(data: dict, *path: str) -> dict:
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict):
+            return {}
+        cur = cur.get(key, {})
+    return cur if isinstance(cur, dict) else {}
+
+
+def _cdn_upload_fields(raw: dict, filepath: str, blob: bytes, aeskey: str) -> dict:
+    data = _first_nested_dict(raw, "data", "data") or _first_nested_dict(raw, "data") or raw
+    fileid = (
+        data.get("fileid")
+        or data.get("file_id")
+        or data.get("fileId")
+        or data.get("fileID")
+        or ""
+    )
+    authkey = data.get("authkey") or data.get("aeskey") or aeskey
+    filemd5 = data.get("filemd5") or data.get("md5") or data.get("rawfilemd5") or hashlib.md5(blob).hexdigest()
+    filesize = data.get("filesize") or data.get("fileSize") or data.get("rawtotalsize") or len(blob)
+    filecrc32 = data.get("filecrc32") or data.get("filecrc") or data.get("crc32") or (zlib.crc32(blob) & 0xffffffff)
+    return {
+        "fileid": str(fileid),
+        "authkey": str(authkey),
+        "filemd5": str(filemd5),
+        "filesize": str(filesize),
+        "filecrc32": str(filecrc32),
+        "rawmidimgsize": str(data.get("rawmidimgsize") or data.get("rawtotalsize") or filesize),
+        "rawthumbsize": str(data.get("rawthumbsize") or ""),
+        "thumbheight": str(data.get("thumbheight") or ""),
+        "thumbwidth": str(data.get("thumbwidth") or ""),
+        "filepath": filepath,
+        "raw": raw,
+    }
+
+
+async def cdn_upload_image(filepath: str, user_name: str = "filehelper", file_data: str | None = None) -> dict:
+    """Upload one image to CDN and return fields usable by SendImgMsg_NoSrc."""
+    if not IS_HOOK:
+        return {"error": "CDN upload is only supported in hook mode"}
+
+    blob = bytes.fromhex(file_data) if file_data else b""
+    if not blob:
+        with open(filepath, "rb") as f:
+            blob = f.read()
+        file_data = blob.hex()
+
+    aeskey = os.urandom(16).hex()
+    body = {
+        "fileType": 2,
+        "aeskey": aeskey,
+        "filePath": filepath,
+        "fileData": file_data,
+        "userName": user_name or "filehelper",
+        "chatType": 1 if str(user_name).endswith("@chatroom") else 0,
+    }
+    r = await _post("/upload", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
+    raw = safe_json(r)
+    fields = _cdn_upload_fields(raw, filepath, blob, aeskey)
+    if not fields.get("fileid"):
+        fields["error"] = raw.get("retmsg") or raw.get("error") or "CDN upload did not return fileid"
+    return fields
+
+
+async def send_image_no_src(wxidorgid: str, cdn_fields: dict) -> dict:
+    """Send an already-uploaded CDN image through the lower-level no-source endpoint."""
+    if not IS_HOOK:
+        return {"error": "SendImgMsg_NoSrc is only supported in hook mode"}
+    body = {
+        "wxidorgid": wxidorgid,
+        "fileid": str(cdn_fields.get("fileid", "")),
+        "authkey": str(cdn_fields.get("authkey", "")),
+        "filemd5": str(cdn_fields.get("filemd5", "")),
+        "filesize": str(cdn_fields.get("filesize", "")),
+        "filecrc32": str(cdn_fields.get("filecrc32", "")),
+    }
+    for key in ("rawmidimgsize", "rawthumbsize", "thumbheight", "thumbwidth"):
+        value = cdn_fields.get(key)
+        if value not in (None, ""):
+            body[key] = str(value)
+    r = await _post("/SendImgMsg_NoSrc", json=body, timeout=90.0 if IS_LOCAL_HOOK else 180.0)
+    return safe_json(r)
+
+
+async def send_file(wxid: str, filepath: str, file_data: str | None = None) -> dict:
     """Send file."""
     if IS_HOOK:
-        r = await _post("/SendFileMsg", json={"wxid": wxid, "filepath": filepath})
+        body = _attach_file_data({"wxid": wxid, "filepath": filepath}, "filepath", file_data)
+        r = await _post("/SendFileMsg", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
     else:
         r = await _post("/sendfileuploadmsg/", json={
             "userName": wxid,
@@ -321,10 +459,11 @@ async def send_file(wxid: str, filepath: str) -> dict:
     return safe_json(r)
 
 
-async def send_video(wxid: str, videopath: str) -> dict:
+async def send_video(wxid: str, videopath: str, file_data: str | None = None) -> dict:
     """Send video."""
     if IS_HOOK:
-        r = await _post("/SendVideoMsg", json={"wxid": wxid, "videopath": videopath})
+        body = _attach_file_data({"wxid": wxid, "videopath": videopath}, "videopath", file_data)
+        r = await _post("/SendVideoMsg", json=body, timeout=300.0 if IS_LOCAL_HOOK else 600.0)
     else:
         r = await _post("/uploadvideo/", json={
             "userName": wxid,
@@ -333,22 +472,24 @@ async def send_video(wxid: str, videopath: str) -> dict:
     return safe_json(r)
 
 
-async def send_voice(wxid: str, voice_file: str, time_ms: int) -> dict:
+async def send_voice(wxid: str, voice_file: str, time_ms: int, file_data: str | None = None) -> dict:
     """Send voice (SILK format)."""
     if IS_HOOK:
-        r = await _post("/SendVoiceMsg", json={
+        body = _attach_file_data({
             "wxid": wxid, "voice_file": voice_file, "time_ms": time_ms
-        })
+        }, "voice_file", file_data)
+        r = await _post("/SendVoiceMsg", json=body, timeout=120.0 if IS_LOCAL_HOOK else 180.0)
         return safe_json(r)
     else:
         _log("[API] Remote mode: SendVoiceMsg not directly supported")
         return {"error": "SendVoiceMsg not supported in remote mode"}
 
 
-async def send_gif(wxid: str, gifpath: str) -> dict:
+async def send_gif(wxid: str, gifpath: str, file_data: str | None = None) -> dict:
     """Send GIF."""
     if IS_HOOK:
-        r = await _post("/SendGIFMsg", json={"wxid": wxid, "gifpath": gifpath})
+        body = _attach_file_data({"wxid": wxid, "gifpath": gifpath}, "gifpath", file_data)
+        r = await _post("/SendGIFMsg", json=body, timeout=120.0 if IS_LOCAL_HOOK else 180.0)
     else:
         r = await _post("/sendemoji/", json={
             "userName": wxid,

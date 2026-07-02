@@ -1440,14 +1440,22 @@ class SendImageRequest(BaseModel):
     wxid: str
     picpath: str
     diyfilename: str = ""
+    fileData: str = ""
 
 class SendFileRequest(BaseModel):
     wxid: str
     filepath: str
+    fileData: str = ""
 
 class SendVideoRequest(BaseModel):
     wxid: str
     videopath: str
+    fileData: str = ""
+
+class SendGifRequest(BaseModel):
+    wxid: str
+    gifpath: str
+    fileData: str = ""
 
 class SendQuoteRequest(BaseModel):
     towxid: str
@@ -1463,6 +1471,10 @@ class SendAtRequest(BaseModel):
     nicknamelist: str
     msg: str
 
+class BroadcastTextRequest(BaseModel):
+    wxids: list[str]
+    msg: str
+
 class RevokeRequest(BaseModel):
     msg_svrid: int
     to_wxid: str
@@ -1472,6 +1484,51 @@ class SessionActionRequest(BaseModel):
 
 
 _send_counter = 0
+
+_BROADCAST_IMG_CDN_KEYS = (
+    "fileid",
+    "authkey",
+    "filemd5",
+    "filesize",
+    "filecrc32",
+    "rawmidimgsize",
+    "rawthumbsize",
+    "thumbheight",
+    "thumbwidth",
+)
+
+
+def _send_result_ok(result: dict) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("error"):
+        return False
+    status_code = result.get("status_code")
+    if status_code is not None:
+        try:
+            if int(status_code) >= 400:
+                return False
+        except Exception:
+            pass
+    code = result.get("code")
+    if code is not None:
+        try:
+            if int(code) < 0:
+                return False
+        except Exception:
+            pass
+    ret = result.get("ret")
+    if ret is not None:
+        try:
+            if int(ret) <= 0 and not result.get("MsgSvrID"):
+                return False
+        except Exception:
+            pass
+    retmsg = str(result.get("retmsg") or "").lower()
+    if retmsg and retmsg not in {"success", "ok"} and "error" in retmsg:
+        return False
+    return True
+
 
 async def _broadcast_local_sent_message(chat_id: str, msg_type: str, content: str = "", extra: dict | None = None) -> None:
     global _send_counter
@@ -1516,22 +1573,29 @@ async def send_text(req: SendTextRequest):
 
 @app.post("/api/send/image")
 async def send_image(req: SendImageRequest):
-    result = await wechat_api.send_image(req.wxid, req.picpath, req.diyfilename)
+    result = await wechat_api.send_image(req.wxid, req.picpath, req.diyfilename, req.fileData)
     await _broadcast_local_sent_message(req.wxid, "3", "", {"img_path": req.picpath})
     return result
 
 
 @app.post("/api/send/file")
 async def send_file(req: SendFileRequest):
-    result = await wechat_api.send_file(req.wxid, req.filepath)
+    result = await wechat_api.send_file(req.wxid, req.filepath, req.fileData)
     await _broadcast_local_sent_message(req.wxid, "49", "", {"file_path": req.filepath})
     return result
 
 
 @app.post("/api/send/video")
 async def send_video(req: SendVideoRequest):
-    result = await wechat_api.send_video(req.wxid, req.videopath)
+    result = await wechat_api.send_video(req.wxid, req.videopath, req.fileData)
     await _broadcast_local_sent_message(req.wxid, "43", "", {"video_path": req.videopath})
+    return result
+
+
+@app.post("/api/send/gif")
+async def send_gif(req: SendGifRequest):
+    result = await wechat_api.send_gif(req.wxid, req.gifpath, req.fileData)
+    await _broadcast_local_sent_message(req.wxid, "47", "", {"gif_path": req.gifpath})
     return result
 
 
@@ -1554,6 +1618,111 @@ async def send_at(req: SendAtRequest):
 
 _UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "_uploads")
 os.makedirs(_UPLOAD_DIR, exist_ok=True)
+
+
+@app.post("/api/broadcast/text")
+async def broadcast_text(req: BroadcastTextRequest):
+    """Broadcast text using the low-level NoSrc endpoint and patch local UI cache."""
+    wxids = [w for w in req.wxids if w]
+    results = []
+    sent = 0
+    failed = 0
+    for wxid in wxids:
+        try:
+            result = await wechat_api.send_text_no_src(wxid, req.msg)
+            ok = _send_result_ok(result)
+            if ok:
+                sent += 1
+                await _broadcast_local_sent_message(wxid, "1", req.msg)
+            else:
+                failed += 1
+            results.append({"wxid": wxid, "ok": ok, "result": result})
+        except Exception as e:
+            failed += 1
+            results.append({"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+    return {"total": len(wxids), "sent": sent, "failed": failed, "results": results}
+
+
+@app.post("/api/broadcast/image-upload")
+async def broadcast_image_upload(wxids: str = Form(...), file: UploadFile = File(...)):
+    """Upload one image to CDN once, then broadcast it via SendImgMsg_NoSrc."""
+    try:
+        target_wxids = [w for w in json.loads(wxids) if w]
+    except Exception:
+        target_wxids = [w.strip() for w in wxids.split(",") if w.strip()]
+    if not target_wxids:
+        return {"total": 0, "sent": 0, "failed": 0, "results": [], "error": "no targets"}
+
+    ext = os.path.splitext(file.filename or "img.png")[1] or ".png"
+    filename = f"broadcast_img_{int(time.time())}_{target_wxids[0]}{ext}"
+    filepath = os.path.join(_UPLOAD_DIR, filename)
+    data = await file.read()
+    with open(filepath, "wb") as f:
+        f.write(data)
+    _log(f"[BROADCAST] Saved image: {filepath} ({len(data)} bytes)")
+
+    send_path = filepath
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(io.BytesIO(data))
+        max_dim = 1920
+        max_bytes = 500_000
+        needs_compress = (
+            img.mode == "RGBA"
+            or ext.lower() == ".png"
+            or len(data) > max_bytes
+            or max(img.size) > max_dim
+        )
+        if needs_compress:
+            rgb = img.convert("RGB") if img.mode != "RGB" else img
+            w, h = rgb.size
+            if max(w, h) > max_dim:
+                ratio = max_dim / max(w, h)
+                rgb = rgb.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
+            jpg_path = os.path.splitext(filepath)[0] + ".jpg"
+            for quality in (85, 70, 55):
+                rgb.save(jpg_path, "JPEG", quality=quality)
+                if os.path.getsize(jpg_path) <= max_bytes:
+                    break
+            send_path = jpg_path
+            _log(f"[BROADCAST] Compressed image for CDN: {send_path}")
+    except Exception as e:
+        _log(f"[BROADCAST] Image compression skipped: {e}")
+
+    cdn = await wechat_api.cdn_upload_image(send_path, target_wxids[0])
+    if cdn.get("error"):
+        return {
+            "total": len(target_wxids),
+            "sent": 0,
+            "failed": len(target_wxids),
+            "results": [{"wxid": wxid, "ok": False, "error": cdn["error"]} for wxid in target_wxids],
+            "cdn": {k: cdn.get(k) for k in _BROADCAST_IMG_CDN_KEYS},
+        }
+
+    results = []
+    sent = 0
+    failed = 0
+    for wxid in target_wxids:
+        try:
+            result = await wechat_api.send_image_no_src(wxid, cdn)
+            ok = _send_result_ok(result)
+            if ok:
+                sent += 1
+                await _broadcast_local_sent_message(wxid, "3", "", {"img_path": filepath})
+            else:
+                failed += 1
+            results.append({"wxid": wxid, "ok": ok, "result": result})
+        except Exception as e:
+            failed += 1
+            results.append({"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    return {
+        "total": len(target_wxids),
+        "sent": sent,
+        "failed": failed,
+        "results": results,
+        "cdn": {k: cdn.get(k) for k in _BROADCAST_IMG_CDN_KEYS},
+    }
 
 
 @app.post("/api/send/image-upload")
@@ -1603,19 +1772,7 @@ async def send_image_upload(wxid: str = Form(...), file: UploadFile = File(...))
     except Exception as e:
         _log(f"[UPLOAD] Image compression skipped: {e}")
 
-    # Remote Hook: WeChat runs on a remote server and can't access local paths.
-    # Pass a publicly-accessible URL so the remote Hook can download the image.
-    # Use CALLBACK_PORT (not SERVER_PORT) because the remote Hook can only reach
-    # the callback port (which is separately forwarded/exposed).
-    diy = ""
-    if config.IS_REMOTE_HOOK:
-        basename = os.path.basename(send_path)
-        url = f"http://{config.PUBLIC_IP}:{config.CALLBACK_PORT}/uploads/{basename}"
-        _log(f"[UPLOAD] Remote mode → picpath URL: {url}")
-        diy = basename
-        send_path = url
-
-    result = await wechat_api.send_image(wxid, send_path, diy)
+    result = await wechat_api.send_image(wxid, send_path)
     await _broadcast_local_sent_message(wxid, "3", "", {"img_path": filepath})
     return result
 
@@ -1631,16 +1788,40 @@ async def send_file_upload(wxid: str = Form(...), file: UploadFile = File(...)):
         f.write(data)
     _log(f"[UPLOAD] Saved file: {filepath} ({len(data)} bytes)")
 
-    # Remote Hook: pass a publicly-accessible URL (same approach as image upload)
-    send_path = filepath
-    if config.IS_REMOTE_HOOK:
-        basename = os.path.basename(filepath)
-        url = f"http://{config.PUBLIC_IP}:{config.CALLBACK_PORT}/uploads/{basename}"
-        _log(f"[UPLOAD] Remote mode → filepath URL: {url}")
-        send_path = url
-
-    result = await wechat_api.send_file(wxid, send_path)
+    result = await wechat_api.send_file(wxid, filepath)
     await _broadcast_local_sent_message(wxid, "49", safe_name, {"file_path": filepath})
+    return result
+
+
+@app.post("/api/send/video-upload")
+async def send_video_upload(wxid: str = Form(...), file: UploadFile = File(...)):
+    """Upload a video from the browser and send it via WeChat."""
+    safe_name = (file.filename or "video.mp4").replace("\\", "_").replace("/", "_")
+    filename = f"{int(time.time())}_{safe_name}"
+    filepath = os.path.join(_UPLOAD_DIR, filename)
+    data = await file.read()
+    with open(filepath, "wb") as f:
+        f.write(data)
+    _log(f"[UPLOAD] Saved video: {filepath} ({len(data)} bytes)")
+
+    result = await wechat_api.send_video(wxid, filepath)
+    await _broadcast_local_sent_message(wxid, "43", "", {"video_path": filepath})
+    return result
+
+
+@app.post("/api/send/gif-upload")
+async def send_gif_upload(wxid: str = Form(...), file: UploadFile = File(...)):
+    """Upload a GIF/sticker file from the browser and send it via WeChat."""
+    safe_name = (file.filename or "emoji.gif").replace("\\", "_").replace("/", "_")
+    filename = f"{int(time.time())}_{safe_name}"
+    filepath = os.path.join(_UPLOAD_DIR, filename)
+    data = await file.read()
+    with open(filepath, "wb") as f:
+        f.write(data)
+    _log(f"[UPLOAD] Saved GIF: {filepath} ({len(data)} bytes)")
+
+    result = await wechat_api.send_gif(wxid, filepath)
+    await _broadcast_local_sent_message(wxid, "47", "", {"gif_path": filepath})
     return result
 
 

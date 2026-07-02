@@ -19,6 +19,7 @@ venv/
 env/
 
 # Backend runtime data and caches
+.run/
 backend/_uploads/
 backend/.img_cache/
 backend/.avatar_cache/

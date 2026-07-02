@@ -60,16 +60,28 @@ export const sendText = (wxid: string, msg: string) =>
     body: JSON.stringify({ wxid, msg }),
   });
 
-export const sendImage = (wxid: string, picpath: string) =>
+export const sendImage = (wxid: string, picpath: string, fileData = "") =>
   fetchJSON("/api/send/image", {
     method: "POST",
-    body: JSON.stringify({ wxid, picpath }),
+    body: JSON.stringify({ wxid, picpath, fileData }),
   });
 
-export const sendFile = (wxid: string, filepath: string) =>
+export const sendFile = (wxid: string, filepath: string, fileData = "") =>
   fetchJSON("/api/send/file", {
     method: "POST",
-    body: JSON.stringify({ wxid, filepath }),
+    body: JSON.stringify({ wxid, filepath, fileData }),
+  });
+
+export const sendVideo = (wxid: string, videopath: string, fileData = "") =>
+  fetchJSON("/api/send/video", {
+    method: "POST",
+    body: JSON.stringify({ wxid, videopath, fileData }),
+  });
+
+export const sendGif = (wxid: string, gifpath: string, fileData = "") =>
+  fetchJSON("/api/send/gif", {
+    method: "POST",
+    body: JSON.stringify({ wxid, gifpath, fileData }),
   });
 
 export const sendImageUpload = async (wxid: string, file: File) => {
@@ -84,7 +96,37 @@ export const sendFileUpload = async (wxid: string, file: File) => {
   const form = new FormData();
   form.append("wxid", wxid);
   form.append("file", file);
-  const res = await fetchWithTimeout("/api/send/file-upload", { method: "POST", body: form }, 60_000);
+  const res = await fetchWithTimeout("/api/send/file-upload", { method: "POST", body: form }, 120_000);
+  return res.json();
+};
+
+export const sendVideoUpload = async (wxid: string, file: File) => {
+  const form = new FormData();
+  form.append("wxid", wxid);
+  form.append("file", file);
+  const res = await fetchWithTimeout("/api/send/video-upload", { method: "POST", body: form }, 180_000);
+  return res.json();
+};
+
+export const sendGifUpload = async (wxid: string, file: File) => {
+  const form = new FormData();
+  form.append("wxid", wxid);
+  form.append("file", file);
+  const res = await fetchWithTimeout("/api/send/gif-upload", { method: "POST", body: form }, 120_000);
+  return res.json();
+};
+
+export const broadcastText = (wxids: string[], msg: string) =>
+  fetchJSON("/api/broadcast/text", {
+    method: "POST",
+    body: JSON.stringify({ wxids, msg }),
+  });
+
+export const broadcastImageUpload = async (wxids: string[], file: File) => {
+  const form = new FormData();
+  form.append("wxids", JSON.stringify(wxids));
+  form.append("file", file);
+  const res = await fetchWithTimeout("/api/broadcast/image-upload", { method: "POST", body: form }, 300_000);
   return res.json();
 };
 

@@ -4,14 +4,14 @@ import SessionList, { type SessionMenuAction } from "./components/SessionList";
 import ChatArea from "./components/ChatArea";
 import {
   batchGetContactBrief,
+  broadcastImageUpload,
+  broadcastText,
   getContactProfiles,
   getGroupMemberNames,
   markAsRead,
   markSessionUnread,
   muteSession,
   refreshSessions,
-  sendImageUpload,
-  sendText,
   stickyChat,
   unmuteSession,
   unpinChat,
@@ -1684,40 +1684,51 @@ function BroadcastPanel({
     setSending(true);
     setSent(0);
     setFailed(0);
-    let ok = 0;
-    let bad = 0;
+    const status = new Map(wxids.map((wxid) => [wxid, true]));
+    const updateProgress = () => {
+      let ok = 0;
+      let bad = 0;
+      for (const value of status.values()) {
+        if (value) ok += 1;
+        else bad += 1;
+      }
+      setSent(ok);
+      setFailed(bad);
+    };
+    const applyResult = (res: any, targets: string[]) => {
+      const rows = Array.isArray(res?.results) ? res.results : [];
+      if (rows.length === 0 && res?.error) {
+        for (const wxid of targets) status.set(wxid, false);
+        return;
+      }
+      const seen = new Set<string>();
+      for (const row of rows) {
+        const wxid = String(row?.wxid || "");
+        if (!wxid) continue;
+        seen.add(wxid);
+        if (!row?.ok) status.set(wxid, false);
+      }
+      for (const wxid of targets) {
+        if (!seen.has(wxid)) status.set(wxid, false);
+      }
+    };
     try {
-      for (const wxid of wxids) {
+      for (const part of parts) {
+        const activeWxids = wxids.filter((wxid) => status.get(wxid));
+        if (activeWxids.length === 0) break;
         try {
-          let targetFailed = false;
-          for (const part of parts) {
-            if (part.type === "text") {
-              const textRes = await sendText(wxid, part.text);
-              const textCode = Number(textRes?.code ?? textRes?.ret ?? 0);
-              if (textRes?.error || textCode < 0) {
-                targetFailed = true;
-                break;
-              }
-            } else {
-              const imageRes = await sendImageUpload(wxid, part.image.file);
-              const imageCode = Number(imageRes?.code ?? imageRes?.ret ?? 0);
-              if (imageRes?.error || imageCode < 0) {
-                targetFailed = true;
-                break;
-              }
-            }
-            await new Promise((resolve) => window.setTimeout(resolve, 120));
-          }
-          if (targetFailed) bad += 1;
-          else ok += 1;
+          const res = part.type === "text"
+            ? await broadcastText(activeWxids, part.text)
+            : await broadcastImageUpload(activeWxids, part.image.file);
+          applyResult(res, activeWxids);
         } catch {
-          bad += 1;
+          for (const wxid of activeWxids) status.set(wxid, false);
         }
-        setSent(ok);
-        setFailed(bad);
+        updateProgress();
         await new Promise((resolve) => window.setTimeout(resolve, 120));
       }
     } finally {
+      updateProgress();
       setSending(false);
     }
   };

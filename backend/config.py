@@ -47,11 +47,35 @@ _cfg = _load_yaml()
 # ─── Login mode ────────────────────────────────────────────────────
 
 _VALID_MODES = ("local_hook", "remote_hook", "remote_protocol")
+_MODE_BY_NUMBER = {
+    1: "local_hook",
+    2: "remote_hook",
+    3: "remote_protocol",
+}
 
-LOGIN_MODE: str = str(_cfg.get("login", "local_hook")).strip().lower()
-assert LOGIN_MODE in _VALID_MODES, (
-    f"Invalid login mode: {LOGIN_MODE!r}, must be one of {_VALID_MODES}"
-)
+def _resolve_login_mode(cfg: dict) -> tuple[int, str]:
+    raw_mode = cfg.get("wechat_mode")
+    if raw_mode is None:
+        raw_mode = cfg.get("login", 1)
+
+    raw_text = str(raw_mode).strip().lower()
+    if raw_text in ("1", "2", "3"):
+        mode_number = int(raw_text)
+        return mode_number, _MODE_BY_NUMBER[mode_number]
+
+    if raw_text not in _VALID_MODES:
+        raise ValueError(
+            f"Invalid wechat_mode/login: {raw_mode!r}, "
+            f"wechat_mode must be 1/2/3 or login must be one of {_VALID_MODES}"
+        )
+
+    for mode_number, mode_name in _MODE_BY_NUMBER.items():
+        if mode_name == raw_text:
+            return mode_number, mode_name
+
+    raise ValueError(f"Invalid login mode: {raw_mode!r}")
+
+WECHAT_MODE, LOGIN_MODE = _resolve_login_mode(_cfg)
 
 IS_LOCAL_HOOK = LOGIN_MODE == "local_hook"
 IS_REMOTE_HOOK = LOGIN_MODE == "remote_hook"
@@ -87,7 +111,7 @@ SERVER_PORT = int(_cfg.get("server_port", 5000))
 CALLBACK_PORT = int(_cfg.get("callback_port", SERVER_PORT))
 CALLBACK_PATH = str(_cfg.get("callback_path", "/api/callback"))
 CALLBACK_URL = f"http://{PUBLIC_IP}:{CALLBACK_PORT}{CALLBACK_PATH}"
-RECV_TYPE = int(_cfg.get("recv_type", 2))
+RECV_TYPE = int(_cfg.get("recvtype", _cfg.get("recv_type", 2)))
 if RECV_TYPE not in (1, 2):
     print(f"[CONFIG] ⚠ invalid recv_type={RECV_TYPE!r}, using 2", flush=True)
     RECV_TYPE = 2
@@ -98,7 +122,7 @@ MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL = int(_cfg.get("max_restarts_after_button_l
 
 # ─── Log loaded config ────────────────────────────────────────────
 
-print(f"[CONFIG] mode={LOGIN_MODE}  host={HOOK_HOST}  "
+print(f"[CONFIG] wechat_mode={WECHAT_MODE}  mode={LOGIN_MODE}  host={HOOK_HOST}  "
       f"api_port={HOOK_PORT}  mgr_port={MGR_PORT}  "
       f"server_port={SERVER_PORT}  callback={CALLBACK_URL}  "
       f"recv_type={RECV_TYPE}  "
