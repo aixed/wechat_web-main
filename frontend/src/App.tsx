@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, type FormEvent, type TouchEvent } from "react";
+import { useState, useCallback, useEffect, useRef, type FormEvent, type ReactNode, type TouchEvent } from "react";
 import { useWebSocket } from "./useWebSocket";
 import SessionList, { type SessionMenuAction } from "./components/SessionList";
 import ChatArea from "./components/ChatArea";
@@ -38,6 +38,7 @@ type PortalTheme = "dark" | "light";
 const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
 const PINNED_ORDER_THRESHOLD = 1_000_000_000_000;
+const MOBILE_SWIPE_DIRECTION_EPSILON = 0.25;
 
 function clampSidePanelWidth(value: number): number {
   return Math.min(460, Math.max(236, Math.round(value)));
@@ -68,6 +69,132 @@ function useIsMobileViewport() {
   }, []);
 
   return isMobile;
+}
+
+function isNoSwipeTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest("input, textarea, select, a, [data-no-swipe='true']"));
+}
+
+function MobileSwipeFrame({
+  children,
+  dark,
+  onBack,
+  onForward,
+}: {
+  children: ReactNode;
+  dark: boolean;
+  onBack?: () => void;
+  onForward?: () => void;
+}) {
+  const [dragX, setDragX] = useState(0);
+  const [settling, setSettling] = useState(false);
+  const touchRef = useRef<{
+    x: number;
+    y: number;
+    active: boolean;
+    horizontal: boolean | null;
+    blocked: boolean;
+  } | null>(null);
+
+  const clampDrag = (dx: number) => {
+    const width = Math.max(1, window.innerWidth || 1);
+    const max = width * 0.84;
+    const allowed = dx > 0 ? Boolean(onBack) : Boolean(onForward);
+    const amount = Math.min(Math.abs(dx), max);
+    const eased = allowed ? amount : Math.min(amount * 0.18, 24);
+    return Math.sign(dx) * eased;
+  };
+
+  const finishGesture = (action?: () => void, targetX = 0) => {
+    setSettling(true);
+    setDragX(targetX);
+    window.setTimeout(() => {
+      action?.();
+      setDragX(0);
+      setSettling(false);
+    }, action ? 150 : 180);
+  };
+
+  const handleTouchStart = (event: TouchEvent<HTMLDivElement>) => {
+    const touch = event.touches[0];
+    if (!touch) return;
+    touchRef.current = {
+      x: touch.clientX,
+      y: touch.clientY,
+      active: true,
+      horizontal: null,
+      blocked: isNoSwipeTarget(event.target),
+    };
+    setSettling(false);
+  };
+
+  const handleTouchMove = (event: TouchEvent<HTMLDivElement>) => {
+    const start = touchRef.current;
+    const touch = event.touches[0];
+    if (!start || !start.active || !touch || start.blocked) return;
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (start.horizontal === null && (Math.abs(dx) > MOBILE_SWIPE_DIRECTION_EPSILON || Math.abs(dy) > MOBILE_SWIPE_DIRECTION_EPSILON)) {
+      start.horizontal = Math.abs(dx) > Math.abs(dy);
+    }
+    if (!start.horizontal) return;
+    event.preventDefault();
+    setDragX(clampDrag(dx));
+  };
+
+  const handleTouchEnd = (event: TouchEvent<HTMLDivElement>) => {
+    const start = touchRef.current;
+    touchRef.current = null;
+    const touch = event.changedTouches[0];
+    if (!start || !touch || start.blocked) {
+      finishGesture();
+      return;
+    }
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (!start.horizontal || Math.abs(dx) <= Math.abs(dy)) {
+      finishGesture();
+      return;
+    }
+    const width = Math.max(1, window.innerWidth || 1);
+    if (dx > width / 2 && onBack) {
+      finishGesture(onBack, width);
+      return;
+    }
+    if (dx < -width / 2 && onForward) {
+      finishGesture(onForward, -width);
+      return;
+    }
+    finishGesture();
+  };
+
+  const progress = Math.min(1, Math.abs(dragX) / Math.max(1, window.innerWidth || 1));
+
+  return (
+    <div
+      className={`mobile-swipe-stage h-dvh w-screen overflow-hidden ${dark ? "bg-[#050505]" : "bg-[#dcdcdc]"}`}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
+      onTouchCancel={() => finishGesture()}
+    >
+      <div
+        className="mobile-swipe-backdrop"
+        style={{ opacity: progress * 0.62 }}
+      />
+      <div
+        className="mobile-swipe-page h-full w-full"
+        style={{
+          transform: `translate3d(${dragX}px, 0, 0)`,
+          transition: settling ? "transform 180ms cubic-bezier(.22, .8, .22, 1)" : "none",
+          boxShadow: dragX === 0 ? "none" : `${dragX > 0 ? "-18px" : "18px"} 0 34px rgba(0,0,0,${0.18 + progress * 0.28})`,
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
 }
 
 interface DirectoryEntry {
@@ -1979,35 +2106,58 @@ export default function App() {
   }
 
   if (isMobile) {
+    const firstMobileSession = sessions[0];
+    const firstMobileContact = mobileTab === "contacts" ? (friendEntries[0] || groupEntries[0]) : null;
+    const canMobileForward = Boolean(
+      (mobileTab === "chats" && firstMobileSession) ||
+      (mobileTab === "contacts" && firstMobileContact) ||
+      mobileTab === "me",
+    );
+    const handleMobileForward = () => {
+      if (mobileTab === "chats" && firstMobileSession) {
+        handleSelectChat(firstMobileSession.wxid, firstMobileSession);
+        return;
+      }
+      if (mobileTab === "contacts" && firstMobileContact) {
+        openDirectoryProfile(firstMobileContact);
+        return;
+      }
+      if (mobileTab === "me") {
+        openMobileSelfProfileDetail();
+      }
+    };
+
     if (activeChat && activeSession) {
       return (
-        <div className={`h-dvh w-screen overflow-hidden ${darkTheme ? "bg-[#111111]" : "bg-[#ededed]"}`}>
-          {!connected && (
-            <div className="fixed top-0 left-0 right-0 bg-[#e6a23c] text-black text-center text-[12px] py-1 z-50">
-              正在连接后端服务器...
-            </div>
-          )}
-          <ChatArea
-            mobile
-            session={activeSession}
-            messages={activeMsgs}
-            selfWxid={selfWxid}
-            onBack={handleBack}
-            onNewMessages={handleNewMessages}
-            avatarMap={avatarMap}
-            contactMap={contactMap}
-            contactProfiles={contactProfiles}
-            onRequestContactProfile={ensureContactProfiles}
-            onInputChange={setHasUnsavedInput}
-            dark={darkTheme}
-          />
-        </div>
+        <MobileSwipeFrame dark={darkTheme} onBack={handleBack}>
+          <div className={`h-dvh w-screen overflow-hidden ${darkTheme ? "bg-[#111111]" : "bg-[#ededed]"}`}>
+            {!connected && (
+              <div className="fixed top-0 left-0 right-0 bg-[#e6a23c] text-black text-center text-[12px] py-1 z-50">
+                正在连接后端服务器...
+              </div>
+            )}
+            <ChatArea
+              mobile
+              session={activeSession}
+              messages={activeMsgs}
+              selfWxid={selfWxid}
+              onBack={handleBack}
+              onNewMessages={handleNewMessages}
+              avatarMap={avatarMap}
+              contactMap={contactMap}
+              contactProfiles={contactProfiles}
+              onRequestContactProfile={ensureContactProfiles}
+              onInputChange={setHasUnsavedInput}
+              dark={darkTheme}
+            />
+          </div>
+        </MobileSwipeFrame>
       );
     }
 
     if (mobileProfileDetailOpen) {
       return (
-        <>
+        <MobileSwipeFrame dark={darkTheme} onBack={() => setMobileProfileDetailOpen(false)}>
           <MobileProfileDetailPage
             profile={selfProfile}
             fallbackName={selfInfoName}
@@ -2028,46 +2178,61 @@ export default function App() {
               dark={darkTheme}
             />
           )}
-        </>
+        </MobileSwipeFrame>
       );
     }
 
     if (directoryProfileEntry) {
       return (
-        <MobileDirectoryProfilePage
-          entry={directoryProfileEntry}
-          profile={contactProfiles[directoryProfileEntry.wxid]}
-          loading={directoryProfileLoading}
+        <MobileSwipeFrame
           dark={darkTheme}
           onBack={() => setDirectoryProfileWxid(null)}
-          onMessage={() => handleSelectChat(directoryProfileEntry.wxid, {
+          onForward={() => handleSelectChat(directoryProfileEntry.wxid, {
             nickname: directoryProfileEntry.name,
             avatar: directoryProfileEntry.avatar,
             is_group: directoryProfileEntry.is_group,
           })}
-        />
+        >
+          <MobileDirectoryProfilePage
+            entry={directoryProfileEntry}
+            profile={contactProfiles[directoryProfileEntry.wxid]}
+            loading={directoryProfileLoading}
+            dark={darkTheme}
+            onBack={() => setDirectoryProfileWxid(null)}
+            onMessage={() => handleSelectChat(directoryProfileEntry.wxid, {
+              nickname: directoryProfileEntry.name,
+              avatar: directoryProfileEntry.avatar,
+              is_group: directoryProfileEntry.is_group,
+            })}
+          />
+        </MobileSwipeFrame>
       );
     }
 
     return (
-      <MobileMainShell
-        tab={mobileTab}
-        sessions={sessions}
-        friends={friendEntries}
-        groups={groupEntries}
-        selfName={selfInfoName}
-        selfWxid={selfWxid}
-        selfAvatar={selfAvatar}
-        selfProfile={selfProfile}
-        contactsLoading={contactsHydrating}
+      <MobileSwipeFrame
         dark={darkTheme}
-        onSwitchTab={switchMobileTab}
-        onSelectChat={handleSelectChat}
-        onSelectContact={openDirectoryProfile}
-        onHydrateContacts={hydrateDirectoryContacts}
-        onOpenSelfDetail={openMobileSelfProfileDetail}
-        onBackToAccounts={handleLeaveAccount}
-      />
+        onBack={handleLeaveAccount}
+        onForward={canMobileForward ? handleMobileForward : undefined}
+      >
+        <MobileMainShell
+          tab={mobileTab}
+          sessions={sessions}
+          friends={friendEntries}
+          groups={groupEntries}
+          selfName={selfInfoName}
+          selfWxid={selfWxid}
+          selfAvatar={selfAvatar}
+          selfProfile={selfProfile}
+          contactsLoading={contactsHydrating}
+          dark={darkTheme}
+          onSwitchTab={switchMobileTab}
+          onSelectChat={handleSelectChat}
+          onSelectContact={openDirectoryProfile}
+          onHydrateContacts={hydrateDirectoryContacts}
+          onOpenSelfDetail={openMobileSelfProfileDetail}
+        />
+      </MobileSwipeFrame>
     );
   }
 
@@ -2429,61 +2594,65 @@ function MobileAccountPortal({
 
   if (showBroadcast) {
     return (
-      <MobileMultiAccountBroadcastPage
-        accounts={accounts}
-        theme={theme}
-        onBack={() => setShowBroadcast(false)}
-      />
+      <MobileSwipeFrame dark={dark} onBack={() => setShowBroadcast(false)}>
+        <MobileMultiAccountBroadcastPage
+          accounts={accounts}
+          theme={theme}
+          onBack={() => setShowBroadcast(false)}
+        />
+      </MobileSwipeFrame>
     );
   }
 
   return (
-    <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
-      <MobileTopBar dark={dark} title="微信账号" rightLabel="刷新" onRight={onRefresh} leftLabel="退出" onLeft={onLogout} />
-      <div className={`px-[14px] py-[12px] border-b flex items-center justify-between ${dark ? "border-[#242424]" : "border-[#dedede]"}`}>
-        <button
-          type="button"
-          onClick={() => setShowBroadcast(true)}
-          className="h-[36px] px-[14px] rounded-full bg-[#07c160] text-white text-[14px] active:opacity-85"
-        >
-          多号群发
-        </button>
-        <ThemeSwitch theme={theme} onChange={onThemeChange} />
-      </div>
-      <div className="flex-1 overflow-y-auto px-[14px] py-[14px] pb-[calc(18px+env(safe-area-inset-bottom))]">
-        {loading && accounts.length === 0 && <div className="text-center text-[#888] text-[14px] mt-[40px]">正在读取微信连接...</div>}
-        {!loading && accounts.length === 0 && (
-          <div className="text-center text-[#888] text-[14px] leading-[24px] mt-[44px]">
-            暂无连接的微信<br />请让客户端 DLL 连接到当前后端 `/agent`
+    <MobileSwipeFrame dark={dark} onForward={accounts[0] ? () => onSelectAccount(accounts[0]) : undefined}>
+      <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+        <MobileTopBar dark={dark} title="微信账号" rightLabel="刷新" onRight={onRefresh} leftLabel="退出" onLeft={onLogout} />
+        <div className={`px-[14px] py-[12px] border-b flex items-center justify-between ${dark ? "border-[#242424]" : "border-[#dedede]"}`}>
+          <button
+            type="button"
+            onClick={() => setShowBroadcast(true)}
+            className="h-[36px] px-[14px] rounded-full bg-[#07c160] text-white text-[14px] active:opacity-85"
+          >
+            多号群发
+          </button>
+          <ThemeSwitch theme={theme} onChange={onThemeChange} />
+        </div>
+        <div className="flex-1 overflow-y-auto px-[14px] py-[14px] pb-[calc(18px+env(safe-area-inset-bottom))]">
+          {loading && accounts.length === 0 && <div className="text-center text-[#888] text-[14px] mt-[40px]">正在读取微信连接...</div>}
+          {!loading && accounts.length === 0 && (
+            <div className="text-center text-[#888] text-[14px] leading-[24px] mt-[44px]">
+              暂无连接的微信<br />请让客户端 DLL 连接到当前后端 `/agent`
+            </div>
+          )}
+          <div className="space-y-[12px]">
+            {accounts.map((account) => {
+              const meta = statusMeta(account);
+              return (
+              <button
+                key={account.id}
+                type="button"
+                onClick={() => onSelectAccount(account)}
+                className={`w-full min-h-[86px] rounded-[12px] shadow-sm px-[14px] py-[12px] flex items-center gap-[12px] text-left active:opacity-90 ${
+                  dark ? "bg-[#1b1b1b]" : "bg-white active:bg-[#f4f4f4]"
+                }`}
+              >
+                <AccountAvatar account={account} />
+                <div className="min-w-0 flex-1">
+                  <div className="text-[18px] font-medium truncate">{displayName(account)}</div>
+                  <div className={`text-[13px] truncate mt-[4px] ${dark ? "text-[#888]" : "text-[#888]"}`}>{account.wxid || account.account_id || account.id}</div>
+                  <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>WS {account.id}</div>
+                </div>
+                <span className={`text-[12px] px-[7px] py-[3px] rounded-full ${meta.className}`}>
+                  {meta.text}
+                </span>
+              </button>
+              );
+            })}
           </div>
-        )}
-        <div className="space-y-[12px]">
-          {accounts.map((account) => {
-            const meta = statusMeta(account);
-            return (
-            <button
-              key={account.id}
-              type="button"
-              onClick={() => onSelectAccount(account)}
-              className={`w-full min-h-[86px] rounded-[12px] shadow-sm px-[14px] py-[12px] flex items-center gap-[12px] text-left active:opacity-90 ${
-                dark ? "bg-[#1b1b1b]" : "bg-white active:bg-[#f4f4f4]"
-              }`}
-            >
-              <AccountAvatar account={account} />
-              <div className="min-w-0 flex-1">
-                <div className="text-[18px] font-medium truncate">{displayName(account)}</div>
-                <div className={`text-[13px] truncate mt-[4px] ${dark ? "text-[#888]" : "text-[#888]"}`}>{account.wxid || account.account_id || account.id}</div>
-                <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>WS {account.id}</div>
-              </div>
-              <span className={`text-[12px] px-[7px] py-[3px] rounded-full ${meta.className}`}>
-                {meta.text}
-              </span>
-            </button>
-            );
-          })}
         </div>
       </div>
-    </div>
+    </MobileSwipeFrame>
   );
 }
 
@@ -2810,7 +2979,6 @@ function MobileMainShell({
   onSelectContact,
   onHydrateContacts,
   onOpenSelfDetail,
-  onBackToAccounts,
 }: {
   tab: MobileTab;
   sessions: Session[];
@@ -2827,11 +2995,10 @@ function MobileMainShell({
   onSelectContact: (entry: DirectoryEntry) => void;
   onHydrateContacts: () => void;
   onOpenSelfDetail: () => void;
-  onBackToAccounts: () => void;
 }) {
   return (
     <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
-      {tab === "chats" && <MobileChatsView sessions={sessions} onSelectChat={onSelectChat} onBackToAccounts={onBackToAccounts} dark={dark} />}
+      {tab === "chats" && <MobileChatsView sessions={sessions} onSelectChat={onSelectChat} dark={dark} />}
       {tab === "contacts" && (
         <MobileContactsView
           friends={friends}
@@ -2873,40 +3040,14 @@ function MobileSearchBar({ placeholder = "Search", dark = false }: { placeholder
 function MobileChatsView({
   sessions,
   onSelectChat,
-  onBackToAccounts,
   dark,
 }: {
   sessions: Session[];
   onSelectChat: (wxid: string) => void;
-  onBackToAccounts: () => void;
   dark: boolean;
 }) {
-  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
-
-  const handleTouchStart = (event: TouchEvent<HTMLDivElement>) => {
-    const touch = event.touches[0];
-    if (!touch) return;
-    touchStartRef.current = { x: touch.clientX, y: touch.clientY };
-  };
-
-  const handleTouchEnd = (event: TouchEvent<HTMLDivElement>) => {
-    const start = touchStartRef.current;
-    touchStartRef.current = null;
-    const touch = event.changedTouches[0];
-    if (!start || !touch) return;
-    const dx = touch.clientX - start.x;
-    const dy = touch.clientY - start.y;
-    if (dx > 90 && Math.abs(dx) > Math.abs(dy) * 1.35) {
-      onBackToAccounts();
-    }
-  };
-
   return (
-    <div
-      className="flex-1 min-h-0 overflow-y-auto pt-[calc(env(safe-area-inset-top)+8px)] pb-[10px]"
-      onTouchStart={handleTouchStart}
-      onTouchEnd={handleTouchEnd}
-    >
+    <div className="flex-1 min-h-0 overflow-y-auto pt-[calc(env(safe-area-inset-top)+8px)] pb-[10px]">
       <MobileSearchBar dark={dark} />
       <div className={dark ? "bg-[#111111]" : "bg-white"}>
         {sessions.length === 0 && <div className={`text-center text-[14px] py-[48px] ${dark ? "text-[#666]" : "text-[#999]"}`}>暂无会话</div>}
