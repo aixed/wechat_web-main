@@ -207,6 +207,8 @@ app_state = {
     "last_messages": {},    # {wxid: {content, type, is_sender, time}}
     "avatar_urls": {},      # {wxid: direct_url} extracted from contact data
     "initialized": False,
+    "contacts_loaded": False,
+    "session_list_loaded": False,
 }
 
 message_store = MessageStore()
@@ -220,6 +222,7 @@ _account_card_refresh_at: dict[str, float] = {}
 _account_card_refreshing: set[str] = set()
 _initializing_agents: set[str] = set()
 _agent_login_status_seen: dict[str, str] = {}
+_CONTACT_INIT_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _new_app_state() -> dict:
@@ -230,6 +233,8 @@ def _new_app_state() -> dict:
         "last_messages": {},
         "avatar_urls": {},
         "initialized": False,
+        "contacts_loaded": False,
+        "session_list_loaded": False,
     }
 
 
@@ -712,7 +717,18 @@ def _store_message_and_session(chat_id: str, msg: dict) -> dict:
         "time": msg_timestamp,
     }
     try:
-        sqlite_cache.upsert_messages(chat_id, [msg], owner_wxid=_contact_owner_wxid())
+        owner_wxid = _contact_owner_wxid()
+        sqlite_cache.upsert_messages(chat_id, [msg], owner_wxid=owner_wxid)
+        sqlite_cache.upsert_session_preview(
+            chat_id,
+            nickname=message_store.get_contact(chat_id).get("name", ""),
+            content=preview,
+            msg_type=str(msg.get("msgtype", "") or "1"),
+            timestamp=msg_timestamp,
+            unread_delta=1 if is_recv else 0,
+            owner_wxid=owner_wxid,
+        )
+        _load_session_cache_into_state(owner_wxid)
     except Exception as e:
         _log(f"[SQLITE_CACHE] realtime write failed for {chat_id}: {type(e).__name__}: {e}")
     return {
@@ -854,8 +870,6 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     try:
         owner_wxid = _contact_owner_wxid()
         cached_contact_count = sqlite_cache.count_contacts(owner_wxid=owner_wxid)
-        if cached_contact_count > 0 and not sqlite_cache.has_contact_init_done(owner_wxid=owner_wxid):
-            sqlite_cache.mark_contact_init_done(owner_wxid=owner_wxid)
         app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
         _log(f"[INIT 1/7] ✓ Contact init skipped during login; loaded {cached_contact_count} cached contacts")
     except Exception as e:
@@ -1050,6 +1064,13 @@ class ActivateAccountRequest(BaseModel):
 class MultiBroadcastTextRequest(BaseModel):
     wxids: list[str] = []
     msg: str
+    agent_ids: list[str] = []
+    target_types: list[str] = []
+    mode: str = "nosrc"
+
+
+class MultiBroadcastTargetsRequest(BaseModel):
+    wxids: list[str] = []
     agent_ids: list[str] = []
     target_types: list[str] = []
 
@@ -1285,17 +1306,8 @@ async def wechat_callback(request: Request):
         normalized_messages.append(normalized)
         session_updates.append(_store_message_and_session(chat_id, normalized))
 
-    # Update the cached session list with any new chat_ids from callbacks
-    # so they'll be included in future /api/sessions/refresh DB queries
-    if session_updates and isinstance(app_state.get("sessions"), dict):
-        cached_data = app_state["sessions"].get("data", [])
-        cached_wxids = {s.get("strUsrName", "") for s in cached_data}
-        for su in session_updates:
-            wxid = su.get("wxid", "")
-            if wxid and wxid not in cached_wxids:
-                cached_data.append({"strUsrName": wxid, "strNickName": ""})
-                cached_wxids.add(wxid)
-                _log(f"[SESSIONS] Added new session to cache: {wxid}")
+    if session_updates:
+        _load_session_cache_into_state(_contact_owner_wxid())
 
     # Broadcast normalized callback data to all connected frontends
     await manager.broadcast({
@@ -1465,39 +1477,103 @@ async def _query_session_list_from_db() -> dict:
     if not isinstance(rows, list):
         rows = []
 
-    def row_value(row: dict, *keys: str):
-        for key in keys:
-            if key in row and row.get(key) is not None:
-                return row.get(key)
-        return ""
-
     sessions: list[dict] = []
     seen: set[str] = set()
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
         wxid = str(
-            row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid")
+            _row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid")
         ).strip()
         if not wxid or wxid in seen:
             continue
         nickname = str(
-            row_value(row, "strNickName", "StrNickName", "NickName", "nickname")
+            _row_value(row, "strNickName", "StrNickName", "NickName", "nickname")
         )
         seen.add(wxid)
         session = dict(row)
         session.update({
             "strUsrName": wxid,
             "strNickName": nickname,
-            "strContent": row_value(row, "strContent", "StrContent", "content"),
-            "nUnReadCount": row_value(row, "nUnReadCount", "UnReadCount", "unread"),
-            "othersAtMe": row_value(row, "othersAtMe", "OthersAtMe", "atMe"),
-            "nOrder": row_value(row, "nOrder", "NOrder", "order"),
-            "order": row_value(row, "nOrder", "NOrder", "order"),
+            "strContent": _row_value(row, "strContent", "StrContent", "content"),
+            "nUnReadCount": _row_value(row, "nUnReadCount", "UnReadCount", "unread"),
+            "othersAtMe": _row_value(row, "othersAtMe", "OthersAtMe", "atMe"),
+            "nOrder": _row_value(row, "nOrder", "NOrder", "order"),
+            "order": _row_value(row, "nOrder", "NOrder", "order"),
         })
         sessions.append(session)
 
     return {"data": sessions}
+
+
+def _row_value(row: dict, *keys: str):
+    for key in keys:
+        if key in row and row.get(key) is not None:
+            return row.get(key)
+    return ""
+
+
+def _to_int(value) -> int:
+    try:
+        if value in (None, ""):
+            return 0
+        return int(float(value))
+    except Exception:
+        return 0
+
+
+def _session_rows_from_cache(owner_wxid: str = "") -> list[dict]:
+    owner_wxid = owner_wxid or _contact_owner_wxid()
+    return sqlite_cache.get_sessions(owner_wxid=owner_wxid)
+
+
+def _session_snapshot_from_cache(owner_wxid: str = "") -> dict:
+    return {"data": _session_rows_from_cache(owner_wxid)}
+
+
+def _last_messages_from_session_rows(rows: list[dict]) -> dict[str, dict]:
+    last_messages: dict[str, dict] = {}
+    for session in rows or []:
+        if not isinstance(session, dict):
+            continue
+        wxid = str(_row_value(session, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
+        content = str(_row_value(session, "strContent", "StrContent", "content", "lastMsg") or "")
+        if not wxid:
+            continue
+        last_messages[wxid] = {
+            "content": content,
+            "type": str(_row_value(session, "nMsgType", "NMsgType", "msgType", "type") or "1"),
+            "is_sender": _to_int(_row_value(session, "isSender", "IsSender", "is_sender")),
+            "time": _to_int(_row_value(
+                session,
+                "nTime",
+                "NTime",
+                "nUpdateTime",
+                "nCreateTime",
+                "CreateTime",
+                "timestamp",
+                "lastTimestamp",
+            )),
+        }
+    return last_messages
+
+
+def _load_session_cache_into_state(owner_wxid: str = "") -> tuple[dict, dict]:
+    snapshot = _session_snapshot_from_cache(owner_wxid)
+    rows = snapshot.get("data") or []
+    last_messages = _last_messages_from_session_rows(rows)
+    app_state["sessions"] = snapshot
+    app_state["last_messages"] = {**(app_state.get("last_messages") or {}), **last_messages}
+    return snapshot, last_messages
+
+
+def _contact_init_lock(owner_wxid: str) -> asyncio.Lock:
+    key = owner_wxid or "__default__"
+    lock = _CONTACT_INIT_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CONTACT_INIT_LOCKS[key] = lock
+    return lock
 
 
 def _contact_profile_wxid(profile: dict) -> str:
@@ -1507,7 +1583,11 @@ def _contact_profile_wxid(profile: dict) -> str:
         or profile.get("userName")
         or profile.get("strUsrName")
         or profile.get("username")
+        or profile.get("gid")
+        or profile.get("chatroomid")
+        or profile.get("chatroom_id")
         or profile.get("describe")
+        or profile.get("account")
         or ""
     )
 
@@ -1547,7 +1627,24 @@ def _contact_profile_avatar(profile: dict) -> str:
     )
 
 
+def _contact_payload(raw: dict | list) -> dict | list:
+    """Unwrap common Hook response envelopes while keeping contact-shaped dicts intact."""
+    if not isinstance(raw, dict):
+        return raw
+    current = raw
+    for _ in range(3):
+        if any(k in current for k in ("friend", "friends", "chatroom", "chatrooms", "group", "groups")):
+            return current
+        nested = current.get("data")
+        if isinstance(nested, dict):
+            current = nested
+            continue
+        break
+    return current
+
+
 def _all_raw_contact_entries(contacts: dict | list) -> list[dict]:
+    contacts = _contact_payload(contacts)
     if isinstance(contacts, list):
         source = contacts
     elif isinstance(contacts, dict):
@@ -1839,6 +1936,7 @@ def _profile_has_useful_payload(profile: dict) -> bool:
 
 
 def _cache_raw_contacts(contacts: dict) -> tuple[int, int]:
+    contacts = _contact_payload(contacts)
     if not isinstance(contacts, dict):
         return 0, 0
     friend_list = contacts.get("friend") or contacts.get("friends") or []
@@ -1903,10 +2001,10 @@ async def _broadcast_contact_profile_updates(updates: dict[str, dict]) -> None:
     })
 
 
-async def _cache_contact_profiles(profiles: list[dict]) -> dict[str, dict]:
+async def _cache_contact_profiles(profiles: list[dict], *, owner_wxid: str = "") -> dict[str, dict]:
     """Save full profiles plus brief name/avatar caches. Returns frontend updates."""
     now = time.time()
-    owner_wxid = _contact_owner_wxid()
+    owner_wxid = owner_wxid or _contact_owner_wxid()
     updates: dict[str, dict] = {}
     async with _CONTACT_PROFILE_LOCK:
         async with _CONTACT_BRIEF_LOCK:
@@ -1932,7 +2030,12 @@ async def _cache_contact_profiles(profiles: list[dict]) -> dict[str, dict]:
     return updates
 
 
-async def _fetch_and_cache_contact_details(wxids: list[str], *, broadcast_updates: bool = False) -> dict[str, dict]:
+async def _fetch_and_cache_contact_details(
+    wxids: list[str],
+    *,
+    broadcast_updates: bool = False,
+    owner_wxid: str = "",
+) -> dict[str, dict]:
     targets: list[str] = []
     seen: set[str] = set()
     for wxid in wxids or []:
@@ -1952,7 +2055,7 @@ async def _fetch_and_cache_contact_details(wxids: list[str], *, broadcast_update
             contacts = data.get("contacts") if isinstance(data, dict) else []
             if not isinstance(contacts, list):
                 contacts = [data] if isinstance(data, dict) and _contact_profile_wxid(data) else []
-            updates = await _cache_contact_profiles([c for c in contacts if isinstance(c, dict)])
+            updates = await _cache_contact_profiles([c for c in contacts if isinstance(c, dict)], owner_wxid=owner_wxid)
             result.update(updates)
             if broadcast_updates and updates:
                 await _broadcast_contact_profile_updates(updates)
@@ -1963,55 +2066,88 @@ async def _fetch_and_cache_contact_details(wxids: list[str], *, broadcast_update
 
 
 async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_empty: bool = False) -> dict:
+    """Load the directory from local SQLite, initializing it once via InitContact.
+
+    GetFriendAndChatRoomList is intentionally not used here; on remote Hook it can
+    crash WeChat. InitContact provides the wxid/gid list, then GetContact fills
+    details in 100-id batches in the background.
+    """
     owner_wxid = _contact_owner_wxid()
-    cached_before = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
-    init_done = sqlite_cache.has_contact_init_done(owner_wxid=owner_wxid)
-    if cached_before and not init_done:
-        sqlite_cache.mark_contact_init_done(owner_wxid=owner_wxid)
-        init_done = True
-
-    contacts: dict = {}
-    raw_entries: list[dict] = []
-    first_error: Exception | None = None
-    try:
-        contacts = await wechat_api.get_friend_and_chatroom_list(list_type)
-        raw_entries = _all_raw_contact_entries(contacts)
-    except Exception as e:
-        first_error = e
-        _log(f"[CONTACTS] GetFriendAndChatRoomList type={list_type} failed: {type(e).__name__}: {e}")
-
-    if init_if_empty and not raw_entries and (not init_done or not cached_before):
-        _log("[CONTACTS] GetFriendAndChatRoomList returned no contacts; running InitContact fallback")
-        await wechat_api.init_contact()
-        sqlite_cache.mark_contact_init_done(owner_wxid=owner_wxid)
-        contacts = await wechat_api.get_friend_and_chatroom_list(list_type)
-        raw_entries = _all_raw_contact_entries(contacts)
-    elif raw_entries and not init_done:
-        sqlite_cache.mark_contact_init_done(owner_wxid=owner_wxid)
-
-    if not raw_entries:
+    if app_state.get("contacts_loaded"):
         snapshot = _contacts_snapshot_from_db(owner_wxid)
         app_state["contacts"] = snapshot
-        if first_error and not cached_before:
-            raise first_error
-        _log("[CONTACTS] no remote contacts returned; served local SQLite snapshot")
         return snapshot
 
-    raw_entries = _all_raw_contact_entries(contacts)
-    new_wxids: list[str] = []
-    for entry in raw_entries:
-        wxid = _contact_profile_wxid(entry)
-        if wxid and wxid not in cached_before:
-            new_wxids.append(wxid)
-    friend_count, room_count = _cache_raw_contacts(contacts)
-    _log(
-        f"[CONTACTS] refreshed type={list_type}: friends={friend_count} groups={room_count} "
-        f"new={len(new_wxids)}"
-    )
-    if new_wxids:
-        await _fetch_and_cache_contact_details(new_wxids, broadcast_updates=True)
-    app_state["contacts"] = contacts
-    return contacts
+    cached_snapshot = _contacts_snapshot_from_db(owner_wxid)
+    if cached_snapshot.get("friend") or cached_snapshot.get("chatroom"):
+        app_state["contacts"] = cached_snapshot
+        app_state["contacts_loaded"] = True
+        _log(
+            f"[CONTACTS] served local SQLite directory: "
+            f"friends={len(cached_snapshot.get('friend') or [])} groups={len(cached_snapshot.get('chatroom') or [])}"
+        )
+        return cached_snapshot
+
+    lock = _contact_init_lock(owner_wxid)
+    async with lock:
+        if app_state.get("contacts_loaded"):
+            snapshot = _contacts_snapshot_from_db(owner_wxid)
+            app_state["contacts"] = snapshot
+            return snapshot
+
+        cached_snapshot = _contacts_snapshot_from_db(owner_wxid)
+        if cached_snapshot.get("friend") or cached_snapshot.get("chatroom"):
+            app_state["contacts"] = cached_snapshot
+            app_state["contacts_loaded"] = True
+            return cached_snapshot
+
+        cached_before = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+        try:
+            _log("[CONTACTS] first directory open: calling InitContact")
+            contacts = await wechat_api.init_contact()
+        except Exception as e:
+            snapshot = _contacts_snapshot_from_db(owner_wxid)
+            app_state["contacts"] = snapshot
+            if snapshot.get("friend") or snapshot.get("chatroom"):
+                _log(f"[CONTACTS] InitContact failed; served local cache: {type(e).__name__}: {e}")
+                return snapshot
+            raise
+
+        raw_entries = _all_raw_contact_entries(contacts)
+        friend_count, room_count = _cache_raw_contacts(contacts)
+        app_state["contacts_loaded"] = True
+        snapshot = _contacts_snapshot_from_db(owner_wxid)
+        app_state["contacts"] = snapshot
+        _log(
+            f"[CONTACTS] InitContact cached: friends={friend_count} groups={room_count} "
+            f"entries={len(raw_entries)} cached_before={len(cached_before)}"
+        )
+
+        wxids = []
+        seen: set[str] = set()
+        for entry in raw_entries:
+            wxid = _contact_profile_wxid(entry)
+            if not wxid or wxid in seen:
+                continue
+            seen.add(wxid)
+            wxids.append(wxid)
+
+        if wxids:
+            hydrate_agent_id = _active_agent_id or agent_manager.active_id() or ""
+
+            async def _hydrate_details(owner: str, ids: list[str], agent_id: str) -> None:
+                try:
+                    with wechat_api.use_agent(agent_id):
+                        await _fetch_and_cache_contact_details(ids, broadcast_updates=True, owner_wxid=owner)
+                    app_state["contacts"] = _contacts_snapshot_from_db(owner)
+                    _log(f"[CONTACTS] GetContact hydration complete: {len(ids)} ids")
+                except Exception as e:
+                    _log(f"[CONTACTS] GetContact hydration task failed: {type(e).__name__}: {e}")
+
+            task = asyncio.create_task(_hydrate_details(owner_wxid, wxids, hydrate_agent_id))
+            _track_background_send(task, "contacts_getcontact")
+
+        return snapshot
 
 
 async def _ensure_contact_profiles(
@@ -2135,7 +2271,7 @@ async def _ensure_contact_profiles(
                             profile = merged
                     except Exception as e:
                         _log(f"[PROFILE] OpenIM GetContact merge skipped ({wxid}): {type(e).__name__}: {e}")
-                    return await _cache_contact_profiles([profile])
+                    return await _cache_contact_profiles([profile], owner_wxid=owner_wxid)
                 except Exception as e:
                     _log(f"[PROFILE] GetOpenIMContact failed ({wxid}): {type(e).__name__}: {e}")
                     return {}
@@ -2154,7 +2290,7 @@ async def _ensure_contact_profiles(
                 contacts = data.get("contacts") if isinstance(data, dict) else []
                 if not isinstance(contacts, list):
                     contacts = [data] if isinstance(data, dict) and _contact_profile_wxid(data) else []
-                updates = await _cache_contact_profiles(contacts)
+                updates = await _cache_contact_profiles(contacts, owner_wxid=owner_wxid)
                 result.update(updates)
                 if broadcast_updates and updates:
                     await _broadcast_contact_profile_updates(updates)
@@ -2330,39 +2466,29 @@ async def get_sessions():
 
 @app.get("/api/sessions/refresh")
 async def refresh_sessions():
-    """Refresh session list from MicroMsg.db Session ordered by nOrder desc."""
+    """Load session list once from native WeChat DB, then serve local SQLite cache."""
     t0 = time.time()
-    try:
-        db_sessions = await _query_session_list_from_db()
-        if db_sessions.get("data"):
-            app_state["sessions"] = db_sessions
-    except Exception as e:
-        _log(f"[REFRESH] Query Session table failed: {type(e).__name__}: {e}")
-
-    raw_sessions = app_state["sessions"]
-    session_list = raw_sessions.get("data", []) if isinstance(raw_sessions, dict) else []
-    last_messages: dict[str, dict] = {}
-    for session in session_list:
-        if not isinstance(session, dict):
-            continue
-        wxid = str(session.get("strUsrName") or session.get("StrUsrName") or "")
-        content = str(session.get("strContent") or session.get("StrContent") or "")
-        if not wxid or not content:
-            continue
+    owner_wxid = _contact_owner_wxid()
+    if not app_state.get("session_list_loaded"):
         try:
-            msg_time = int(session.get("nTime") or session.get("NTime") or session.get("nUpdateTime") or 0)
-        except Exception:
-            msg_time = 0
-        last_messages[wxid] = {
-            "content": content,
-            "type": str(session.get("nMsgType") or session.get("NMsgType") or session.get("msgType") or "1"),
-            "is_sender": 0,
-            "time": msg_time,
-        }
-    app_state["last_messages"] = {**(app_state.get("last_messages") or {}), **last_messages}
+            db_sessions = await _query_session_list_from_db()
+            session_rows = db_sessions.get("data", []) if isinstance(db_sessions, dict) else []
+            if session_rows:
+                sqlite_cache.upsert_sessions(session_rows, owner_wxid=owner_wxid)
+                app_state["session_list_loaded"] = True
+                _log(f"[REFRESH] native Session table cached: {len(session_rows)} rows")
+            else:
+                _log("[REFRESH] native Session table returned empty; falling back to local cache")
+                app_state["session_list_loaded"] = True
+        except Exception as e:
+            _log(f"[REFRESH] Query Session table failed; using local cache: {type(e).__name__}: {e}")
+            app_state["session_list_loaded"] = True
+
+    raw_sessions, last_messages = _load_session_cache_into_state(owner_wxid)
+    session_list = raw_sessions.get("data", []) if isinstance(raw_sessions, dict) else []
 
     total_ms = int((time.time() - t0) * 1000)
-    _log(f"[REFRESH] ✓ {len(session_list)} sessions from Session table; no per-session MSG query — {total_ms}ms")
+    _log(f"[REFRESH] ✓ {len(session_list)} sessions from local cache; no per-session MSG query — {total_ms}ms")
     return {"sessions": raw_sessions, "last_messages": last_messages}
 
 
@@ -2496,6 +2622,7 @@ class SendAtRequest(BaseModel):
 class BroadcastTextRequest(BaseModel):
     wxids: list[str]
     msg: str
+    mode: str = "nosrc"
 
 class RevokeRequest(BaseModel):
     msg_svrid: int
@@ -2772,16 +2899,17 @@ os.makedirs(_UPLOAD_DIR, exist_ok=True)
 
 @app.post("/api/broadcast/text")
 async def broadcast_text(req: BroadcastTextRequest):
-    """Broadcast text using the low-level NoSrc endpoint and patch local UI cache."""
+    """Broadcast text using NoSrc by default, or normal SendTextMsg when requested."""
     wxids = [w for w in req.wxids if w]
     agent_id = _active_agent_id or agent_manager.active_id() or ""
+    normal_mode = str(req.mode or "").lower() in {"normal", "src", "regular"}
     sem = asyncio.Semaphore(_send_api_parallelism())
 
     async def _send_one(wxid: str) -> dict:
         async with sem:
             try:
                 with wechat_api.use_agent(agent_id):
-                    result = await wechat_api.send_text_no_src(wxid, req.msg)
+                    result = await (wechat_api.send_text(wxid, req.msg) if normal_mode else wechat_api.send_text_no_src(wxid, req.msg))
                 ok = _send_result_ok(result)
                 if ok:
                     await _broadcast_local_sent_for_agent(agent_id, wxid, "1", req.msg)
@@ -2819,8 +2947,8 @@ async def _broadcast_image_to_targets(
 
 
 @app.post("/api/broadcast/image-upload")
-async def broadcast_image_upload(wxids: str = Form(...), file: UploadFile = File(...)):
-    """Upload one image to CDN once, then broadcast it via SendImgMsg_NoSrc."""
+async def broadcast_image_upload(wxids: str = Form(...), mode: str = Form("nosrc"), file: UploadFile = File(...)):
+    """Broadcast an uploaded image through NoSrc CDN or normal SendPicMsg(fileData)."""
     try:
         target_wxids = [w for w in json.loads(wxids) if w]
     except Exception:
@@ -2835,6 +2963,28 @@ async def broadcast_image_upload(wxids: str = Form(...), file: UploadFile = File
     with open(filepath, "wb") as f:
         f.write(data)
     _log(f"[BROADCAST] Saved image: {filepath} ({len(data)} bytes)")
+
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    if str(mode or "").lower() in {"normal", "src", "regular"}:
+        db_image_id = sqlite_cache.put_media_blob(data, file.content_type or "image/*", file.filename or filename)
+        sem = asyncio.Semaphore(_send_api_parallelism())
+
+        async def _send_normal(wxid: str) -> dict:
+            async with sem:
+                try:
+                    with wechat_api.use_agent(agent_id):
+                        result = await wechat_api.send_image(wxid, filepath, "", data.hex())
+                    ok = _send_result_ok(result)
+                    if ok:
+                        await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", {"db_image_id": db_image_id, "img_path": filepath})
+                    return {"wxid": wxid, "ok": ok, "result": result}
+                except Exception as e:
+                    return {"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        results = await asyncio.gather(*(_send_normal(wxid) for wxid in target_wxids)) if target_wxids else []
+        sent = sum(1 for row in results if row.get("ok"))
+        failed = len(results) - sent
+        return {"total": len(target_wxids), "sent": sent, "failed": failed, "results": results, "mode": "normal"}
 
     send_path = filepath
     try:
@@ -2864,7 +3014,6 @@ async def broadcast_image_upload(wxids: str = Form(...), file: UploadFile = File
     except Exception as e:
         _log(f"[BROADCAST] Image compression skipped: {e}")
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
     with wechat_api.use_agent(agent_id):
         cdn = await wechat_api.cdn_upload_image(send_path, target_wxids[0])
     if cdn.get("error"):
@@ -2916,6 +3065,7 @@ def _normalize_broadcast_target_types(raw_types) -> set[str]:
 
 
 def _raw_contact_list(raw_contacts: dict | list, key: str) -> list:
+    raw_contacts = _contact_payload(raw_contacts)
     if not raw_contacts:
         return []
     if isinstance(raw_contacts, list):
@@ -2944,6 +3094,10 @@ def _contact_wxid(entry) -> str:
         or entry.get("userName")
         or entry.get("strUsrName")
         or entry.get("username")
+        or entry.get("gid")
+        or entry.get("chatroomid")
+        or entry.get("chatroom_id")
+        or entry.get("account")
         or ""
     ).strip()
 
@@ -2960,29 +3114,20 @@ def _dedupe_targets(wxids: list[str]) -> list[str]:
     return out
 
 
-async def _ensure_account_contacts(agent_id: str):
-    async with _ACCOUNT_LOCK:
-        await agent_manager.set_active(agent_id)
-        _activate_runtime(agent_id)
-        with wechat_api.use_agent(agent_id):
-            login_status = await _refresh_agent_login_status(agent_id)
-            if str(login_status.get("status") or "") != "3":
-                raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
-            if not app_state.get("initialized"):
-                await _run_backend_initialization(agent_id)
-        cached_contacts = app_state.get("contacts")
-        if cached_contacts:
-            return cached_contacts
-        with wechat_api.use_agent(agent_id):
-            contacts = await _refresh_contacts_incremental(list_type="0", init_if_empty=True)
-        app_state["contacts"] = contacts
-        return contacts
+def _contact_counts(raw_contacts: dict | list) -> dict[str, int]:
+    return {
+        "friends": len([
+            entry for entry in _raw_contact_list(raw_contacts, "friend")
+            if _contact_wxid(entry) and not _contact_wxid(entry).endswith("@chatroom")
+        ]),
+        "groups": len([
+            entry for entry in _raw_contact_list(raw_contacts, "chatroom")
+            if _contact_wxid(entry) and _contact_wxid(entry).endswith("@chatroom")
+        ]),
+    }
 
 
-async def _resolve_account_broadcast_targets(agent_id: str, target_types: set[str]) -> list[str]:
-    if not target_types:
-        return []
-    contacts = await _ensure_account_contacts(agent_id)
+def _resolve_targets_from_contacts(contacts: dict | list, target_types: set[str]) -> list[str]:
     targets: list[str] = []
     if "friends" in target_types:
         for entry in _raw_contact_list(contacts, "friend"):
@@ -2997,34 +3142,109 @@ async def _resolve_account_broadcast_targets(agent_id: str, target_types: set[st
     return _dedupe_targets(targets)
 
 
-@app.post("/api/accounts/broadcast/text")
-async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
-    agent_ids = [a for a in (req.agent_ids or []) if agent_manager.is_connected(a)]
-    if not agent_ids:
-        agent_ids = [a["id"] for a in agent_manager.agents() if a.get("id")]
-    direct_targets = [w for w in req.wxids if w]
-    target_types = _normalize_broadcast_target_types(req.target_types)
+async def _ensure_account_contacts(agent_id: str):
+    async with _ACCOUNT_LOCK:
+        await agent_manager.set_active(agent_id)
+        _activate_runtime(agent_id)
+        with wechat_api.use_agent(agent_id):
+            login_status = await _refresh_agent_login_status(agent_id)
+            if str(login_status.get("status") or "") != "3":
+                raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
+            if not app_state.get("initialized"):
+                await _run_backend_initialization(agent_id)
+        owner_wxid = _contact_owner_wxid()
+        cached_contacts = _contacts_snapshot_from_db(owner_wxid)
+        if cached_contacts.get("friend") or cached_contacts.get("chatroom"):
+            app_state["contacts"] = cached_contacts
+            app_state["contacts_loaded"] = True
+            counts = _contact_counts(cached_contacts)
+            _log(f"[BROADCAST] local contacts for {owner_wxid}: friends={counts['friends']} groups={counts['groups']}")
+            return cached_contacts
+        with wechat_api.use_agent(agent_id):
+            contacts = await _refresh_contacts_incremental(list_type="0", init_if_empty=True)
+        app_state["contacts"] = contacts
+        counts = _contact_counts(contacts)
+        _log(f"[BROADCAST] initialized contacts for {owner_wxid}: friends={counts['friends']} groups={counts['groups']}")
+        return contacts
+
+
+async def _resolve_account_broadcast_targets(agent_id: str, target_types: set[str]) -> list[str]:
+    if not target_types:
+        return []
+    contacts = await _ensure_account_contacts(agent_id)
+    return _resolve_targets_from_contacts(contacts, target_types)
+
+
+async def _prepare_multi_account_targets(
+    agent_ids: list[str],
+    direct_targets: list[str],
+    target_types: set[str],
+) -> tuple[list[str], list[tuple[str, str]], dict[str, int], dict[str, dict[str, int]], list[dict]]:
+    connected_agents = [a for a in (agent_ids or []) if agent_manager.is_connected(a)]
+    if not connected_agents:
+        connected_agents = [a["id"] for a in agent_manager.agents() if a.get("id")]
+
     total = 0
     account_targets: dict[str, int] = {}
+    account_counts: dict[str, dict[str, int]] = {}
     work_items: list[tuple[str, str]] = []
     skipped_results: list[dict] = []
 
-    for agent_id in agent_ids:
+    for agent_id in connected_agents:
         try:
             if direct_targets:
                 with wechat_api.use_agent(agent_id):
                     login_status = await _refresh_agent_login_status(agent_id)
                 if str(login_status.get("status") or "") != "3":
                     raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
-                target_wxids = direct_targets
+                target_wxids = _dedupe_targets(direct_targets)
+                account_counts[agent_id] = {"friends": 0, "groups": 0, "targets": len(target_wxids)}
             else:
-                target_wxids = await _resolve_account_broadcast_targets(agent_id, target_types)
+                contacts = await _ensure_account_contacts(agent_id)
+                counts = _contact_counts(contacts)
+                target_wxids = _resolve_targets_from_contacts(contacts, target_types)
+                account_counts[agent_id] = {**counts, "targets": len(target_wxids)}
         except Exception as e:
             target_wxids = []
+            account_counts.setdefault(agent_id, {"friends": 0, "groups": 0, "targets": 0})
             skipped_results.append({"agent_id": agent_id, "wxid": "", "ok": False, "error": f"{type(e).__name__}: {e}"})
         account_targets[agent_id] = len(target_wxids)
         total += len(target_wxids)
         work_items.extend((agent_id, wxid) for wxid in target_wxids)
+
+    return connected_agents, work_items, account_targets, account_counts, skipped_results
+
+
+@app.post("/api/accounts/broadcast/targets")
+async def multi_account_broadcast_targets(req: MultiBroadcastTargetsRequest):
+    direct_targets = [w for w in req.wxids if w]
+    target_types = _normalize_broadcast_target_types(req.target_types)
+    selected_agents, work_items, account_targets, account_counts, skipped = await _prepare_multi_account_targets(
+        req.agent_ids,
+        direct_targets,
+        target_types,
+    )
+    return {
+        "accounts": len(selected_agents),
+        "targets": len(work_items),
+        "total": len(work_items),
+        "account_targets": account_targets,
+        "account_counts": account_counts,
+        "results": skipped,
+    }
+
+
+@app.post("/api/accounts/broadcast/text")
+async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
+    direct_targets = [w for w in req.wxids if w]
+    target_types = _normalize_broadcast_target_types(req.target_types)
+    normal_mode = str(req.mode or "").lower() in {"normal", "src", "regular"}
+    agent_ids, work_items, account_targets, account_counts, skipped_results = await _prepare_multi_account_targets(
+        req.agent_ids,
+        direct_targets,
+        target_types,
+    )
+    total = len(work_items)
 
     sem = asyncio.Semaphore(_send_api_parallelism())
 
@@ -3032,7 +3252,7 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
         async with sem:
             try:
                 with wechat_api.use_agent(agent_id):
-                    result = await wechat_api.send_text_no_src(wxid, req.msg)
+                    result = await (wechat_api.send_text(wxid, req.msg) if normal_mode else wechat_api.send_text_no_src(wxid, req.msg))
                 ok = _send_result_ok(result)
                 if ok:
                     await _broadcast_local_sent_for_agent(agent_id, wxid, "1", req.msg)
@@ -3045,7 +3265,16 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
     sent = sum(1 for row in results if row.get("ok"))
     failed = len(results) - sent
 
-    return {"accounts": len(agent_ids), "targets": total, "account_targets": account_targets, "total": total, "sent": sent, "failed": failed, "results": results}
+    return {
+        "accounts": len(agent_ids),
+        "targets": total,
+        "account_targets": account_targets,
+        "account_counts": account_counts,
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "results": results,
+    }
 
 
 @app.post("/api/accounts/broadcast/image-upload")
@@ -3053,6 +3282,7 @@ async def multi_account_broadcast_image_upload(
     wxids: str = Form("[]"),
     agent_ids: str = Form("[]"),
     target_types: str = Form("[]"),
+    mode: str = Form("nosrc"),
     file: UploadFile = File(...),
 ):
     try:
@@ -3063,15 +3293,21 @@ async def multi_account_broadcast_image_upload(
         requested_agents = [a for a in json.loads(agent_ids or "[]") if a]
     except Exception:
         requested_agents = [a.strip() for a in str(agent_ids or "").split(",") if a.strip()]
-    selected_agents = [a for a in requested_agents if agent_manager.is_connected(a)]
-    if not selected_agents:
-        selected_agents = [a["id"] for a in agent_manager.agents() if a.get("id")]
     try:
         parsed_target_types = _normalize_broadcast_target_types(json.loads(target_types or "[]"))
     except Exception:
         parsed_target_types = _normalize_broadcast_target_types([x.strip() for x in str(target_types or "").split(",") if x.strip()])
+    selected_agents, work_items, account_targets, account_counts, skipped_results = await _prepare_multi_account_targets(
+        requested_agents,
+        target_wxids,
+        parsed_target_types,
+    )
     if not target_wxids and not parsed_target_types:
         return {"accounts": len(selected_agents), "targets": 0, "total": 0, "sent": 0, "failed": 0, "results": [], "error": "no targets"}
+    normal_mode = str(mode or "").lower() in {"normal", "src", "regular"}
+    work_by_agent: dict[str, list[str]] = {}
+    for agent_id, wxid in work_items:
+        work_by_agent.setdefault(agent_id, []).append(wxid)
 
     data = await file.read()
     original_name = os.path.basename(file.filename or "multi_broadcast.png") or "multi_broadcast.png"
@@ -3103,33 +3339,37 @@ async def multi_account_broadcast_image_upload(
     file_hex = upload_bytes.hex()
 
     sent = 0
-    failed = 0
-    results = []
-    total_targets = 0
-    account_targets: dict[str, int] = {}
+    failed = len(skipped_results)
+    results = list(skipped_results)
+    total_targets = len(work_items)
     for agent_id in selected_agents:
-        try:
-            if target_wxids:
-                with wechat_api.use_agent(agent_id):
-                    login_status = await _refresh_agent_login_status(agent_id)
-                if str(login_status.get("status") or "") != "3":
-                    raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
-                agent_targets = target_wxids
-            else:
-                agent_targets = await _resolve_account_broadcast_targets(agent_id, parsed_target_types)
-        except Exception as e:
-            account_targets[agent_id] = 0
-            failed += 1
-            results.append({"agent_id": agent_id, "wxid": "", "ok": False, "error": f"{type(e).__name__}: {e}"})
-            continue
-        account_targets[agent_id] = len(agent_targets)
-        total_targets += len(agent_targets)
+        agent_targets = work_by_agent.get(agent_id, [])
         if not agent_targets:
             continue
         async with _ACCOUNT_LOCK:
             await agent_manager.set_active(agent_id)
             _activate_runtime(agent_id)
             db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
+        if normal_mode:
+            sem = asyncio.Semaphore(_send_api_parallelism())
+
+            async def _send_normal(wxid: str) -> dict:
+                async with sem:
+                    try:
+                        with wechat_api.use_agent(agent_id):
+                            result = await wechat_api.send_image(wxid, upload_name, "", file_hex)
+                        ok = _send_result_ok(result)
+                        if ok:
+                            await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", {"db_image_id": db_image_id})
+                        return {"agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result}
+                    except Exception as e:
+                        return {"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+            send_results = await asyncio.gather(*(_send_normal(wxid) for wxid in agent_targets))
+            sent += sum(1 for row in send_results if row.get("ok"))
+            failed += sum(1 for row in send_results if not row.get("ok"))
+            results.extend(send_results)
+            continue
         with wechat_api.use_agent(agent_id):
             try:
                 cdn = await wechat_api.cdn_upload_image(upload_name, agent_targets[0], file_data=file_hex)
@@ -3163,6 +3403,7 @@ async def multi_account_broadcast_image_upload(
         "accounts": len(selected_agents),
         "targets": total_targets,
         "account_targets": account_targets,
+        "account_counts": account_counts,
         "total": total_targets,
         "sent": sent,
         "failed": failed,
@@ -3312,6 +3553,11 @@ async def mark_read(wxid: str):
     """Mark a chat as read: clear unread in store + broadcast to all frontends."""
     # Clear in our in-memory store
     message_store.mark_read(wxid)
+    try:
+        sqlite_cache.mark_session_read(wxid, owner_wxid=_contact_owner_wxid())
+        _load_session_cache_into_state(_contact_owner_wxid())
+    except Exception as e:
+        _log(f"[MARK_READ] local session cache update failed for {wxid}: {e}")
     # Also tell the WeChat hook to clear the native unread badge
     result = {}
     try:

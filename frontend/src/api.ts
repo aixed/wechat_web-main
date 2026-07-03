@@ -158,30 +158,38 @@ export const sendGifUpload = async (wxid: string, file: File) => {
   return res.json();
 };
 
-export const broadcastText = (wxids: string[], msg: string) =>
+export const broadcastText = (wxids: string[], msg: string, mode = "nosrc") =>
   fetchJSON("/api/broadcast/text", {
     method: "POST",
-    body: JSON.stringify({ wxids, msg }),
+    body: JSON.stringify({ wxids, msg, mode }),
   });
 
-export const broadcastImageUpload = async (wxids: string[], file: File) => {
+export const broadcastImageUpload = async (wxids: string[], file: File, mode = "nosrc") => {
   const form = new FormData();
   form.append("wxids", JSON.stringify(wxids));
+  form.append("mode", mode);
   form.append("file", file);
   const res = await fetchWithTimeout("/api/broadcast/image-upload", { method: "POST", body: form, headers: authHeaders() }, 300_000);
   return res.json();
 };
 
-export const multiAccountBroadcastText = (agentIds: string[], targetTypes: string[], msg: string) =>
+export const multiAccountBroadcastText = (agentIds: string[], targetTypes: string[], msg: string, mode = "nosrc") =>
   fetchJSON("/api/accounts/broadcast/text", {
     method: "POST",
-    body: JSON.stringify({ agent_ids: agentIds, target_types: targetTypes, msg }),
+    body: JSON.stringify({ agent_ids: agentIds, target_types: targetTypes, msg, mode }),
   });
 
-export const multiAccountBroadcastImageUpload = async (agentIds: string[], targetTypes: string[], file: File) => {
+export const getMultiAccountBroadcastTargets = (agentIds: string[], targetTypes: string[]) =>
+  fetchJSON("/api/accounts/broadcast/targets", {
+    method: "POST",
+    body: JSON.stringify({ agent_ids: agentIds, target_types: targetTypes }),
+  });
+
+export const multiAccountBroadcastImageUpload = async (agentIds: string[], targetTypes: string[], file: File, mode = "nosrc") => {
   const form = new FormData();
   form.append("agent_ids", JSON.stringify(agentIds));
   form.append("target_types", JSON.stringify(targetTypes));
+  form.append("mode", mode);
   form.append("file", file);
   const res = await fetchWithTimeout("/api/accounts/broadcast/image-upload", { method: "POST", body: form, headers: authHeaders() }, 600_000);
   return res.json();
