@@ -377,7 +377,7 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
 
 # ─── Startup / Shutdown ────────────────────────────────────────────
 
-async def _run_backend_initialization():
+async def _run_backend_initialization() -> bool:
     """Initialize cached state from the Hook/Protocol API."""
     _log("=" * 60)
     _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}]")
@@ -548,6 +548,11 @@ async def _run_backend_initialization():
     else:
         _log("[INIT 6/7] ⊘ No sessions to load last messages for.")
 
+    if config.AGENT_WS_ENABLED and not agent_manager.is_connected():
+        _log("[INIT 7/7] Agent disconnected during initialization; will retry on next connection.")
+        app_state["initialized"] = False
+        return False
+
     _log("[INIT 7/7] ✓ Initialization complete.")
     app_state["initialized"] = True
     _log("=" * 60)
@@ -557,13 +562,17 @@ async def _run_backend_initialization():
         _log(f"Agent WS: {config.CLIENT_WSS_URL}  path={config.AGENT_WS_PATH}")
     _log(f"Callback URL: {config.CALLBACK_URL}")
     _log("=" * 60)
+    return True
 
 async def _run_initialization_after_agent():
-    _log(f"[INIT] Waiting for DLL agent on {config.AGENT_WS_PATH} ...")
-    while not agent_manager.is_connected():
+    while True:
+        _log(f"[INIT] Waiting for DLL agent on {config.AGENT_WS_PATH} ...")
+        while not agent_manager.is_connected():
+            await asyncio.sleep(1)
+        _log("[INIT] DLL agent connected; starting Hook initialization")
+        if await _run_backend_initialization():
+            return
         await asyncio.sleep(1)
-    _log("[INIT] DLL agent connected; starting Hook initialization")
-    await _run_backend_initialization()
 
 
 @asynccontextmanager
