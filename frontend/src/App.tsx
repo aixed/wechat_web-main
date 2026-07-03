@@ -316,7 +316,7 @@ function buildAvatarMap(contacts: any, avatarUrls: Record<string, string> | unde
       ...(Array.isArray(contacts) ? contacts : []),
     ];
     for (const c of list) {
-      const wxid = c.wxid || c.UserName || c.userName || c.strUsrName || "";
+      const wxid = contactWxid(c);
       if (!wxid || map[wxid]) continue;
       const url =
         c.headimgurl || c.head_img || c.head_big || c.head_small ||
@@ -328,6 +328,21 @@ function buildAvatarMap(contacts: any, avatarUrls: Record<string, string> | unde
     }
   }
   return map;
+}
+
+function contactWxid(c: any): string {
+  if (!c || typeof c !== "object") return "";
+  return String(
+    c.wxid ||
+    c.UserName ||
+    c.userName ||
+    c.strUsrName ||
+    c.username ||
+    c.gid ||
+    c.chatroomid ||
+    c.chatroom_id ||
+    ""
+  );
 }
 
 function contactListFromRaw(raw: any): any[] {
@@ -940,11 +955,9 @@ export default function App() {
     const requestAccountId = selectedAccountIdRef.current;
     setContactsHydrating(true);
     try {
-      let contactsForDirectory = rawContacts;
       const refreshed = await getContacts();
       if (selectedAccountIdRef.current !== requestAccountId) return;
       if (refreshed && typeof refreshed === "object" && !(refreshed as any).error) {
-        contactsForDirectory = refreshed;
         setRawContacts(refreshed);
         const names = buildContactMap(refreshed);
         const avatars = buildAvatarMap(refreshed, undefined);
@@ -956,15 +969,6 @@ export default function App() {
         }
       }
 
-      const friends = contactListFromRaw(contactsForDirectory);
-      const rooms = chatroomListFromRaw(contactsForDirectory);
-      const wxids = Array.from(new Set([
-        ...friends.map((c: any) => c.wxid || c.UserName || ""),
-        ...rooms.map((c: any) => c.wxid || c.UserName || c.strUsrName || ""),
-      ].filter(Boolean)));
-      if (wxids.length > 0) {
-        await ensureContactProfiles(wxids);
-      }
       if (selectedAccountIdRef.current !== requestAccountId) return;
       setContactsHydrated(true);
     } catch (err) {
@@ -974,7 +978,7 @@ export default function App() {
         setContactsHydrating(false);
       }
     }
-  }, [contactsHydrated, contactsHydrating, ensureContactProfiles, rawContacts]);
+  }, [contactsHydrated, contactsHydrating]);
 
   const openSelfProfileCard = useCallback(async () => {
     if (!selfWxid) return;
@@ -1788,7 +1792,7 @@ export default function App() {
 
   const friendEntries: DirectoryEntry[] = sortDirectoryEntries(contactListFromRaw(rawContacts)
     .map((c: any) => {
-      const wxid = c.wxid || c.UserName || c.userName || c.strUsrName || "";
+      const wxid = contactWxid(c);
       if (!wxid || shouldFilterSession(wxid)) return null;
       const profile = contactProfiles[wxid];
       const fallbackName = c.markname || c.nickname || c.NickName || c.strNickName || contactMap[wxid] || wxid;
@@ -1820,7 +1824,7 @@ export default function App() {
 
   const rawRoomEntries = chatroomListFromRaw(rawContacts)
     .map((c: any) => ({
-      wxid: c.wxid || c.UserName || c.userName || c.strUsrName || "",
+      wxid: contactWxid(c),
       name: c.nickname || c.NickName || c.strNickName || "",
       avatar: c.smallhead || c.bighead || c.SmallHeadImgUrl || c.BigHeadImgUrl ||
         c.headimgurl || c.head_img || c.head_big || c.head_small ||
@@ -2888,16 +2892,19 @@ function MobileContactsView({
 
   return (
     <div className="relative flex-1 min-h-0 overflow-y-auto pb-[10px]">
-      <MobileTopBar dark={dark} title="Contacts" rightLabel="＋" />
-      <div className="h-[44px] px-[12px] flex items-center">
-        <div className={`w-full h-[36px] rounded-[7px] flex items-center gap-[7px] px-[12px] ${dark ? "bg-[#242424] text-[#777]" : "bg-white text-[#b7b7b7]"}`}>
-          <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
-          </svg>
-          <input value={query} onChange={(e) => setQuery(e.target.value)} className={`bg-transparent outline-none flex-1 text-[16px] ${dark ? "text-[#e8e8e8] placeholder-[#777]" : "text-[#111] placeholder-[#b7b7b7]"}`} placeholder="Search" />
+      <div className={`sticky top-0 z-20 ${dark ? "bg-[#111111]" : "bg-[#ededed]"}`}>
+        <MobileTopBar dark={dark} title="Contacts" rightLabel="＋" />
+        <div className="h-[44px] px-[12px] flex items-center">
+          <div className={`w-full h-[36px] rounded-[7px] flex items-center gap-[7px] px-[12px] ${dark ? "bg-[#242424] text-[#777]" : "bg-white text-[#b7b7b7]"}`}>
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
+            </svg>
+            <input value={query} onChange={(e) => setQuery(e.target.value)} className={`bg-transparent outline-none flex-1 text-[16px] ${dark ? "text-[#e8e8e8] placeholder-[#777]" : "text-[#111] placeholder-[#b7b7b7]"}`} placeholder="Search" />
+          </div>
         </div>
+        <ContactCountBar friends={friends.length} groups={groups.length} dark={dark} mobile />
+        {loading && <div className={`px-[22px] py-[6px] text-[12px] ${dark ? "text-[#777]" : "text-[#999]"}`}>正在补全联系人资料...</div>}
       </div>
-      {loading && <div className={`px-[22px] py-[6px] text-[12px] ${dark ? "text-[#777]" : "text-[#999]"}`}>正在补全联系人资料...</div>}
       <div className={dark ? "bg-[#111111]" : "bg-white"}>
         <MobileContactStaticRow dark={dark} color="#ffad33" label="New Friends" icon="person+" />
         <MobileContactStaticRow dark={dark} color="#ffad33" label="Chats Only Friends" icon="person" />
@@ -3633,7 +3640,7 @@ function ContactsPanel({
 
   return (
     <div className={`h-full flex flex-col ${dark ? "bg-[#191919] text-[#e8e8e8]" : "bg-[#e9e8e8] text-[#111]"}`}>
-      <div className="h-[92px] px-[18px] flex items-center gap-[12px] shrink-0">
+      <div className="px-[18px] pt-[18px] pb-[10px] flex items-center gap-[12px] shrink-0">
         <div className={`flex-1 h-[38px] rounded-[4px] flex items-center px-[10px] ${dark ? "bg-[#262626]" : "bg-[#dcdcdc]"}`}>
           <svg className={`w-[18px] h-[18px] shrink-0 ${dark ? "text-[#666]" : "text-[#777]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -3656,10 +3663,11 @@ function ContactsPanel({
           </svg>
         </button>
       </div>
+      <ContactCountBar friends={friends.length} groups={groups.length} dark={dark} />
 
       {loading && (
         <div className={`px-[18px] pb-[8px] text-[12px] shrink-0 ${dark ? "text-[#777]" : "text-[#888]"}`}>
-          正在从本地缓存补全联系人资料...
+          正在通过 GetContact 批量补全联系人资料...
         </div>
       )}
 
@@ -3668,6 +3676,29 @@ function ContactsPanel({
         {friendSections.map((section) => (
           <ContactSection key={section.title} dark={dark} title={section.title} entries={section.entries} onSelect={onSelect} />
         ))}
+      </div>
+    </div>
+  );
+}
+
+function ContactCountBar({
+  friends,
+  groups,
+  dark,
+  mobile,
+}: {
+  friends: number;
+  groups: number;
+  dark: boolean;
+  mobile?: boolean;
+}) {
+  return (
+    <div className={`${mobile ? "px-[18px] pb-[8px]" : "px-[18px] pb-[10px]"} shrink-0`}>
+      <div className={`h-[28px] rounded-[4px] flex items-center gap-[14px] px-[10px] text-[13px] ${
+        dark ? "bg-[#202020] text-[#9a9a9a]" : "bg-[#dddddd] text-[#666]"
+      }`}>
+        <span>好友 <strong className={dark ? "text-[#e8e8e8]" : "text-[#111]"}>{friends}</strong></span>
+        <span>群 <strong className={dark ? "text-[#e8e8e8]" : "text-[#111]"}>{groups}</strong></span>
       </div>
     </div>
   );
