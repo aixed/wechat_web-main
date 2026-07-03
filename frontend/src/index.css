@@ -49,3 +49,24 @@ html, body, #root {
   user-select: none;
   -webkit-user-select: none;
 }
+
+.mobile-swipe-stage {
+  position: relative;
+  touch-action: pan-y;
+  overscroll-behavior-x: contain;
+}
+
+.mobile-swipe-backdrop {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, rgba(7, 193, 96, 0.18), transparent 42%, transparent 58%, rgba(7, 193, 96, 0.14));
+  transition: opacity 160ms ease;
+}
+
+.mobile-swipe-page {
+  position: relative;
+  z-index: 1;
+  will-change: transform;
+}
