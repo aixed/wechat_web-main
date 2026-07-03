@@ -40,6 +40,9 @@ class AgentConnection:
     avatar: str = ""
     server_port: str = ""
     initialized: bool = False
+    login_status: str = ""
+    login_message: str = ""
+    login_status_updated_at: float = 0.0
     registered: bool = False
 
 
@@ -74,6 +77,8 @@ class AgentWebSocketManager:
         wxid: str = "",
         nickname: str = "",
         avatar: str = "",
+        login_status: str = "",
+        login_message: str = "",
         initialized: bool | None = None,
     ) -> None:
         async with self._lock:
@@ -89,6 +94,11 @@ class AgentWebSocketManager:
                 conn.nickname = nickname
             if avatar:
                 conn.avatar = avatar
+            if login_status:
+                conn.login_status = str(login_status)
+                conn.login_status_updated_at = time.time()
+            if login_message:
+                conn.login_message = str(login_message)
             if initialized is not None:
                 conn.initialized = initialized
 
@@ -125,6 +135,9 @@ class AgentWebSocketManager:
                 "last_seen_at": conn.last_seen_at,
                 "pending": len(conn.pending),
                 "initialized": conn.initialized,
+                "login_status": conn.login_status,
+                "login_message": conn.login_message,
+                "login_status_updated_at": conn.login_status_updated_at,
                 "active": conn.id == self._active_id,
             })
         rows.sort(key=lambda x: x.get("connected_at", 0))
@@ -146,6 +159,9 @@ class AgentWebSocketManager:
             "last_seen_at": conn.last_seen_at,
             "pending": len(conn.pending),
             "initialized": conn.initialized,
+            "login_status": conn.login_status,
+            "login_message": conn.login_message,
+            "login_status_updated_at": conn.login_status_updated_at,
             "active": conn.id == self._active_id,
         }
 

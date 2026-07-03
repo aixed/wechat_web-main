@@ -41,6 +41,9 @@ export interface WeChatAccount {
   last_seen_at?: number;
   pending?: number;
   initialized?: boolean;
+  login_status?: string;
+  login_message?: string;
+  login_status_updated_at?: number;
   active?: boolean;
 }
 
