@@ -748,10 +748,10 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         _log(f"[INIT 2/4] ✗ contacts load failed: {e}")
 
     try:
-        _log("[INIT 3/7] Loading sessions...")
-        app_state["sessions"] = await wechat_api.get_current_session()
+        _log("[INIT 3/7] Loading sessions from MicroMsg.db Session...")
+        app_state["sessions"] = await _query_session_list_from_db()
         count = len(app_state["sessions"].get("data", [])) if isinstance(app_state["sessions"], dict) else 0
-        _log(f"[INIT 3/7] ✓ Sessions loaded: {count}")
+        _log(f"[INIT 3/7] ✓ Sessions loaded from Session table: {count}")
     except Exception as e:
         _log(f"[INIT 3/7] ✗ sessions load failed: {e}")
 
@@ -1412,35 +1412,45 @@ def _normalize_wxids(wxids: list[str]) -> list[str]:
 
 async def _query_session_list_from_db() -> dict:
     """Read the native WeChat Session table ordered by nOrder."""
-    sql = "select strUsrName, strNickName from Session order by nOrder desc"
+    sql = "select * from Session order by nOrder desc"
     data = await wechat_api.query_db("MicroMsg.db", sql, timeout=8.0)
     rows = data.get("data") if isinstance(data, dict) else []
+    if isinstance(rows, dict):
+        rows = rows.get("data") or rows.get("rows") or []
     if not isinstance(rows, list):
         rows = []
 
-    sessions: list[dict[str, str]] = []
+    def row_value(row: dict, *keys: str):
+        for key in keys:
+            if key in row and row.get(key) is not None:
+                return row.get(key)
+        return ""
+
+    sessions: list[dict] = []
     seen: set[str] = set()
-    for row in rows:
+    for index, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
         wxid = str(
-            row.get("strUsrName")
-            or row.get("StrUsrName")
-            or row.get("UserName")
-            or row.get("wxid")
-            or ""
+            row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid")
         ).strip()
         if not wxid or wxid in seen:
             continue
         nickname = str(
-            row.get("strNickName")
-            or row.get("StrNickName")
-            or row.get("NickName")
-            or row.get("nickname")
-            or ""
+            row_value(row, "strNickName", "StrNickName", "NickName", "nickname")
         )
         seen.add(wxid)
-        sessions.append({"strUsrName": wxid, "strNickName": nickname})
+        session = dict(row)
+        session.update({
+            "strUsrName": wxid,
+            "strNickName": nickname,
+            "strContent": row_value(row, "strContent", "StrContent", "content"),
+            "nUnReadCount": row_value(row, "nUnReadCount", "UnReadCount", "unread"),
+            "othersAtMe": row_value(row, "othersAtMe", "OthersAtMe", "atMe"),
+            "nOrder": row_value(row, "nOrder", "NOrder", "order"),
+            "order": index,
+        })
+        sessions.append(session)
 
     return {"data": sessions}
 

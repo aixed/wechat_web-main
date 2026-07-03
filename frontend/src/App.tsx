@@ -20,7 +20,6 @@ import {
   multiAccountBroadcastImageUpload,
   multiAccountBroadcastText,
   muteSession,
-  refreshSessions,
   setActiveAgentId,
   setAccessKey,
   stickyChat,
@@ -134,7 +133,32 @@ function formatSessionTime(ts: number): string {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
-// ─── Parse sessions from /GetCurrentSession ──────────────────────
+function pickFirstString(...values: any[]): string {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    const text = String(value);
+    if (text !== "") return text;
+  }
+  return "";
+}
+
+function pickFirstNumber(...values: any[]): number {
+  for (const value of values) {
+    if (value === undefined || value === null || value === "") continue;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return 0;
+}
+
+function isTruthySessionFlag(value: any): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const text = String(value ?? "").trim().toLowerCase();
+  return text === "1" || text === "true" || text === "yes";
+}
+
+// ─── Parse sessions from the WeChat Session table snapshot ───────
 function parseSessions(
   raw: any,
   nameMap: Record<string, string>,
@@ -146,14 +170,35 @@ function parseSessions(
 
   return list
     .map((s: any, index: number) => {
-      const wxid = s.strUsrName || s.wxid || "";
+      const wxid = pickFirstString(
+        s.strUsrName,
+        s.StrUsrName,
+        s.UserName,
+        s.userName,
+        s.wxid,
+      ).trim();
       if (shouldFilterSession(wxid)) return null;
 
       const lastMsg = lastMessages[wxid];
       let lastMsgPreview = "";
       let lastTimestamp = 0;
+      const sessionContent = pickFirstString(s.strContent, s.StrContent, s.content, s.lastMsg);
+      const unread = pickFirstNumber(s.nUnReadCount, s.UnReadCount, s.unread);
+      const atMe = isTruthySessionFlag(s.othersAtMe ?? s.OthersAtMe ?? s.atMe);
+      const sessionTimestamp = pickFirstNumber(
+        s.nTime,
+        s.NTime,
+        s.nUpdateTime,
+        s.nCreateTime,
+        s.CreateTime,
+        s.timestamp,
+        s.lastTimestamp,
+      );
 
-      if (lastMsg) {
+      if (sessionContent) {
+        lastMsgPreview = replaceWechatEmojis(sessionContent);
+        lastTimestamp = sessionTimestamp || 0;
+      } else if (lastMsg) {
         let content = lastMsg.content || "";
         let senderPrefix = "";
         // For group messages, resolve "senderWxid:\n" prefix to nickname
@@ -177,17 +222,24 @@ function parseSessions(
         lastMsgPreview = senderPrefix + formatMsgTypePreview(lastMsg.type, content);
         lastTimestamp = lastMsg.time || 0;
       }
+      if (lastMsg && (!lastTimestamp || lastMsg.time > lastTimestamp)) {
+        lastTimestamp = lastMsg.time || lastTimestamp;
+      }
+      if (atMe && lastMsgPreview && !lastMsgPreview.startsWith("[有人@我]")) {
+        lastMsgPreview = `[有人@我] ${lastMsgPreview}`;
+      }
 
       return {
         wxid,
-        nickname: nameMap[wxid] || s.strNickName || s.nickname || wxid,
+        nickname: nameMap[wxid] || pickFirstString(s.strNickName, s.StrNickName, s.NickName, s.nickname) || wxid,
         avatar: "",
         lastMsg: lastMsgPreview,
         lastTime: formatSessionTime(lastTimestamp),
         lastTimestamp,
-        unread: 0,
+        unread,
+        atMe,
         muted: false,
-        order: Number.isFinite(Number(s.order)) ? Number(s.order) : index,
+        order: index,
         is_group: wxid.includes("@chatroom"),
       } as Session;
     })
@@ -1377,57 +1429,6 @@ export default function App() {
     const timer = window.setInterval(loadAccounts, 3000);
     return () => window.clearInterval(timer);
   }, [authenticated, selectedAccountId, loadAccounts]);
-
-  // ─── Periodic session refresh (picks up PC-sent messages missed by hook) ──
-  useEffect(() => {
-    // Only poll when on the session list (not inside a chat)
-    if (activeChat) return;
-    if (!connected) return;
-
-    const refresh = () => {
-      refreshSessions()
-        .then((resp: any) => {
-          if (!resp) return;
-          const rawSessions = resp.sessions;
-          const lastMessages = resp.last_messages || {};
-
-          const parsed = parseSessions(rawSessions, contactMap, lastMessages);
-          if (parsed.length === 0) return;
-
-          setSessions((prev) => {
-            // Merge: update existing sessions with fresh DB data, add any new ones
-            const prevMap = new Map(prev.map((s) => [s.wxid, s]));
-            for (const fresh of parsed) {
-              const existing = prevMap.get(fresh.wxid);
-              if (existing) {
-                const hasNewerMessage = (fresh.lastTimestamp || 0) > (existing.lastTimestamp || 0);
-                prevMap.set(fresh.wxid, {
-                  ...existing,
-                  nickname: existing.nickname || fresh.nickname,
-                  avatar: existing.avatar || avatarMap[fresh.wxid] || fresh.avatar || "",
-                  order: fresh.order,
-                  lastMsg: hasNewerMessage ? (fresh.lastMsg || existing.lastMsg) : existing.lastMsg,
-                  lastTime: hasNewerMessage ? (fresh.lastTime || existing.lastTime) : existing.lastTime,
-                  lastTimestamp: hasNewerMessage ? fresh.lastTimestamp : existing.lastTimestamp,
-                });
-              } else {
-                // New session not in our list yet
-                prevMap.set(fresh.wxid, {
-                  ...fresh,
-                  avatar: avatarMap[fresh.wxid] || "",
-                });
-              }
-            }
-            return sortSessionsForDisplay(Array.from(prevMap.values()));
-          });
-        })
-        .catch(() => {}); // silent fail
-    };
-
-    refresh();
-    const timer = setInterval(refresh, 30_000);
-    return () => clearInterval(timer);
-  }, [activeChat, connected, contactMap, avatarMap]);
 
   // ─── Navigation (browser history integration for mobile back gesture) ──
   const handleSelectChat = (wxid: string, seed?: Partial<Session>) => {
