@@ -12,7 +12,11 @@ interface ChatAreaProps {
   avatarMap: Record<string, string>;
   contactMap: Record<string, string>;
   contactProfiles: Record<string, ContactProfile>;
-  onRequestContactProfile: (wxids: string[], gid?: string) => Promise<Record<string, ContactProfile>>;
+  onRequestContactProfile: (
+    wxids: string[],
+    gid?: string,
+    options?: { force?: boolean },
+  ) => Promise<Record<string, ContactProfile>>;
   onInputChange?: (hasText: boolean) => void;
   mobile?: boolean;
   dark?: boolean;
@@ -118,19 +122,13 @@ export default function ChatArea({
     setProfileWxid(wxid);
     setProfileError("");
 
-    const existing = contactProfiles[wxid];
-    const raw = existing?.profile || {};
-    const usefulKeys = Object.keys(raw).filter((key) => key !== "wxid");
-    const hasUsefulProfile = usefulKeys.length > 0 && (
-      !wxid.endsWith("@openim") || Boolean(raw.OpenIM || raw.OpenIMDetail || raw.openim_detail)
-    );
-    if (hasUsefulProfile) {
-      return;
-    }
-
     setProfileLoading(true);
     try {
-      await onRequestContactProfile([wxid], wxid.endsWith("@openim") && session.is_group ? session.wxid : "");
+      await onRequestContactProfile(
+        [wxid],
+        wxid.endsWith("@openim") && session.is_group ? session.wxid : "",
+        { force: true },
+      );
     } catch (err) {
       console.error("[PROFILE]", err);
       setProfileError("资料加载失败");

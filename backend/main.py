@@ -179,11 +179,10 @@ def _safe_runtime_id(agent_id: str) -> str:
 def _runtime_for(agent_id: str) -> dict:
     key = str(agent_id or "default")
     if key not in _account_runtimes:
-        cache_path = os.path.join(os.path.dirname(__file__), ".sqlite_cache", f"{_safe_runtime_id(key)}.sqlite3")
         _account_runtimes[key] = {
             "app_state": _new_app_state(),
             "message_store": MessageStore(),
-            "sqlite_cache": SqliteMessageCache(cache_path),
+            "sqlite_cache": sqlite_cache,
         }
     return _account_runtimes[key]
 
@@ -261,8 +260,10 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
 
 def _put_self_info_field(key: str, value: str) -> None:
     value = str(value or "").strip()
-    if not value or not isinstance(app_state.get("self_info"), dict):
+    if not value:
         return
+    if not isinstance(app_state.get("self_info"), dict):
+        app_state["self_info"] = {"data": {}}
     self_info = app_state["self_info"]
     data = self_info.get("data")
     if isinstance(data, dict):
@@ -402,14 +403,14 @@ def _schedule_account_card_refresh() -> None:
 
 # ─── Contact brief cache (name + avatar URL) ─────────────────────────
 # Used to avoid repeatedly calling BatchGetContactBriefInfo for the same wxids.
-_CONTACT_BRIEF_CACHE: dict[str, dict] = {}  # wxid -> {"name": str, "avatar": str, "ts": float}
+_CONTACT_BRIEF_CACHE: dict[str, dict] = {}  # owner::wxid -> {"name": str, "avatar": str, "ts": float}
 _CONTACT_BRIEF_CACHE_TTL_SEC = 24 * 60 * 60  # 24h
 _CONTACT_BRIEF_LOCK = asyncio.Lock()
 
 
 # ─── Full contact profile cache ────────────────────────────────────
 # Populated lazily via /GetContact for strangers / new chats.
-_CONTACT_PROFILE_CACHE: dict[str, dict] = {}  # wxid -> {"profile": dict, "ts": float}
+_CONTACT_PROFILE_CACHE: dict[str, dict] = {}  # owner::wxid -> {"profile": dict, "ts": float}
 _CONTACT_PROFILE_CACHE_TTL_SEC = 24 * 60 * 60
 _CONTACT_PROFILE_LOCK = asyncio.Lock()
 
@@ -428,6 +429,18 @@ def _get_self_wxid() -> str:
     if isinstance(data, dict) and data.get("wxid"):
         return data.get("wxid", "")
     return self_info.get("wxid", "")
+
+
+def _contact_owner_wxid(self_wxid: str = "") -> str:
+    owner = str(self_wxid or _get_self_wxid() or "").strip()
+    if owner:
+        return owner
+    agent_id = str(_active_agent_id or agent_manager.active_id() or "").strip()
+    return f"agent:{agent_id}" if agent_id else "default"
+
+
+def _contact_cache_key(wxid: str, owner_wxid: str = "") -> str:
+    return f"{_contact_owner_wxid(owner_wxid)}::{str(wxid or '').strip()}"
 
 
 def _format_preview(msg_type: str, content: str) -> str:
@@ -560,7 +573,7 @@ def _store_message_and_session(chat_id: str, msg: dict) -> dict:
             if sender_wxid:
                 sender_name = (
                     message_store.get_contact(sender_wxid).get("name", "")
-                    or _CONTACT_BRIEF_CACHE.get(sender_wxid, {}).get("name", "")
+                    or _CONTACT_BRIEF_CACHE.get(_contact_cache_key(sender_wxid), {}).get("name", "")
                     or sender_wxid
                 )
                 preview = f"{sender_name}: {preview}"
@@ -581,7 +594,7 @@ def _store_message_and_session(chat_id: str, msg: dict) -> dict:
         "time": msg_timestamp,
     }
     try:
-        sqlite_cache.upsert_messages(chat_id, [msg])
+        sqlite_cache.upsert_messages(chat_id, [msg], owner_wxid=_contact_owner_wxid())
     except Exception as e:
         _log(f"[SQLITE_CACHE] realtime write failed for {chat_id}: {type(e).__name__}: {e}")
     return {
@@ -729,19 +742,8 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         _log("[INIT 2/4] Loading contacts...")
         contacts = await wechat_api.get_friend_and_chatroom_list()
         app_state["contacts"] = contacts
-        friend_list = contacts.get("friend", []) if isinstance(contacts, dict) else []
-        for c in friend_list:
-            if not isinstance(c, dict):
-                continue
-            wxid = c.get("wxid") or c.get("UserName") or ""
-            name = c.get("markname") or c.get("nickname") or c.get("NickName") or ""
-            avatar = (
-                c.get("headimgurl") or c.get("head_img") or c.get("head_big") or
-                c.get("head_small") or c.get("headimg") or c.get("avatar") or ""
-            )
-            if wxid:
-                message_store.set_contact(wxid, name=name, avatar=avatar)
-        _log(f"[INIT 2/4] ✓ Contacts loaded: {len(friend_list)}")
+        friend_count, room_count = _cache_raw_contacts(contacts)
+        _log(f"[INIT 2/4] ✓ Contacts loaded: {friend_count} friends, {room_count} groups")
     except Exception as e:
         _log(f"[INIT 2/4] ✗ contacts load failed: {e}")
 
@@ -810,7 +812,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
 
     # 6. Load last messages. Prefer local SQLite cache; only missings hit Hook DB.
     if session_wxids_for_avatars:
-        cached_last = sqlite_cache.get_last_messages(session_wxids_for_avatars)
+        cached_last = sqlite_cache.get_last_messages(session_wxids_for_avatars, owner_wxid=_contact_owner_wxid())
         if cached_last:
             app_state["last_messages"] = dict(cached_last)
             _log(f"[INIT 6/7] ✓ Loaded {len(cached_last)} last messages from local SQLite cache.")
@@ -824,7 +826,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
                     timeout=35.0,
                 )
                 app_state["last_messages"].update(last_msgs)
-                sqlite_cache.upsert_last_messages(last_msgs)
+                sqlite_cache.upsert_last_messages(last_msgs, owner_wxid=_contact_owner_wxid())
                 _log(f"[INIT 6/7] ✓ Last messages loaded from Hook DB for {len(last_msgs)} sessions.")
             else:
                 _log("[INIT 6/7] ✓ All session last messages came from local SQLite cache.")
@@ -837,7 +839,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
             preload_chats = 0
             preload_msgs = 0
             for wxid in session_wxids_for_avatars:
-                cached_msgs = sqlite_cache.get_messages(wxid, 50)
+                cached_msgs = sqlite_cache.get_messages(wxid, 50, owner_wxid=_contact_owner_wxid())
                 if cached_msgs:
                     message_store.add_history(wxid, cached_msgs)
                     preload_chats += 1
@@ -1118,6 +1120,10 @@ async def wechat_callback(request: Request):
         callback_agent_id = _active_agent_id or agent_manager.active_id()
     if callback_agent_id:
         _activate_runtime(callback_agent_id)
+    if self_wxid:
+        _self_wxid_to_agent_id[self_wxid] = callback_agent_id or _active_agent_id or agent_manager.active_id()
+        _put_self_info_field("wxid", self_wxid)
+        _put_self_info_field("selfwxid", self_wxid)
 
     # ── RecvType=2: raw protobuf → parse into msglist ──────────
     pb_msg = data.get("pb_msg")
@@ -1312,6 +1318,7 @@ async def websocket_endpoint(websocket: WebSocket):
             "sessions": app_state["sessions"],
             "last_messages": app_state["last_messages"],
             "avatar_urls": app_state.get("avatar_urls", {}),
+            "contact_profiles": sqlite_cache.get_contacts(owner_wxid=_contact_owner_wxid()),
             "messages_cache": message_store.get_all_messages(),
             "session_cache": message_store.get_sessions(),
         }
@@ -1349,6 +1356,7 @@ async def get_contacts():
     if not app_state["contacts"]:
         await wechat_api.init_contact()
         app_state["contacts"] = await wechat_api.get_friend_and_chatroom_list()
+        _cache_raw_contacts(app_state["contacts"])
     return app_state["contacts"]
 
 
@@ -1357,6 +1365,7 @@ async def refresh_contacts():
     """Force refresh contacts from Hook."""
     await wechat_api.init_contact()
     app_state["contacts"] = await wechat_api.get_friend_and_chatroom_list()
+    _cache_raw_contacts(app_state["contacts"])
     return app_state["contacts"]
 
 
@@ -1380,6 +1389,7 @@ class BriefBatchRequest(BaseModel):
 class ProfileBatchRequest(BaseModel):
     wxids: list[str] = []
     gid: str = ""
+    force: bool = False
 
 
 def _normalize_wxids(wxids: list[str]) -> list[str]:
@@ -1440,6 +1450,8 @@ def _contact_profile_wxid(profile: dict) -> str:
         profile.get("wxid")
         or profile.get("UserName")
         or profile.get("userName")
+        or profile.get("strUsrName")
+        or profile.get("username")
         or profile.get("describe")
         or ""
     )
@@ -1453,6 +1465,7 @@ def _contact_profile_name(profile: dict) -> str:
         or profile.get("NickName")
         or profile.get("nickname")
         or profile.get("nick")
+        or profile.get("strNickName")
         or _contact_profile_wxid(profile)
         or ""
     )
@@ -1468,6 +1481,12 @@ def _contact_profile_avatar(profile: dict) -> str:
         or profile.get("head_img")
         or profile.get("head_big")
         or profile.get("head_small")
+        or profile.get("HeadImgUrl")
+        or profile.get("HeadUrl")
+        or profile.get("smallHeadUrl")
+        or profile.get("bigHeadUrl")
+        or profile.get("smallheadimgurl")
+        or profile.get("bigheadimgurl")
         or profile.get("avatar")
         or ""
     )
@@ -1700,9 +1719,81 @@ def _contact_profile_summary(profile: dict) -> dict:
     }
 
 
+def _profile_has_useful_payload(profile: dict) -> bool:
+    if not isinstance(profile, dict):
+        return False
+    return any(key != "wxid" and value not in ("", None, {}, []) for key, value in profile.items())
+
+
+def _cache_raw_contacts(contacts: dict) -> tuple[int, int]:
+    if not isinstance(contacts, dict):
+        return 0, 0
+    friend_list = contacts.get("friend") or contacts.get("friends") or []
+    if not isinstance(friend_list, list):
+        friend_list = []
+    room_list = (
+        contacts.get("chatroom")
+        or contacts.get("chatrooms")
+        or contacts.get("group")
+        or contacts.get("groups")
+        or []
+    )
+    if not isinstance(room_list, list):
+        room_list = []
+    data_list = contacts.get("data") if isinstance(contacts.get("data"), list) else []
+    if data_list:
+        friend_wxids = {_contact_profile_wxid(c) for c in friend_list if isinstance(c, dict)}
+        room_wxids = {_contact_profile_wxid(c) for c in room_list if isinstance(c, dict)}
+        for entry in data_list:
+            if not isinstance(entry, dict):
+                continue
+            wxid = _contact_profile_wxid(entry)
+            if not wxid or wxid in friend_wxids or wxid in room_wxids:
+                continue
+            if wxid.endswith("@chatroom"):
+                room_list.append(entry)
+                room_wxids.add(wxid)
+            else:
+                friend_list.append(entry)
+                friend_wxids.add(wxid)
+    raw_contact_updates: dict[str, dict] = {}
+    for c in [*friend_list, *room_list]:
+        if not isinstance(c, dict):
+            continue
+        wxid = _contact_profile_wxid(c)
+        if not wxid:
+            continue
+        name = _contact_profile_name(c)
+        avatar = _contact_profile_avatar(c)
+        message_store.set_contact(wxid, name=name, avatar=avatar)
+        raw_contact_updates[wxid] = {
+            "wxid": wxid,
+            "name": name or wxid,
+            "avatar": avatar,
+            "is_group": wxid.endswith("@chatroom"),
+            "profile": dict(c),
+        }
+    if raw_contact_updates:
+        sqlite_cache.upsert_contacts(raw_contact_updates, owner_wxid=_contact_owner_wxid())
+    return len(friend_list), len(room_list)
+
+
+async def _broadcast_contact_profile_updates(updates: dict[str, dict]) -> None:
+    if not updates:
+        return
+    await manager.broadcast({
+        "type": "contact_profiles",
+        "data": {
+            "account_id": _active_agent_id or agent_manager.active_id(),
+            "members": updates,
+        },
+    })
+
+
 async def _cache_contact_profiles(profiles: list[dict]) -> dict[str, dict]:
     """Save full profiles plus brief name/avatar caches. Returns frontend updates."""
     now = time.time()
+    owner_wxid = _contact_owner_wxid()
     updates: dict[str, dict] = {}
     async with _CONTACT_PROFILE_LOCK:
         async with _CONTACT_BRIEF_LOCK:
@@ -1716,16 +1807,27 @@ async def _cache_contact_profiles(profiles: list[dict]) -> dict[str, dict]:
                 summary = _contact_profile_summary(profile)
                 name = summary.get("name", "")
                 avatar = summary.get("avatar", "")
-                _CONTACT_PROFILE_CACHE[wxid] = {"profile": profile, "ts": now}
-                _CONTACT_BRIEF_CACHE[wxid] = {"name": name, "avatar": avatar, "ts": now}
+                cache_key = _contact_cache_key(wxid, owner_wxid)
+                _CONTACT_PROFILE_CACHE[cache_key] = {"profile": profile, "ts": now}
+                _CONTACT_BRIEF_CACHE[cache_key] = {"name": name, "avatar": avatar, "ts": now}
                 if avatar:
                     avatar_urls[wxid] = avatar
                 message_store.set_contact(wxid, name=name, avatar=avatar)
                 updates[wxid] = summary
+            if updates:
+                sqlite_cache.upsert_contacts(updates, owner_wxid=owner_wxid)
     return updates
 
 
-async def _ensure_contact_profiles(wxids: list[str], *, require_full: bool = True, gid: str = "") -> dict[str, dict]:
+async def _ensure_contact_profiles(
+    wxids: list[str],
+    *,
+    require_full: bool = True,
+    gid: str = "",
+    broadcast_updates: bool = False,
+    fetch_missing: bool = False,
+    force_refresh: bool = False,
+) -> dict[str, dict]:
     """Return contact profiles/summaries from cache, calling /GetContact for misses.
 
     require_full=True is used by the profile card and fetches when the full
@@ -1739,21 +1841,27 @@ async def _ensure_contact_profiles(wxids: list[str], *, require_full: bool = Tru
     now = time.time()
     result: dict[str, dict] = {}
     missing: list[str] = []
+    owner_wxid = _contact_owner_wxid()
+    db_cached = sqlite_cache.get_contacts(wxids, owner_wxid=owner_wxid)
 
     async with _CONTACT_PROFILE_LOCK:
         async with _CONTACT_BRIEF_LOCK:
             avatar_urls = app_state.get("avatar_urls", {}) or {}
             for wxid in wxids:
-                cached_profile = _CONTACT_PROFILE_CACHE.get(wxid)
+                cache_key = _contact_cache_key(wxid, owner_wxid)
+                cached_profile = _CONTACT_PROFILE_CACHE.get(cache_key)
                 profile_ok = bool(cached_profile) and (
                     now - float(cached_profile.get("ts", 0)) <= _CONTACT_PROFILE_CACHE_TTL_SEC
                 )
                 if profile_ok:
                     profile = cached_profile.get("profile", {}) or {}
-                    result[wxid] = _contact_profile_summary(profile)
-                    continue
+                    summary = _contact_profile_summary(profile)
+                    if summary.get("avatar"):
+                        result[wxid] = summary
+                        if not force_refresh:
+                            continue
 
-                cached_brief = _CONTACT_BRIEF_CACHE.get(wxid)
+                cached_brief = _CONTACT_BRIEF_CACHE.get(cache_key)
                 brief_ok = bool(cached_brief) and (
                     now - float(cached_brief.get("ts", 0)) <= _CONTACT_BRIEF_CACHE_TTL_SEC
                 )
@@ -1774,9 +1882,38 @@ async def _ensure_contact_profiles(wxids: list[str], *, require_full: bool = Tru
                 has_real_name = bool(name and name != wxid)
                 if not require_full and has_real_name and avatar:
                     result[wxid] = {"wxid": wxid, "name": name or wxid, "avatar": avatar, "profile": {}}
-                    continue
+                    if not force_refresh:
+                        continue
+
+                db_entry = db_cached.get(wxid)
+                if db_entry:
+                    db_profile = db_entry.get("profile") if isinstance(db_entry.get("profile"), dict) else {"wxid": wxid}
+                    db_avatar = str(db_entry.get("avatar") or "")
+                    db_name = str(db_entry.get("name") or wxid)
+                    if db_avatar and (not require_full or _profile_has_useful_payload(db_profile)):
+                        summary = {
+                            "wxid": wxid,
+                            "name": db_name,
+                            "avatar": db_avatar,
+                            "profile": db_profile,
+                        }
+                        result[wxid] = summary
+                        _CONTACT_PROFILE_CACHE[cache_key] = {"profile": db_profile, "ts": now}
+                        _CONTACT_BRIEF_CACHE[cache_key] = {"name": db_name, "avatar": db_avatar, "ts": now}
+                        avatar_urls[wxid] = db_avatar
+                        message_store.set_contact(wxid, name=db_name, avatar=db_avatar)
+                        if not force_refresh:
+                            continue
 
                 missing.append(wxid)
+
+    if broadcast_updates and result:
+        await _broadcast_contact_profile_updates(result)
+
+    if not (fetch_missing or force_refresh):
+        for wxid in wxids:
+            result.setdefault(wxid, {"wxid": wxid, "name": wxid, "avatar": "", "profile": {"wxid": wxid}})
+        return result
 
     openim_missing = [wxid for wxid in missing if wxid.endswith("@openim")]
     regular_missing = [wxid for wxid in missing if not wxid.endswith("@openim")]
@@ -1810,6 +1947,8 @@ async def _ensure_contact_profiles(wxids: list[str], *, require_full: bool = Tru
 
         for updates in await asyncio.gather(*(fetch_openim_profile(wxid) for wxid in openim_missing)):
             result.update(updates)
+            if broadcast_updates and updates:
+                await _broadcast_contact_profile_updates(updates)
 
     if regular_missing:
         batch_size = 100
@@ -1822,6 +1961,8 @@ async def _ensure_contact_profiles(wxids: list[str], *, require_full: bool = Tru
                     contacts = [data] if isinstance(data, dict) and _contact_profile_wxid(data) else []
                 updates = await _cache_contact_profiles(contacts)
                 result.update(updates)
+                if broadcast_updates and updates:
+                    await _broadcast_contact_profile_updates(updates)
             except Exception as e:
                 _log(f"[PROFILE] GetContact failed ({len(batch)}): {type(e).__name__}: {e}")
             await asyncio.sleep(0.05)
@@ -1855,8 +1996,10 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
         return {"members": {}}
 
     now = time.time()
+    owner_wxid = _contact_owner_wxid()
     members: dict[str, dict] = {}
     missing: list[str] = []
+    db_cached = sqlite_cache.get_contacts(wxids, owner_wxid=owner_wxid)
 
     # 1) Serve from cache or preloaded avatar_urls
     async with _CONTACT_BRIEF_LOCK:
@@ -1871,7 +2014,8 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
 
         avatar_urls = app_state.get("avatar_urls", {}) or {}
         for wxid in wxids:
-            cached = _CONTACT_BRIEF_CACHE.get(wxid)
+            cache_key = _contact_cache_key(wxid, owner_wxid)
+            cached = _CONTACT_BRIEF_CACHE.get(cache_key)
             cached_ok = bool(cached) and (now - float(cached.get("ts", 0)) <= _CONTACT_BRIEF_CACHE_TTL_SEC)
             direct_avatar = avatar_urls.get(wxid, "")
 
@@ -1882,6 +2026,15 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
                     avatar = direct_avatar
                 if name and name != wxid:
                     members[wxid] = {"name": name, "avatar": avatar}
+                    continue
+
+            db_entry = db_cached.get(wxid)
+            if db_entry:
+                db_name = str(db_entry.get("name") or "")
+                db_avatar = direct_avatar or str(db_entry.get("avatar") or "")
+                if db_name and db_name != wxid and db_avatar:
+                    members[wxid] = {"name": db_name, "avatar": db_avatar}
+                    _CONTACT_BRIEF_CACHE[cache_key] = {"name": db_name, "avatar": db_avatar, "ts": now}
                     continue
 
             missing.append(wxid)
@@ -1913,13 +2066,33 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
                     found_in_batch[wxid] = {"name": name, "avatar": avatar}
 
                 if found_in_batch:
+                    contact_updates: dict[str, dict] = {}
                     async with _CONTACT_BRIEF_LOCK:
                         avatar_urls = app_state.get("avatar_urls", {}) or {}
                         for wxid, entry in found_in_batch.items():
                             if not entry.get("avatar") and avatar_urls.get(wxid):
                                 entry["avatar"] = avatar_urls[wxid]
                             members[wxid] = entry
-                            _CONTACT_BRIEF_CACHE[wxid] = {"name": entry.get("name", ""), "avatar": entry.get("avatar", ""), "ts": now}
+                            profile = {
+                                "wxid": wxid,
+                                "nickname": entry.get("name", ""),
+                                "SmallHeadImgUrl": entry.get("avatar", ""),
+                                "BigHeadImgUrl": entry.get("avatar", ""),
+                            }
+                            contact_updates[wxid] = {
+                                "wxid": wxid,
+                                "name": entry.get("name", "") or wxid,
+                                "avatar": entry.get("avatar", ""),
+                                "is_group": wxid.endswith("@chatroom"),
+                                "profile": profile,
+                            }
+                            _CONTACT_BRIEF_CACHE[_contact_cache_key(wxid, owner_wxid)] = {
+                                "name": entry.get("name", ""),
+                                "avatar": entry.get("avatar", ""),
+                                "ts": now,
+                            }
+                    if contact_updates:
+                        sqlite_cache.upsert_contacts(contact_updates, owner_wxid=owner_wxid)
             except Exception as e:
                 _log(f"[BRIEF] batch brief info failed ({len(batch)}): {e}")
 
@@ -1943,7 +2116,14 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
 @app.post("/api/contacts/profile-batch")
 async def post_contacts_profile_batch(req: ProfileBatchRequest):
     """Resolve full contact profiles via /GetContact with a runtime cache."""
-    members = await _ensure_contact_profiles(req.wxids, require_full=True, gid=req.gid)
+    members = await _ensure_contact_profiles(
+        req.wxids,
+        require_full=True,
+        gid=req.gid,
+        broadcast_updates=True,
+        fetch_missing=req.force,
+        force_refresh=req.force,
+    )
     return {"members": members}
 
 
@@ -1976,7 +2156,7 @@ async def refresh_sessions():
     cache_count = 0
     if missing_wxids:
         try:
-            cached_messages = sqlite_cache.get_last_messages(missing_wxids)
+            cached_messages = sqlite_cache.get_last_messages(missing_wxids, owner_wxid=_contact_owner_wxid())
             for wxid, msg in cached_messages.items():
                 if wxid not in last_messages:
                     last_messages[wxid] = msg
@@ -1995,7 +2175,7 @@ async def refresh_sessions():
                     # Cache DB results so we don't re-query next time
                     app_state["last_messages"][wxid] = msg
                     db_count += 1
-            sqlite_cache.upsert_last_messages(db_messages)
+            sqlite_cache.upsert_last_messages(db_messages, owner_wxid=_contact_owner_wxid())
         except Exception:
             pass
 
@@ -2014,8 +2194,9 @@ async def get_messages(wxid: str, limit: int = 50, db: str = "MSG0.db"):
     Prefer local SQLite cache once a wxid has been initialized; query Hook DB
     only for first-time cache warmup.
     """
-    if sqlite_cache.has_initialized(wxid):
-        cached = sqlite_cache.get_messages(wxid, limit)
+    owner_wxid = _contact_owner_wxid()
+    if sqlite_cache.has_initialized(wxid, owner_wxid=owner_wxid):
+        cached = sqlite_cache.get_messages(wxid, limit, owner_wxid=owner_wxid)
         if cached:
             message_store.add_history(wxid, cached)
         return {"data": message_store.get_messages(wxid, limit), "source": "sqlite"}
@@ -2026,9 +2207,9 @@ async def get_messages(wxid: str, limit: int = 50, db: str = "MSG0.db"):
     message_store.add_history(wxid, normalized)
     try:
         if normalized:
-            sqlite_cache.upsert_messages(wxid, normalized, mark_initialized=True)
+            sqlite_cache.upsert_messages(wxid, normalized, mark_initialized=True, owner_wxid=owner_wxid)
         else:
-            sqlite_cache.mark_initialized(wxid)
+            sqlite_cache.mark_initialized(wxid, owner_wxid=owner_wxid)
     except Exception as e:
         _log(f"[SQLITE_CACHE] history write failed for {wxid}: {type(e).__name__}: {e}")
     return {"data": message_store.get_messages(wxid, limit), "source": "hook_db"}
@@ -2040,7 +2221,8 @@ async def get_older_messages(wxid: str, before: int = 0, limit: int = 50):
     Returns messages with CreateTime < before, sorted chronologically."""
     if before <= 0:
         return {"data": []}
-    cached = sqlite_cache.get_messages(wxid, limit, before=before)
+    owner_wxid = _contact_owner_wxid()
+    cached = sqlite_cache.get_messages(wxid, limit, before=before, owner_wxid=owner_wxid)
     if cached:
         message_store.add_history_no_flag(wxid, cached)
         return {"data": cached, "source": "sqlite"}
@@ -2051,7 +2233,7 @@ async def get_older_messages(wxid: str, before: int = 0, limit: int = 50):
     # Add to store so they persist in memory
     message_store.add_history_no_flag(wxid, normalized)
     try:
-        sqlite_cache.upsert_messages(wxid, normalized)
+        sqlite_cache.upsert_messages(wxid, normalized, owner_wxid=owner_wxid)
     except Exception as e:
         _log(f"[SQLITE_CACHE] older-history write failed for {wxid}: {type(e).__name__}: {e}")
     return {"data": normalized, "source": "hook_db"}
@@ -2990,7 +3172,7 @@ os.makedirs(_IMG_CACHE_DIR, exist_ok=True)
 def _image_file_response(path: str, msg_id: str = ""):
     if msg_id and path:
         try:
-            updated = sqlite_cache.update_image_path_by_msg_id(str(msg_id), path)
+            updated = sqlite_cache.update_image_path_by_msg_id(str(msg_id), path, owner_wxid=_contact_owner_wxid())
             if updated:
                 _log(f"[SQLITE_CACHE] image path cached for msg_id={msg_id}: {path}")
         except Exception as e:

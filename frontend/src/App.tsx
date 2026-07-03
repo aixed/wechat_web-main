@@ -197,10 +197,15 @@ function parseSessions(
 function buildContactMap(raw: any): Record<string, string> {
   const map: Record<string, string> = {};
   if (!raw) return map;
-  const list = raw.friend || raw.data || (Array.isArray(raw) ? raw : []);
+  const list = [
+    ...(raw.friend || raw.friends || []),
+    ...(raw.chatroom || raw.chatrooms || raw.group || raw.groups || []),
+    ...(Array.isArray(raw.data) ? raw.data : []),
+    ...(Array.isArray(raw) ? raw : []),
+  ];
   for (const c of list) {
-    const wxid = c.wxid || c.UserName || "";
-    const name = c.markname || c.nickname || c.NickName || "";
+    const wxid = c.wxid || c.UserName || c.userName || c.strUsrName || "";
+    const name = c.markname || c.nickname || c.NickName || c.strNickName || "";
     if (wxid && name) map[wxid] = name;
   }
   return map;
@@ -215,13 +220,21 @@ function buildAvatarMap(contacts: any, avatarUrls: Record<string, string> | unde
     }
   }
   if (contacts) {
-    const list = contacts.friend || contacts.data || (Array.isArray(contacts) ? contacts : []);
+    const list = [
+      ...(contacts.friend || contacts.friends || []),
+      ...(contacts.chatroom || contacts.chatrooms || contacts.group || contacts.groups || []),
+      ...(Array.isArray(contacts.data) ? contacts.data : []),
+      ...(Array.isArray(contacts) ? contacts : []),
+    ];
     for (const c of list) {
-      const wxid = c.wxid || c.UserName || "";
+      const wxid = c.wxid || c.UserName || c.userName || c.strUsrName || "";
       if (!wxid || map[wxid]) continue;
       const url =
         c.headimgurl || c.head_img || c.head_big || c.head_small ||
-        c.headimg || c.bigheadimgurl || c.smallheadimgurl || c.avatar || "";
+        c.headimg || c.bigheadimgurl || c.smallheadimgurl ||
+        c.HeadImgUrl || c.SmallHeadImgUrl || c.BigHeadImgUrl ||
+        c.HeadUrl || c.smallHeadUrl || c.bigHeadUrl ||
+        c.avatar || "";
       if (url) map[wxid] = url;
     }
   }
@@ -261,6 +274,17 @@ function profileAvatar(profile: ContactProfile | undefined, fallback = ""): stri
     raw.smallhead ||
     raw.BigHeadImgUrl ||
     raw.bighead ||
+    raw.headimgurl ||
+    raw.head_img ||
+    raw.head_big ||
+    raw.head_small ||
+    raw.headimg ||
+    raw.HeadImgUrl ||
+    raw.HeadUrl ||
+    raw.smallHeadUrl ||
+    raw.bigHeadUrl ||
+    raw.smallheadimgurl ||
+    raw.bigheadimgurl ||
     fallback ||
     ""
   );
@@ -573,6 +597,7 @@ export default function App() {
   const briefTimer = useRef<number | null>(null);
   const briefInFlight = useRef(false);
   const briefRequestedWxids = useRef<Set<string>>(new Set());
+  const groupProfileRequestedWxids = useRef<Set<string>>(new Set());
   const groupNamesFetched = useRef<Set<string>>(new Set());
   // Keep a live ref to avatarMap so flushBriefQueue always sees the latest
   const avatarMapRef = useRef(avatarMap);
@@ -581,6 +606,8 @@ export default function App() {
   contactMapRef.current = contactMap;
   const contactProfilesRef = useRef(contactProfiles);
   contactProfilesRef.current = contactProfiles;
+  const selectedAccountIdRef = useRef(selectedAccountId);
+  selectedAccountIdRef.current = selectedAccountId;
 
   const resetChatState = useCallback(() => {
     setSelfWxid("");
@@ -598,6 +625,7 @@ export default function App() {
     setContactsHydrated(false);
     pendingBriefWxids.current.clear();
     briefRequestedWxids.current.clear();
+    groupProfileRequestedWxids.current.clear();
     groupNamesFetched.current.clear();
   }, []);
 
@@ -708,11 +736,9 @@ export default function App() {
     const nextAvatars: Record<string, string> = {};
 
     for (const [wxid, entry] of Object.entries(updates)) {
-      const name = entry?.name || entry?.profile?.Remark || entry?.profile?.NickName || "";
-      const avatar = entry?.avatar ||
-        entry?.profile?.SmallHeadImgUrl ||
-        entry?.profile?.BigHeadImgUrl ||
-        "";
+      const raw = entry?.profile || {};
+      const name = entry?.name || raw.Remark || raw.remark || raw.NickName || raw.nickname || raw.strNickName || "";
+      const avatar = profileAvatar(entry, "");
       if (name && name !== wxid) nextNames[wxid] = name;
       if (avatar) nextAvatars[wxid] = avatar;
     }
@@ -733,7 +759,13 @@ export default function App() {
     }
   }, []);
 
-  const ensureContactProfiles = useCallback(async (wxids: string[], gid = "") => {
+  const ensureContactProfiles = useCallback(async (
+    wxids: string[],
+    gid = "",
+    options: { force?: boolean } = {},
+  ) => {
+    const requestAccountId = selectedAccountIdRef.current;
+    const force = Boolean(options.force);
     const unique = Array.from(new Set((wxids || []).filter(Boolean)));
     const cached: Record<string, ContactProfile> = {};
     const missing: string[] = [];
@@ -744,7 +776,7 @@ export default function App() {
       const hasUsefulProfile = usefulKeys.length > 0 && (
         !wxid.endsWith("@openim") || Boolean(raw.OpenIM || raw.OpenIMDetail || raw.openim_detail)
       );
-      if (hasUsefulProfile) {
+      if (hasUsefulProfile && !force) {
         cached[wxid] = hit;
       } else {
         missing.push(wxid);
@@ -752,14 +784,30 @@ export default function App() {
     }
     if (missing.length === 0) return cached;
 
-    const data = await getContactProfiles(missing, gid);
+    const data = await getContactProfiles(missing, gid, force);
     const members = data?.members || {};
+    if (selectedAccountIdRef.current !== requestAccountId) {
+      return { ...cached, ...members };
+    }
     applyContactProfileUpdates(members);
     return { ...cached, ...members };
   }, [applyContactProfileUpdates]);
 
+  const ensureGroupProfiles = useCallback((wxids: string[]) => {
+    const missing = Array.from(new Set((wxids || [])
+      .filter((wxid) => wxid && wxid.includes("@chatroom"))
+      .filter((wxid) => !avatarMapRef.current[wxid])
+      .filter((wxid) => !groupProfileRequestedWxids.current.has(wxid))));
+    if (missing.length === 0) return;
+    missing.forEach((wxid) => groupProfileRequestedWxids.current.add(wxid));
+    ensureContactProfiles(missing).catch((err) => {
+      console.error("[GROUP_PROFILE]", err);
+    });
+  }, [ensureContactProfiles]);
+
   const hydrateDirectoryContacts = useCallback(async () => {
     if (contactsHydrating || contactsHydrated) return;
+    const requestAccountId = selectedAccountIdRef.current;
     const friends = contactListFromRaw(rawContacts);
     const rooms = chatroomListFromRaw(rawContacts);
     const wxids = Array.from(new Set([
@@ -773,22 +821,23 @@ export default function App() {
     setContactsHydrating(true);
     try {
       await ensureContactProfiles(wxids);
+      if (selectedAccountIdRef.current !== requestAccountId) return;
       setContactsHydrated(true);
     } catch (err) {
       console.error("[CONTACTS] hydrate failed:", err);
     } finally {
-      setContactsHydrating(false);
+      if (selectedAccountIdRef.current === requestAccountId) {
+        setContactsHydrating(false);
+      }
     }
   }, [contactsHydrated, contactsHydrating, ensureContactProfiles, rawContacts]);
 
   const openSelfProfileCard = useCallback(async () => {
     if (!selfWxid) return;
     setSelfCardOpen(true);
-    const hit = contactProfilesRef.current[selfWxid];
-    if (hit?.profile && Object.keys(hit.profile).length > 0) return;
     setSelfProfileLoading(true);
     try {
-      await ensureContactProfiles([selfWxid]);
+      await ensureContactProfiles([selfWxid], "", { force: true });
     } catch (err) {
       console.error("[SELF_PROFILE]", err);
     } finally {
@@ -799,11 +848,9 @@ export default function App() {
   const openMobileSelfProfileDetail = useCallback(async () => {
     if (!selfWxid) return;
     setMobileProfileDetailOpen(true);
-    const hit = contactProfilesRef.current[selfWxid];
-    if (hit?.profile && Object.keys(hit.profile).length > 0) return;
     setSelfProfileLoading(true);
     try {
-      await ensureContactProfiles([selfWxid]);
+      await ensureContactProfiles([selfWxid], "", { force: true });
     } catch (err) {
       console.error("[SELF_PROFILE]", err);
     } finally {
@@ -836,8 +883,10 @@ export default function App() {
     if (wxids.length === 0) return;
 
     briefInFlight.current = true;
+    const requestAccountId = selectedAccountIdRef.current;
     batchGetContactBrief(wxids)
       .then((data: any) => {
+        if (selectedAccountIdRef.current !== requestAccountId) return;
         const members = data?.members;
         if (!members || typeof members !== "object") return;
 
@@ -941,9 +990,11 @@ export default function App() {
   const fetchGroupMemberNames = useCallback((gid: string) => {
     if (groupNamesFetched.current.has(gid)) return;
     groupNamesFetched.current.add(gid);
+    const requestAccountId = selectedAccountIdRef.current;
 
     getGroupMemberNames(gid)
       .then((data: any) => {
+        if (selectedAccountIdRef.current !== requestAccountId) return;
         const names = data?.names;
         if (!names || typeof names !== "object") return;
 
@@ -971,6 +1022,7 @@ export default function App() {
         sessions: rawSessions,
         last_messages,
         avatar_urls,
+        contact_profiles,
         messages_cache,
         session_cache,
       } = wsMsg.data as any;
@@ -979,10 +1031,20 @@ export default function App() {
       setRawContacts(contacts);
 
       const nameMap = buildContactMap(contacts);
-      setContactMap(nameMap);
-
       const avatars = buildAvatarMap(contacts, avatar_urls);
+      const cachedProfiles = (contact_profiles && typeof contact_profiles === "object") ? contact_profiles : {};
+      for (const [profileWxid, entry] of Object.entries<ContactProfile>(cachedProfiles)) {
+        const raw = entry?.profile || {};
+        const name = entry?.name || raw.Remark || raw.remark || raw.NickName || raw.nickname || raw.strNickName || "";
+        const avatar = profileAvatar(entry, "");
+        if (name && name !== profileWxid) nameMap[profileWxid] = name;
+        if (avatar) avatars[profileWxid] = avatar;
+      }
+      setContactMap(nameMap);
       setAvatarMap(avatars);
+      if (Object.keys(cachedProfiles).length > 0) {
+        setContactProfiles((prev) => ({ ...prev, ...cachedProfiles }));
+      }
 
       const parsed = parseSessions(rawSessions, nameMap, last_messages || {});
       let enriched: Session[] = parsed.map((s) => ({
@@ -1032,6 +1094,10 @@ export default function App() {
       if (openimNeedsProfile.length > 0) {
         ensureContactProfiles(openimNeedsProfile).catch((err) => console.error("[OPENIM_PROFILE]", err));
       }
+      const groupNeedsProfile = enriched
+        .filter((s) => s.is_group && !avatars[s.wxid])
+        .map((s) => s.wxid);
+      ensureGroupProfiles(groupNeedsProfile);
 
       if (messages_cache && typeof messages_cache === "object") {
         setChatMessages((prev) => {
@@ -1054,6 +1120,11 @@ export default function App() {
         "avatars:", Object.keys(avatars).length);
     }
 
+    if (wsMsg.type === "contact_profiles") {
+      const members = (wsMsg.data as any)?.members || {};
+      applyContactProfileUpdates(members);
+    }
+
     if (wsMsg.type === "wechat_message") {
       const { sendorrecv } = wsMsg.data as any;
       const msglist = ((wsMsg.data as any).messages || (wsMsg.data as any).msglist || []) as any[];
@@ -1065,12 +1136,13 @@ export default function App() {
       const liveAvatarMap = { ...avatarMap };
       for (const [wxid, entry] of Object.entries<any>(contactUpdates)) {
         const name = entry?.name || entry?.profile?.Remark || entry?.profile?.NickName || "";
-        const avatar = entry?.avatar || entry?.profile?.SmallHeadImgUrl || entry?.profile?.BigHeadImgUrl || "";
+        const avatar = profileAvatar(entry, "");
         if (name && name !== wxid) liveContactMap[wxid] = name;
         if (avatar) liveAvatarMap[wxid] = avatar;
       }
 
       const groupSenderWxidsByChat = new Map<string, Set<string>>();
+      const groupChatWxidsNeedingProfile = new Set<string>();
       const directChatWxids = new Set<string>();
       const chatsToAutoRead = new Set<string>();
 
@@ -1086,6 +1158,7 @@ export default function App() {
 
         // If it's an incoming group message, queue brief lookup for the sender wxid.
         if (isIncoming && chatId.includes("@chatroom")) {
+          if (!liveAvatarMap[chatId]) groupChatWxidsNeedingProfile.add(chatId);
           const senderWxid = String(chatMsg.fromid || "");
           if (senderWxid && senderWxid !== myWxid) {
             const existing = groupSenderWxidsByChat.get(chatId) || new Set<string>();
@@ -1180,6 +1253,9 @@ export default function App() {
       for (const [chatId, senderWxids] of groupSenderWxidsByChat.entries()) {
         hydrateGroupSenders(chatId, Array.from(senderWxids), myWxid || selfWxid);
       }
+      if (groupChatWxidsNeedingProfile.size > 0) {
+        ensureGroupProfiles(Array.from(groupChatWxidsNeedingProfile));
+      }
       if (directChatWxids.size > 0) {
         const directWxids = Array.from(directChatWxids);
         const directOpenimWxids = directWxids.filter((wxid) => wxid.endsWith("@openim"));
@@ -1240,7 +1316,7 @@ export default function App() {
         );
       }
     }
-  }, [selfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, hydrateGroupSenders, ensureContactProfiles, applyContactProfileUpdates, selectedAccountId]);
+  }, [selfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, hydrateGroupSenders, ensureContactProfiles, ensureGroupProfiles, applyContactProfileUpdates, selectedAccountId]);
 
   const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId));
 
@@ -1508,10 +1584,10 @@ export default function App() {
 
   const friendEntries: DirectoryEntry[] = sortDirectoryEntries(contactListFromRaw(rawContacts)
     .map((c: any) => {
-      const wxid = c.wxid || c.UserName || "";
+      const wxid = c.wxid || c.UserName || c.userName || c.strUsrName || "";
       if (!wxid || shouldFilterSession(wxid)) return null;
       const profile = contactProfiles[wxid];
-      const fallbackName = c.markname || c.nickname || c.NickName || contactMap[wxid] || wxid;
+      const fallbackName = c.markname || c.nickname || c.NickName || c.strNickName || contactMap[wxid] || wxid;
       const fallbackAvatar =
         avatarMap[wxid] ||
         c.smallhead ||
@@ -1520,6 +1596,13 @@ export default function App() {
         c.head_img ||
         c.head_big ||
         c.head_small ||
+        c.SmallHeadImgUrl ||
+        c.BigHeadImgUrl ||
+        c.HeadImgUrl ||
+        c.HeadUrl ||
+        c.smallHeadUrl ||
+        c.bigHeadUrl ||
+        c.avatar ||
         "";
       return {
         wxid,
@@ -1533,9 +1616,11 @@ export default function App() {
 
   const rawRoomEntries = chatroomListFromRaw(rawContacts)
     .map((c: any) => ({
-      wxid: c.wxid || c.UserName || c.strUsrName || "",
+      wxid: c.wxid || c.UserName || c.userName || c.strUsrName || "",
       name: c.nickname || c.NickName || c.strNickName || "",
-      avatar: c.smallhead || c.bighead || "",
+      avatar: c.smallhead || c.bighead || c.SmallHeadImgUrl || c.BigHeadImgUrl ||
+        c.headimgurl || c.head_img || c.head_big || c.head_small ||
+        c.HeadImgUrl || c.HeadUrl || c.smallHeadUrl || c.bigHeadUrl || c.avatar || "",
     }))
     .filter((c: any) => c.wxid);
   const sessionRoomEntries = sessions
@@ -1736,11 +1821,11 @@ export default function App() {
           aria-label="调整列表宽度"
           aria-orientation="vertical"
           onPointerDown={startSidePanelResize}
-          className={`absolute top-0 right-[-4px] z-30 h-full w-[8px] cursor-col-resize flex justify-center ${
-            darkTheme ? "hover:bg-[#1f1f1f]" : "hover:bg-[#e0e0e0]"
-          }`}
+          className="absolute top-0 right-[-2px] z-30 h-full w-[4px] cursor-col-resize flex justify-center group"
         >
-          <div className={`h-full w-px ${darkTheme ? "bg-[#2a2a2a]" : "bg-[#d8d8d8]"}`} />
+          <div className={`h-full w-px transition-colors ${
+            darkTheme ? "bg-[#2a2a2a] group-hover:bg-[#3a3a3a]" : "bg-[#d0d0d0] group-hover:bg-[#bdbdbd]"
+          }`} />
         </div>
       </div>
 
@@ -3040,7 +3125,7 @@ function ContactsPanel({
 
       {loading && (
         <div className={`px-[18px] pb-[8px] text-[12px] shrink-0 ${dark ? "text-[#777]" : "text-[#888]"}`}>
-          正在通过 GetContact 批量补全联系人资料...
+          正在从本地缓存补全联系人资料...
         </div>
       )}
 

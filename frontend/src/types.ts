@@ -89,6 +89,7 @@ export interface WSInitMessage {
       sender_wxid?: string;
     }>;
     avatar_urls: Record<string, string>;
+    contact_profiles?: Record<string, ContactProfile>;
     messages_cache?: Record<string, ChatMessage[]>;
     session_cache?: Record<string, {
       wxid: string;
@@ -142,4 +143,12 @@ export interface WSMarkRead {
   };
 }
 
-export type WSMessage = WSInitMessage | WSCallbackMessage | WSMessageSent | WSMarkRead;
+export interface WSContactProfiles {
+  type: "contact_profiles";
+  data: {
+    account_id?: string;
+    members: Record<string, ContactProfile>;
+  };
+}
+
+export type WSMessage = WSInitMessage | WSCallbackMessage | WSMessageSent | WSMarkRead | WSContactProfiles;
