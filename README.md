@@ -7,7 +7,7 @@
 ## 功能特性
 
 - 支持 `local_hook`、`remote_hook`、`remote_protocol` 三种连接模式；其中 `remote_hook` 表示远程客户端 Hook。
-- 支持远程客户端 DLL 通过 `wss://.../agent` 主动连到后端，客户端不需要公网 IP，后端复用现有接口封装向 DLL 发送 JSON 调用。
+- 支持远程客户端 DLL 通过 `ws://.../agent` 或 `wss://.../agent` 主动连到后端，客户端不需要公网 IP，后端复用现有接口封装向 DLL 发送 JSON 调用。
 - 后端使用 FastAPI 封装微信 Hook/协议接口，并通过 WebSocket 向前端推送消息。
 - 前端使用 React + TypeScript + Vite，实现类似聊天客户端的会话与消息界面。
 - 支持联系人、群聊、历史消息、未读状态、头像缓存和群成员昵称解析。
@@ -82,15 +82,15 @@ npm run lint
 
 主要配置项：
 
-- `wechat_mode`：微信使用方式，`1`=本地 Hook，`2`=远程客户端 Hook（客户端 DLL 主动连本后端 WSS），`3`=远程服务器协议。旧配置 `login` 仍兼容，可选 `local_hook`、`remote_hook`、`remote_protocol`。
+- `wechat_mode`：微信使用方式，`1`=本地 Hook，`2`=远程客户端 Hook（客户端 DLL 主动连本后端 WS/WSS），`3`=远程服务器协议。旧配置 `login` 仍兼容，可选 `local_hook`、`remote_hook`、`remote_protocol`。
 - `*_host` / `*_api_port` / `*_mgr_port`：不同模式下的服务地址和端口。
 - `ip`：本后端的公网 IP 或域名，供远程客户端 DLL 主动连接和回调访问。
 - `RDV`：远程服务所需的连接或鉴权标识。
 - `server_port`：后端主服务端口。
 - `agent_ws_enabled`：是否启用远程客户端 DLL 主动连接本后端的 `/agent` WebSocket 通道；启用后 Hook API 调用会通过这条长连接发给 DLL。
 - `agent_ws_path`：DLL 连接路径，默认 `/agent`。
-- `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；`client_wss_port` 默认 `443`，此时 DLL 可配置 `RemoteWS="wss://1.14.149.2/agent"`，非默认端口则写成 `wss://1.14.149.2:端口/agent`。
-- 公网 `client_wss_port` 需要由反向代理或外层 TLS 服务转发到后端 `server_port`，并保留 WebSocket Upgrade 头。
+- `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；无证书测试可用 `client_wss_scheme: "ws"`、`client_wss_port: 5000`，DLL 配置 `RemoteWS="ws://1.14.149.2:5000/agent"`；正式 TLS 部署用 `client_wss_scheme: "wss"`、`client_wss_port: 443`，DLL 配置 `RemoteWS="wss://1.14.149.2/agent"`。
+- 使用 `wss` 时，公网 `client_wss_port` 需要由反向代理或外层 TLS 服务转发到后端 `server_port`，并保留 WebSocket Upgrade 头；使用 `ws://IP:5000` 测试时可直连后端服务端口。
 - `callback_port` / `callback_path`：远程客户端 Hook 回调本后端的地址配置。
 - `recvtype`：Hook 消息接收类型，默认 `1`；`1` 为 Hook 直接返回 `msglist`，`2` 为 protobuf/raw `pb_msg`。旧配置 `recv_type` 仍兼容。
 - `WECHAT_FILES_BASE`：可选环境变量，用于指定本机微信文件目录；不设置时会按 `APPDATA/WxDirDataPath/<RDV>/WeChat Files` 推导。
