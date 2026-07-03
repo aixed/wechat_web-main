@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, type ReactNode } from "react";
 import type { ChatMessage } from "../types";
 import { getImageUrl, getDbImageUrl, downloadImage, authQuery } from "../api";
 import { replaceWechatEmojis } from "../utils/wechatEmoji";
@@ -11,6 +11,7 @@ interface MessageBubbleProps {
   senderName?: string;
   avatarUrl?: string;
   onAvatarClick?: (wxid: string) => void;
+  mobile?: boolean;
 }
 
 function parseRefermsg(xml: string) {
@@ -184,6 +185,57 @@ function EmojiSticker({ msgXml }: { msgXml: string }) {
  * For DB images, sends BytesExtraHex to backend which finds the file on disk.
  */
 const IMAGE_RETRY_DELAYS = [15, 30, 60]; // seconds between retries
+const URL_REGEX = /((?:https?:\/\/|www\.)[^\s<>"']+)/gi;
+const URL_TRAILING_PUNCTUATION = /[),.;!?，。！？、；：]+$/;
+
+function linkHref(url: string): string {
+  return /^https?:\/\//i.test(url) ? url : `https://${url}`;
+}
+
+function renderTextWithLinks(text: string, isSelf: boolean, mobile: boolean) {
+  const normalized = (text || "").replace(/\r\n/g, "\n");
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  let index = 0;
+  URL_REGEX.lastIndex = 0;
+
+  let match: RegExpExecArray | null;
+  while ((match = URL_REGEX.exec(normalized)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(replaceWechatEmojis(normalized.slice(lastIndex, match.index)));
+    }
+
+    const rawUrl = match[0];
+    const punctMatch = rawUrl.match(URL_TRAILING_PUNCTUATION);
+    const trailing = punctMatch?.[0] || "";
+    const urlText = trailing ? rawUrl.slice(0, -trailing.length) : rawUrl;
+    if (urlText) {
+      nodes.push(
+        <a
+          key={`url-${index}`}
+          href={linkHref(urlText)}
+          target="_blank"
+          rel="noreferrer"
+          className={`break-all ${isSelf || mobile ? "text-[#576b95]" : "text-[#7ea6d9]"} hover:underline`}
+          onClick={(event) => event.stopPropagation()}
+        >
+          {urlText}
+        </a>,
+      );
+      index += 1;
+    }
+    if (trailing) {
+      nodes.push(replaceWechatEmojis(trailing));
+    }
+
+    lastIndex = match.index + rawUrl.length;
+  }
+
+  if (lastIndex < normalized.length) {
+    nodes.push(replaceWechatEmojis(normalized.slice(lastIndex)));
+  }
+  return nodes.length > 0 ? nodes : replaceWechatEmojis(normalized);
+}
 
 function ChatImage({ message, onEnlarge }: { message: ChatMessage; onEnlarge: (url: string) => void }) {
   const [src, setSrc] = useState<string>("");
@@ -271,7 +323,7 @@ function ChatImage({ message, onEnlarge }: { message: ChatMessage; onEnlarge: (u
 }
 
 export default function MessageBubble({
-  message, isSelf, selfWxid, isGroup, senderName, avatarUrl, onAvatarClick,
+  message, isSelf, selfWxid, isGroup, senderName, avatarUrl, onAvatarClick, mobile = false,
 }: MessageBubbleProps) {
   const msgtype = String(message.msgtype);
   const [enlargedImg, setEnlargedImg] = useState<string | null>(null);
@@ -281,7 +333,7 @@ export default function MessageBubble({
       case "1":
         return (
           <div style={{ fontSize: 17, lineHeight: "20px", wordBreak: "break-word", whiteSpace: "pre-wrap", margin: 0, padding: 0 }}>
-            {replaceWechatEmojis(message.msg?.replace(/\r\n/g, "\n") || "")}
+            {renderTextWithLinks(message.msg || "", isSelf, mobile)}
           </div>
         );
 
@@ -450,7 +502,7 @@ export default function MessageBubble({
   if (msgtype === "10000" || msgtype === "10002") {
     return (
       <div className="flex justify-center py-2 px-4">
-        <div className="text-[12px] text-[#888] bg-[#1e1e1e] rounded px-2.5 py-1">
+        <div className={`text-[12px] text-[#888] rounded px-2.5 py-1 ${mobile ? "bg-[#dedede]" : "bg-[#1e1e1e]"}`}>
           {replaceWechatEmojis(extractSystemText(message.msg))}
         </div>
       </div>
@@ -468,7 +520,7 @@ export default function MessageBubble({
   const avatarWxid = isSelf ? selfWxid : (message.fromid || "");
 
   return (
-    <div className={`flex gap-[8px] ${isSelf ? "flex-row-reverse" : "flex-row"}`} style={{ marginBottom: "0px", padding: "5px" }}>
+    <div className={`flex gap-[8px] ${isSelf ? "flex-row-reverse" : "flex-row"}`} style={{ marginBottom: mobile ? "4px" : "0px", padding: mobile ? "6px 10px" : "5px" }}>
       {/* Avatar — keyed by wxid to prevent state leakage */}
       <div className="shrink-0 mt-[2px]" key={avatarWxid}>
         <button
@@ -486,7 +538,7 @@ export default function MessageBubble({
       </div>
 
       {/* Content */}
-      <div className={`max-w-[65%] ${isSelf ? "items-end" : "items-start"} flex flex-col`} style={{ minWidth: 0, overflow: "hidden" }}>
+      <div className={`${mobile ? "max-w-[72%]" : "max-w-[65%]"} ${isSelf ? "items-end" : "items-start"} flex flex-col`} style={{ minWidth: 0, overflow: "hidden" }}>
         {/* Time label (always shown) + sender name (group, non-self only) */}
         {(() => {
           const timeLabel = formatMessageTime(message.time, message.timestamp);
@@ -516,7 +568,7 @@ export default function MessageBubble({
             className={`text-[17px] ${
               isSelf
                 ? "bg-[#95ec69] text-[#111]"
-                : "bg-[#2d2d2d] text-[#e0e0e0]"
+                : mobile ? "bg-white text-[#111]" : "bg-[#2d2d2d] text-[#e0e0e0]"
             }`}
             style={{
               padding: "8px 10px",

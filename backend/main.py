@@ -1212,14 +1212,21 @@ async def wechat_callback(request: Request):
     # ── Lazy profile hydration for new incoming senders ───────────
     profile_updates: dict[str, dict] = {}
     profile_wxids: list[str] = []
-    for _chat_id, msg in pre_messages:
+    openim_profile_wxids_by_gid: dict[str, list[str]] = {}
+    for chat_id, msg in pre_messages:
         if str(msg.get("sendorrecv", "")) != "2":
             continue
         sender_wxid = str(msg.get("fromid", "") or "")
-        if sender_wxid and sender_wxid != self_wxid and not sender_wxid.endswith("@chatroom"):
+        if not sender_wxid or sender_wxid == self_wxid or sender_wxid.endswith("@chatroom"):
+            continue
+        if sender_wxid.endswith("@openim") and chat_id.endswith("@chatroom"):
+            openim_profile_wxids_by_gid.setdefault(chat_id, []).append(sender_wxid)
+        else:
             profile_wxids.append(sender_wxid)
     if profile_wxids:
         profile_updates = await _ensure_contact_profiles(profile_wxids, require_full=False)
+    for gid, openim_wxids in openim_profile_wxids_by_gid.items():
+        profile_updates.update(await _ensure_contact_profiles(openim_wxids, require_full=False, gid=gid))
 
     # ── Store & collect for broadcast ────────────────────────────
     for chat_id, normalized in pre_messages:
@@ -1371,6 +1378,7 @@ class BriefBatchRequest(BaseModel):
 
 class ProfileBatchRequest(BaseModel):
     wxids: list[str] = []
+    gid: str = ""
 
 
 def _normalize_wxids(wxids: list[str]) -> list[str]:
@@ -1462,6 +1470,88 @@ def _contact_profile_avatar(profile: dict) -> str:
         or profile.get("avatar")
         or ""
     )
+
+
+def _find_openim_payload(data: dict) -> dict:
+    """Find the OpenIM detail payload even when it is nested by the transport."""
+    if not isinstance(data, dict):
+        return {}
+
+    stack = [data]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, dict):
+            continue
+        obj_id = id(current)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if any(k in current for k in ("openim_wxid", "openim_nickname", "openim_head")):
+            return current
+
+        for key in ("data", "Data", "body", "Body", "result", "retdata"):
+            child = current.get(key)
+            if isinstance(child, dict):
+                stack.append(child)
+    return {}
+
+
+def _parse_openim_detail(raw_detail) -> tuple[dict, str]:
+    if not raw_detail:
+        return {}, ""
+    if isinstance(raw_detail, dict):
+        detail = raw_detail
+    else:
+        try:
+            detail = json.loads(str(raw_detail))
+        except Exception:
+            return {}, ""
+
+    company = ""
+    custom_info = detail.get("custom_info")
+    if isinstance(custom_info, list):
+        for item in custom_info:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("title") or "") != "企业":
+                continue
+            rows = item.get("detail")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if isinstance(row, dict) and row.get("desc"):
+                    company = str(row.get("desc") or "")
+                    break
+            if company:
+                break
+    return detail, company
+
+
+def _openim_profile_from_payload(payload: dict, requested_wxid: str, gid: str = "") -> dict:
+    detail_raw = payload.get("openim_detail")
+    detail, company = _parse_openim_detail(detail_raw)
+    wxid = str(payload.get("openim_wxid") or requested_wxid or "").strip()
+    nickname = str(payload.get("openim_nickname") or wxid or "").strip()
+    avatar = str(payload.get("openim_head") or "").strip()
+
+    return {
+        "wxid": wxid,
+        "UserName": wxid,
+        "NickName": nickname,
+        "nickname": nickname,
+        "SmallHeadImgUrl": avatar,
+        "BigHeadImgUrl": avatar,
+        "avatar": avatar,
+        "OpenIM": True,
+        "OpenIMGid": str(gid or ""),
+        "OpenIMCompany": company,
+        "OpenIMDetail": detail,
+        "openim_detail": detail_raw or "",
+        "openim_invt": payload.get("openim_invt") or "",
+        "SourceText": "企业微信",
+    }
 
 
 def _parse_label_map(data: dict) -> dict[str, str]:
@@ -1634,7 +1724,7 @@ async def _cache_contact_profiles(profiles: list[dict]) -> dict[str, dict]:
     return updates
 
 
-async def _ensure_contact_profiles(wxids: list[str], *, require_full: bool = True) -> dict[str, dict]:
+async def _ensure_contact_profiles(wxids: list[str], *, require_full: bool = True, gid: str = "") -> dict[str, dict]:
     """Return contact profiles/summaries from cache, calling /GetContact for misses.
 
     require_full=True is used by the profile card and fetches when the full
@@ -1687,10 +1777,43 @@ async def _ensure_contact_profiles(wxids: list[str], *, require_full: bool = Tru
 
                 missing.append(wxid)
 
-    if missing:
+    openim_missing = [wxid for wxid in missing if wxid.endswith("@openim")]
+    regular_missing = [wxid for wxid in missing if not wxid.endswith("@openim")]
+
+    if openim_missing:
+        sem = asyncio.Semaphore(8)
+
+        async def fetch_openim_profile(wxid: str) -> dict[str, dict]:
+            async with sem:
+                try:
+                    data = await wechat_api.get_openim_contact(wxid, gid=gid)
+                    payload = _find_openim_payload(data)
+                    if not payload:
+                        return {}
+                    profile = _openim_profile_from_payload(payload, wxid, gid=gid)
+                    try:
+                        contact_data = await wechat_api.get_contact([wxid])
+                        contacts = contact_data.get("contacts") if isinstance(contact_data, dict) else []
+                        if not isinstance(contacts, list):
+                            contacts = [contact_data] if isinstance(contact_data, dict) and _contact_profile_wxid(contact_data) else []
+                        if contacts and isinstance(contacts[0], dict):
+                            merged = dict(contacts[0])
+                            merged.update({k: v for k, v in profile.items() if v not in ("", None, {})})
+                            profile = merged
+                    except Exception as e:
+                        _log(f"[PROFILE] OpenIM GetContact merge skipped ({wxid}): {type(e).__name__}: {e}")
+                    return await _cache_contact_profiles([profile])
+                except Exception as e:
+                    _log(f"[PROFILE] GetOpenIMContact failed ({wxid}): {type(e).__name__}: {e}")
+                    return {}
+
+        for updates in await asyncio.gather(*(fetch_openim_profile(wxid) for wxid in openim_missing)):
+            result.update(updates)
+
+    if regular_missing:
         batch_size = 100
-        for i in range(0, len(missing), batch_size):
-            batch = missing[i:i + batch_size]
+        for i in range(0, len(regular_missing), batch_size):
+            batch = regular_missing[i:i + batch_size]
             try:
                 data = await wechat_api.get_contact(batch)
                 contacts = data.get("contacts") if isinstance(data, dict) else []
@@ -1819,7 +1942,7 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
 @app.post("/api/contacts/profile-batch")
 async def post_contacts_profile_batch(req: ProfileBatchRequest):
     """Resolve full contact profiles via /GetContact with a runtime cache."""
-    members = await _ensure_contact_profiles(req.wxids, require_full=True)
+    members = await _ensure_contact_profiles(req.wxids, require_full=True, gid=req.gid)
     return {"members": members}
 
 

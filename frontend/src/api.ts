@@ -75,10 +75,10 @@ export const batchGetContactBrief = (wxids: string[]) =>
     method: "POST",
     body: JSON.stringify({ wxids }),
   });
-export const getContactProfiles = (wxids: string[]) =>
+export const getContactProfiles = (wxids: string[], gid = "") =>
   fetchJSON("/api/contacts/profile-batch", {
     method: "POST",
-    body: JSON.stringify({ wxids }),
+    body: JSON.stringify({ wxids, gid }),
   });
 export const getSessions = () => fetchJSON("/api/sessions");
 export const refreshSessions = () => fetchJSON("/api/sessions/refresh");
