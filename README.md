@@ -80,6 +80,23 @@ npm run lint
 
 `config.yaml` 不会被提交到仓库。公开部署或提交代码前，请确认没有把真实 IP、RDV、Token、账号信息、日志、缓存文件或聊天媒体数据提交到 Git。
 
+### 远程 Hook DLL 启动参数
+
+使用远程 Hook 模式时，DLL 启动微信的参数必须带 `RemoteWS`。该参数用于让远程微信客户端主动建立到 Web 后端的 WebSocket 长连接，后端后续的接口调用会通过这条连接转发给对应的 Hook 客户端。
+
+示例：
+
+```text
+"C:\Program Files (x86)\Tencent\WeChat391016\WeChat\WeChat.exe" CallBackURL=http://localhost:8000/receiveChatBotMsg&RecvType=1&ConnectType=http&RemoteWS="ws://1.14.149.2:5000/agent"&StartPort=30001&RDV=127f78ac
+```
+
+`RemoteWS` 支持两种形式：
+
+- `ws://host:port/agent`：普通 WebSocket，适合内网、测试环境，或后端端口直接暴露的部署方式。
+- `wss://host/agent`：TLS 加密 WebSocket，适合公网正式部署，通常由 Nginx/Caddy 等反向代理提供 HTTPS/WSS 证书，并转发到后端服务端口。
+
+如果有多个微信客户端，每个客户端仍连接同一个 `RemoteWS` 地址；项目会根据远程 Hook 上报的 `agent_id` 和回调里的 `selfwxid` 区分不同微信号。
+
 主要配置项：
 
 - `wechat_mode`：微信使用方式，`1`=本地 Hook，`2`=远程客户端 Hook（客户端 DLL 主动连本后端 WS/WSS），`3`=远程服务器协议。旧配置 `login` 仍兼容，可选 `local_hook`、`remote_hook`、`remote_protocol`。
