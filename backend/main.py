@@ -158,6 +158,7 @@ _ACCOUNT_LOCK = asyncio.Lock()
 _ACCOUNT_CARD_REFRESH_INTERVAL_SEC = 20.0
 _account_card_refresh_at: dict[str, float] = {}
 _account_card_refreshing: set[str] = set()
+_initializing_agents: set[str] = set()
 _agent_login_status_seen: dict[str, str] = {}
 
 
@@ -445,7 +446,7 @@ def _schedule_account_card_refresh() -> None:
     now = time.time()
     for account in agent_manager.agents():
         agent_id = str(account.get("id") or "")
-        if not agent_id or agent_id in _account_card_refreshing:
+        if not agent_id or agent_id in _account_card_refreshing or agent_id in _initializing_agents:
             continue
         last = _account_card_refresh_at.get(agent_id, 0.0)
         if now - last < _ACCOUNT_CARD_REFRESH_INTERVAL_SEC:
@@ -702,6 +703,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     selected_agent = _activate_runtime(agent_id or agent_manager.active_id())
     if selected_agent:
         await agent_manager.set_active(selected_agent)
+        _initializing_agents.add(selected_agent)
     _log("=" * 60)
     _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}] agent={selected_agent or 'default'}")
     _log("=" * 60)
@@ -725,6 +727,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         _log("[INIT 0] ⚠ API not reachable after 30s, skip initialization")
         app_state["initialized"] = False
         await agent_manager.update_account(selected_agent, initialized=False, login_message="接口未就绪")
+        _initializing_agents.discard(selected_agent)
         return False
     wechat_api._consecutive_failures = 0  # ensure clean slate for init
 
@@ -732,6 +735,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         _log(f"[INIT 0] ⏸ WeChat not logged in; skip initialization. status={login_status.get('status') or '?'} msg={login_status.get('message') or '-'}")
         app_state["initialized"] = False
         await agent_manager.update_account(selected_agent, initialized=False)
+        _initializing_agents.discard(selected_agent)
         return False
 
     # Phase 1 — run sequentially to avoid concurrent Hook access (Hook is NOT thread-safe)
@@ -918,11 +922,13 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         _log("[INIT 7/7] Agent disconnected during initialization; will retry on next connection.")
         app_state["initialized"] = False
         await agent_manager.update_account(selected_agent, initialized=False)
+        _initializing_agents.discard(selected_agent)
         return False
 
     _log("[INIT 7/7] ✓ Initialization complete.")
     app_state["initialized"] = True
     await agent_manager.update_account(selected_agent, initialized=True)
+    _initializing_agents.discard(selected_agent)
     _log("=" * 60)
     _log(f"Backend ready at http://{config.SERVER_HOST}:{config.SERVER_PORT}")
     _log(f"Login mode: {config.LOGIN_MODE}  |  API: {config.HOOK_BASE_URL}")
