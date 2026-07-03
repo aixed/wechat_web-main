@@ -685,6 +685,7 @@ export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("chats");
   const [sessionsHydrating, setSessionsHydrating] = useState(false);
   const [sessionsHydrated, setSessionsHydrated] = useState(false);
+  const [sessionsRequested, setSessionsRequested] = useState(false);
   const [contactsHydrating, setContactsHydrating] = useState(false);
   const [contactsHydrated, setContactsHydrated] = useState(false);
   const [selfCardOpen, setSelfCardOpen] = useState(false);
@@ -730,6 +731,7 @@ export default function App() {
     setViewMode("chats");
     setSessionsHydrating(false);
     setSessionsHydrated(false);
+    setSessionsRequested(false);
     setMobileTab("chats");
     setMobileProfileDetailOpen(false);
     setDirectoryProfileWxid(null);
@@ -988,6 +990,9 @@ export default function App() {
   const switchMode = useCallback((mode: ViewMode) => {
     setViewMode(mode);
     setActiveChat(null);
+    if (mode === "chats") {
+      setSessionsRequested(true);
+    }
     if (mode === "contacts") {
       hydrateDirectoryContacts();
     }
@@ -998,6 +1003,9 @@ export default function App() {
     setActiveChat(null);
     setDirectoryProfileWxid(null);
     setMobileProfileDetailOpen(false);
+    if (tab === "chats") {
+      setSessionsRequested(true);
+    }
     if (tab === "contacts") {
       hydrateDirectoryContacts();
     }
@@ -1537,11 +1545,11 @@ export default function App() {
   const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId));
 
   useEffect(() => {
-    if (!authenticated || !selectedAccountId) return;
+    if (!authenticated || !selectedAccountId || !sessionsRequested) return;
     const wantsChats = isMobile ? mobileTab === "chats" : viewMode === "chats";
     if (!wantsChats || activeChat) return;
     hydrateChatSessions();
-  }, [activeChat, authenticated, hydrateChatSessions, isMobile, mobileTab, selectedAccountId, viewMode]);
+  }, [activeChat, authenticated, hydrateChatSessions, isMobile, mobileTab, selectedAccountId, sessionsRequested, viewMode]);
 
   useEffect(() => {
     if (!authenticated || selectedAccountId) return;
