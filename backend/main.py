@@ -357,18 +357,23 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
     message = parsed["message"]
     wxid = parsed["wxid"]
     nickname = parsed["nickname"]
-    avatar = ""
-
     agent = agent_manager.get_agent(agent_id) or {}
-    current_wxid = str(agent.get("wxid") or agent.get("account_id") or wxid or "")
+    current_avatar = str(agent.get("avatar") or "").strip()
+    avatar = current_avatar
 
-    if status == "5":
+    current_wxid = str(agent.get("wxid") or agent.get("account_id") or wxid or "")
+    current_nickname = str(agent.get("nickname") or agent.get("name") or "").strip()
+
+    needs_self_profile = status == "5" or (
+        status == "3" and (not wxid or not nickname or not current_avatar)
+    )
+    if needs_self_profile:
         try:
             self_info = await wechat_api.get_self_info()
             identity = _self_identity_from_response(self_info, agent_id=agent_id, current_wxid=current_wxid)
             wxid = identity["wxid"] or wxid
-            nickname = identity["nickname"] or nickname
-            avatar = identity["avatar"]
+            nickname = identity["nickname"] or nickname or current_nickname
+            avatar = identity["avatar"] or current_avatar
         except Exception as e:
             _log(f"[LOGIN_STATUS] GetSelfLoginInfo failed agent={agent_id}: {type(e).__name__}: {e}")
 
@@ -1104,13 +1109,13 @@ async def activate_account(req: ActivateAccountRequest):
     async with _ACCOUNT_LOCK:
         account = agent_manager.get_agent(agent_id) or {}
         cached_status = str(account.get("login_status") or "").strip()
-        if cached_status and cached_status != "3":
+        if cached_status != "3":
             return {
                 "ok": False,
-                "error": "wechat not logged in",
+                "error": "wechat login status is not ready",
                 "login_status": {
                     "status": cached_status,
-                    "message": str(account.get("login_message") or ""),
+                    "message": str(account.get("login_message") or "等待微信登录状态刷新"),
                     "wxid": str(account.get("wxid") or account.get("account_id") or ""),
                     "nickname": str(account.get("nickname") or ""),
                     "avatar": str(account.get("avatar") or ""),
