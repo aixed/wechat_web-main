@@ -12,6 +12,7 @@ import {
   getAccessKey,
   getAccounts,
   getContactProfiles,
+  getGroupMemberDetails,
   getGroupMemberNames,
   loginWithKey,
   markAsRead,
@@ -297,6 +298,36 @@ function profileArea(raw: Record<string, any> | undefined): string {
   const province = String(raw.Province || raw.province || "").trim();
   const displayCountry = country && country !== "CN" ? country : "";
   return [displayCountry, area, province].filter(Boolean).join(" ");
+}
+
+function profileField(raw: Record<string, any> | undefined, keys: string[]): string {
+  if (!raw) return "";
+  for (const key of keys) {
+    const value = raw[key];
+    if (value === undefined || value === null) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function sourceLabel(source: unknown): string {
+  const n = Number(source || 0);
+  if (!n) return "";
+  const labels: Record<number, string> = {
+    1: "通过搜索QQ号添加",
+    2: "通过邮箱添加",
+    3: "通过搜索微信号添加",
+    6: "通过单向添加",
+    10: "通过朋友圈添加",
+    12: "通过QQ好友添加",
+    14: "通过群聊添加",
+    15: "通过搜索手机号添加",
+    17: "通过名片分享添加",
+    30: "通过扫一扫添加",
+    31: "通过Facebook添加",
+  };
+  return labels[n] || `来源 ${n}`;
 }
 
 const contactNameCollator = new Intl.Collator("zh-Hans-CN-u-co-pinyin", {
@@ -585,6 +616,8 @@ export default function App() {
   const [selfImageOpen, setSelfImageOpen] = useState(false);
   const [mobileTab, setMobileTab] = useState<MobileTab>("chats");
   const [mobileProfileDetailOpen, setMobileProfileDetailOpen] = useState(false);
+  const [directoryProfileWxid, setDirectoryProfileWxid] = useState<string | null>(null);
+  const [directoryProfileLoading, setDirectoryProfileLoading] = useState(false);
   const [sidePanelWidth, setSidePanelWidth] = useState(() => {
     const stored = Number(window.localStorage.getItem(SIDE_PANEL_WIDTH_STORAGE));
     return Number.isFinite(stored) && stored > 0 ? clampSidePanelWidth(stored) : 272;
@@ -621,6 +654,8 @@ export default function App() {
     setViewMode("chats");
     setMobileTab("chats");
     setMobileProfileDetailOpen(false);
+    setDirectoryProfileWxid(null);
+    setDirectoryProfileLoading(false);
     setContactsHydrating(false);
     setContactsHydrated(false);
     pendingBriefWxids.current.clear();
@@ -869,11 +904,27 @@ export default function App() {
   const switchMobileTab = useCallback((tab: MobileTab) => {
     setMobileTab(tab);
     setActiveChat(null);
+    setDirectoryProfileWxid(null);
     setMobileProfileDetailOpen(false);
     if (tab === "contacts") {
       hydrateDirectoryContacts();
     }
   }, [hydrateDirectoryContacts]);
+
+  const openDirectoryProfile = useCallback(async (entry: DirectoryEntry) => {
+    if (!entry?.wxid) return;
+    setViewMode("contacts");
+    setActiveChat(null);
+    setDirectoryProfileWxid(entry.wxid);
+    setDirectoryProfileLoading(true);
+    try {
+      await ensureContactProfiles([entry.wxid]);
+    } catch (err) {
+      console.error("[DIRECTORY_PROFILE]", err);
+    } finally {
+      setDirectoryProfileLoading(false);
+    }
+  }, [ensureContactProfiles]);
 
   const flushBriefQueue = useCallback(() => {
     if (briefInFlight.current) return;
@@ -1381,6 +1432,7 @@ export default function App() {
   // ─── Navigation (browser history integration for mobile back gesture) ──
   const handleSelectChat = (wxid: string, seed?: Partial<Session>) => {
     setViewMode("chats");
+    setDirectoryProfileWxid(null);
     setSessions((prev) => {
       if (prev.some((s) => s.wxid === wxid)) return prev;
       const seeded: Session = {
@@ -1639,6 +1691,11 @@ export default function App() {
     });
   }
   const groupEntries = sortDirectoryEntries(Array.from(groupEntryMap.values()));
+  const directoryEntryMap = new Map<string, DirectoryEntry>();
+  for (const entry of [...friendEntries, ...groupEntries]) {
+    directoryEntryMap.set(entry.wxid, entry);
+  }
+  const directoryProfileEntry = directoryProfileWxid ? directoryEntryMap.get(directoryProfileWxid) || null : null;
   const selfProfile = selfWxid ? contactProfiles[selfWxid] : undefined;
   const selfInfoName = contactMap[selfWxid] || (selfProfile ? profileDisplayName(selfProfile, "") : "") || "我";
   const selfAvatar =
@@ -1743,6 +1800,23 @@ export default function App() {
       );
     }
 
+    if (directoryProfileEntry) {
+      return (
+        <MobileDirectoryProfilePage
+          entry={directoryProfileEntry}
+          profile={contactProfiles[directoryProfileEntry.wxid]}
+          loading={directoryProfileLoading}
+          dark={darkTheme}
+          onBack={() => setDirectoryProfileWxid(null)}
+          onMessage={() => handleSelectChat(directoryProfileEntry.wxid, {
+            nickname: directoryProfileEntry.name,
+            avatar: directoryProfileEntry.avatar,
+            is_group: directoryProfileEntry.is_group,
+          })}
+        />
+      );
+    }
+
     return (
       <MobileMainShell
         tab={mobileTab}
@@ -1757,6 +1831,7 @@ export default function App() {
         dark={darkTheme}
         onSwitchTab={switchMobileTab}
         onSelectChat={handleSelectChat}
+        onSelectContact={openDirectoryProfile}
         onHydrateContacts={hydrateDirectoryContacts}
         onOpenSelfDetail={openMobileSelfProfileDetail}
         onBackToAccounts={handleLeaveAccount}
@@ -1802,11 +1877,7 @@ export default function App() {
             loading={contactsHydrating}
             dark={darkTheme}
             onHydrate={hydrateDirectoryContacts}
-            onSelect={(entry) => handleSelectChat(entry.wxid, {
-              nickname: entry.name,
-              avatar: entry.avatar,
-              is_group: entry.is_group,
-            })}
+            onSelect={openDirectoryProfile}
           />
         )}
         {viewMode === "broadcast" && (
@@ -1830,7 +1901,20 @@ export default function App() {
       </div>
 
       <div className={`flex-1 min-w-0 h-full ${darkTheme ? "bg-[#111111]" : "bg-[#ededed]"}`}>
-        {activeChat && activeSession ? (
+        {viewMode === "contacts" && directoryProfileEntry ? (
+          <DirectoryProfilePane
+            entry={directoryProfileEntry}
+            profile={contactProfiles[directoryProfileEntry.wxid]}
+            fallbackAvatar={directoryProfileEntry.avatar}
+            loading={directoryProfileLoading}
+            dark={darkTheme}
+            onMessage={() => handleSelectChat(directoryProfileEntry.wxid, {
+              nickname: directoryProfileEntry.name,
+              avatar: directoryProfileEntry.avatar,
+              is_group: directoryProfileEntry.is_group,
+            })}
+          />
+        ) : activeChat && activeSession ? (
           <ChatArea
             session={activeSession}
             messages={activeMsgs}
@@ -2386,6 +2470,7 @@ function MobileMainShell({
   dark,
   onSwitchTab,
   onSelectChat,
+  onSelectContact,
   onHydrateContacts,
   onOpenSelfDetail,
   onBackToAccounts,
@@ -2402,6 +2487,7 @@ function MobileMainShell({
   dark: boolean;
   onSwitchTab: (tab: MobileTab) => void;
   onSelectChat: (wxid: string, fallback?: Partial<Session>) => void;
+  onSelectContact: (entry: DirectoryEntry) => void;
   onHydrateContacts: () => void;
   onOpenSelfDetail: () => void;
   onBackToAccounts: () => void;
@@ -2416,7 +2502,7 @@ function MobileMainShell({
           loading={contactsLoading}
           dark={dark}
           onHydrate={onHydrateContacts}
-          onSelect={(entry) => onSelectChat(entry.wxid, { nickname: entry.name, avatar: entry.avatar, is_group: entry.is_group })}
+          onSelect={onSelectContact}
         />
       )}
       {tab === "me" && (
@@ -3430,6 +3516,296 @@ function BroadcastSelectButton({ label, onClick, dark }: { label: string; onClic
     >
       {label}
     </button>
+  );
+}
+
+interface GroupMemberBrief {
+  wxid: string;
+  name: string;
+  avatar: string;
+}
+
+function DirectoryProfilePane({
+  entry,
+  profile,
+  fallbackAvatar,
+  loading,
+  dark,
+  onMessage,
+}: {
+  entry: DirectoryEntry;
+  profile?: ContactProfile;
+  fallbackAvatar: string;
+  loading: boolean;
+  dark: boolean;
+  onMessage: () => void;
+}) {
+  const raw = profile?.profile || {};
+  const name = profileDisplayName(profile, entry.name || entry.wxid);
+  const avatar = profileAvatar(profile, fallbackAvatar);
+  const alias = profileField(raw, ["Alias", "alias", "WXAccount", "account"]);
+  const area = profileArea(raw);
+  const remark = profileField(raw, ["Remark", "remark", "markname"]);
+  const phone = profileField(raw, ["Mobile", "mobile", "Phone", "phone", "tel", "Tel"]);
+  const labelText = profileField(raw, ["LabelText", "LabelName", "LabelNames", "labelText", "labelname"]);
+  const sign = profileField(raw, ["SignInfo", "Signature", "signature", "Description", "sign"]);
+  const sourceText = sourceLabel(raw.Source ?? raw.source);
+  const isOpenIM = entry.wxid.endsWith("@openim") || Boolean(raw.OpenIM || raw.openim_detail);
+
+  return (
+    <div className={`h-full overflow-y-auto ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#f5f5f5] text-[#111]"}`}>
+      <div className="max-w-[620px] mx-auto px-[48px] pt-[74px] pb-[48px]">
+        {entry.is_group ? (
+          <GroupDirectoryProfile entry={entry} dark={dark} loading={loading} onMessage={onMessage} />
+        ) : (
+          <div className={`w-full ${dark ? "text-[#e8e8e8]" : "text-[#111]"}`}>
+            <div className="flex items-start gap-[22px]">
+              <MobileAvatar name={name} avatar={avatar} size={76} />
+              <div className="min-w-0 flex-1 pt-[2px]">
+                <div className="flex items-center gap-[8px]">
+                  <div className="text-[24px] leading-[30px] font-medium truncate">{name}</div>
+                  {!isOpenIM && (
+                    <svg className="w-[18px] h-[18px] text-[#1e9bf0] shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                      <circle cx="12" cy="7" r="4" />
+                      <path d="M4.8 21c.8-4.2 3.2-6.3 7.2-6.3s6.4 2.1 7.2 6.3H4.8Z" />
+                    </svg>
+                  )}
+                </div>
+                <div className={`mt-[5px] text-[16px] leading-[24px] truncate ${dark ? "text-[#888]" : "text-[#999]"}`}>
+                  微信号：{alias || entry.wxid}
+                </div>
+                {area && <div className={`text-[16px] leading-[24px] truncate ${dark ? "text-[#888]" : "text-[#999]"}`}>地区：{area}</div>}
+                {loading && <div className={`mt-[10px] text-[13px] ${dark ? "text-[#777]" : "text-[#999]"}`}>正在加载资料...</div>}
+              </div>
+              <div className={`text-[24px] ${dark ? "text-[#777]" : "text-[#999]"}`}>...</div>
+            </div>
+
+            <div className={`h-px my-[28px] ${dark ? "bg-[#2a2a2a]" : "bg-[#e3e3e3]"}`} />
+            <ProfileInfoRows
+              dark={dark}
+              rows={[
+                ["备注", remark || (profile?.name && profile.name !== name ? profile.name : "")],
+                ["电话", phone],
+                ["标签", labelText],
+              ]}
+            />
+            <div className={`h-px my-[24px] ${dark ? "bg-[#2a2a2a]" : "bg-[#e3e3e3]"}`} />
+            <ProfileInfoRows
+              dark={dark}
+              rows={[
+                ["个性签名", sign],
+                ["来源", sourceText],
+              ]}
+            />
+            <div className={`h-px my-[26px] ${dark ? "bg-[#2a2a2a]" : "bg-[#e3e3e3]"}`} />
+            <div className="flex justify-center">
+              <button
+                type="button"
+                onClick={onMessage}
+                className="w-[166px] h-[48px] rounded-[2px] bg-[#07c160] text-white text-[18px] active:opacity-85"
+              >
+                发消息
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProfileInfoRows({ rows, dark }: { rows: Array<[string, string | undefined]>; dark: boolean }) {
+  const visible = rows.filter(([, value]) => String(value || "").trim());
+  if (visible.length === 0) return null;
+  return (
+    <div className="space-y-[10px]">
+      {visible.map(([label, value]) => (
+        <div key={label} className="grid grid-cols-[98px_1fr] gap-[12px] text-[16px] leading-[24px]">
+          <div className={dark ? "text-[#888]" : "text-[#999]"}>{label}</div>
+          <div className="min-w-0 break-words">{value}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function GroupDirectoryProfile({
+  entry,
+  dark,
+  loading,
+  onMessage,
+}: {
+  entry: DirectoryEntry;
+  dark: boolean;
+  loading: boolean;
+  onMessage: () => void;
+}) {
+  const [members, setMembers] = useState<GroupMemberBrief[]>([]);
+  const [membersLoading, setMembersLoading] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    setMembersLoading(true);
+    getGroupMemberDetails(entry.wxid)
+      .then((data: any) => {
+        if (!alive) return;
+        const rawMembers = data?.members && typeof data.members === "object" ? data.members : {};
+        const next = Object.entries<any>(rawMembers).map(([wxid, info]) => ({
+          wxid,
+          name: String(info?.name || wxid),
+          avatar: String(info?.avatar || ""),
+        }));
+        setMembers(next);
+      })
+      .catch((err: Error) => console.error("[GROUP_PROFILE]", err))
+      .finally(() => {
+        if (alive) setMembersLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [entry.wxid]);
+
+  const shown = members.slice(0, 16);
+  const memberCount = members.length || Number((entry.name.match(/（(\d+)）|\((\d+)\)/)?.[1] || entry.name.match(/（(\d+)）|\((\d+)\)/)?.[2]) || 0);
+
+  return (
+    <div className="min-h-full flex flex-col">
+      <div className="text-[24px] font-medium truncate">{entry.name || entry.wxid}{memberCount ? ` (${memberCount})` : ""}</div>
+      <div className={`mt-[24px] rounded-[2px] p-[24px] ${dark ? "bg-[#171717]" : "bg-white"}`}>
+        {shown.length > 0 ? (
+          <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 gap-x-[20px] gap-y-[22px]">
+            {shown.map((member) => (
+              <div key={member.wxid} className="min-w-0 flex flex-col items-center">
+                <MobileAvatar name={member.name} avatar={member.avatar} size={58} />
+                <div className={`mt-[8px] w-full text-center text-[13px] truncate ${dark ? "text-[#888]" : "text-[#999]"}`}>{member.name}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className={`h-[96px] flex items-center justify-center text-[14px] ${dark ? "text-[#777]" : "text-[#999]"}`}>
+            {membersLoading || loading ? "正在加载群成员..." : "暂无群成员资料"}
+          </div>
+        )}
+      </div>
+      <div className="flex-1 min-h-[160px]" />
+      <div className="flex justify-center pb-[24px]">
+        <button
+          type="button"
+          onClick={onMessage}
+          className="w-[200px] h-[52px] rounded-[2px] bg-[#07c160] text-white text-[18px] active:opacity-85"
+        >
+          发消息
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MobileDirectoryProfilePage({
+  entry,
+  profile,
+  loading,
+  dark,
+  onBack,
+  onMessage,
+}: {
+  entry: DirectoryEntry;
+  profile?: ContactProfile;
+  loading: boolean;
+  dark: boolean;
+  onBack: () => void;
+  onMessage: () => void;
+}) {
+  const raw = profile?.profile || {};
+  const name = profileDisplayName(profile, entry.name || entry.wxid);
+  const avatar = profileAvatar(profile, entry.avatar);
+  const alias = profileField(raw, ["Alias", "alias", "WXAccount", "account"]) || entry.wxid;
+  const area = profileArea(raw);
+  const labelText = profileField(raw, ["LabelText", "LabelName", "LabelNames", "labelText", "labelname"]);
+  const sign = profileField(raw, ["SignInfo", "Signature", "signature", "Description", "sign"]);
+  const sourceText = sourceLabel(raw.Source ?? raw.source);
+
+  return (
+    <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+      <MobileTopBar dark={dark} title="" leftLabel="‹" rightLabel="..." onLeft={onBack} />
+      <div className="flex-1 overflow-y-auto">
+        <div className={`px-[22px] pt-[22px] pb-[28px] ${dark ? "bg-[#111111]" : "bg-white"}`}>
+          <div className="flex items-center gap-[16px]">
+            <MobileAvatar name={name} avatar={avatar} group={entry.is_group} size={68} />
+            <div className="min-w-0 flex-1">
+              <div className="text-[23px] font-semibold truncate">{name}</div>
+              <div className={`mt-[5px] text-[16px] truncate ${dark ? "text-[#888]" : "text-[#777]"}`}>
+                {entry.is_group ? entry.wxid : `Weixin ID: ${alias}`}
+              </div>
+              {area && <div className={`mt-[3px] text-[15px] truncate ${dark ? "text-[#888]" : "text-[#777]"}`}>{area}</div>}
+            </div>
+          </div>
+          {loading && <div className={`mt-[12px] text-[13px] ${dark ? "text-[#777]" : "text-[#999]"}`}>正在加载资料...</div>}
+        </div>
+        <div className={`h-[10px] ${dark ? "bg-[#1a1a1a]" : "bg-[#ededed]"}`} />
+        {!entry.is_group && (
+          <>
+            {labelText && <MobileProfileRow dark={dark} label="Tags" value={labelText} />}
+            {sign && <MobileProfileRow dark={dark} label="What's Up" value={sign} />}
+            {sourceText && <MobileProfileRow dark={dark} label="Source" value={sourceText} />}
+            <div className={`h-[10px] ${dark ? "bg-[#1a1a1a]" : "bg-[#ededed]"}`} />
+          </>
+        )}
+        {entry.is_group && <MobileGroupMemberStrip gid={entry.wxid} dark={dark} />}
+        <button
+          type="button"
+          onClick={onMessage}
+          className={`w-full h-[58px] flex items-center justify-center gap-[8px] border-y text-[17px] font-medium ${dark ? "bg-[#111111] border-[#242424] text-[#6f88b7] active:bg-[#242424]" : "bg-white border-[#ededed] text-[#576b95] active:bg-[#f7f7f7]"}`}
+        >
+          <svg className="w-[20px] h-[20px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 6.5A3.5 3.5 0 0 1 7.5 3h9A3.5 3.5 0 0 1 20 6.5v5A3.5 3.5 0 0 1 16.5 15H11l-5 4v-4.35A3.5 3.5 0 0 1 4 11.5v-5Z" />
+          </svg>
+          Messages
+        </button>
+        <div className={`h-[58px] flex items-center justify-center gap-[8px] text-[16px] ${dark ? "bg-[#111111] text-[#6f88b7]" : "bg-white text-[#576b95]"}`}>
+          <span>☏ Voice or Video Call</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MobileGroupMemberStrip({ gid, dark }: { gid: string; dark: boolean }) {
+  const [members, setMembers] = useState<GroupMemberBrief[]>([]);
+  useEffect(() => {
+    let alive = true;
+    getGroupMemberDetails(gid)
+      .then((data: any) => {
+        if (!alive) return;
+        const rawMembers = data?.members && typeof data.members === "object" ? data.members : {};
+        setMembers(Object.entries<any>(rawMembers).slice(0, 12).map(([wxid, info]) => ({
+          wxid,
+          name: String(info?.name || wxid),
+          avatar: String(info?.avatar || ""),
+        })));
+      })
+      .catch((err: Error) => console.error("[MOBILE_GROUP_PROFILE]", err));
+    return () => {
+      alive = false;
+    };
+  }, [gid]);
+
+  if (members.length === 0) return null;
+  return (
+    <>
+      <div className={`px-[18px] py-[18px] ${dark ? "bg-[#111111]" : "bg-white"}`}>
+        <div className="grid grid-cols-4 gap-y-[16px]">
+          {members.map((member) => (
+            <div key={member.wxid} className="min-w-0 flex flex-col items-center">
+              <MobileAvatar name={member.name} avatar={member.avatar} size={48} />
+              <div className={`mt-[6px] w-full px-[4px] text-center text-[12px] truncate ${dark ? "text-[#888]" : "text-[#777]"}`}>{member.name}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className={`h-[10px] ${dark ? "bg-[#1a1a1a]" : "bg-[#ededed]"}`} />
+    </>
   );
 }
 

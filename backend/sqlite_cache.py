@@ -102,6 +102,20 @@ class SqliteMessageCache:
                 );
                 CREATE INDEX IF NOT EXISTS idx_contacts_owner_group_name
                     ON contacts (owner_wxid, is_group, name);
+
+                CREATE TABLE IF NOT EXISTS group_members (
+                    owner_wxid TEXT NOT NULL DEFAULT '',
+                    gid TEXT NOT NULL,
+                    wxid TEXT NOT NULL,
+                    display_order INTEGER NOT NULL DEFAULT 0,
+                    nickname TEXT NOT NULL DEFAULT '',
+                    avatar TEXT NOT NULL DEFAULT '',
+                    profile_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (owner_wxid, gid, wxid)
+                );
+                CREATE INDEX IF NOT EXISTS idx_group_members_owner_gid_order
+                    ON group_members (owner_wxid, gid, display_order);
                 """
             )
 
@@ -378,6 +392,111 @@ class SqliteMessageCache:
                 "name": row["name"] or wxid,
                 "avatar": row["avatar"] or "",
                 "is_group": bool(int(row["is_group"] or 0)),
+                "profile": profile,
+                "updated_at": int(row["updated_at"] or 0),
+            }
+        return out
+
+    def upsert_group_members(self, gid: str, members: list[dict[str, Any]] | dict[str, dict[str, Any]], *, owner_wxid: str = "") -> None:
+        gid = str(gid or "").strip()
+        if not gid or not members:
+            return
+        owner_wxid = str(owner_wxid or "").strip()
+        now = int(time.time())
+        if isinstance(members, dict):
+            iterable = list(members.values())
+        else:
+            iterable = list(members)
+        rows = []
+        for idx, member in enumerate(iterable):
+            if not isinstance(member, dict):
+                continue
+            wxid = str(member.get("wxid") or member.get("userName") or member.get("username") or "").strip()
+            if not wxid:
+                continue
+            profile = member.get("profile")
+            if not isinstance(profile, dict):
+                profile = dict(member)
+            if not profile.get("wxid"):
+                profile["wxid"] = wxid
+            nickname = str(
+                member.get("name")
+                or member.get("nickname")
+                or member.get("displayname")
+                or profile.get("nickname")
+                or profile.get("NickName")
+                or wxid
+            )
+            avatar = str(
+                member.get("avatar")
+                or member.get("user_head_small")
+                or member.get("user_head_big")
+                or profile.get("SmallHeadImgUrl")
+                or profile.get("BigHeadImgUrl")
+                or profile.get("smallhead")
+                or profile.get("bighead")
+                or ""
+            )
+            rows.append((
+                owner_wxid,
+                gid,
+                wxid,
+                idx,
+                nickname,
+                avatar,
+                json.dumps(profile, ensure_ascii=False),
+                now,
+            ))
+        if not rows:
+            return
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO group_members (owner_wxid, gid, wxid, display_order, nickname, avatar, profile_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_wxid, gid, wxid) DO UPDATE SET
+                    display_order=excluded.display_order,
+                    nickname=COALESCE(NULLIF(excluded.nickname, ''), group_members.nickname),
+                    avatar=COALESCE(NULLIF(excluded.avatar, ''), group_members.avatar),
+                    profile_json=CASE
+                        WHEN excluded.profile_json IS NOT NULL AND excluded.profile_json != '{}' THEN excluded.profile_json
+                        ELSE group_members.profile_json
+                    END,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+
+    def get_group_members(self, gid: str, *, owner_wxid: str = "") -> dict[str, dict[str, Any]]:
+        gid = str(gid or "").strip()
+        if not gid:
+            return {}
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT wxid, display_order, nickname, avatar, profile_json, updated_at
+                FROM group_members
+                WHERE owner_wxid = ? AND gid = ?
+                ORDER BY display_order ASC, nickname ASC
+                """,
+                (owner_wxid, gid),
+            ).fetchall()
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                profile = json.loads(row["profile_json"] or "{}")
+            except Exception:
+                profile = {}
+            if not isinstance(profile, dict):
+                profile = {}
+            wxid = str(row["wxid"] or "")
+            if wxid and not profile.get("wxid"):
+                profile["wxid"] = wxid
+            out[wxid] = {
+                "wxid": wxid,
+                "name": row["nickname"] or wxid,
+                "avatar": row["avatar"] or "",
                 "profile": profile,
                 "updated_at": int(row["updated_at"] or 0),
             }
