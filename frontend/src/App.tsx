@@ -30,6 +30,28 @@ import type { ContactProfile, Session, ChatMessage, WSMessage, WeChatAccount } f
 import { replaceWechatEmojis } from "./utils/wechatEmoji";
 
 type ViewMode = "chats" | "contacts" | "broadcast";
+type MobileTab = "chats" | "contacts" | "me";
+
+function useIsMobileViewport() {
+  const getValue = () => {
+    if (typeof window === "undefined") return false;
+    return window.innerWidth <= 768 || (window.matchMedia?.("(pointer: coarse)").matches && window.innerWidth <= 1024);
+  };
+  const [isMobile, setIsMobile] = useState(getValue);
+
+  useEffect(() => {
+    const update = () => setIsMobile(getValue());
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("orientationchange", update);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("orientationchange", update);
+    };
+  }, []);
+
+  return isMobile;
+}
 
 interface DirectoryEntry {
   wxid: string;
@@ -463,6 +485,7 @@ function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessag
 
 // ─── App Component ───────────────────────────────────────────────
 export default function App() {
+  const isMobile = useIsMobileViewport();
   const [authenticated, setAuthenticated] = useState(() => Boolean(getAccessKey()));
   const [selectedAccountId, setSelectedAccountId] = useState("");
   const [accounts, setAccounts] = useState<WeChatAccount[]>([]);
@@ -482,6 +505,8 @@ export default function App() {
   const [selfCardOpen, setSelfCardOpen] = useState(false);
   const [selfProfileLoading, setSelfProfileLoading] = useState(false);
   const [selfImageOpen, setSelfImageOpen] = useState(false);
+  const [mobileTab, setMobileTab] = useState<MobileTab>("chats");
+  const [mobileProfileDetailOpen, setMobileProfileDetailOpen] = useState(false);
 
   // ─── Resolve avatars for group senders (incremental) ─────────────
   // Instead of fetching ALL group members (slow BatchGetContactBriefInfo),
@@ -509,6 +534,8 @@ export default function App() {
     setActiveChat(null);
     setChatMessages({});
     setViewMode("chats");
+    setMobileTab("chats");
+    setMobileProfileDetailOpen(false);
     setContactsHydrating(false);
     setContactsHydrated(false);
     pendingBriefWxids.current.clear();
@@ -619,13 +646,18 @@ export default function App() {
     }
   }, []);
 
-  const ensureContactProfiles = useCallback(async (wxids: string[]) => {
+  const ensureContactProfiles = useCallback(async (wxids: string[], gid = "") => {
     const unique = Array.from(new Set((wxids || []).filter(Boolean)));
     const cached: Record<string, ContactProfile> = {};
     const missing: string[] = [];
     for (const wxid of unique) {
       const hit = contactProfilesRef.current[wxid];
-      if (hit?.profile && Object.keys(hit.profile).length > 0) {
+      const raw = hit?.profile || {};
+      const usefulKeys = Object.keys(raw).filter((key) => key !== "wxid");
+      const hasUsefulProfile = usefulKeys.length > 0 && (
+        !wxid.endsWith("@openim") || Boolean(raw.OpenIM || raw.OpenIMDetail || raw.openim_detail)
+      );
+      if (hasUsefulProfile) {
         cached[wxid] = hit;
       } else {
         missing.push(wxid);
@@ -633,7 +665,7 @@ export default function App() {
     }
     if (missing.length === 0) return cached;
 
-    const data = await getContactProfiles(missing);
+    const data = await getContactProfiles(missing, gid);
     const members = data?.members || {};
     applyContactProfileUpdates(members);
     return { ...cached, ...members };
@@ -677,10 +709,34 @@ export default function App() {
     }
   }, [ensureContactProfiles, selfWxid]);
 
+  const openMobileSelfProfileDetail = useCallback(async () => {
+    if (!selfWxid) return;
+    setMobileProfileDetailOpen(true);
+    const hit = contactProfilesRef.current[selfWxid];
+    if (hit?.profile && Object.keys(hit.profile).length > 0) return;
+    setSelfProfileLoading(true);
+    try {
+      await ensureContactProfiles([selfWxid]);
+    } catch (err) {
+      console.error("[SELF_PROFILE]", err);
+    } finally {
+      setSelfProfileLoading(false);
+    }
+  }, [ensureContactProfiles, selfWxid]);
+
   const switchMode = useCallback((mode: ViewMode) => {
     setViewMode(mode);
     setActiveChat(null);
     if (mode === "contacts") {
+      hydrateDirectoryContacts();
+    }
+  }, [hydrateDirectoryContacts]);
+
+  const switchMobileTab = useCallback((tab: MobileTab) => {
+    setMobileTab(tab);
+    setActiveChat(null);
+    setMobileProfileDetailOpen(false);
+    if (tab === "contacts") {
       hydrateDirectoryContacts();
     }
   }, [hydrateDirectoryContacts]);
@@ -767,6 +823,7 @@ export default function App() {
       if (!wxid) continue;
       if (wxid === selfId) continue;
       if (wxid.includes("@chatroom")) continue;
+      if (wxid.endsWith("@openim")) continue;
       const hasName = Boolean(currentContacts[wxid] && currentContacts[wxid] !== wxid);
       const hasAvatar = Boolean(currentAvatars[wxid]);
       if (hasName && hasAvatar) continue;
@@ -777,6 +834,21 @@ export default function App() {
     }
     scheduleBriefFlush();
   }, [selfWxid, scheduleBriefFlush]);
+
+  const hydrateGroupSenders = useCallback((groupId: string, wxids: string[], mySelfWxid?: string) => {
+    const unique = Array.from(new Set((wxids || []).filter(Boolean)));
+    if (unique.length === 0) return;
+    const openimWxids = unique.filter((wxid) => wxid.endsWith("@openim"));
+    const regularWxids = unique.filter((wxid) => !wxid.endsWith("@openim"));
+    if (regularWxids.length > 0) {
+      queueBriefLookup(regularWxids, mySelfWxid);
+    }
+    if (openimWxids.length > 0) {
+      ensureContactProfiles(openimWxids, groupId).catch((err) => {
+        console.error("[OPENIM_PROFILE]", err);
+      });
+    }
+  }, [ensureContactProfiles, queueBriefLookup]);
 
   // ─── Fetch group member names (fast) on entering a group ──────────
   const fetchGroupMemberNames = useCallback((gid: string) => {
@@ -867,7 +939,12 @@ export default function App() {
           (!nameMap[s.wxid] && (!s.nickname || s.nickname === s.wxid))
         ))
         .map((s) => s.wxid);
-      queueBriefLookup(needsBrief, wxid);
+      const openimNeedsProfile = needsBrief.filter((targetWxid) => targetWxid.endsWith("@openim"));
+      const regularNeedsBrief = needsBrief.filter((targetWxid) => !targetWxid.endsWith("@openim"));
+      queueBriefLookup(regularNeedsBrief, wxid);
+      if (openimNeedsProfile.length > 0) {
+        ensureContactProfiles(openimNeedsProfile).catch((err) => console.error("[OPENIM_PROFILE]", err));
+      }
 
       if (messages_cache && typeof messages_cache === "object") {
         setChatMessages((prev) => {
@@ -906,7 +983,7 @@ export default function App() {
         if (avatar) liveAvatarMap[wxid] = avatar;
       }
 
-      const groupSenderWxids = new Set<string>();
+      const groupSenderWxidsByChat = new Map<string, Set<string>>();
       const directChatWxids = new Set<string>();
       const chatsToAutoRead = new Set<string>();
 
@@ -924,7 +1001,9 @@ export default function App() {
         if (isIncoming && chatId.includes("@chatroom")) {
           const senderWxid = String(chatMsg.fromid || "");
           if (senderWxid && senderWxid !== myWxid) {
-            groupSenderWxids.add(senderWxid);
+            const existing = groupSenderWxidsByChat.get(chatId) || new Set<string>();
+            existing.add(senderWxid);
+            groupSenderWxidsByChat.set(chatId, existing);
           }
         }
         if (!chatId.includes("@chatroom")) {
@@ -1011,11 +1090,17 @@ export default function App() {
         markAsRead(cid).catch(() => {});
       }
 
-      if (groupSenderWxids.size > 0) {
-        queueBriefLookup(Array.from(groupSenderWxids));
+      for (const [chatId, senderWxids] of groupSenderWxidsByChat.entries()) {
+        hydrateGroupSenders(chatId, Array.from(senderWxids), myWxid || selfWxid);
       }
       if (directChatWxids.size > 0) {
-        queueBriefLookup(Array.from(directChatWxids), myWxid || selfWxid);
+        const directWxids = Array.from(directChatWxids);
+        const directOpenimWxids = directWxids.filter((wxid) => wxid.endsWith("@openim"));
+        const directRegularWxids = directWxids.filter((wxid) => !wxid.endsWith("@openim"));
+        queueBriefLookup(directRegularWxids, myWxid || selfWxid);
+        if (directOpenimWxids.length > 0) {
+          ensureContactProfiles(directOpenimWxids).catch((err) => console.error("[OPENIM_PROFILE]", err));
+        }
       }
     }
     if (wsMsg.type === "message_sent") {
@@ -1068,7 +1153,7 @@ export default function App() {
         );
       }
     }
-  }, [selfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, applyContactProfileUpdates, selectedAccountId]);
+  }, [selfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, hydrateGroupSenders, ensureContactProfiles, applyContactProfileUpdates, selectedAccountId]);
 
   const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId));
 
@@ -1170,7 +1255,7 @@ export default function App() {
           }
         }
         if (senderWxids.length > 0) {
-          queueBriefLookup(senderWxids);
+          hydrateGroupSenders(wxid, senderWxids, selfWxid);
         }
       }
     }
@@ -1329,7 +1414,7 @@ export default function App() {
         senderWxids.add(from);
       }
       if (senderWxids.size > 0) {
-        queueBriefLookup(Array.from(senderWxids));
+        hydrateGroupSenders(wxid, Array.from(senderWxids), selfWxid);
       }
     }
   };
@@ -1405,6 +1490,17 @@ export default function App() {
   }
 
   if (!selectedAccountId) {
+    if (isMobile) {
+      return (
+        <MobileAccountPortal
+          accounts={accounts}
+          loading={accountsLoading}
+          onRefresh={loadAccounts}
+          onSelectAccount={handleSelectAccount}
+          onLogout={handleLogout}
+        />
+      );
+    }
     return (
       <AccountPortal
         accounts={accounts}
@@ -1412,6 +1508,77 @@ export default function App() {
         onRefresh={loadAccounts}
         onSelectAccount={handleSelectAccount}
         onLogout={handleLogout}
+      />
+    );
+  }
+
+  if (isMobile) {
+    if (activeChat && activeSession) {
+      return (
+        <div className="h-dvh w-screen overflow-hidden bg-[#ededed]">
+          {!connected && (
+            <div className="fixed top-0 left-0 right-0 bg-[#e6a23c] text-black text-center text-[12px] py-1 z-50">
+              正在连接后端服务器...
+            </div>
+          )}
+          <ChatArea
+            mobile
+            session={activeSession}
+            messages={activeMsgs}
+            selfWxid={selfWxid}
+            onBack={handleBack}
+            onNewMessages={handleNewMessages}
+            avatarMap={avatarMap}
+            contactMap={contactMap}
+            contactProfiles={contactProfiles}
+            onRequestContactProfile={ensureContactProfiles}
+            onInputChange={setHasUnsavedInput}
+          />
+        </div>
+      );
+    }
+
+    if (mobileProfileDetailOpen) {
+      return (
+        <>
+          <MobileProfileDetailPage
+            profile={selfProfile}
+            fallbackName={selfInfoName}
+            fallbackAvatar={selfAvatar}
+            loading={selfProfileLoading}
+            onBack={() => setMobileProfileDetailOpen(false)}
+            onAvatarClick={() => setSelfImageOpen(true)}
+          />
+          {selfImageOpen && (
+            <LargeAvatarOverlay
+              src={
+                selfProfile?.profile?.BigHeadImgUrl ||
+                selfProfile?.profile?.head_big ||
+                selfAvatar
+              }
+              onClose={() => setSelfImageOpen(false)}
+            />
+          )}
+        </>
+      );
+    }
+
+    return (
+      <MobileMainShell
+        tab={mobileTab}
+        sessions={sessions}
+        friends={friendEntries}
+        groups={groupEntries}
+        selfName={selfInfoName}
+        selfWxid={selfWxid}
+        selfAvatar={selfAvatar}
+        selfProfile={selfProfile}
+        contactsLoading={contactsHydrating}
+        onSwitchTab={switchMobileTab}
+        onSelectChat={handleSelectChat}
+        onHydrateContacts={hydrateDirectoryContacts}
+        onOpenSelfDetail={openMobileSelfProfileDetail}
+        onBackToAccounts={handleLeaveAccount}
       />
     );
   }
@@ -1645,6 +1812,438 @@ function AccountAvatar({ account }: { account: WeChatAccount }) {
   return (
     <div className="w-[54px] h-[54px] rounded-[5px] bg-[#07c160] text-white flex items-center justify-center text-[22px] shrink-0">
       {name[0]}
+    </div>
+  );
+}
+
+function MobileAccountPortal({
+  accounts,
+  loading,
+  onRefresh,
+  onSelectAccount,
+  onLogout,
+}: {
+  accounts: WeChatAccount[];
+  loading: boolean;
+  onRefresh: () => void;
+  onSelectAccount: (account: WeChatAccount) => void;
+  onLogout: () => void;
+}) {
+  const displayName = (account: WeChatAccount) =>
+    (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
+    account.wxid ||
+    account.account_id ||
+    "微信";
+
+  return (
+    <div className="h-dvh w-screen bg-[#ededed] text-[#111] overflow-hidden flex flex-col">
+      <MobileTopBar title="微信账号" rightLabel="刷新" onRight={onRefresh} leftLabel="退出" onLeft={onLogout} />
+      <div className="flex-1 overflow-y-auto px-[14px] py-[14px] pb-[calc(18px+env(safe-area-inset-bottom))]">
+        {loading && accounts.length === 0 && <div className="text-center text-[#888] text-[14px] mt-[40px]">正在读取在线微信...</div>}
+        {!loading && accounts.length === 0 && (
+          <div className="text-center text-[#888] text-[14px] leading-[24px] mt-[44px]">
+            暂无在线微信<br />请让客户端 DLL 连接到当前后端 `/agent`
+          </div>
+        )}
+        <div className="space-y-[12px]">
+          {accounts.map((account) => (
+            <button
+              key={account.id}
+              type="button"
+              onClick={() => onSelectAccount(account)}
+              className="w-full min-h-[86px] rounded-[12px] bg-white active:bg-[#f4f4f4] shadow-sm px-[14px] py-[12px] flex items-center gap-[12px] text-left"
+            >
+              <AccountAvatar account={account} />
+              <div className="min-w-0 flex-1">
+                <div className="text-[18px] font-medium truncate">{displayName(account)}</div>
+                <div className="text-[13px] text-[#888] truncate mt-[4px]">{account.wxid || account.account_id || account.id}</div>
+                <div className="text-[11px] text-[#aaa] truncate mt-[3px]">WS {account.id}</div>
+              </div>
+              <span className={`text-[12px] px-[7px] py-[3px] rounded-full ${
+                account.initialized ? "bg-[#e5f7ed] text-[#07c160]" : "bg-[#fff3d9] text-[#b78200]"
+              }`}>
+                {account.initialized ? "已就绪" : "初始化"}
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MobileTopBar({
+  title,
+  leftLabel,
+  rightLabel,
+  onLeft,
+  onRight,
+}: {
+  title: string;
+  leftLabel?: string;
+  rightLabel?: string;
+  onLeft?: () => void;
+  onRight?: () => void;
+}) {
+  return (
+    <div className="shrink-0 bg-[#ededed] border-b border-[#dedede] pt-[env(safe-area-inset-top)]">
+      <div className="h-[54px] px-[14px] grid grid-cols-[72px_1fr_72px] items-center">
+        <button type="button" onClick={onLeft} className="text-left text-[15px] text-[#333] active:opacity-60">
+          {leftLabel || ""}
+        </button>
+        <div className="text-center text-[17px] font-semibold truncate">{title}</div>
+        <button type="button" onClick={onRight} className="text-right text-[15px] text-[#333] active:opacity-60">
+          {rightLabel || ""}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MobileMainShell({
+  tab,
+  sessions,
+  friends,
+  groups,
+  selfName,
+  selfWxid,
+  selfAvatar,
+  selfProfile,
+  contactsLoading,
+  onSwitchTab,
+  onSelectChat,
+  onHydrateContacts,
+  onOpenSelfDetail,
+  onBackToAccounts,
+}: {
+  tab: MobileTab;
+  sessions: Session[];
+  friends: DirectoryEntry[];
+  groups: DirectoryEntry[];
+  selfName: string;
+  selfWxid: string;
+  selfAvatar: string;
+  selfProfile?: ContactProfile;
+  contactsLoading: boolean;
+  onSwitchTab: (tab: MobileTab) => void;
+  onSelectChat: (wxid: string, fallback?: Partial<Session>) => void;
+  onHydrateContacts: () => void;
+  onOpenSelfDetail: () => void;
+  onBackToAccounts: () => void;
+}) {
+  return (
+    <div className="h-dvh w-screen bg-[#ededed] text-[#111] overflow-hidden flex flex-col">
+      {tab === "chats" && <MobileChatsView sessions={sessions} onSelectChat={onSelectChat} onBackToAccounts={onBackToAccounts} />}
+      {tab === "contacts" && (
+        <MobileContactsView
+          friends={friends}
+          groups={groups}
+          loading={contactsLoading}
+          onHydrate={onHydrateContacts}
+          onSelect={(entry) => onSelectChat(entry.wxid, { nickname: entry.name, avatar: entry.avatar, is_group: entry.is_group })}
+        />
+      )}
+      {tab === "me" && (
+        <MobileMeView
+          selfName={selfName}
+          selfWxid={selfWxid}
+          selfAvatar={selfAvatar}
+          profile={selfProfile}
+          onOpenSelfDetail={onOpenSelfDetail}
+        />
+      )}
+      <MobileTabBar active={tab} onChange={onSwitchTab} />
+    </div>
+  );
+}
+
+function MobileSearchBar({ placeholder = "Search" }: { placeholder?: string }) {
+  return (
+    <div className="h-[44px] px-[12px] flex items-center">
+      <div className="w-full h-[36px] rounded-[7px] bg-white flex items-center justify-center gap-[7px] text-[#b7b7b7]">
+        <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
+        </svg>
+        <span className="text-[16px]">{placeholder}</span>
+      </div>
+    </div>
+  );
+}
+
+function MobileChatsView({
+  sessions,
+  onSelectChat,
+  onBackToAccounts,
+}: {
+  sessions: Session[];
+  onSelectChat: (wxid: string) => void;
+  onBackToAccounts: () => void;
+}) {
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto pb-[10px]">
+      <MobileTopBar title="Weixin" leftLabel="账号" rightLabel="＋" onLeft={onBackToAccounts} />
+      <MobileSearchBar />
+      <div className="h-[48px] px-[22px] flex items-center gap-[14px] text-[#777] text-[14px] border-b border-[#dedede]">
+        <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
+          <rect x="3" y="5" width="18" height="12" rx="1.5" />
+          <path d="M8 21h8M12 17v4" />
+        </svg>
+        <span>Logged in to Weixin for Windows.</span>
+      </div>
+      <div className="bg-white">
+        {sessions.length === 0 && <div className="text-center text-[#999] text-[14px] py-[48px]">暂无会话</div>}
+        {sessions.map((session) => (
+          <MobileSessionRow key={session.wxid} session={session} onClick={() => onSelectChat(session.wxid)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MobileSessionRow({ session, onClick }: { session: Session; onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick} className="w-full h-[74px] pl-[14px] pr-[12px] flex items-center gap-[12px] text-left active:bg-[#f4f4f4]">
+      <MobileAvatar name={session.nickname || session.wxid} avatar={session.avatar} group={session.is_group} size={52} />
+      <div className="min-w-0 flex-1 h-full border-b border-[#ededed] flex flex-col justify-center">
+        <div className="flex items-baseline gap-[8px]">
+          <div className="text-[17px] leading-[23px] truncate flex-1">{session.nickname || session.wxid}</div>
+          <div className="text-[12px] text-[#b8b8b8] shrink-0">{session.lastTime || ""}</div>
+        </div>
+        <div className="mt-[3px] flex items-center gap-[6px]">
+          <div className="text-[14px] text-[#aaa] truncate flex-1">{session.lastMsg || ""}</div>
+          {session.muted && <span className="text-[#b8b8b8] text-[12px]">静音</span>}
+          {!session.muted && session.unread && session.unread > 0 ? (
+            <span className="min-w-[18px] h-[18px] rounded-full bg-[#fa5151] text-white text-[11px] flex items-center justify-center px-[5px]">
+              {session.unread > 99 ? "99+" : session.unread}
+            </span>
+          ) : null}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function MobileContactsView({
+  friends,
+  groups,
+  loading,
+  onHydrate,
+  onSelect,
+}: {
+  friends: DirectoryEntry[];
+  groups: DirectoryEntry[];
+  loading: boolean;
+  onHydrate: () => void;
+  onSelect: (entry: DirectoryEntry) => void;
+}) {
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    onHydrate();
+  }, [onHydrate]);
+  const q = query.trim().toLowerCase();
+  const filteredFriends = friends.filter((entry) => !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q));
+  const filteredGroups = groups.filter((entry) => !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q));
+
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto pb-[10px]">
+      <MobileTopBar title="Contacts" rightLabel="＋" />
+      <div className="h-[44px] px-[12px] flex items-center">
+        <div className="w-full h-[36px] rounded-[7px] bg-white flex items-center gap-[7px] px-[12px] text-[#b7b7b7]">
+          <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
+          </svg>
+          <input value={query} onChange={(e) => setQuery(e.target.value)} className="bg-transparent outline-none flex-1 text-[16px] text-[#111] placeholder-[#b7b7b7]" placeholder="Search" />
+        </div>
+      </div>
+      {loading && <div className="px-[22px] py-[6px] text-[12px] text-[#999]">正在补全联系人资料...</div>}
+      <div className="bg-white">
+        <MobileContactStaticRow color="#ffad33" label="New Friends" icon="person+" />
+        <MobileContactStaticRow color="#ffad33" label="Chats Only Friends" icon="person" />
+        <MobileContactStaticRow color="#07c160" label="Group Chats" icon="group" />
+        <MobileContactStaticRow color="#1e9bf0" label="Tags" icon="tag" />
+        <MobileContactStaticRow color="#1688f0" label="Official Accounts" icon="leaf" />
+        <MobileContactStaticRow color="#21a8f4" label="Service Accounts" icon="diamond" />
+      </div>
+      {filteredGroups.length > 0 && <MobileContactSection title="群聊" entries={filteredGroups} onSelect={onSelect} />}
+      {filteredFriends.length > 0 && <MobileContactSection title="A" entries={filteredFriends} onSelect={onSelect} />}
+    </div>
+  );
+}
+
+function MobileContactStaticRow({ color, label, icon }: { color: string; label: string; icon: string }) {
+  return (
+    <div className="h-[58px] pl-[22px] pr-[12px] flex items-center gap-[14px]">
+      <div className="w-[38px] h-[38px] rounded-[5px] flex items-center justify-center text-white" style={{ backgroundColor: color }}>
+        <svg className="w-[23px] h-[23px]" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+          {icon === "tag" && <path strokeLinecap="round" strokeLinejoin="round" d="m4 12 8-8h7v7l-8 8-7-7Zm12-5h.01" />}
+          {icon === "leaf" && <path strokeLinecap="round" strokeLinejoin="round" d="M5 5c8 0 13 5 14 14-8-1-14-6-14-14Zm0 0c4 5 8 9 14 14" />}
+          {icon === "diamond" && <path strokeLinecap="round" strokeLinejoin="round" d="m12 4 7 8-7 8-7-8 7-8Zm-7 8h14" />}
+          {icon === "group" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 11a4 4 0 1 0-8 0 4 4 0 0 0 8 0ZM4.5 21c.8-4.2 3.3-6.3 7.5-6.3s6.7 2.1 7.5 6.3" />}
+          {icon !== "tag" && icon !== "leaf" && icon !== "diamond" && icon !== "group" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0ZM5 21c.8-4 3.1-6 7-6s6.2 2 7 6M18 6v4M20 8h-4" />}
+        </svg>
+      </div>
+      <div className="flex-1 h-full border-b border-[#ededed] flex items-center text-[17px]">{label}</div>
+    </div>
+  );
+}
+
+function MobileContactSection({ title, entries, onSelect }: { title: string; entries: DirectoryEntry[]; onSelect: (entry: DirectoryEntry) => void }) {
+  return (
+    <div>
+      <div className="h-[34px] px-[22px] flex items-center text-[14px] text-[#777]">{title}</div>
+      <div className="bg-white">
+        {entries.map((entry) => (
+          <button key={`${entry.source}_${entry.wxid}`} type="button" onClick={() => onSelect(entry)} className="w-full h-[62px] pl-[22px] pr-[12px] flex items-center gap-[12px] text-left active:bg-[#f4f4f4]">
+            <MobileAvatar name={entry.name || entry.wxid} avatar={entry.avatar} group={entry.is_group} size={42} />
+            <div className="flex-1 min-w-0 h-full border-b border-[#ededed] flex items-center">
+              <div className="text-[17px] truncate">{entry.name || entry.wxid}</div>
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MobileMeView({
+  selfName,
+  selfWxid,
+  selfAvatar,
+  profile,
+  onOpenSelfDetail,
+}: {
+  selfName: string;
+  selfWxid: string;
+  selfAvatar: string;
+  profile?: ContactProfile;
+  onOpenSelfDetail: () => void;
+}) {
+  const raw = profile?.profile || {};
+  const alias = raw.Alias || raw.alias || selfWxid;
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto pb-[10px]">
+      <div className="h-[76px] pt-[env(safe-area-inset-top)] bg-white" />
+      <button type="button" onClick={onOpenSelfDetail} className="w-full bg-white px-[34px] py-[26px] flex items-center gap-[22px] text-left active:bg-[#f7f7f7]">
+        <MobileAvatar name={selfName} avatar={selfAvatar} size={78} />
+        <div className="min-w-0 flex-1">
+          <div className="text-[24px] font-semibold truncate">{selfName}</div>
+          <div className="text-[16px] text-[#777] mt-[7px] truncate">Weixin ID: {alias || selfWxid}</div>
+        </div>
+        <div className="text-[#b8b8b8] text-[24px]">›</div>
+      </button>
+      <div className="h-[10px] bg-[#ededed]" />
+      <MobileMeRow label="Pay and Services" color="#07c160" />
+      <MobileMeRow label="Favorites" color="#ff7043" />
+      <MobileMeRow label="Moments" color="#1e9bf0" />
+      <MobileMeRow label="Works" color="#21a8f4" />
+      <MobileMeRow label="Stores and Cards" color="#ff6b6b" />
+      <MobileMeRow label="Sticker Gallery" color="#ffc300" />
+      <div className="h-[10px] bg-[#ededed]" />
+      <MobileMeRow label="Settings" color="#1e9bf0" />
+    </div>
+  );
+}
+
+function MobileMeRow({ label, color }: { label: string; color: string }) {
+  return (
+    <div className="h-[56px] bg-white pl-[28px] pr-[18px] flex items-center gap-[18px]">
+      <div className="w-[22px] h-[22px] rounded-[5px] border-2" style={{ borderColor: color }} />
+      <div className="flex-1 h-full border-b border-[#ededed] flex items-center text-[17px]">{label}</div>
+      <div className="text-[#b8b8b8] text-[24px]">›</div>
+    </div>
+  );
+}
+
+function MobileProfileDetailPage({
+  profile,
+  fallbackName,
+  fallbackAvatar,
+  loading,
+  onBack,
+  onAvatarClick,
+}: {
+  profile?: ContactProfile;
+  fallbackName: string;
+  fallbackAvatar: string;
+  loading: boolean;
+  onBack: () => void;
+  onAvatarClick: () => void;
+}) {
+  const raw = profile?.profile || {};
+  const name = profileDisplayName(profile, fallbackName);
+  const avatar = profileAvatar(profile, fallbackAvatar);
+  const alias = raw.Alias || raw.alias || raw.account || profile?.wxid || "";
+  const gender = String(raw.Sex || raw.sex || "") === "1" ? "Male" : String(raw.Sex || raw.sex || "") === "2" ? "Female" : "";
+  const phone = raw.Mobile || raw.mobile || raw.Phone || raw.phone || "";
+  const signature = raw.Signature || raw.signature || raw.Description || "";
+  const area = profileArea(raw);
+  return (
+    <div className="h-dvh w-screen bg-[#ededed] text-[#111] overflow-hidden flex flex-col">
+      <MobileTopBar title="Profile" leftLabel="‹" onLeft={onBack} />
+      <div className="flex-1 overflow-y-auto">
+        <MobileProfileRow label="Profile Photo" value="" onClick={onAvatarClick} image={avatar} />
+        <MobileProfileRow label="Name" value={name} />
+        {gender && <MobileProfileRow label="Gender" value={gender} />}
+        <MobileProfileRow label="Region" value={area || ""} />
+        {phone && <MobileProfileRow label="Phone" value={phone} />}
+        <MobileProfileRow label="ID" value={alias} />
+        <MobileProfileRow label="My QR Code" value="▦" />
+        {profile?.wxid && <MobileProfileRow label="Tickle" value={profile.wxid} />}
+        <MobileProfileRow label="What's Up" value={signature} />
+        <div className="h-[10px] bg-[#ededed]" />
+        <MobileProfileRow label="Incoming Call Ringtones" value="" />
+        <div className="h-[10px] bg-[#ededed]" />
+        <MobileProfileRow label="My Address" value="" />
+        <MobileProfileRow label="My Fapiao Titles" value="" />
+        <div className="h-[10px] bg-[#ededed]" />
+        <MobileProfileRow label="WeBeans" value="" />
+        {loading && <div className="px-[22px] py-[14px] text-[13px] text-[#999]">正在加载资料...</div>}
+      </div>
+    </div>
+  );
+}
+
+function MobileProfileRow({ label, value, image, onClick }: { label: string; value?: string; image?: string; onClick?: () => void }) {
+  return (
+    <button type="button" onClick={onClick} className="w-full min-h-[58px] bg-white pl-[22px] pr-[16px] flex items-center text-left active:bg-[#f7f7f7]">
+      <div className="text-[17px] flex-1">{label}</div>
+      {image ? <img src={image} alt="" className="w-[38px] h-[38px] rounded-[4px] object-cover" /> : <div className="max-w-[58%] text-[16px] text-[#888] truncate">{value || ""}</div>}
+      <div className="text-[#b8b8b8] text-[24px] ml-[8px]">›</div>
+    </button>
+  );
+}
+
+function MobileTabBar({ active, onChange }: { active: MobileTab; onChange: (tab: MobileTab) => void }) {
+  return (
+    <div className="shrink-0 h-[64px] pb-[env(safe-area-inset-bottom)] bg-white/95 border-t border-[#dedede] grid grid-cols-3">
+      <MobileTabButton active={active === "chats"} label="Chats" onClick={() => onChange("chats")} icon="chat" />
+      <MobileTabButton active={active === "contacts"} label="Contacts" onClick={() => onChange("contacts")} icon="contacts" />
+      <MobileTabButton active={active === "me"} label="Me" onClick={() => onChange("me")} icon="me" />
+    </div>
+  );
+}
+
+function MobileTabButton({ active, label, icon, onClick }: { active: boolean; label: string; icon: string; onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick} className={`flex flex-col items-center justify-center gap-[2px] ${active ? "text-[#07c160]" : "text-[#222]"}`}>
+      <svg className="w-[25px] h-[25px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+        {icon === "chat" && <path strokeLinecap="round" strokeLinejoin="round" d="M4 6.5A3.5 3.5 0 0 1 7.5 3h9A3.5 3.5 0 0 1 20 6.5v5A3.5 3.5 0 0 1 16.5 15H11l-5 4v-4.35A3.5 3.5 0 0 1 4 11.5v-5Z" />}
+        {icon === "contacts" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 11a4 4 0 1 0-8 0 4 4 0 0 0 8 0ZM4.5 21c.8-4.2 3.3-6.3 7.5-6.3s6.7 2.1 7.5 6.3M18 6v4M20 8h-4" />}
+        {icon === "me" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0ZM5 21c.8-4 3.1-6 7-6s6.2 2 7 6" />}
+      </svg>
+      <span className="text-[11px] leading-[13px]">{label}</span>
+    </button>
+  );
+}
+
+function MobileAvatar({ name, avatar, group, size = 42 }: { name: string; avatar?: string; group?: boolean; size?: number }) {
+  const [failed, setFailed] = useState(false);
+  if (avatar && !failed) {
+    return <img src={avatar} alt="" className="rounded-[6px] object-cover shrink-0" style={{ width: size, height: size }} onError={() => setFailed(true)} loading="lazy" />;
+  }
+  return (
+    <div className={`rounded-[6px] text-white flex items-center justify-center shrink-0 ${group ? "bg-[#576b95]" : "bg-[#07c160]"}`} style={{ width: size, height: size, fontSize: Math.max(15, size * 0.38) }}>
+      {(name || "?")[0]}
     </div>
   );
 }

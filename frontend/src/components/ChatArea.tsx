@@ -12,8 +12,9 @@ interface ChatAreaProps {
   avatarMap: Record<string, string>;
   contactMap: Record<string, string>;
   contactProfiles: Record<string, ContactProfile>;
-  onRequestContactProfile: (wxids: string[]) => Promise<Record<string, ContactProfile>>;
+  onRequestContactProfile: (wxids: string[], gid?: string) => Promise<Record<string, ContactProfile>>;
   onInputChange?: (hasText: boolean) => void;
+  mobile?: boolean;
 }
 
 /* Group sender parsing removed — WeChat 4.x stores sender in BytesExtra, backend extracts it */
@@ -39,7 +40,7 @@ function imageFilesFromClipboardData(data: DataTransfer | null): File[] {
 
 export default function ChatArea({
   session, messages, selfWxid, onBack, onNewMessages, avatarMap, contactMap,
-  contactProfiles, onRequestContactProfile, onInputChange,
+  contactProfiles, onRequestContactProfile, onInputChange, mobile = false,
 }: ChatAreaProps) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -99,20 +100,25 @@ export default function ChatArea({
     setProfileError("");
 
     const existing = contactProfiles[wxid];
-    if (existing?.profile && Object.keys(existing.profile).length > 0) {
+    const raw = existing?.profile || {};
+    const usefulKeys = Object.keys(raw).filter((key) => key !== "wxid");
+    const hasUsefulProfile = usefulKeys.length > 0 && (
+      !wxid.endsWith("@openim") || Boolean(raw.OpenIM || raw.OpenIMDetail || raw.openim_detail)
+    );
+    if (hasUsefulProfile) {
       return;
     }
 
     setProfileLoading(true);
     try {
-      await onRequestContactProfile([wxid]);
+      await onRequestContactProfile([wxid], wxid.endsWith("@openim") && session.is_group ? session.wxid : "");
     } catch (err) {
       console.error("[PROFILE]", err);
       setProfileError("资料加载失败");
     } finally {
       setProfileLoading(false);
     }
-  }, [contactProfiles, onRequestContactProfile]);
+  }, [contactProfiles, onRequestContactProfile, session.is_group, session.wxid]);
 
   // ─── Auto-scroll to bottom ──────────────────────────────────────
   const scrollToBottom = useCallback((instant?: boolean) => {
@@ -427,6 +433,12 @@ export default function ChatArea({
     el.style.height = Math.min(Math.max(el.scrollHeight, TEXTAREA_BASE_HEIGHT), TEXTAREA_MAX_HEIGHT) + "px";
   };
 
+  const handleMobileInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setInput(val);
+    onInputChange?.(val.trim().length > 0 || pendingImages.length > 0);
+  };
+
   const addPendingImages = useCallback((files: File[]) => {
     const imageFiles = files.filter((file) => file.type.startsWith("image/"));
     if (imageFiles.length === 0) return false;
@@ -527,21 +539,25 @@ export default function ChatArea({
 
   // ─── Render ─────────────────────────────────────────────────────
   return (
-    <div className="h-full w-full flex flex-col bg-[#191919]">
+    <div className={`h-full w-full flex flex-col ${mobile ? "bg-[#ededed]" : "bg-[#191919]"}`}>
       {/* ─── Top bar ─── */}
-      <div className="h-[48px] px-[10px] flex items-center shrink-0 border-b border-[#2a2a2a] bg-[#191919] z-10">
+      <div className={`px-[10px] flex items-center shrink-0 z-10 ${
+        mobile
+          ? "h-[56px] pt-[env(safe-area-inset-top)] border-b border-[#dedede] bg-[#ededed]"
+          : "h-[48px] border-b border-[#2a2a2a] bg-[#191919]"
+      }`}>
         <button
           onClick={onBack}
-          className="w-[36px] h-[36px] flex items-center justify-center text-[#e5e5e5]"
+          className={`w-[36px] h-[36px] flex items-center justify-center ${mobile ? "text-[#111]" : "text-[#e5e5e5]"}`}
         >
           <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
           </svg>
         </button>
-        <h2 className="flex-1 text-center text-[17px] font-medium text-[#e5e5e5] truncate pr-[36px]">
+        <h2 className={`flex-1 text-center text-[17px] font-medium truncate pr-[36px] ${mobile ? "text-[#111]" : "text-[#e5e5e5]"}`}>
           {session.nickname || session.wxid}
         </h2>
-        <button className="w-[36px] h-[36px] flex items-center justify-center text-[#e5e5e5]">
+        <button className={`w-[36px] h-[36px] flex items-center justify-center ${mobile ? "text-[#111]" : "text-[#e5e5e5]"}`}>
           <svg className="w-[20px] h-[20px]" fill="currentColor" viewBox="0 0 24 24">
             <circle cx="5" cy="12" r="1.5" />
             <circle cx="12" cy="12" r="1.5" />
@@ -554,13 +570,13 @@ export default function ChatArea({
       {loadingHistory && messages.length === 0 ? (
         /* While fetching initial history, show a stable placeholder
            instead of an empty chat that flashes before messages appear */
-        <div className="flex-1 bg-[#111111] flex items-end justify-center pb-6">
+        <div className={`flex-1 flex items-end justify-center pb-6 ${mobile ? "bg-[#ededed]" : "bg-[#111111]"}`}>
           <span className="text-[12px] text-[#5c5c5c]">加载历史消息...</span>
         </div>
       ) : (
         <div
           ref={messagesContainerRef}
-          className="flex-1 overflow-y-auto min-h-0 bg-[#111111]"
+          className={`flex-1 overflow-y-auto min-h-0 ${mobile ? "bg-[#ededed]" : "bg-[#111111]"}`}
         >
           <div className="py-2 pb-1">
             {/* Load older messages indicator */}
@@ -599,6 +615,7 @@ export default function ChatArea({
                   senderName={senderName}
                   avatarUrl={isSelf ? (avatarMap[selfWxid] || "") : senderAvatarUrl}
                   onAvatarClick={handleAvatarClick}
+                  mobile={mobile}
                 />
               );
             })}
@@ -609,6 +626,27 @@ export default function ChatArea({
       )}
 
       {/* ─── Bottom input bar ─── */}
+      {mobile ? (
+        <MobileChatInput
+          input={input}
+          inputMode={inputMode}
+          sending={sending}
+          canSend={canSend}
+          showPlusMenu={showPlusMenu}
+          pendingImages={pendingImages}
+          textareaRef={textareaRef}
+          albumInputRef={albumInputRef}
+          cameraInputRef={cameraInputRef}
+          fileInputRef={fileInputRef}
+          onInput={handleMobileInput}
+          onKeyDown={handleKeyDown}
+          onSend={handleSend}
+          onRemoveImage={removePendingImage}
+          onToggleVoice={() => { setInputMode(inputMode === "text" ? "voice" : "text"); setShowPlusMenu(false); }}
+          onTogglePlus={() => setShowPlusMenu((v) => !v)}
+          onFocus={() => setShowPlusMenu(false)}
+        />
+      ) : (
       <div className="shrink-0 min-h-[176px] border-t border-[#2a2a2a] bg-[#1e1e1e] px-[16px] py-[8px] pb-[max(8px,env(safe-area-inset-bottom))]">
         <div className="h-[34px] flex items-center justify-between">
           <div className="flex items-center gap-[14px]">
@@ -775,6 +813,7 @@ export default function ChatArea({
           </div>
         )}
       </div>
+      )}
 
       {/* Hidden file inputs */}
       <input ref={albumInputRef}  type="file" accept="image/*"          className="hidden" onChange={handleImagePick} />
@@ -793,6 +832,155 @@ export default function ChatArea({
         />
       )}
     </div>
+  );
+}
+
+function MobileChatInput({
+  input,
+  inputMode,
+  sending,
+  canSend,
+  showPlusMenu,
+  pendingImages,
+  textareaRef,
+  albumInputRef,
+  cameraInputRef,
+  fileInputRef,
+  onInput,
+  onKeyDown,
+  onSend,
+  onRemoveImage,
+  onToggleVoice,
+  onTogglePlus,
+  onFocus,
+}: {
+  input: string;
+  inputMode: "text" | "voice";
+  sending: boolean;
+  canSend: boolean;
+  showPlusMenu: boolean;
+  pendingImages: PendingImage[];
+  textareaRef: React.RefObject<HTMLTextAreaElement | null>;
+  albumInputRef: React.RefObject<HTMLInputElement | null>;
+  cameraInputRef: React.RefObject<HTMLInputElement | null>;
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  onInput: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
+  onKeyDown: (e: React.KeyboardEvent) => void;
+  onSend: () => void;
+  onRemoveImage: (id: string) => void;
+  onToggleVoice: () => void;
+  onTogglePlus: () => void;
+  onFocus: () => void;
+}) {
+  return (
+    <div className="shrink-0 border-t border-[#dedede] bg-[#f7f7f7] pb-[env(safe-area-inset-bottom)]">
+      {pendingImages.length > 0 && (
+        <div className="px-[12px] pt-[8px] flex gap-[8px] overflow-x-auto">
+          {pendingImages.map((image) => (
+            <div key={image.id} className="relative w-[58px] h-[58px] shrink-0 rounded-[6px] overflow-hidden bg-white border border-[#ddd]">
+              <img src={image.url} alt="" className="w-full h-full object-cover" draggable={false} />
+              <button
+                type="button"
+                onClick={() => onRemoveImage(image.id)}
+                className="absolute top-[2px] right-[2px] w-[18px] h-[18px] rounded-full bg-black/65 text-white text-[14px] leading-[16px] flex items-center justify-center"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="h-[58px] px-[10px] flex items-center gap-[8px]">
+        <button type="button" onClick={onToggleVoice} className="w-[34px] h-[34px] rounded-full border border-[#222] flex items-center justify-center text-[#222] active:bg-[#e8e8e8]">
+          {inputMode === "text" ? (
+            <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 0 0 6-6v-1.5m-6 7.5a6 6 0 0 1-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 0 1-3-3V4.5a3 3 0 1 1 6 0v8.25a3 3 0 0 1-3 3Z" />
+            </svg>
+          ) : (
+            <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 7h16M4 12h16M4 17h10" />
+            </svg>
+          )}
+        </button>
+
+        <div className="flex-1 min-w-0 h-[38px] bg-white rounded-[4px] flex items-center px-[10px]">
+          {inputMode === "text" ? (
+            <>
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={onInput}
+                onKeyDown={onKeyDown}
+                onFocus={onFocus}
+                rows={1}
+                className="flex-1 h-[24px] leading-[24px] resize-none outline-none bg-transparent text-[16px] text-[#111] overflow-hidden"
+              />
+              <svg className="w-[22px] h-[22px] text-[#777] shrink-0" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 0 0 6-6v-1.5m-6 7.5a6 6 0 0 1-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 0 1-3-3V4.5a3 3 0 1 1 6 0v8.25a3 3 0 0 1-3 3Z" />
+              </svg>
+            </>
+          ) : (
+            <button type="button" className="w-full h-full text-[16px] text-[#444] active:bg-[#f2f2f2]">按住 说话</button>
+          )}
+        </div>
+
+        <button type="button" className="w-[34px] h-[34px] rounded-full border border-[#222] flex items-center justify-center text-[#222] active:bg-[#e8e8e8]">
+          <svg className="w-[24px] h-[24px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15.2 15.2a4.5 4.5 0 0 1-6.4 0M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM9.2 9.8h.01M14.8 9.8h.01" />
+          </svg>
+        </button>
+
+        {canSend ? (
+          <button
+            type="button"
+            disabled={sending}
+            onClick={onSend}
+            className="h-[34px] px-[12px] rounded-[4px] bg-[#07c160] text-white text-[14px] disabled:bg-[#9eddb9]"
+          >
+            {sending ? "发送中" : "发送"}
+          </button>
+        ) : (
+          <button type="button" onClick={onTogglePlus} className="w-[34px] h-[34px] rounded-full border border-[#222] flex items-center justify-center text-[#222] active:bg-[#e8e8e8]">
+            <svg className={`w-[25px] h-[25px] transition-transform ${showPlusMenu ? "rotate-45" : ""}`} fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 5v14M5 12h14" />
+            </svg>
+          </button>
+        )}
+      </div>
+
+      {showPlusMenu && (
+        <div className="h-[330px] bg-[#f7f7f7] border-t border-[#e5e5e5] px-[20px] pt-[18px]">
+          <div className="grid grid-cols-4 gap-y-[20px] gap-x-[18px]">
+            <MobilePlusItem label="Album" onClick={() => albumInputRef.current?.click()} icon={<path d="M4 17 9.5 11.5 13 15l2-2 5 5M5 5h14v14H5zM8.5 9a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" />} />
+            <MobilePlusItem label="Camera" onClick={() => cameraInputRef.current?.click()} icon={<path d="M5 8h3l1.4-2h5.2L16 8h3v10H5zM12 16a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />} />
+            <MobilePlusItem label="Video Call" disabled icon={<path d="M4 7h10v10H4zM14 10l6-3v10l-6-3z" />} />
+            <MobilePlusItem label="Location" disabled icon={<path d="M12 21s6-5.4 6-11a6 6 0 1 0-12 0c0 5.6 6 11 6 11ZM12 12.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4Z" />} />
+            <MobilePlusItem label="Red Packet" disabled icon={<path d="M5 7h14v12H5zM5 7l7 5 7-5M9 4h6v3H9z" />} />
+            <MobilePlusItem label="Gift" disabled icon={<path d="M4 10h16v10H4zM12 10v10M4 14h16M7 6c0-1.2 1-2 2-2 2 0 3 3 3 3s1-3 3-3c1 0 2 .8 2 2s-1 2-2 2H9c-1 0-2-.8-2-2Z" />} />
+            <MobilePlusItem label="Transfer" disabled icon={<path d="M6 8h12M6 16h12M9 5 6 8l3 3M15 13l3 3-3 3" />} />
+            <MobilePlusItem label="Voice Input" onClick={() => fileInputRef.current?.click()} icon={<path d="M12 15a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v7a3 3 0 0 0 3 3ZM5 11a7 7 0 0 0 14 0M12 18v4" />} />
+          </div>
+          <div className="mt-[22px] flex justify-center gap-[8px]">
+            <span className="w-[8px] h-[8px] rounded-full bg-[#888]" />
+            <span className="w-[8px] h-[8px] rounded-full bg-[#d8d8d8]" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MobilePlusItem({ icon, label, onClick, disabled }: { icon: React.ReactNode; label: string; onClick?: () => void; disabled?: boolean }) {
+  return (
+    <button type="button" onClick={disabled ? undefined : onClick} className={`flex flex-col items-center gap-[8px] ${disabled ? "opacity-60" : "active:opacity-70"}`}>
+      <div className="w-[58px] h-[58px] rounded-[12px] bg-white flex items-center justify-center text-[#555] shadow-sm">
+        <svg className="w-[30px] h-[30px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+          {icon}
+        </svg>
+      </div>
+      <span className="text-[12px] leading-[15px] text-[#777] text-center whitespace-nowrap">{label}</span>
+    </button>
   );
 }
 
@@ -836,6 +1024,21 @@ function ContactProfileCard({
   onClose: () => void;
 }) {
   const raw = profile?.profile || {};
+  const isOpenIM = Boolean(raw.OpenIM || wxid.endsWith("@openim"));
+  if (isOpenIM) {
+    return (
+      <OpenIMContactProfileCard
+        wxid={wxid}
+        profile={profile}
+        fallbackName={fallbackName}
+        fallbackAvatar={fallbackAvatar}
+        loading={loading}
+        error={error}
+        onClose={onClose}
+      />
+    );
+  }
+
   const remark = profileField(raw, ["Remark", "remark", "markname"]);
   const nickName = profileField(raw, ["NickName", "nickname", "nick"]);
   const name = remark || profile?.name || nickName || fallbackName || wxid;
@@ -941,6 +1144,215 @@ function ContactProfileCard({
         </div>
       </div>
     </div>
+  );
+}
+
+interface OpenIMInfoItem {
+  title: string;
+  icon: string;
+  desc: string;
+  url: string;
+}
+
+function OpenIMContactProfileCard({
+  wxid,
+  profile,
+  fallbackName,
+  fallbackAvatar,
+  loading,
+  error,
+  onClose,
+}: {
+  wxid: string;
+  profile?: ContactProfile;
+  fallbackName: string;
+  fallbackAvatar: string;
+  loading: boolean;
+  error: string;
+  onClose: () => void;
+}) {
+  const raw = profile?.profile || {};
+  const remark = profileField(raw, ["Remark", "remark", "markname"]);
+  const nickName = profileField(raw, ["NickName", "nickname", "nick"]);
+  const name = remark || profile?.name || nickName || fallbackName || wxid;
+  const avatar = profile?.avatar || raw.SmallHeadImgUrl || raw.BigHeadImgUrl || raw.avatar || fallbackAvatar || "";
+  const sex = Number(raw.Sex || 0);
+  const rows = openimInfoRows(raw);
+  const sourceRow = rows.find((row) => row.title === "来自") || {
+    title: "来自",
+    icon: "https://wwcdn.weixin.qq.com/node/wework/images/glyph_wecom_colored_16.png",
+    desc: profileField(raw, ["SourceText"]) || "企业微信",
+    url: "",
+  };
+  const companyRow = rows.find((row) => row.title === "企业") || {
+    title: "企业",
+    icon: "",
+    desc: profileField(raw, ["OpenIMCompany", "company", "CorpName"]),
+    url: "",
+  };
+  const realNameRow = rows.find((row) => row.title === "实名") || {
+    title: "实名",
+    icon: "",
+    desc: profileField(raw, ["RealName", "realname"]),
+    url: "",
+  };
+  const isFriend = Boolean(
+    remark ||
+    raw.ContactFlag ||
+    raw.FriendFlag ||
+    raw.IsFriend ||
+    raw.is_friend ||
+    raw.is_contact ||
+    raw.ContactType
+  );
+  const showNickname = Boolean(isFriend && nickName && nickName !== name);
+
+  return (
+    <div
+      className="fixed inset-0 z-[9998] bg-black/45 flex items-center justify-center px-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-[420px] bg-[#f7f7f7] text-[#111] rounded-[2px] shadow-2xl overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-[36px] pt-[34px] pb-[24px]">
+          <div className="flex items-start gap-[22px]">
+            {avatar ? (
+              <img
+                src={avatar}
+                alt=""
+                className="w-[88px] h-[88px] rounded-[8px] object-cover bg-[#ddd] shrink-0"
+              />
+            ) : (
+              <div className="w-[88px] h-[88px] rounded-[8px] bg-[#576b95] flex items-center justify-center text-white text-[28px] shrink-0">
+                {(name || wxid)[0] || "?"}
+              </div>
+            )}
+            <div className="min-w-0 flex-1 pt-[2px]">
+              <div className="flex items-center gap-[7px] min-w-0">
+                <h3 className="text-[24px] leading-[30px] font-medium break-words">{name}</h3>
+                {sex > 0 && <SexIcon sex={sex} />}
+              </div>
+              {companyRow.desc && (
+                <div className="mt-[5px] text-[16px] leading-[22px] text-[#ff7f00] truncate">
+                  @{companyRow.desc}
+                </div>
+              )}
+              {showNickname && (
+                <div className="mt-[4px] text-[16px] leading-[22px] text-[#888] truncate">
+                  昵称：{nickName}
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="w-[28px] h-[28px] shrink-0 text-[#777] flex items-center justify-center active:opacity-60"
+              aria-label="关闭"
+            >
+              <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 6l12 12M18 6 6 18" />
+              </svg>
+            </button>
+          </div>
+
+          <div className="h-px bg-[#e6e6e6] my-[28px]" />
+
+          {isFriend && remark && <ProfileRow label="备注" value={remark} />}
+          {isFriend && remark && <div className="h-px bg-[#e6e6e6] my-[24px]" />}
+
+          <div className="text-[17px] leading-[24px] text-[#8a8a8a] mb-[12px]">企业信息</div>
+          {sourceRow.desc && <OpenIMInfoRow item={sourceRow} />}
+          {companyRow.desc && <OpenIMInfoRow item={companyRow} />}
+          {realNameRow.desc && <OpenIMInfoRow item={realNameRow} />}
+
+          {(loading || error) && (
+            <div className={`mt-[18px] text-[13px] ${error ? "text-[#c44545]" : "text-[#888]"}`}>
+              {error || "正在加载资料..."}
+            </div>
+          )}
+        </div>
+
+        <div className="h-px bg-[#e6e6e6]" />
+        {isFriend ? (
+          <div className="grid grid-cols-3 h-[104px] bg-white">
+            <ProfileAction
+              label="发消息"
+              icon={<path d="M4 6.5A3.5 3.5 0 0 1 7.5 3h9A3.5 3.5 0 0 1 20 6.5v5A3.5 3.5 0 0 1 16.5 15H11l-5 4v-4.35A3.5 3.5 0 0 1 4 11.5v-5Z" />}
+              onClick={onClose}
+            />
+            <ProfileAction
+              label="语音聊天"
+              icon={<path d="M6.6 4.2 9 3.6l2 4-1.5 1.5a10.2 10.2 0 0 0 5.4 5.4L16.4 13l4 2-.6 2.4c-.2.8-.9 1.4-1.8 1.3C10.7 18.2 5.8 13.3 5.3 6c-.1-.9.5-1.6 1.3-1.8Z" />}
+            />
+            <ProfileAction
+              label="视频聊天"
+              icon={<path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h7A2.5 2.5 0 0 1 16 6.5v7A2.5 2.5 0 0 1 13.5 16h-7A2.5 2.5 0 0 1 4 13.5v-7Zm12.5 2.2 3.5-2.1v6.8l-3.5-2.1V8.7Z" />}
+            />
+          </div>
+        ) : (
+          <div className="h-[104px] bg-white flex items-center justify-center">
+            <button
+              type="button"
+              className="h-[46px] px-[28px] rounded-[5px] bg-[#07c160] text-white text-[18px] active:bg-[#06ad56]"
+            >
+              添加到通讯录
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function openimInfoRows(raw: Record<string, any>): OpenIMInfoItem[] {
+  let detail = raw.OpenIMDetail;
+  if (!detail && raw.openim_detail) {
+    try {
+      detail = JSON.parse(String(raw.openim_detail));
+    } catch {
+      detail = null;
+    }
+  }
+  const customInfo = Array.isArray(detail?.custom_info) ? detail.custom_info : [];
+  const rows: OpenIMInfoItem[] = [];
+  for (const item of customInfo) {
+    if (!item || typeof item !== "object") continue;
+    const title = String(item.title || "").trim();
+    const firstDetail = Array.isArray(item.detail) ? item.detail.find((row: any) => row?.desc) : null;
+    if (!title || !firstDetail) continue;
+    rows.push({
+      title,
+      icon: String(firstDetail.icon || ""),
+      desc: String(firstDetail.desc || "").trim(),
+      url: String(firstDetail.action_param?.url || ""),
+    });
+  }
+  return rows;
+}
+
+function OpenIMInfoRow({ item }: { item: OpenIMInfoItem }) {
+  const content = (
+    <div className="grid grid-cols-[96px_minmax(0,1fr)] gap-[12px] py-[4px] text-[18px] leading-[28px]">
+      <div className="text-[#8a8a8a]">{item.title}</div>
+      <div className="min-w-0 flex items-center gap-[6px] text-[#111]">
+        {item.icon && <img src={item.icon} alt="" className="w-[20px] h-[20px] object-contain shrink-0" />}
+        <span className="truncate">{item.desc}</span>
+        {item.url && (
+          <svg className="w-[18px] h-[18px] text-[#aaa] shrink-0 ml-auto" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="m9 18 6-6-6-6" />
+          </svg>
+        )}
+      </div>
+    </div>
+  );
+
+  if (!item.url) return content;
+  return (
+    <a href={item.url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()} className="block">
+      {content}
+    </a>
   );
 }
 

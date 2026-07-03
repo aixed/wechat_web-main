@@ -318,6 +318,17 @@ async def get_contact(wxids: list[str]) -> dict:
     return safe_json(r)
 
 
+async def get_openim_contact(wxid: str, gid: str = "") -> dict:
+    """Get Enterprise WeChat/OpenIM contact details from Hook."""
+    name = str(wxid or "").strip()
+    if not name:
+        return {}
+    if not IS_HOOK:
+        return {"error": "GetOpenIMContact is only supported in hook mode"}
+    r = await _post("/GetOpenIMContact", json={"gid": str(gid or ""), "wxid": name})
+    return safe_json(r)
+
+
 async def get_contact_label_list() -> dict:
     """Get contact label id/name list."""
     if IS_HOOK:
