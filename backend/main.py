@@ -18,6 +18,7 @@ import time
 import httpx
 import base64
 import io
+from typing import Any
 
 import config
 import wechat_api
@@ -288,11 +289,12 @@ def _extract_self_wxid(data: dict) -> str:
     )
 
 
-def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid: str = "") -> dict[str, str]:
+def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid: str = "") -> dict[str, Any]:
     if not isinstance(data, dict):
         data = {}
     nested = data.get("data") if isinstance(data.get("data"), dict) else {}
     source = nested or data
+    profile = dict(source)
     wxid = str(
         source.get("wxid")
         or source.get("Wxid")
@@ -324,7 +326,45 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
         or data.get("head_img")
         or ""
     ).strip()
-    return {"wxid": wxid, "nickname": nickname, "avatar": avatar}
+    account = str(
+        source.get("account")
+        or source.get("alias")
+        or source.get("Alias")
+        or source.get("wechat_account")
+        or source.get("userName")
+        or ""
+    ).strip()
+    phone = str(
+        source.get("tel")
+        or source.get("Tel")
+        or source.get("phone")
+        or source.get("Phone")
+        or source.get("mobile")
+        or source.get("Mobile")
+        or ""
+    ).strip()
+    country = str(source.get("country") or source.get("Country") or "").strip()
+    province = str(source.get("province") or source.get("Province") or "").strip()
+    city = str(source.get("city") or source.get("City") or "").strip()
+    display_country = country if country and country.upper() != "CN" else ""
+    region = " ".join(part for part in [display_country, province, city] if part).strip()
+    signature = str(
+        source.get("diy_sign")
+        or source.get("signature")
+        or source.get("Signature")
+        or source.get("sign")
+        or ""
+    ).strip()
+    return {
+        "wxid": wxid,
+        "nickname": nickname,
+        "avatar": avatar,
+        "account": account,
+        "phone": phone,
+        "region": region,
+        "signature": signature,
+        "profile": profile,
+    }
 
 
 def _login_status_from_response(data: dict) -> dict[str, str]:
@@ -360,12 +400,29 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
     agent = agent_manager.get_agent(agent_id) or {}
     current_avatar = str(agent.get("avatar") or "").strip()
     avatar = current_avatar
+    current_phone = str(agent.get("phone") or "").strip()
+    current_region = str(agent.get("region") or "").strip()
+    current_signature = str(agent.get("signature") or "").strip()
+    current_account = str(agent.get("wechat_account") or "").strip()
+    phone = current_phone
+    region = current_region
+    signature = current_signature
+    wechat_account = current_account
+    profile: dict[str, Any] = {}
 
     current_wxid = str(agent.get("wxid") or agent.get("account_id") or wxid or "")
     current_nickname = str(agent.get("nickname") or agent.get("name") or "").strip()
 
     needs_self_profile = status == "5" or (
-        status == "3" and (not wxid or not nickname or not current_avatar)
+        status == "3" and (
+            not wxid
+            or not nickname
+            or not current_avatar
+            or not current_phone
+            or not current_region
+            or not current_signature
+            or not current_account
+        )
     )
     if needs_self_profile:
         try:
@@ -374,6 +431,11 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
             wxid = identity["wxid"] or wxid
             nickname = identity["nickname"] or nickname or current_nickname
             avatar = identity["avatar"] or current_avatar
+            phone = identity["phone"] or current_phone
+            region = identity["region"] or current_region
+            signature = identity["signature"] or current_signature
+            wechat_account = identity["account"] or current_account
+            profile = identity.get("profile") or {}
         except Exception as e:
             _log(f"[LOGIN_STATUS] GetSelfLoginInfo failed agent={agent_id}: {type(e).__name__}: {e}")
 
@@ -392,6 +454,11 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
         wxid=wxid,
         nickname=nickname,
         avatar=avatar,
+        phone=phone,
+        region=region,
+        signature=signature,
+        wechat_account=wechat_account,
+        profile=profile,
         login_status=status,
         login_message=message,
         initialized=initialized,
