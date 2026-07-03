@@ -2067,6 +2067,24 @@ function AccessGate({
   );
 }
 
+function accountStatusMeta(account: WeChatAccount, dark: boolean): { text: string; className: string } {
+  const status = String(account.login_status || "");
+  const message = String(account.login_message || "");
+  const success = dark ? "bg-[#123d27] text-[#49d17d]" : "bg-[#e5f7ed] text-[#078f49]";
+  const warning = dark ? "bg-[#3d3112] text-[#e6bd51]" : "bg-[#fff3d9] text-[#9a6b00]";
+  const neutral = dark ? "bg-[#252525] text-[#aaa]" : "bg-[#f0f0f0] text-[#666]";
+
+  if (status === "5") return { text: message || "点击进入微信", className: warning };
+  if (status === "2") return { text: message || "正在登录中...", className: warning };
+  if (status === "3") {
+    return account.initialized
+      ? { text: "已就绪", className: success }
+      : { text: "初始化中", className: warning };
+  }
+  if (account.initialized) return { text: "已就绪", className: success };
+  return { text: message || "等待登录", className: neutral };
+}
+
 function AccountPortal({
   accounts,
   loading,
@@ -2097,7 +2115,7 @@ function AccountPortal({
         <div className={`h-[96px] px-[24px] flex items-center justify-between border-b ${dark ? "border-[#242424]" : "border-[#e0e0e0]"}`}>
           <div>
             <div className="text-[22px] font-medium">微信账号</div>
-            <div className={`text-[12px] mt-[3px] ${dark ? "text-[#777]" : "text-[#888]"}`}>在线 {accounts.length} 个</div>
+            <div className={`text-[12px] mt-[3px] ${dark ? "text-[#777]" : "text-[#888]"}`}>连接 {accounts.length} 个</div>
             <div className="mt-[9px]">
               <ThemeSwitch theme={theme} onChange={onThemeChange} />
             </div>
@@ -2120,14 +2138,16 @@ function AccountPortal({
           </div>
         </div>
         <div className="flex-1 overflow-y-auto p-[18px]">
-          {loading && accounts.length === 0 && <div className="text-[#777] text-[14px]">正在读取在线微信...</div>}
+          {loading && accounts.length === 0 && <div className="text-[#777] text-[14px]">正在读取微信连接...</div>}
           {accounts.length === 0 && !loading && (
             <div className="text-[#777] text-[14px] leading-[24px]">
-              暂无在线微信。请让客户端 DLL 连接到当前后端 `/agent`。
+              暂无连接的微信。请让客户端 DLL 连接到当前后端 `/agent`。
             </div>
           )}
           <div className="space-y-[12px]">
-            {accounts.map((account) => (
+            {accounts.map((account) => {
+              const meta = accountStatusMeta(account, dark);
+              return (
             <button
                 key={account.id}
                 type="button"
@@ -2143,15 +2163,12 @@ function AccountPortal({
                   <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{account.peer || "connected"}</div>
                   <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#555]" : "text-[#aaa]"}`} title={account.id}>WS {account.id}</div>
                 </div>
-                <div className={`text-[12px] px-[7px] py-[3px] rounded-[4px] ${
-                  account.initialized
-                    ? (dark ? "bg-[#123d27] text-[#49d17d]" : "bg-[#e5f7ed] text-[#078f49]")
-                    : (dark ? "bg-[#3d3112] text-[#e6bd51]" : "bg-[#fff3d9] text-[#9a6b00]")
-                }`}>
-                  {account.initialized ? "已就绪" : "初始化中"}
+                <div className={`text-[12px] px-[7px] py-[3px] rounded-[4px] ${meta.className}`}>
+                  {meta.text}
                 </div>
               </button>
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>
@@ -2233,6 +2250,7 @@ function MobileAccountPortal({
 }) {
   const [showBroadcast, setShowBroadcast] = useState(false);
   const dark = theme === "dark";
+  const statusMeta = (account: WeChatAccount) => accountStatusMeta(account, dark);
   const displayName = (account: WeChatAccount) =>
     (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
     account.wxid ||
@@ -2263,14 +2281,16 @@ function MobileAccountPortal({
         <ThemeSwitch theme={theme} onChange={onThemeChange} />
       </div>
       <div className="flex-1 overflow-y-auto px-[14px] py-[14px] pb-[calc(18px+env(safe-area-inset-bottom))]">
-        {loading && accounts.length === 0 && <div className="text-center text-[#888] text-[14px] mt-[40px]">正在读取在线微信...</div>}
+        {loading && accounts.length === 0 && <div className="text-center text-[#888] text-[14px] mt-[40px]">正在读取微信连接...</div>}
         {!loading && accounts.length === 0 && (
           <div className="text-center text-[#888] text-[14px] leading-[24px] mt-[44px]">
-            暂无在线微信<br />请让客户端 DLL 连接到当前后端 `/agent`
+            暂无连接的微信<br />请让客户端 DLL 连接到当前后端 `/agent`
           </div>
         )}
         <div className="space-y-[12px]">
-          {accounts.map((account) => (
+          {accounts.map((account) => {
+            const meta = statusMeta(account);
+            return (
             <button
               key={account.id}
               type="button"
@@ -2285,15 +2305,12 @@ function MobileAccountPortal({
                 <div className={`text-[13px] truncate mt-[4px] ${dark ? "text-[#888]" : "text-[#888]"}`}>{account.wxid || account.account_id || account.id}</div>
                 <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>WS {account.id}</div>
               </div>
-              <span className={`text-[12px] px-[7px] py-[3px] rounded-full ${
-                account.initialized
-                  ? (dark ? "bg-[#123d27] text-[#49d17d]" : "bg-[#e5f7ed] text-[#07c160]")
-                  : (dark ? "bg-[#3d3112] text-[#e6bd51]" : "bg-[#fff3d9] text-[#b78200]")
-              }`}>
-                {account.initialized ? "已就绪" : "初始化"}
+              <span className={`text-[12px] px-[7px] py-[3px] rounded-full ${meta.className}`}>
+                {meta.text}
               </span>
             </button>
-          ))}
+            );
+          })}
         </div>
       </div>
     </div>

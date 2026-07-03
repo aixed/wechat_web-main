@@ -158,6 +158,7 @@ _ACCOUNT_LOCK = asyncio.Lock()
 _ACCOUNT_CARD_REFRESH_INTERVAL_SEC = 20.0
 _account_card_refresh_at: dict[str, float] = {}
 _account_card_refreshing: set[str] = set()
+_agent_login_status_seen: dict[str, str] = {}
 
 
 def _new_app_state() -> dict:
@@ -256,6 +257,79 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
         or ""
     ).strip()
     return {"wxid": wxid, "nickname": nickname, "avatar": avatar}
+
+
+def _login_status_from_response(data: dict) -> dict[str, str]:
+    if not isinstance(data, dict):
+        data = {}
+    nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+    source = nested or data
+    return {
+        "status": str(source.get("onlinestatus") or source.get("onlineStatus") or source.get("status") or "").strip(),
+        "message": str(source.get("msg") or source.get("message") or source.get("retmsg") or "").strip(),
+        "wxid": str(source.get("selfwxid") or source.get("selfWxid") or source.get("wxid") or "").strip(),
+        "nickname": str(source.get("nickname") or source.get("NickName") or "").strip(),
+    }
+
+
+async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
+    """Poll /IsLoginStatus and update account-card metadata.
+
+    Status 3 is the only state that may continue into expensive initialization.
+    Status 5 means WeChat is at the "enter WeChat" screen; then GetSelfLoginInfo
+    is safe and needed for showing avatar/name/wxid on the account card.
+    """
+    agent_id = str(agent_id or "").strip()
+    if config.AGENT_WS_ENABLED and (not agent_id or not agent_manager.is_connected(agent_id)):
+        return {"status": "", "message": "agent not connected", "wxid": "", "nickname": "", "avatar": ""}
+
+    raw_status = await wechat_api.is_login_status()
+    parsed = _login_status_from_response(raw_status)
+    status = parsed["status"]
+    message = parsed["message"]
+    wxid = parsed["wxid"]
+    nickname = parsed["nickname"]
+    avatar = ""
+
+    agent = agent_manager.get_agent(agent_id) or {}
+    current_wxid = str(agent.get("wxid") or agent.get("account_id") or wxid or "")
+
+    if status == "5":
+        try:
+            self_info = await wechat_api.get_self_info()
+            identity = _self_identity_from_response(self_info, agent_id=agent_id, current_wxid=current_wxid)
+            wxid = identity["wxid"] or wxid
+            nickname = identity["nickname"] or nickname
+            avatar = identity["avatar"]
+        except Exception as e:
+            _log(f"[LOGIN_STATUS] GetSelfLoginInfo failed agent={agent_id}: {type(e).__name__}: {e}")
+
+    if wxid:
+        _self_wxid_to_agent_id[wxid] = agent_id
+    if nickname in {agent_id, wxid}:
+        nickname = ""
+
+    initialized = None if status == "3" else False
+    if status != "3":
+        runtime = _runtime_for(agent_id)
+        runtime["app_state"]["initialized"] = False
+
+    await agent_manager.update_account(
+        agent_id,
+        wxid=wxid,
+        nickname=nickname,
+        avatar=avatar,
+        login_status=status,
+        login_message=message,
+        initialized=initialized,
+    )
+
+    status_key = f"{status}:{message}"
+    if _agent_login_status_seen.get(agent_id) != status_key:
+        _agent_login_status_seen[agent_id] = status_key
+        _log(f"[LOGIN_STATUS] agent={agent_id} onlinestatus={status or '?'} msg={message or '-'} wxid={wxid or '-'}")
+
+    return {"status": status, "message": message, "wxid": wxid, "nickname": nickname, "avatar": avatar}
 
 
 def _put_self_info_field(key: str, value: str) -> None:
@@ -358,28 +432,8 @@ async def _refresh_account_card(agent_id: str) -> None:
         return
 
     try:
-        agent = agent_manager.get_agent(agent_id) or {}
-        current_wxid = str(agent.get("wxid") or agent.get("account_id") or "")
         with wechat_api.use_agent(agent_id):
-            self_info = await wechat_api.get_self_info()
-            identity = _self_identity_from_response(self_info, agent_id=agent_id, current_wxid=current_wxid)
-            wxid = identity["wxid"]
-            nickname = identity["nickname"]
-            avatar = identity["avatar"]
-
-            if wxid and (not nickname or not avatar):
-                brief = _brief_entry_from_response(await wechat_api.batch_get_contact_brief_info(wxid), wxid)
-                if not nickname:
-                    nickname = str(brief.get("name") or "").strip()
-                if not avatar:
-                    avatar = str(brief.get("avatar") or "").strip()
-                if nickname in {agent_id, wxid}:
-                    nickname = ""
-
-            if wxid:
-                _self_wxid_to_agent_id[wxid] = agent_id
-            if wxid or nickname or avatar:
-                await agent_manager.update_account(agent_id, wxid=wxid, nickname=nickname, avatar=avatar)
+            await _refresh_agent_login_status(agent_id)
     except Exception as e:
         _log(f"[ACCOUNT] card refresh failed agent={agent_id}: {type(e).__name__}: {e}")
     finally:
@@ -652,14 +706,15 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}] agent={selected_agent or 'default'}")
     _log("=" * 60)
 
-    # Phase 0 — wait for Hook/Protocol API to be reachable
-    _log("[INIT 0] Checking API connectivity...")
+    # Phase 0 — wait for Hook/Protocol API to be reachable and logged in
+    _log("[INIT 0] Checking login status...")
+    login_status: dict[str, str] = {}
     for attempt in range(15):  # up to 30 seconds
         try:
             # Reset circuit breaker for each attempt
             wechat_api._consecutive_failures = 0
-            test = await wechat_api._post("/IsLoginStatus", json={})
-            _log(f"[INIT 0] ✓ API reachable (status={test.status_code})")
+            login_status = await _refresh_agent_login_status(selected_agent)
+            _log(f"[INIT 0] ✓ IsLoginStatus onlinestatus={login_status.get('status') or '?'} msg={login_status.get('message') or '-'}")
             wechat_api._consecutive_failures = 0
             break
         except Exception as e:
@@ -667,8 +722,17 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
             _log(f"[INIT 0] Waiting for API... ({(attempt+1)*2}s) {type(e).__name__}")
             await asyncio.sleep(2)
     else:
-        _log("[INIT 0] ⚠ API not reachable after 30s, continuing anyway...")
+        _log("[INIT 0] ⚠ API not reachable after 30s, skip initialization")
+        app_state["initialized"] = False
+        await agent_manager.update_account(selected_agent, initialized=False, login_message="接口未就绪")
+        return False
     wechat_api._consecutive_failures = 0  # ensure clean slate for init
+
+    if str(login_status.get("status") or "") != "3":
+        _log(f"[INIT 0] ⏸ WeChat not logged in; skip initialization. status={login_status.get('status') or '?'} msg={login_status.get('message') or '-'}")
+        app_state["initialized"] = False
+        await agent_manager.update_account(selected_agent, initialized=False)
+        return False
 
     # Phase 1 — run sequentially to avoid concurrent Hook access (Hook is NOT thread-safe)
     try:
@@ -874,9 +938,12 @@ async def _run_initialization_after_agent():
         while not agent_manager.is_connected():
             await asyncio.sleep(1)
         for agent_id in agent_manager.uninitialized_agent_ids():
-            _log(f"[INIT] DLL agent connected; starting Hook initialization for {agent_id}")
             async with _ACCOUNT_LOCK:
                 with wechat_api.use_agent(agent_id):
+                    login_status = await _refresh_agent_login_status(agent_id)
+                    if str(login_status.get("status") or "") != "3":
+                        continue
+                    _log(f"[INIT] WeChat logged in; starting Hook initialization for {agent_id}")
                     await _run_backend_initialization(agent_id)
         await asyncio.sleep(1)
 
@@ -1010,8 +1077,16 @@ async def activate_account(req: ActivateAccountRequest):
     async with _ACCOUNT_LOCK:
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
-        if not app_state.get("initialized"):
-            with wechat_api.use_agent(agent_id):
+        with wechat_api.use_agent(agent_id):
+            login_status = await _refresh_agent_login_status(agent_id)
+            if str(login_status.get("status") or "") != "3":
+                return {
+                    "ok": False,
+                    "error": "wechat not logged in",
+                    "login_status": login_status,
+                    "account": agent_manager.get_agent(agent_id),
+                }
+            if not app_state.get("initialized"):
                 await _run_backend_initialization(agent_id)
     return {"ok": True, "active_id": agent_id, "account": agent_manager.get_agent(agent_id)}
 
@@ -2778,8 +2853,11 @@ async def _ensure_account_contacts(agent_id: str):
     async with _ACCOUNT_LOCK:
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
-        if not app_state.get("initialized"):
-            with wechat_api.use_agent(agent_id):
+        with wechat_api.use_agent(agent_id):
+            login_status = await _refresh_agent_login_status(agent_id)
+            if str(login_status.get("status") or "") != "3":
+                raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
+            if not app_state.get("initialized"):
                 await _run_backend_initialization(agent_id)
         cached_contacts = app_state.get("contacts")
         if cached_contacts:
@@ -2819,12 +2897,21 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
     total = 0
     account_targets: dict[str, int] = {}
     work_items: list[tuple[str, str]] = []
+    skipped_results: list[dict] = []
 
     for agent_id in agent_ids:
-        if direct_targets:
-            target_wxids = direct_targets
-        else:
-            target_wxids = await _resolve_account_broadcast_targets(agent_id, target_types)
+        try:
+            if direct_targets:
+                with wechat_api.use_agent(agent_id):
+                    login_status = await _refresh_agent_login_status(agent_id)
+                if str(login_status.get("status") or "") != "3":
+                    raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
+                target_wxids = direct_targets
+            else:
+                target_wxids = await _resolve_account_broadcast_targets(agent_id, target_types)
+        except Exception as e:
+            target_wxids = []
+            skipped_results.append({"agent_id": agent_id, "wxid": "", "ok": False, "error": f"{type(e).__name__}: {e}"})
         account_targets[agent_id] = len(target_wxids)
         total += len(target_wxids)
         work_items.extend((agent_id, wxid) for wxid in target_wxids)
@@ -2844,6 +2931,7 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
                 return {"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
     results = await asyncio.gather(*(_send_one(agent_id, wxid) for agent_id, wxid in work_items)) if work_items else []
+    results = skipped_results + results
     sent = sum(1 for row in results if row.get("ok"))
     failed = len(results) - sent
 
@@ -2910,7 +2998,20 @@ async def multi_account_broadcast_image_upload(
     total_targets = 0
     account_targets: dict[str, int] = {}
     for agent_id in selected_agents:
-        agent_targets = target_wxids or await _resolve_account_broadcast_targets(agent_id, parsed_target_types)
+        try:
+            if target_wxids:
+                with wechat_api.use_agent(agent_id):
+                    login_status = await _refresh_agent_login_status(agent_id)
+                if str(login_status.get("status") or "") != "3":
+                    raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
+                agent_targets = target_wxids
+            else:
+                agent_targets = await _resolve_account_broadcast_targets(agent_id, parsed_target_types)
+        except Exception as e:
+            account_targets[agent_id] = 0
+            failed += 1
+            results.append({"agent_id": agent_id, "wxid": "", "ok": False, "error": f"{type(e).__name__}: {e}"})
+            continue
         account_targets[agent_id] = len(agent_targets)
         total_targets += len(agent_targets)
         if not agent_targets:

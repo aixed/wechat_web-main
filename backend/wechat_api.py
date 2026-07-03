@@ -272,6 +272,14 @@ async def get_self_info() -> dict:
     return safe_json(r)
 
 
+async def is_login_status() -> dict:
+    """Return WeChat login status before any initialization-heavy Hook calls."""
+    if IS_HOOK:
+        r = await _post("/IsLoginStatus", json={}, timeout=5.0, bypass_circuit_breaker=True)
+        return safe_json(r)
+    return {"msg": "登陆完成！", "onlinestatus": "3"}
+
+
 async def init_contact() -> dict:
     """Initialize contact list (must call before GetFriendAndChatRoomList).
 
