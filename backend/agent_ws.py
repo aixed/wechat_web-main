@@ -83,6 +83,8 @@ class AgentWebSocketManager:
             if wxid:
                 conn.wxid = wxid
                 conn.account_id = wxid
+                if conn.nickname == conn.id:
+                    conn.nickname = ""
             if nickname:
                 conn.nickname = nickname
             if avatar:
@@ -292,6 +294,7 @@ class AgentWebSocketManager:
         if message_agent_id:
             await self._bind_agent_id(conn, message_agent_id)
         self._update_metadata_from_message(conn, message)
+        await self._dedupe_same_wxid(conn)
 
         if msg_type == "hello" or (msg_type in {"", "register"} and message_agent_id):
             body = self._metadata_for_connection(conn)
@@ -393,6 +396,8 @@ class AgentWebSocketManager:
         if self_wxid:
             conn.wxid = self_wxid
             conn.account_id = self_wxid
+            if conn.nickname == conn.id:
+                conn.nickname = ""
 
         server_port = str(
             message.get("ServerPort")
@@ -410,6 +415,29 @@ class AgentWebSocketManager:
         if conn.server_port:
             body["ServerPort"] = conn.server_port
         return body
+
+    async def _dedupe_same_wxid(self, conn: AgentConnection) -> None:
+        wxid = str(conn.wxid or "").strip()
+        if not wxid:
+            return
+
+        old_conns: list[AgentConnection] = []
+        async with self._lock:
+            for cid, item in list(self._connections.items()):
+                if item is conn or not item.registered or item.wxid != wxid:
+                    continue
+                self._connections.pop(cid, None)
+                old_conns.append(item)
+                if self._active_id == cid:
+                    self._active_id = conn.id
+
+        for old_conn in old_conns:
+            for future in old_conn.pending.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("wechat account reconnected"))
+            old_conn.pending = {}
+            await self._close_socket(old_conn.websocket, code=1012, reason="wechat account reconnected")
+            print(f"[AGENT_WS] replaced wxid={wxid} old_id={old_conn.id} new_id={conn.id}", flush=True)
 
     async def _bind_agent_id(self, conn: AgentConnection, agent_id: str) -> None:
         agent_id = str(agent_id or "").strip()

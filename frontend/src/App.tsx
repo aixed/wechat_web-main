@@ -1566,6 +1566,12 @@ function AccountPortal({
   onSelectAccount: (account: WeChatAccount) => void;
   onLogout: () => void;
 }) {
+  const accountDisplayName = (account: WeChatAccount) =>
+    (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
+    account.wxid ||
+    account.account_id ||
+    "微信";
+
   return (
     <div className="h-dvh w-screen bg-[#111111] text-[#e8e8e8] overflow-hidden flex">
       <div className="w-[420px] max-w-[44vw] min-w-[340px] border-r border-[#2b2b2b] h-full flex flex-col">
@@ -1604,13 +1610,14 @@ function AccountPortal({
                 key={account.id}
                 type="button"
                 onClick={() => onSelectAccount(account)}
-                className="w-full min-h-[82px] rounded-[6px] bg-[#1b1b1b] hover:bg-[#242424] active:bg-[#2b2b2b] border border-[#2b2b2b] p-[14px] flex items-center gap-[14px] text-left"
+                className="w-full min-h-[100px] rounded-[6px] bg-[#1b1b1b] hover:bg-[#242424] active:bg-[#2b2b2b] border border-[#2b2b2b] p-[14px] flex items-center gap-[14px] text-left"
               >
                 <AccountAvatar account={account} />
                 <div className="min-w-0 flex-1">
-                  <div className="text-[18px] truncate">{account.nickname || account.wxid || account.id}</div>
+                  <div className="text-[18px] truncate">{accountDisplayName(account)}</div>
                   <div className="text-[12px] text-[#888] truncate mt-[5px]">{account.wxid || account.account_id || account.id}</div>
                   <div className="text-[12px] text-[#666] truncate mt-[3px]">{account.peer || "connected"}</div>
+                  <div className="text-[11px] text-[#555] truncate mt-[3px]" title={account.id}>WS {account.id}</div>
                 </div>
                 <div className={`text-[12px] px-[7px] py-[3px] rounded-[4px] ${
                   account.initialized ? "bg-[#123d27] text-[#49d17d]" : "bg-[#3d3112] text-[#e6bd51]"
@@ -1631,7 +1638,7 @@ function AccountPortal({
 
 function AccountAvatar({ account }: { account: WeChatAccount }) {
   const [failed, setFailed] = useState(false);
-  const name = account.nickname || account.wxid || account.id || "?";
+  const name = (account.nickname && account.nickname !== account.id ? account.nickname : "") || account.wxid || account.account_id || "?";
   if (account.avatar && !failed) {
     return <img src={account.avatar} alt="" className="w-[54px] h-[54px] rounded-[5px] object-cover bg-[#333]" onError={() => setFailed(true)} />;
   }
@@ -1720,7 +1727,9 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
                     onChange={() => toggleAgent(account.id)}
                     className="accent-[#07c160]"
                   />
-                  <span className="text-[13px]">{account.nickname || account.wxid || account.id}</span>
+                  <span className="text-[13px]">
+                    {(account.nickname && account.nickname !== account.id ? account.nickname : "") || account.wxid || account.id}
+                  </span>
                 </label>
               ))}
             </div>
