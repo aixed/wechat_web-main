@@ -2777,19 +2777,29 @@ async def post_contacts_profile_batch(req: ProfileBatchRequest):
 
 
 @app.get("/api/sessions")
-async def get_sessions():
+async def get_sessions(request: Request):
     """Get current session (conversation) list from cache."""
+    agent_id = _request_agent_id(request)
+    if agent_id and agent_manager.is_connected(agent_id):
+        await agent_manager.set_active(agent_id)
+        _activate_runtime(agent_id)
+        _load_session_cache_into_state(_contact_owner_wxid())
     return app_state["sessions"] or {}
 
 
 @app.get("/api/sessions/refresh")
-async def refresh_sessions():
+async def refresh_sessions(request: Request):
     """Load session list once from native WeChat DB, then serve local SQLite cache."""
     t0 = time.time()
+    agent_id = _request_agent_id(request)
+    if agent_id and agent_manager.is_connected(agent_id):
+        await agent_manager.set_active(agent_id)
+        _activate_runtime(agent_id)
     owner_wxid = _contact_owner_wxid()
     if not app_state.get("session_list_loaded"):
         try:
-            db_sessions = await _query_session_list_from_db()
+            with wechat_api.use_agent(agent_id or _active_agent_id or agent_manager.active_id()):
+                db_sessions = await _query_session_list_from_db()
             session_rows = db_sessions.get("data", []) if isinstance(db_sessions, dict) else []
             if session_rows:
                 sqlite_cache.upsert_sessions(session_rows, owner_wxid=owner_wxid)
