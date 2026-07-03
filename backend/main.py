@@ -33,6 +33,45 @@ def _log(msg: str):
     print(msg, flush=True)
 
 
+_RUN_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".run")
+_CALLBACK_SAMPLE_PATH = os.path.join(_RUN_DIR, "callback_samples.jsonl")
+_CALLBACK_SAMPLE_ENABLED = os.environ.get("WECHAT_CALLBACK_SAMPLE_LOG", "0") == "1"
+
+
+def _scrub_callback_payload(value, max_string: int = 500):
+    """Return a log-friendly callback sample without huge binary fields."""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if lowered in {"img_base64", "pb_msg", "voice_hex", "voice_data", "filedata"}:
+                out[key] = f"<omitted len={len(str(item or ''))}>"
+            else:
+                out[key] = _scrub_callback_payload(item, max_string=max_string)
+        return out
+    if isinstance(value, list):
+        return [_scrub_callback_payload(item, max_string=max_string) for item in value[:10]]
+    if isinstance(value, str) and len(value) > max_string:
+        return value[:max_string] + f"...(truncated,total_len={len(value)})"
+    return value
+
+
+def _log_callback_sample(data: dict) -> None:
+    if not _CALLBACK_SAMPLE_ENABLED:
+        return
+    try:
+        os.makedirs(_RUN_DIR, exist_ok=True)
+        sample = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "top_keys": list(data.keys()) if isinstance(data, dict) else [],
+            "sample": _scrub_callback_payload(data),
+        }
+        with open(_CALLBACK_SAMPLE_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+    except Exception as e:
+        _log(f"[CALLBACK_SAMPLE] write failed: {type(e).__name__}: {e}")
+
+
 def _detect_callback_image_ext(data: bytes) -> str:
     """Detect common image formats from magic bytes. Defaults to jpg."""
     if not data:
@@ -48,11 +87,27 @@ def _detect_callback_image_ext(data: bytes) -> str:
     return "jpg"
 
 
-def _save_img_base64_to_cache(img_b64: str, msg_id: str) -> tuple[str | None, int]:
-    """Decode img_base64 and save to backend cache. Returns (filepath_or_None, byte_len)."""
-    if not img_b64:
+def _detect_callback_file_ext(data: bytes, default_ext: str = "bin") -> str:
+    if not data:
+        return default_ext
+    if data[:3] == b"GIF":
+        return "gif"
+    if data[:4] == b"\x89PNG":
+        return "png"
+    if data[:2] == b"\xff\xd8":
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:4] in (b"\x00\x00\x00\x18", b"\x00\x00\x00\x20") and b"ftyp" in data[:16]:
+        return "mp4"
+    return default_ext
+
+
+def _save_callback_base64_to_cache(data_b64: str, msg_id: str, media_kind: str, default_ext: str) -> tuple[str | None, int]:
+    """Decode callback base64 and save to backend cache."""
+    if not data_b64:
         return None, 0
-    s = str(img_b64).strip()
+    s = str(data_b64).strip()
     # Strip possible data URI prefix: data:image/png;base64,...
     if "," in s[:100] and "base64" in s[:100].lower():
         s = s.split(",", 1)[1].strip()
@@ -65,22 +120,27 @@ def _save_img_base64_to_cache(img_b64: str, msg_id: str) -> tuple[str | None, in
     if not blob or len(blob) < 16:
         return None, 0
     # Guardrail: avoid accidental huge payloads
-    if len(blob) > 30 * 1024 * 1024:
-        _log(f"[IMG_BASE64] Skip too-large payload: {len(blob)} bytes")
+    if len(blob) > 100 * 1024 * 1024:
+        _log(f"[CALLBACK_BASE64] Skip too-large {media_kind}: {len(blob)} bytes")
         return None, len(blob)
 
-    cb_dir = os.path.join(_IMG_CACHE_DIR, "callback")
+    cb_dir = os.path.join(_IMG_CACHE_DIR, "callback", media_kind)
     os.makedirs(cb_dir, exist_ok=True)
     safe_id = "".join(c for c in (msg_id or "") if c.isalnum() or c in ("_", "-", "."))[:80] or f"cb_{int(time.time())}"
-    ext = _detect_callback_image_ext(blob)
+    ext = _detect_callback_file_ext(blob, default_ext)
     filepath = os.path.join(cb_dir, f"{safe_id}.{ext}")
     try:
         with open(filepath, "wb") as f:
             f.write(blob)
         return filepath, len(blob)
     except Exception as e:
-        _log(f"[IMG_BASE64] Save failed: {type(e).__name__}: {e}")
+        _log(f"[CALLBACK_BASE64] Save failed: {type(e).__name__}: {e}")
         return None, len(blob)
+
+
+def _save_img_base64_to_cache(img_b64: str, msg_id: str) -> tuple[str | None, int]:
+    """Decode img_base64 and save to backend cache. Returns (filepath_or_None, byte_len)."""
+    return _save_callback_base64_to_cache(img_b64, msg_id, "image", "jpg")
 
 
 # ─── Pending CDN image downloads (bridge callback → download endpoint) ──
@@ -582,11 +642,14 @@ def _normalize_callback_message(msg: dict, sendorrecv: str, self_wxid: str) -> t
         "img_path": msg.get("img_path"),
         "img_len": msg.get("img_len"),
         "video_path": msg.get("video_path"),
+        "video_len": msg.get("video_len"),
         "voice_len": msg.get("voice_len"),
         "voice_hex": msg.get("voice_hex"),
         "voice_data": msg.get("voice_data"),
         "gif_path": msg.get("gif_path"),
+        "gif_len": msg.get("gif_len"),
         "file_path": msg.get("file_path"),
+        "file_len": msg.get("file_len"),
         "info": msg.get("info"),
         "msgsource": msg.get("msgsource"),
     }
@@ -1031,86 +1094,26 @@ async def activate_account(req: ActivateAccountRequest):
     return {"ok": True, "active_id": agent_id, "account": agent_manager.get_agent(agent_id)}
 
 
-# ─── Direction verification (DB-based) ────────────────────────────
-
-async def _verify_msg_directions(
-    messages: list[tuple[str, dict]], self_wxid: str
-) -> None:
-    """Verify and correct message direction using the DB ``IsSender`` flag.
-
-    The Hook DLL (RecvType=1) may incorrectly report phone-sent *sync*
-    messages as *received*, with ``fromid`` set to the conversation partner
-    instead of self.  This function queries the WeChat local DB for the
-    true ``IsSender`` value and corrects in-place if needed.
-    """
-    if not self_wxid or not messages:
-        return
-
-    # Collect non-group, non-self-sent messages with a real MsgSvrID
-    verify: list[tuple[int, str]] = []
-    for i, (_chat_id, msg) in enumerate(messages):
-        if (msg.get("isSender") == 0
-                and not msg.get("fromgid")
-                and msg.get("id")
-                and not str(msg["id"]).startswith("cb_")):
-            verify.append((i, str(msg["id"])))
-
-    if not verify:
-        return
-
-    svrids = [s for _, s in verify]
-    _log(f"[DIR_VERIFY] Checking {len(svrids)} messages: {svrids}")
-
-    # Batch query across all MSG*.db files in parallel
-    ids_sql = ",".join(f"'{s}'" for s in svrids)
-    sql = f"SELECT MsgSvrID, IsSender FROM MSG WHERE MsgSvrID IN ({ids_sql})"
-
-    is_sender_map: dict[str, bool] = {}
-    try:
-        tasks = [
-            wechat_api.query_db(db, sql, timeout=2.0)
-            for db in ["MSG0.db", "MSG1.db", "MSG2.db", "MSG3.db"]
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception):
-                continue
-            if isinstance(r, dict):
-                rows = r.get("data", [])
-                if isinstance(rows, list):
-                    for row in rows:
-                        if isinstance(row, dict):
-                            svrid = str(row.get("MsgSvrID", ""))
-                            if svrid and str(row.get("IsSender", "0")) == "1":
-                                is_sender_map[svrid] = True
-    except Exception as e:
-        _log(f"[DIR_VERIFY] DB query error: {e}")
-        return
-
-    # Correct messages where DB says self-sent
-    for idx, svrid in verify:
-        if is_sender_map.get(svrid):
-            _chat_id, msg = messages[idx]
-            old_from = msg["fromid"]
-            msg["sendorrecv"] = "1"
-            msg["isSender"] = 1
-            msg["fromid"] = self_wxid
-            msg["toid"] = old_from
-            # For self-sent DM: chat_id = the conversation partner (recipient)
-            new_chat_id = old_from
-            messages[idx] = (new_chat_id, msg)
-            _log(f"[DIR_FIX] ✓ {svrid}: corrected to self-sent (was from={old_from})")
-
-    if is_sender_map:
-        _log(f"[DIR_FIX] Corrected {len(is_sender_map)} message(s)")
-
-
 # ─── WeChat Hook Callback (receives messages from Hook) ────────────
 
 @app.post("/api/callback")
 async def wechat_callback(request: Request):
     """Receive messages from WeChat Hook and broadcast to frontend via WebSocket."""
-    data = await request.json()
+    raw_body = await request.body()
+    try:
+        data = json.loads(raw_body.decode("utf-8-sig"))
+    except Exception:
+        try:
+            form = await request.form()
+            data = dict(form)
+        except Exception:
+            data = {"raw": raw_body.decode("utf-8", errors="replace")}
+    if not isinstance(data, dict):
+        data = {"raw": data}
+    original_path = request.headers.get("x-original-callback-path", "")
+    if original_path:
+        data.setdefault("_callback_path", original_path)
+    _log_callback_sample(data)
 
     # Log top-level callback keys for debugging CDN download callbacks
     top_keys = list(data.keys()) if isinstance(data, dict) else []
@@ -1154,7 +1157,7 @@ async def wechat_callback(request: Request):
         msglist = data.get("msglist", []) or []
     normalized_messages: list[dict] = []
     session_updates: list[dict] = []
-    pre_messages: list[tuple[str, dict]] = []  # (chat_id, normalized) — stored after direction verify
+    pre_messages: list[tuple[str, dict]] = []  # (chat_id, normalized) — stored after callback normalization
 
     # Check if there are pending CDN downloads (for smarter callback matching)
     async with _pending_cdn_lock:
@@ -1173,37 +1176,66 @@ async def wechat_callback(request: Request):
             svrid = msg.get("msgsvrid", "")
             _log(f"[CB_MSG] keys={keys} type={msgtype_dbg} svrid={svrid} has_b64={has_b64} has_path={has_path}")
 
-        # If image arrives as base64 (common in remote_hook), decode+cache and convert to img_path.
-        # This keeps websocket payload small and lets frontend reuse existing img_path rendering.
+        # If media arrives as base64 (common in remote_hook), decode+cache and
+        # convert to a local path. This keeps websocket payload small and lets
+        # frontend reuse existing media rendering without querying WeChat DB.
         try:
-            img_b64 = msg.get("img_base64") if isinstance(msg, dict) else None
-            if img_b64:
+            if isinstance(msg, dict):
                 mid = str(msg.get("msgsvrid", "") or msg.get("clientmsgid", "") or f"cb_{int(time.time())}")
-                saved, blen = _save_img_base64_to_cache(str(img_b64), mid)
-                if saved:
-                    msg["img_path"] = saved
+                media_specs = [
+                    ("img_base64", "img_path", "image", "jpg"),
+                    ("video_base64", "video_path", "video", "mp4"),
+                    ("file_base64", "file_path", "file", "bin"),
+                    ("gif_base64", "gif_path", "gif", "gif"),
+                ]
+            else:
+                media_specs = []
+                mid = ""
+
+            for source_key, path_key, media_kind, default_ext in media_specs:
+                media_b64 = msg.get(source_key)
+                if not media_b64:
+                    continue
+                saved, blen = _save_callback_base64_to_cache(
+                    str(media_b64),
+                    f"{mid}_{media_kind}" if media_kind != "image" else mid,
+                    media_kind,
+                    default_ext,
+                )
+                if not saved:
+                    continue
+                msg[path_key] = saved
+                if media_kind == "image":
                     msg["img_len"] = msg.get("img_len") or blen
-                    msg.pop("img_base64", None)  # don't broadcast giant base64
-                    _log(f"[IMG_BASE64] cached → {saved} ({blen} bytes)")
-                    # Try to fulfill pending CDN download by msgsvrid
-                    matched = await _fulfill_cdn_pending(f"msgsvrid:{mid}", saved)
-                    if matched:
-                        _log(f"[IMG_BASE64] ✓ Fulfilled pending CDN by msgsvrid:{mid}")
-                    # If no match by msgsvrid AND there are pending CDN downloads,
-                    # this might be a CDN_Download_Pic callback with a different msgsvrid.
-                    # Since we serialize CDN downloads (1 at a time), fulfilling the
-                    # single pending download is safe.
-                    if not matched and has_pending_cdn:
-                        _log(f"[IMG_BASE64] No msgsvrid match, trying to fulfill pending CDN downloads...")
-                        await _fulfill_all_cdn_pending(saved)
-                        # Also resolve inflight dedup futures
-                        async with _inflight_cdn_lock:
-                            for k, ifut in list(_inflight_cdn_downloads.items()):
-                                if not ifut.done():
-                                    ifut.set_result(saved)
-                            _inflight_cdn_downloads.clear()
+                elif media_kind == "video":
+                    msg["video_len"] = msg.get("video_len") or blen
+                elif media_kind == "file":
+                    msg["file_len"] = msg.get("file_len") or blen
+                msg.pop(source_key, None)
+                _log(f"[CALLBACK_BASE64] cached {media_kind} → {saved} ({blen} bytes)")
+
+                if media_kind != "image":
+                    continue
+
+                # Try to fulfill pending CDN download by msgsvrid
+                matched = await _fulfill_cdn_pending(f"msgsvrid:{mid}", saved)
+                if matched:
+                    _log(f"[IMG_BASE64] ✓ Fulfilled pending CDN by msgsvrid:{mid}")
+                # If no match by msgsvrid AND there are pending CDN downloads,
+                # this might be a CDN_Download_Pic callback with a different msgsvrid.
+                # Since we serialize CDN downloads (1 at a time), fulfilling the
+                # single pending download is safe.
+                if not matched and has_pending_cdn:
+                    _log(f"[IMG_BASE64] No msgsvrid match, trying to fulfill pending CDN downloads...")
+                    await _fulfill_all_cdn_pending(saved)
+                    # Also resolve inflight dedup futures
+                    async with _inflight_cdn_lock:
+                        for k, ifut in list(_inflight_cdn_downloads.items()):
+                            if not ifut.done():
+                                ifut.set_result(saved)
+                        _inflight_cdn_downloads.clear()
         except Exception as e:
-            _log(f"[IMG_BASE64] decode error: {type(e).__name__}: {e}")
+            _log(f"[CALLBACK_BASE64] decode error: {type(e).__name__}: {e}")
 
         msgtype = str(msg.get("msgtype", ""))
         fromid = msg.get("fromid", "")
@@ -1225,11 +1257,9 @@ async def wechat_callback(request: Request):
             continue
         pre_messages.append((chat_id, normalized))
 
-    # ── DB-based direction verification ──────────────────────────
-    # Hook DLL (RecvType=1) may report phone-sent sync messages as received
-    # with fromid = conversation partner.  Check DB IsSender to correct.
-    if pre_messages and self_wxid:
-        await _verify_msg_directions(pre_messages, self_wxid)
+    # Callback payloads already contain either decoded content (RecvType=1)
+    # or PB data (RecvType=2). Do not query WeChat DB from the callback path:
+    # Hook QueryDB is not concurrency-safe and can crash the client.
 
     # ── Lazy profile hydration for new incoming senders ───────────
     profile_updates: dict[str, dict] = {}
@@ -1284,13 +1314,20 @@ async def wechat_callback(request: Request):
     return {"status": "success"}
 
 
-if config.CALLBACK_PATH != "/api/callback":
-    app.add_api_route(
-        config.CALLBACK_PATH,
-        wechat_callback,
-        methods=["POST"],
-        include_in_schema=False,
-    )
+_CALLBACK_PATH_ALIASES = {
+    "/api/callback",
+    config.CALLBACK_PATH,
+    "/receiveChatBotMsg",
+    "/receiveChatBotMsg/msg",
+}
+for _callback_alias in sorted(_CALLBACK_PATH_ALIASES):
+    if _callback_alias != "/api/callback":
+        app.add_api_route(
+            _callback_alias,
+            wechat_callback,
+            methods=["POST"],
+            include_in_schema=False,
+        )
 
 
 # ─── WebSocket (frontend connection) ───────────────────────────────
@@ -2334,15 +2371,31 @@ async def refresh_sessions():
 @app.get("/api/messages/{wxid}")
 async def get_messages(wxid: str, limit: int = 50, db: str = "MSG0.db"):
     """Get chat history for a contact/group.
-    Prefer local SQLite cache once a wxid has been initialized; query Hook DB
-    only for first-time cache warmup.
+    Prefer local SQLite cache. Callback messages are persisted immediately, so
+    reopening a chat can show cached content without touching Hook QueryDB.
     """
     owner_wxid = _contact_owner_wxid()
-    if sqlite_cache.has_initialized(wxid, owner_wxid=owner_wxid):
-        cached = sqlite_cache.get_messages(wxid, limit, owner_wxid=owner_wxid)
-        if cached:
+    initialized = sqlite_cache.has_initialized(wxid, owner_wxid=owner_wxid)
+    cached = sqlite_cache.get_messages(wxid, limit, owner_wxid=owner_wxid)
+    if cached:
+        if initialized:
             message_store.add_history(wxid, cached)
-        return {"data": message_store.get_messages(wxid, limit), "source": "sqlite"}
+            source = "sqlite"
+        else:
+            message_store.add_history_no_flag(wxid, cached)
+            source = "sqlite_partial"
+        return {"data": message_store.get_messages(wxid, limit), "source": source}
+
+    if initialized:
+        existing = message_store.get_messages(wxid, limit)
+        if existing:
+            return {"data": existing, "source": "memory"}
+        return {"data": [], "source": "sqlite"}
+
+    if message_store.is_db_loaded(wxid):
+        existing = message_store.get_messages(wxid, limit)
+        if existing:
+            return {"data": existing, "source": "memory"}
 
     history = await wechat_api.get_chat_history(wxid, max(limit, 100))
     rows = history.get("data", []) if isinstance(history, dict) else []
@@ -4103,7 +4156,6 @@ def _run_callback_server():
     import httpx as _httpx
     _proxy_client = _httpx.AsyncClient(timeout=60.0)
 
-    @cb_app.post("/api/callback")
     async def _cb_proxy(request: _Req):
         """Forward the callback to the main app via HTTP (loopback).
 
@@ -4113,12 +4165,20 @@ def _run_callback_server():
         import asyncio as _aio
         body = await request.body()
         ct = request.headers.get("content-type", "application/json")
+        if not body and request.query_params:
+            body = json.dumps(dict(request.query_params), ensure_ascii=False).encode("utf-8")
+            ct = "application/json"
         _url = f"http://127.0.0.1:{config.SERVER_PORT}/api/callback"
         last_err = None
         for attempt in range(6):  # up to ~15s of retries
             try:
                 resp = await _proxy_client.post(
-                    _url, content=body, headers={"content-type": ct},
+                    _url,
+                    content=body,
+                    headers={
+                        "content-type": ct,
+                        "x-original-callback-path": request.url.path,
+                    },
                 )
                 from starlette.responses import Response as _Resp
                 return _Resp(
@@ -4137,13 +4197,28 @@ def _run_callback_server():
              f"{type(last_err).__name__}: {last_err}")
         return {"error": str(last_err)}
 
-    if config.CALLBACK_PATH != "/api/callback":
-        cb_app.add_api_route(
-            config.CALLBACK_PATH,
-            _cb_proxy,
-            methods=["POST"],
-            include_in_schema=False,
-        )
+    cb_app.add_api_route(
+        "/api/callback",
+        _cb_proxy,
+        methods=["GET", "POST"],
+        include_in_schema=False,
+    )
+
+    for _callback_alias in sorted(_CALLBACK_PATH_ALIASES):
+        if _callback_alias != "/api/callback":
+            cb_app.add_api_route(
+                _callback_alias,
+                _cb_proxy,
+                methods=["GET", "POST"],
+                include_in_schema=False,
+            )
+
+    cb_app.add_api_route(
+        "/{full_path:path}",
+        _cb_proxy,
+        methods=["GET", "POST"],
+        include_in_schema=False,
+    )
 
     @cb_app.get("/api/media/image")
     async def _cb_serve_image(path: str):

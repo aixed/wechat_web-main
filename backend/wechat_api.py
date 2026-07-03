@@ -36,6 +36,7 @@ client = httpx.AsyncClient(base_url=HOOK_BASE_URL, timeout=_DEFAULT_TIMEOUT)
 # Request counter
 _req_id = 0
 _CURRENT_AGENT_ID: contextvars.ContextVar[str] = contextvars.ContextVar("wechat_agent_id", default="")
+_query_db_locks: dict[str, asyncio.Lock] = {}
 
 
 @contextmanager
@@ -732,14 +733,18 @@ async def turn_off_do_not_disturb(gid_or_wxid: str) -> dict:
 async def query_db(dbname: str, sql: str, timeout: float | None = None) -> dict:
     """Query WeChat local SQLite database.
 
-    Note: Remote Hook servers can occasionally hang on QueryDB; callers should
-    pass a shorter timeout or wrap with asyncio.wait_for for bulk operations.
+    The Hook QueryDB route is not safe for concurrent calls on the same
+    WeChat process. Serialize per agent to avoid crashing the client when
+    history, session, and sticker queries overlap.
     """
     if IS_HOOK:
         # Keep QueryDB bounded; remote servers sometimes stall.
         if timeout is None:
             timeout = 10.0 if IS_LOCAL_HOOK else 15.0
-        r = await _post("/QueryDB", json={"dbname": dbname, "sql": sql}, timeout=timeout)
+        agent_key = _CURRENT_AGENT_ID.get() or "__default__"
+        lock = _query_db_locks.setdefault(agent_key, asyncio.Lock())
+        async with lock:
+            r = await _post("/QueryDB", json={"dbname": dbname, "sql": sql}, timeout=timeout)
         return safe_json(r)
     else:
         _log(f"[API] Remote mode: QueryDB not available (db={dbname})")
@@ -903,28 +908,19 @@ def _extract_sender_from_bytes_extra(hex_str: str) -> str:
 
 
 async def _query_db_parallel(dbs: list[str], sql: str) -> list:
-    """Query multiple DB files. Remote: parallel via asyncio.gather. Local: sequential."""
+    """Query multiple DB files sequentially.
+
+    Hook QueryDB is not concurrency-safe on the same WeChat process. Keep this
+    helper sequential even in remote-hook mode.
+    """
     all_rows: list = []
-    if IS_LOCAL_HOOK:
-        for db in dbs:
-            try:
-                data = await query_db(db, sql)
-                if data and isinstance(data.get("data"), list):
-                    all_rows.extend(data["data"])
-            except Exception:
-                continue
-    else:
-        async def _q(db: str):
-            try:
-                data = await query_db(db, sql)
-                if data and isinstance(data.get("data"), list):
-                    return data["data"]
-            except Exception:
-                pass
-            return []
-        results = await asyncio.gather(*[_q(db) for db in dbs])
-        for rows in results:
-            all_rows.extend(rows)
+    for db in dbs:
+        try:
+            data = await query_db(db, sql)
+            if data and isinstance(data.get("data"), list):
+                all_rows.extend(data["data"])
+        except Exception:
+            continue
     return all_rows
 
 
@@ -1068,28 +1064,16 @@ async def get_last_messages_bulk(wxids: list[str]) -> dict:
                 results[talker] = parsed
 
     if not IS_LOCAL_HOOK:
-        # ─── Remote: bounded parallel QueryDB ───────────────────────
-        # The WS transport can handle concurrent calls, but a fresh WeChat
-        # process may disappear if we blast every MSG DB query at once.
-        query_sem = asyncio.Semaphore(max(1, min(4, HOOK_API_CONCURRENCY)))
-
-        async def _q_with_timeout(db: str, sql: str):
-            try:
-                async with query_sem:
-                    return await asyncio.wait_for(query_db(db, sql), timeout=18.0)
-            except Exception:
-                return {}
-
-        tasks = []
+        # ─── Remote: sequential QueryDB ─────────────────────────────
+        # QueryDB is not safe for concurrent calls on one Hook client.
         for batch in batches:
             sql = _build_sql(batch)
             for db in _ALL_DBS:
-                tasks.append(_q_with_timeout(db, sql))
-        all_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in all_results:
-            if isinstance(r, Exception):
-                continue
-            _merge_rows(r)
+                try:
+                    data = await asyncio.wait_for(query_db(db, sql), timeout=18.0)
+                    _merge_rows(data)
+                except Exception:
+                    continue
     else:
         # ─── Local: sequential with bail-on-error ──────────────────
         bail = False
