@@ -919,11 +919,14 @@ async def wechat_callback(request: Request):
 
     sendorrecv = str(data.get("sendorrecv", "") or "")
     self_wxid = _extract_self_wxid(data) or _get_self_wxid()
-    callback_agent_id = str(
-        data.get("agent_id", "")
-        or data.get("agentId", "")
-        or _agent_id_for_self_wxid(self_wxid)
+    mapped_agent_id = (
+        _agent_id_for_self_wxid(self_wxid)
         or agent_manager.agent_id_for_wxid(self_wxid)
+    )
+    callback_agent_id = str(
+        mapped_agent_id
+        or data.get("agent_id", "")
+        or data.get("agentId", "")
         or ""
     )
     if not callback_agent_id and self_wxid:
