@@ -520,6 +520,15 @@ export default function App() {
     setAccountsLoading(true);
     try {
       const data = await getAccounts();
+      if (data?.error === "unauthorized") {
+        clearActiveAgentId();
+        clearAccessKey();
+        setAuthenticated(false);
+        setSelectedAccountId("");
+        setAccounts([]);
+        resetChatState();
+        return;
+      }
       const rows = Array.isArray(data?.accounts) ? data.accounts : [];
       setAccounts(rows);
     } catch (err) {
@@ -527,7 +536,7 @@ export default function App() {
     } finally {
       setAccountsLoading(false);
     }
-  }, []);
+  }, [resetChatState]);
 
   const handleLogin = useCallback(async (key: string) => {
     setAuthError("");
