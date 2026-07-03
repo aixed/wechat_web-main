@@ -50,7 +50,7 @@ if [ -d /proc ]; then
     cwd=$(readlink "$proc/cwd" 2>/dev/null || true)
     cmd=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)
     case "$cwd:$cmd" in
-      "$ROOT_DIR/backend:"*"main.py"*|"$ROOT_DIR/frontend:"*"npm run dev"*|"$ROOT_DIR/frontend:"*"vite"*)
+      "$ROOT_DIR/backend:"*"main.py"*|"$ROOT_DIR/backend:"*"uvicorn main:app"*|"$ROOT_DIR/frontend:"*"npm run dev"*|"$ROOT_DIR/frontend:"*"vite"*)
         append_pid "$pid"
         ;;
     esac

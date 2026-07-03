@@ -24,6 +24,7 @@ backend/_uploads/
 backend/.img_cache/
 backend/.avatar_cache/
 backend/.sticker_cache/
+backend/.sqlite_cache/
 
 # Frontend
 frontend/node_modules/

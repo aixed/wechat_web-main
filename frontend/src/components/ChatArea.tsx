@@ -227,9 +227,8 @@ export default function ChatArea({
     const isFirstLoad = !loadedRef.current.has(session.wxid);
     loadedRef.current.add(session.wxid);
 
-    // Always fetch from backend — not just the first time.
-    // Messages sent from mobile/desktop WeChat don't trigger hook callbacks,
-    // so we must re-fetch DB history every time the user enters a chat.
+    // Always ask the backend for history; the backend serves initialized chats
+    // from its local SQLite cache and only warms missing chats from Hook DB.
     if (isFirstLoad) setLoadingHistory(true);
 
     getMessages(session.wxid, 100)

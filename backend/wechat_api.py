@@ -18,6 +18,7 @@ from config import (
     AGENT_WS_ENABLED,
     AGENT_WS_REQUEST_TIMEOUT,
     HOOK_BASE_URL,
+    HOOK_API_CONCURRENCY,
     IS_HOOK,
     IS_PROTOCOL,
     LOGIN_MODE,
@@ -34,13 +35,12 @@ client = httpx.AsyncClient(base_url=HOOK_BASE_URL, timeout=_DEFAULT_TIMEOUT)
 _req_id = 0
 
 # Concurrency control:
-#  - Local Hook: Lock (serialize everything — DLL is NOT thread-safe)
-#  - Remote:     Semaphore (allow up to N concurrent requests — server handles concurrency)
-_REMOTE_CONCURRENCY = 10
-if IS_LOCAL_HOOK or (AGENT_WS_ENABLED and IS_HOOK):
+#  - Local Hook defaults to 1 (serialize everything — DLL injection can be fragile)
+#  - Remote Hook/Protocol defaults to 10 so slow calls don't block profile/avatar/send APIs
+if HOOK_API_CONCURRENCY <= 1:
     _hook_lock: asyncio.Lock | asyncio.Semaphore = asyncio.Lock()
 else:
-    _hook_lock = asyncio.Semaphore(_REMOTE_CONCURRENCY)
+    _hook_lock = asyncio.Semaphore(HOOK_API_CONCURRENCY)
 
 # ─── Circuit breaker ───────────────────────────────────────────────
 # After consecutive failures, back off to avoid hammering a dying Hook.
@@ -167,7 +167,7 @@ def safe_json(response: httpx.Response) -> dict:
 
 async def _post(endpoint: str, json: dict = None, timeout: float = None,
                 *, bypass_circuit_breaker: bool = False) -> httpx.Response:
-    """Logged POST wrapper — serialized through _hook_lock to protect the Hook."""
+    """Logged POST wrapper with mode-aware concurrency control."""
     global _req_id, _consecutive_failures, _last_failure_time
 
     use_agent_ws = AGENT_WS_ENABLED and IS_HOOK
@@ -1076,8 +1076,7 @@ async def get_last_messages_bulk(wxids: list[str]) -> dict:
 
 
 async def get_avatar_bytes(wxid: str) -> bytes | None:
-    """Get avatar image bytes for a wxid.
-    All Hook calls are already serialized through _hook_lock in _post()."""
+    """Get avatar image bytes for a wxid."""
     if IS_HOOK:
         try:
             data = await get_head_img(wxid)

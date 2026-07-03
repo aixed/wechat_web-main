@@ -24,6 +24,7 @@ import wechat_api
 from agent_ws import agent_manager
 from ws_manager import manager
 from message_store import MessageStore
+from sqlite_cache import SqliteMessageCache
 from pb_parser import parse_raw_pb
 
 
@@ -149,6 +150,7 @@ app_state = {
 }
 
 message_store = MessageStore()
+sqlite_cache = SqliteMessageCache()
 
 
 # ─── Contact brief cache (name + avatar URL) ─────────────────────────
@@ -331,6 +333,10 @@ def _store_message_and_session(chat_id: str, msg: dict) -> dict:
         "is_sender": 1 if str(msg.get("sendorrecv", "")) == "1" else 0,
         "time": msg_timestamp,
     }
+    try:
+        sqlite_cache.upsert_messages(chat_id, [msg])
+    except Exception as e:
+        _log(f"[SQLITE_CACHE] realtime write failed for {chat_id}: {type(e).__name__}: {e}")
     return {
         "wxid": snapshot.wxid,
         "lastMsg": snapshot.last_msg,
@@ -530,21 +536,43 @@ async def _run_backend_initialization() -> bool:
         _log("[INIT 5/7] ⊘ No sessions to load avatars for.")
     app_state["avatar_urls"] = avatar_urls
 
-    # 6. Bulk fetch last messages for all sessions
+    # 6. Load last messages. Prefer local SQLite cache; only missings hit Hook DB.
     if session_wxids_for_avatars:
+        cached_last = sqlite_cache.get_last_messages(session_wxids_for_avatars)
+        if cached_last:
+            app_state["last_messages"] = dict(cached_last)
+            _log(f"[INIT 6/7] ✓ Loaded {len(cached_last)} last messages from local SQLite cache.")
+        missing_last_wxids = [w for w in session_wxids_for_avatars if w not in cached_last]
         try:
-            _log(f"[INIT 6/7] Loading last messages for {len(session_wxids_for_avatars)} sessions...")
-            # Remote Hook servers can stall on QueryDB; don't block startup forever.
-            last_msgs = await asyncio.wait_for(
-                wechat_api.get_last_messages_bulk(session_wxids_for_avatars),
-                timeout=35.0,
-            )
-            app_state["last_messages"] = last_msgs
-            _log(f"[INIT 6/7] ✓ Last messages loaded for {len(last_msgs)} sessions.")
+            if missing_last_wxids:
+                _log(f"[INIT 6/7] Loading last messages for {len(missing_last_wxids)} uncached sessions...")
+                # Remote Hook servers can stall on QueryDB; don't block startup forever.
+                last_msgs = await asyncio.wait_for(
+                    wechat_api.get_last_messages_bulk(missing_last_wxids),
+                    timeout=35.0,
+                )
+                app_state["last_messages"].update(last_msgs)
+                sqlite_cache.upsert_last_messages(last_msgs)
+                _log(f"[INIT 6/7] ✓ Last messages loaded from Hook DB for {len(last_msgs)} sessions.")
+            else:
+                _log("[INIT 6/7] ✓ All session last messages came from local SQLite cache.")
         except asyncio.TimeoutError:
             _log("[INIT 6/7] ⚠ bulk last messages timed out, continuing without DB preload")
         except Exception as e:
             _log(f"[INIT 6/7] ✗ bulk last messages failed: {e}")
+
+        try:
+            preload_chats = 0
+            preload_msgs = 0
+            for wxid in session_wxids_for_avatars:
+                cached_msgs = sqlite_cache.get_messages(wxid, 50)
+                if cached_msgs:
+                    message_store.add_history(wxid, cached_msgs)
+                    preload_chats += 1
+                    preload_msgs += len(cached_msgs)
+            _log(f"[INIT 6/7] ✓ Preloaded {preload_msgs} cached messages for {preload_chats} chats from SQLite.")
+        except Exception as e:
+            _log(f"[INIT 6/7] ✗ SQLite message preload failed: {type(e).__name__}: {e}")
     else:
         _log("[INIT 6/7] ⊘ No sessions to load last messages for.")
 
@@ -1429,7 +1457,19 @@ async def refresh_sessions():
     # Start with real-time callback data (always up-to-date for active chats)
     last_messages = dict(app_state.get("last_messages", {}))
 
-    # Only query DB for sessions NOT already covered by callback data
+    # Only query DB for sessions NOT already covered by callback data or SQLite.
+    missing_wxids = [w for w in wxids if w not in last_messages]
+    cache_count = 0
+    if missing_wxids:
+        try:
+            cached_messages = sqlite_cache.get_last_messages(missing_wxids)
+            for wxid, msg in cached_messages.items():
+                if wxid not in last_messages:
+                    last_messages[wxid] = msg
+                    app_state["last_messages"][wxid] = msg
+                    cache_count += 1
+        except Exception as e:
+            _log(f"[REFRESH] SQLite last-message cache failed: {type(e).__name__}: {e}")
     missing_wxids = [w for w in wxids if w not in last_messages]
     db_count = 0
     if missing_wxids:
@@ -1441,12 +1481,13 @@ async def refresh_sessions():
                     # Cache DB results so we don't re-query next time
                     app_state["last_messages"][wxid] = msg
                     db_count += 1
+            sqlite_cache.upsert_last_messages(db_messages)
         except Exception:
             pass
 
     total_ms = int((time.time() - t0) * 1000)
     _log(f"[REFRESH] ✓ {len(wxids)} sessions from Session table, {len(last_messages)} msgs "
-         f"(callback={len(last_messages) - db_count}, db={db_count}, "
+         f"(callback={len(last_messages) - cache_count - db_count}, sqlite={cache_count}, db={db_count}, "
          f"skipped={len(wxids) - len(missing_wxids)}) — {total_ms}ms")
     return {"sessions": raw_sessions, "last_messages": last_messages}
 
@@ -1455,14 +1496,28 @@ async def refresh_sessions():
 
 @app.get("/api/messages/{wxid}")
 async def get_messages(wxid: str, limit: int = 50, db: str = "MSG0.db"):
-    """Get chat history for a contact/group from WeChat's local DB.
-    Always re-queries the DB to pick up messages sent from PC WeChat
-    (hook callbacks are unreliable for outgoing PC messages)."""
+    """Get chat history for a contact/group.
+    Prefer local SQLite cache once a wxid has been initialized; query Hook DB
+    only for first-time cache warmup.
+    """
+    if sqlite_cache.has_initialized(wxid):
+        cached = sqlite_cache.get_messages(wxid, limit)
+        if cached:
+            message_store.add_history(wxid, cached)
+        return {"data": message_store.get_messages(wxid, limit), "source": "sqlite"}
+
     history = await wechat_api.get_chat_history(wxid, max(limit, 100))
     rows = history.get("data", []) if isinstance(history, dict) else []
     normalized = _normalize_history_rows(wxid, rows)
     message_store.add_history(wxid, normalized)
-    return {"data": message_store.get_messages(wxid, limit)}
+    try:
+        if normalized:
+            sqlite_cache.upsert_messages(wxid, normalized, mark_initialized=True)
+        else:
+            sqlite_cache.mark_initialized(wxid)
+    except Exception as e:
+        _log(f"[SQLITE_CACHE] history write failed for {wxid}: {type(e).__name__}: {e}")
+    return {"data": message_store.get_messages(wxid, limit), "source": "hook_db"}
 
 
 @app.get("/api/messages/{wxid}/older")
@@ -1471,12 +1526,21 @@ async def get_older_messages(wxid: str, before: int = 0, limit: int = 50):
     Returns messages with CreateTime < before, sorted chronologically."""
     if before <= 0:
         return {"data": []}
+    cached = sqlite_cache.get_messages(wxid, limit, before=before)
+    if cached:
+        message_store.add_history_no_flag(wxid, cached)
+        return {"data": cached, "source": "sqlite"}
+
     history = await wechat_api.get_chat_history(wxid, limit, before_time=before)
     rows = history.get("data", []) if isinstance(history, dict) else []
     normalized = _normalize_history_rows(wxid, rows)
     # Add to store so they persist in memory
     message_store.add_history_no_flag(wxid, normalized)
-    return {"data": normalized}
+    try:
+        sqlite_cache.upsert_messages(wxid, normalized)
+    except Exception as e:
+        _log(f"[SQLITE_CACHE] older-history write failed for {wxid}: {type(e).__name__}: {e}")
+    return {"data": normalized, "source": "hook_db"}
 
 
 @app.get("/api/messages/{wxid}/query")
@@ -1966,6 +2030,17 @@ _IMG_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".img_cache")
 os.makedirs(_IMG_CACHE_DIR, exist_ok=True)
 
 
+def _image_file_response(path: str, msg_id: str = ""):
+    if msg_id and path:
+        try:
+            updated = sqlite_cache.update_image_path_by_msg_id(str(msg_id), path)
+            if updated:
+                _log(f"[SQLITE_CACHE] image path cached for msg_id={msg_id}: {path}")
+        except Exception as e:
+            _log(f"[SQLITE_CACHE] image path update failed: {type(e).__name__}: {e}")
+    return FileResponse(path)
+
+
 # Concurrency control for /DownPic:
 # - Local:  Lock (serialize to protect Hook DLL)
 # - Remote: Semaphore (allow a few concurrent CDN downloads)
@@ -2096,7 +2171,7 @@ async def download_image(request: Request):
         for ext in ("jpg", "png", "gif", "webp"):
             cached = os.path.join(cb_dir, f"{safe_id}.{ext}")
             if os.path.exists(cached) and os.path.getsize(cached) > 0:
-                return FileResponse(cached)
+                return _image_file_response(cached, msg_id)
 
     # ═══ Remote Hook: CDN protocol download ════════════════════════
     if not config.IS_LOCAL_HOOK:
@@ -2109,7 +2184,7 @@ async def download_image(request: Request):
 
             # Already downloaded before?
             if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-                return FileResponse(cache_path)
+                return _image_file_response(cache_path, msg_id)
 
             # Also check callback cache by msgsvrid
             if msg_id:
@@ -2118,7 +2193,7 @@ async def download_image(request: Request):
                 for ext in ("jpg", "png", "gif", "webp"):
                     cached = os.path.join(cb_dir, f"{safe_id}.{ext}")
                     if os.path.exists(cached) and os.path.getsize(cached) > 0:
-                        return FileResponse(cached)
+                        return _image_file_response(cached, msg_id)
 
             # ── De-dup: if another request is already downloading this image, just wait ──
             async with _inflight_cdn_lock:
@@ -2132,12 +2207,12 @@ async def download_image(request: Request):
             if shared_fut:
                 try:
                     file_path = await asyncio.wait_for(asyncio.shield(shared_fut), timeout=70.0)
-                    return FileResponse(file_path)
+                    return _image_file_response(file_path, msg_id)
                 except (asyncio.TimeoutError, Exception):
                     pass
                 # Re-check cache after wait
                 if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-                    return FileResponse(cache_path)
+                    return _image_file_response(cache_path, msg_id)
 
             # ── Start new download (serialized: one CDN download at a time) ──
             loop = asyncio.get_event_loop()
@@ -2175,7 +2250,7 @@ async def download_image(request: Request):
                     _log(f"[IMG_DL] ✓ Image received via callback: {file_path}")
                     if not inflight_fut.done():
                         inflight_fut.set_result(file_path)
-                    return FileResponse(file_path)
+                    return _image_file_response(file_path, msg_id)
                 except asyncio.TimeoutError:
                     _log(f"[IMG_DL] ✗ Timed out waiting for callback (60s)")
 
@@ -2196,9 +2271,9 @@ async def download_image(request: Request):
                 for ext in ("jpg", "png", "gif", "webp"):
                     cached = os.path.join(cb_dir2, f"{safe_id2}.{ext}")
                     if os.path.exists(cached) and os.path.getsize(cached) > 0:
-                        return FileResponse(cached)
+                        return _image_file_response(cached, msg_id)
             if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-                return FileResponse(cache_path)
+                return _image_file_response(cache_path, msg_id)
 
             return {"error": "CDN download timed out — image may still arrive via callback, retry later"}
 
@@ -2214,17 +2289,17 @@ async def download_image(request: Request):
     if raw:
         img_dat_paths, thumb_dat_paths, found = _find_local_image(raw)
         if found:
-            return FileResponse(found)
+            return _image_file_response(found, msg_id)
 
     # ─── Phase 2: Decode local .dat files ─────────────────────────
     if img_dat_paths:
         result = await _try_decode_dat(img_dat_paths, "Image")
         if result:
-            return FileResponse(result)
+            return _image_file_response(result, msg_id)
     if thumb_dat_paths:
         result = await _try_decode_dat(thumb_dat_paths, "Thumb")
         if result:
-            return FileResponse(result)
+            return _image_file_response(result, msg_id)
 
     # ─── Phase 3: /DownPic → trigger download → re-check local ───
     if msg_xml and ("<img" in msg_xml or "<msg>" in msg_xml):
@@ -2233,12 +2308,12 @@ async def download_image(request: Request):
 
         # Already downloaded before?
         if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-            return FileResponse(cache_path)
+            return _image_file_response(cache_path, msg_id)
 
         # Serialize DownPic calls
         async with _download_pic_lock:
             if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-                return FileResponse(cache_path)
+                return _image_file_response(cache_path, msg_id)
             try:
                 result = await wechat_api.download_pic(msg_xml, cache_path)
                 _log(f"[DOWNLOAD_PIC] result: {result}")
@@ -2252,25 +2327,25 @@ async def download_image(request: Request):
                 # Check our specified topath
                 if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
                     _log(f"[DOWNLOAD_PIC] Found at topath after {i*0.5:.1f}s")
-                    return FileResponse(cache_path)
+                    return _image_file_response(cache_path, msg_id)
                 # Re-check WeChat local .jpg paths
                 if raw:
                     _, _, found = _find_local_image(raw)
                     if found:
                         _log(f"[DOWNLOAD_PIC] Found local .jpg after {i*0.5:.1f}s")
-                        return FileResponse(found)
+                        return _image_file_response(found, msg_id)
                 # Every 2s, also try decoding newly-appeared .dat files
                 if i > 0 and i % 4 == 0:
                     if img_dat_paths:
                         decoded = await _try_decode_dat(img_dat_paths, "Image-poll")
                         if decoded:
                             _log(f"[DOWNLOAD_PIC] Decoded .dat after {i*0.5:.1f}s")
-                            return FileResponse(decoded)
+                            return _image_file_response(decoded, msg_id)
                     if thumb_dat_paths:
                         decoded = await _try_decode_dat(thumb_dat_paths, "Thumb-poll")
                         if decoded:
                             _log(f"[DOWNLOAD_PIC] Decoded thumb after {i*0.5:.1f}s")
-                            return FileResponse(decoded)
+                            return _image_file_response(decoded, msg_id)
                 await asyncio.sleep(0.5)
 
             _log(f"[DOWNLOAD_PIC] Timed out for xml_hash={xml_hash}")

@@ -87,6 +87,7 @@ npm run lint
 - `ip`：本后端的公网 IP 或域名，供远程客户端 DLL 主动连接和回调访问。
 - `RDV`：远程服务所需的连接或鉴权标识。
 - `server_port`：后端主服务端口。
+- `hook_api_concurrency`：Hook/API 并发数；本地 Hook 默认 `1`，远程 Hook/远程协议默认 `10`，用于避免慢查询阻塞 `GetContact`、头像、发送消息等交互接口。
 - `frontend_port`：前端页面端口，`start-all.sh` 会优先读取此配置；也可用环境变量 `FRONTEND_PORT` 临时覆盖。
 - `agent_ws_enabled`：是否启用远程客户端 DLL 主动连接本后端的 `/agent` WebSocket 通道；启用后 Hook API 调用会通过这条长连接发给 DLL。
 - `agent_ws_path`：DLL 连接路径，默认 `/agent`。
