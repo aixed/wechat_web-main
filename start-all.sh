@@ -119,7 +119,41 @@ PY
 }
 
 choose_frontend_port() {
-  port="${FRONTEND_PORT:-3000}"
+  configured_port="${FRONTEND_PORT:-}"
+  if [ -z "$configured_port" ] && [ -f "$ROOT_DIR/config.yaml" ]; then
+    configured_port=$("$PYTHON_CMD" - "$ROOT_DIR/config.yaml" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+config_path = Path(sys.argv[1])
+data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+value = data.get("frontend_port")
+if value in (None, ""):
+    raise SystemExit(0)
+try:
+    port = int(value)
+except (TypeError, ValueError):
+    raise SystemExit("frontend_port must be an integer")
+if not 1 <= port <= 65535:
+    raise SystemExit("frontend_port must be between 1 and 65535")
+print(port)
+PY
+)
+  fi
+
+  if [ -n "$configured_port" ]; then
+    if is_port_free "$configured_port"; then
+      FRONTEND_PORT="$configured_port"
+      export FRONTEND_PORT
+      return
+    fi
+    log "[ERROR] Frontend port $configured_port is already in use."
+    exit 1
+  fi
+
+  port="3001"
   while [ "$port" -le 3999 ]; do
     if is_port_free "$port"; then
       FRONTEND_PORT="$port"

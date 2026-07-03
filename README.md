@@ -87,6 +87,7 @@ npm run lint
 - `ip`：本后端的公网 IP 或域名，供远程客户端 DLL 主动连接和回调访问。
 - `RDV`：远程服务所需的连接或鉴权标识。
 - `server_port`：后端主服务端口。
+- `frontend_port`：前端页面端口，`start-all.sh` 会优先读取此配置；也可用环境变量 `FRONTEND_PORT` 临时覆盖。
 - `agent_ws_enabled`：是否启用远程客户端 DLL 主动连接本后端的 `/agent` WebSocket 通道；启用后 Hook API 调用会通过这条长连接发给 DLL。
 - `agent_ws_path`：DLL 连接路径，默认 `/agent`。
 - `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；无证书测试可用 `client_wss_scheme: "ws"`、`client_wss_port: 5000`，DLL 配置 `RemoteWS="ws://1.14.149.2:5000/agent"`；正式 TLS 部署用 `client_wss_scheme: "wss"`、`client_wss_port: 443`，DLL 配置 `RemoteWS="wss://1.14.149.2/agent"`。
