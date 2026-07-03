@@ -80,8 +80,11 @@ export const getContactProfiles = (wxids: string[], gid = "", force = false) =>
     method: "POST",
     body: JSON.stringify({ wxids, gid, force }),
   });
-export const getSessions = () => fetchJSON("/api/sessions");
-export const refreshSessions = () => fetchJSON("/api/sessions/refresh");
+const withAgentQuery = (path: string, agentId = "") =>
+  agentId ? `${path}?agent_id=${encodeURIComponent(agentId)}` : path;
+
+export const getSessions = (agentId = "") => fetchJSON(withAgentQuery("/api/sessions", agentId));
+export const refreshSessions = (agentId = "") => fetchJSON(withAgentQuery("/api/sessions/refresh", agentId));
 
 // ─── Messages ────────────────────────────────────────────────────
 

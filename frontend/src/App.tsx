@@ -1431,7 +1431,7 @@ export default function App() {
     const requestAccountId = selectedAccountIdRef.current;
     setSessionsHydrating(true);
     try {
-      const data = await refreshSessions();
+      const data = await refreshSessions(requestAccountId);
       if (selectedAccountIdRef.current !== requestAccountId) return;
       const rawSessions = data?.sessions || data;
       const lastMessages = data?.last_messages || {};
