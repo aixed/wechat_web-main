@@ -34,6 +34,7 @@ type MobileTab = "chats" | "contacts" | "me";
 type PortalTheme = "dark" | "light";
 const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
+const PINNED_ORDER_THRESHOLD = 1_000_000_000_000;
 
 function clampSidePanelWidth(value: number): number {
   return Math.min(460, Math.max(236, Math.round(value)));
@@ -158,6 +159,23 @@ function isTruthySessionFlag(value: any): boolean {
   return text === "1" || text === "true" || text === "yes";
 }
 
+function normalizeSessionOrder(value: any): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function isPinnedSessionOrder(value: any): boolean {
+  return normalizeSessionOrder(value) >= PINNED_ORDER_THRESHOLD;
+}
+
+function nextSessionOrder(timestamp?: number): number {
+  return timestamp || Math.floor(Date.now() / 1000);
+}
+
+function nextPinnedOrder(): number {
+  return Math.max(Date.now(), PINNED_ORDER_THRESHOLD + Math.floor(Date.now() / 1000));
+}
+
 // ─── Parse sessions from the WeChat Session table snapshot ───────
 function parseSessions(
   raw: any,
@@ -185,6 +203,7 @@ function parseSessions(
       const sessionContent = pickFirstString(s.strContent, s.StrContent, s.content, s.lastMsg);
       const unread = pickFirstNumber(s.nUnReadCount, s.UnReadCount, s.unread);
       const atMe = isTruthySessionFlag(s.othersAtMe ?? s.OthersAtMe ?? s.atMe);
+      const nOrder = pickFirstNumber(s.nOrder, s.NOrder, s.order);
       const sessionTimestamp = pickFirstNumber(
         s.nTime,
         s.NTime,
@@ -239,7 +258,8 @@ function parseSessions(
         unread,
         atMe,
         muted: false,
-        order: index,
+        pinned: isTruthySessionFlag(s.pinned) || isPinnedSessionOrder(nOrder),
+        order: nOrder || -index,
         is_group: wxid.includes("@chatroom"),
       } as Session;
     })
@@ -472,11 +492,11 @@ function sortByTimestamp(msgs: ChatMessage[]): ChatMessage[] {
 
 function sortSessionsForDisplay(list: Session[]): Session[] {
   return list.slice().sort((a, b) => {
-    const aOrder = Number.isFinite(a.order) ? Number(a.order) : Number.MAX_SAFE_INTEGER;
-    const bOrder = Number.isFinite(b.order) ? Number(b.order) : Number.MAX_SAFE_INTEGER;
-    if (aOrder !== bOrder) return aOrder - bOrder;
     const pinnedDelta = Number(Boolean(b.pinned)) - Number(Boolean(a.pinned));
     if (pinnedDelta !== 0) return pinnedDelta;
+    const aOrder = normalizeSessionOrder(a.order);
+    const bOrder = normalizeSessionOrder(b.order);
+    if (aOrder !== bOrder) return bOrder - aOrder;
     return (b.lastTimestamp || 0) - (a.lastTimestamp || 0);
   });
 }
@@ -1167,6 +1187,8 @@ export default function App() {
             lastTime: formatSessionTime(ts) || current.lastTime,
             lastTimestamp: ts,
             unread: typeof snap?.unread === "number" ? snap.unread : current.unread,
+            pinned: Boolean(current.pinned || snap?.pinned),
+            order: normalizeSessionOrder(current.order || snap?.order),
           });
         } else {
           enrichedMap.set(sessionWxid, {
@@ -1179,6 +1201,8 @@ export default function App() {
             lastTimestamp: snapTs,
             unread: typeof snap?.unread === "number" ? snap.unread : 0,
             muted: false,
+            pinned: Boolean(snap?.pinned),
+            order: nextSessionOrder(snapTs),
           });
         }
       }
@@ -1325,6 +1349,7 @@ export default function App() {
                   lastTime: timeStr,
                   lastTimestamp: msgTs,
                   unread: isCurrentlyViewing ? 0 : (prev[idx].unread || 0) + unreadDelta,
+                  order: prev[idx].pinned ? prev[idx].order : Math.max(normalizeSessionOrder(prev[idx].order), nextSessionOrder(msgTs)),
                 }
               : {
                   wxid: chatId,
@@ -1336,6 +1361,8 @@ export default function App() {
                   lastTimestamp: msgTs,
                   unread: unreadDelta,
                   muted: false,
+                  pinned: false,
+                  order: nextSessionOrder(msgTs),
             };
             const rest = prev.filter((s) => s.wxid !== chatId);
             return sortSessionsForDisplay([session, ...rest]);
@@ -1391,7 +1418,14 @@ export default function App() {
       setSessions((prev) => {
         const idx = prev.findIndex((s) => s.wxid === chatId);
         const session: Session = idx >= 0
-          ? { ...prev[idx], lastMsg: preview, lastTime: timeStr, lastTimestamp: sentTs, unread: 0 }
+          ? {
+              ...prev[idx],
+              lastMsg: preview,
+              lastTime: timeStr,
+              lastTimestamp: sentTs,
+              unread: 0,
+              order: prev[idx].pinned ? prev[idx].order : Math.max(normalizeSessionOrder(prev[idx].order), nextSessionOrder(sentTs)),
+            }
           : {
               wxid: chatId,
               nickname: contactMap[chatId] || chatId,
@@ -1402,6 +1436,8 @@ export default function App() {
               lastTimestamp: sentTs,
               unread: 0,
               muted: false,
+              pinned: false,
+              order: nextSessionOrder(sentTs),
             };
         const rest = prev.filter((s) => s.wxid !== chatId);
         return sortSessionsForDisplay([session, ...rest]);
@@ -1448,7 +1484,7 @@ export default function App() {
           lastTimestamp: existing.lastTimestamp || nowTs,
           lastTime: existing.lastTime || formatSessionTime(nowTs),
           unread: 0,
-          order: Math.min(Number.isFinite(existing.order) ? Number(existing.order) : Number.MAX_SAFE_INTEGER, -1),
+          order: existing.pinned ? existing.order : Math.max(normalizeSessionOrder(existing.order), nextSessionOrder(nowTs)),
         };
         const rest = prev.filter((s) => s.wxid !== wxid);
         return sortSessionsForDisplay([updated, ...rest]);
@@ -1463,7 +1499,8 @@ export default function App() {
         lastTimestamp: nowTs,
         unread: 0,
         muted: false,
-        order: -1,
+        pinned: false,
+        order: nextSessionOrder(nowTs),
       };
       return sortSessionsForDisplay([seeded, ...prev]);
     });
@@ -1501,14 +1538,14 @@ export default function App() {
       if (action === "pin") {
         await stickyChat(wxid);
         setSessions((prev) => sortSessionsForDisplay(prev.map((s) =>
-          s.wxid === wxid ? { ...s, pinned: true } : s
+          s.wxid === wxid ? { ...s, pinned: true, order: Math.max(normalizeSessionOrder(s.order), nextPinnedOrder()) } : s
         )));
         return;
       }
       if (action === "unpin") {
         await unpinChat(wxid);
         setSessions((prev) => sortSessionsForDisplay(prev.map((s) =>
-          s.wxid === wxid ? { ...s, pinned: false } : s
+          s.wxid === wxid ? { ...s, pinned: false, order: nextSessionOrder(s.lastTimestamp) } : s
         )));
         return;
       }
@@ -1631,7 +1668,13 @@ export default function App() {
         const existing = prev[idx];
         // Only update if this message is newer than what the session already shows
         if (msgTs <= (existing.lastTimestamp || 0)) return prev;
-        const updated = { ...existing, lastMsg: preview, lastTime: timeStr, lastTimestamp: msgTs };
+        const updated = {
+          ...existing,
+          lastMsg: preview,
+          lastTime: timeStr,
+          lastTimestamp: msgTs,
+          order: existing.pinned ? existing.order : Math.max(normalizeSessionOrder(existing.order), nextSessionOrder(msgTs)),
+        };
         const rest = prev.filter((s) => s.wxid !== wxid);
         return sortSessionsForDisplay([updated, ...rest]);
       });
@@ -2587,7 +2630,7 @@ function MobileChatsView({
 function MobileSessionRow({ session, onClick, dark }: { session: Session; onClick: () => void; dark: boolean }) {
   return (
     <button type="button" onClick={onClick} className={`w-full h-[74px] pl-[14px] pr-[12px] flex items-center gap-[12px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
-      <MobileAvatar name={session.nickname || session.wxid} avatar={session.avatar} group={session.is_group} size={52} />
+      <MobileAvatar name={session.nickname || session.wxid} avatar={session.avatar} group={session.is_group} size={52} pinned={session.pinned} />
       <div className={`min-w-0 flex-1 h-full border-b flex flex-col justify-center ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
         <div className="flex items-baseline gap-[8px]">
           <div className="text-[17px] leading-[23px] truncate flex-1">{session.nickname || session.wxid}</div>
@@ -2837,14 +2880,24 @@ function MobileTabButton({ active, label, icon, onClick, dark }: { active: boole
   );
 }
 
-function MobileAvatar({ name, avatar, group, size = 42 }: { name: string; avatar?: string; group?: boolean; size?: number }) {
+function MobileAvatar({ name, avatar, group, size = 42, pinned = false }: { name: string; avatar?: string; group?: boolean; size?: number; pinned?: boolean }) {
   const [failed, setFailed] = useState(false);
-  if (avatar && !failed) {
-    return <img src={avatar} alt="" className="rounded-[6px] object-cover shrink-0" style={{ width: size, height: size }} onError={() => setFailed(true)} loading="lazy" />;
-  }
   return (
-    <div className={`rounded-[6px] text-white flex items-center justify-center shrink-0 ${group ? "bg-[#576b95]" : "bg-[#07c160]"}`} style={{ width: size, height: size, fontSize: Math.max(15, size * 0.38) }}>
-      {(name || "?")[0]}
+    <div className="relative shrink-0" style={{ width: size, height: size }}>
+      {avatar && !failed ? (
+        <img src={avatar} alt="" className="w-full h-full rounded-[6px] object-cover" onError={() => setFailed(true)} loading="lazy" />
+      ) : (
+        <div className={`w-full h-full rounded-[6px] text-white flex items-center justify-center ${group ? "bg-[#576b95]" : "bg-[#07c160]"}`} style={{ fontSize: Math.max(15, size * 0.38) }}>
+          {(name || "?")[0]}
+        </div>
+      )}
+      {pinned ? (
+        <span className="absolute -left-[3px] -top-[3px] w-[16px] h-[16px] rounded-full bg-[#07c160] text-white shadow-sm flex items-center justify-center">
+          <svg className="w-[9px] h-[9px]" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M14.8 2.8 21.2 9.2 18 10.4 14.3 14.1 14.9 19.3 13.4 20.8 9 16.4 4.2 21.2 2.8 19.8 7.6 15 3.2 10.6 4.7 9.1 9.9 9.7 13.6 6 14.8 2.8Z" />
+          </svg>
+        </span>
+      ) : null}
     </div>
   );
 }

@@ -1448,7 +1448,7 @@ async def _query_session_list_from_db() -> dict:
             "nUnReadCount": row_value(row, "nUnReadCount", "UnReadCount", "unread"),
             "othersAtMe": row_value(row, "othersAtMe", "OthersAtMe", "atMe"),
             "nOrder": row_value(row, "nOrder", "NOrder", "order"),
-            "order": index,
+            "order": row_value(row, "nOrder", "NOrder", "order"),
         })
         sessions.append(session)
 

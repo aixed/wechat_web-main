@@ -11,6 +11,16 @@ interface SessionListProps {
   theme?: "dark" | "light";
 }
 
+function PinBadge() {
+  return (
+    <span className="absolute -left-[3px] -top-[3px] w-[15px] h-[15px] rounded-full bg-[#07c160] text-white shadow-sm flex items-center justify-center">
+      <svg className="w-[9px] h-[9px]" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+        <path d="M14.8 2.8 21.2 9.2 18 10.4 14.3 14.1 14.9 19.3 13.4 20.8 9 16.4 4.2 21.2 2.8 19.8 7.6 15 3.2 10.6 4.7 9.1 9.9 9.7 13.6 6 14.8 2.8Z" />
+      </svg>
+    </span>
+  );
+}
+
 /**
  * Session avatar — keyed by wxid to prevent React state reuse across items.
  * If no URL or load error → letter fallback (never inherits previous avatar).
@@ -18,28 +28,28 @@ interface SessionListProps {
 function Avatar({ session }: { session: Session }) {
   const [imgError, setImgError] = useState(false);
   const avatarUrl = session.avatar || "";
-
-  if (avatarUrl && !imgError) {
-    return (
-      <img
-        src={avatarUrl}
-        alt=""
-        className="w-[42px] h-[42px] rounded-[5px] object-cover shrink-0"
-        onError={() => setImgError(true)}
-        loading="lazy"
-      />
-    );
-  }
-
-  // Letter fallback
   const initial = session.nickname?.[0] || session.wxid?.[0] || "?";
+
   return (
-    <div
-      className={`w-[42px] h-[42px] rounded-[5px] flex items-center justify-center text-white text-[16px] font-medium shrink-0 ${
-        session.is_group ? "bg-[#576b95]" : "bg-[#60b044]"
-      }`}
-    >
-      {initial}
+    <div className="relative w-[42px] h-[42px] shrink-0">
+      {avatarUrl && !imgError ? (
+        <img
+          src={avatarUrl}
+          alt=""
+          className="w-full h-full rounded-[5px] object-cover"
+          onError={() => setImgError(true)}
+          loading="lazy"
+        />
+      ) : (
+        <div
+          className={`w-full h-full rounded-[5px] flex items-center justify-center text-white text-[16px] font-medium ${
+            session.is_group ? "bg-[#576b95]" : "bg-[#60b044]"
+          }`}
+        >
+          {initial}
+        </div>
+      )}
+      {session.pinned ? <PinBadge /> : null}
     </div>
   );
 }
