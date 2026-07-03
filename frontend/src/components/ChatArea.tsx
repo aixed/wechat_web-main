@@ -77,6 +77,24 @@ export default function ChatArea({
   const isGroup = session.is_group;
   const canSend = input.trim().length > 0 || pendingImages.length > 0;
 
+  const runSendJobs = useCallback((label: string, jobs: Promise<unknown>[], cleanup?: () => void) => {
+    if (jobs.length === 0) {
+      cleanup?.();
+      return;
+    }
+    void Promise.allSettled(jobs)
+      .then((results) => {
+        results.forEach((result) => {
+          if (result.status === "rejected") {
+            console.error(`[${label}]`, result.reason);
+          }
+        });
+      })
+      .finally(() => {
+        cleanup?.();
+      });
+  }, []);
+
   useEffect(() => {
     pendingImagesRef.current = pendingImages;
   }, [pendingImages]);
@@ -399,23 +417,21 @@ export default function ChatArea({
       textareaRef.current.style.height = `${TEXTAREA_BASE_HEIGHT}px`;
     }
 
-    try {
-      if (msg) {
-        await sendText(session.wxid, msg);
-      }
-      for (const image of imagesToSend) {
-        await sendImageUpload(session.wxid, image.file);
-      }
-    } catch (err) {
-      console.error("[SEND]", err);
-    } finally {
-      imagesToSend.forEach((image) => URL.revokeObjectURL(image.url));
-      setSending(false);
-      // Re-focus textarea so mobile keyboard stays open after sending
-      requestAnimationFrame(() => {
-        textareaRef.current?.focus();
-      });
+    const jobs: Promise<unknown>[] = [];
+    if (msg) {
+      jobs.push(sendText(session.wxid, msg));
     }
+    imagesToSend.forEach((image) => {
+      jobs.push(sendImageUpload(session.wxid, image.file));
+    });
+    runSendJobs("SEND", jobs, () => {
+      imagesToSend.forEach((image) => URL.revokeObjectURL(image.url));
+    });
+    setSending(false);
+    // Re-focus textarea so mobile keyboard stays open after sending
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -482,20 +498,16 @@ export default function ChatArea({
 
   // ─── Plus-menu file handlers ──────────────────────────────────
   const sendImageFile = useCallback(async (file: File) => {
-    if (!file || sending) return;
+    if (!file) return;
     setShowPlusMenu(false);
     setSending(true);
-    try {
-      await sendImageUpload(session.wxid, file);
-    } catch (err) {
-      console.error("[SEND_IMG]", err);
-    } finally {
-      setSending(false);
+    runSendJobs("SEND_IMG", [sendImageUpload(session.wxid, file)], () => {
       requestAnimationFrame(() => {
         textareaRef.current?.focus();
       });
-    }
-  }, [sending, session.wxid]);
+    });
+    setSending(false);
+  }, [runSendJobs, session.wxid]);
 
   const handleImagePick = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -529,13 +541,8 @@ export default function ChatArea({
     e.target.value = "";
     setShowPlusMenu(false);
     setSending(true);
-    try {
-      await sendFileUpload(session.wxid, file);
-    } catch (err) {
-      console.error("[SEND_FILE]", err);
-    } finally {
-      setSending(false);
-    }
+    runSendJobs("SEND_FILE", [sendFileUpload(session.wxid, file)]);
+    setSending(false);
   };
 
   // ─── Render ─────────────────────────────────────────────────────

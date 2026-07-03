@@ -2128,6 +2128,7 @@ class SessionActionRequest(BaseModel):
 
 
 _send_counter = 0
+_background_send_tasks: set[asyncio.Task] = set()
 
 _BROADCAST_IMG_CDN_KEYS = (
     "fileid",
@@ -2174,6 +2175,27 @@ def _send_result_ok(result: dict) -> bool:
     return True
 
 
+def _send_api_parallelism() -> int:
+    try:
+        limit = int(getattr(config, "HOOK_API_CONCURRENCY", 10) or 10)
+    except Exception:
+        limit = 10
+    return max(1, min(limit, 50))
+
+
+def _track_background_send(task: asyncio.Task, label: str) -> None:
+    _background_send_tasks.add(task)
+
+    def _done(done: asyncio.Task) -> None:
+        _background_send_tasks.discard(done)
+        try:
+            done.result()
+        except Exception as e:
+            _log(f"[SEND_BG] {label} task crashed: {type(e).__name__}: {e}")
+
+    task.add_done_callback(_done)
+
+
 async def _broadcast_local_sent_message(chat_id: str, msg_type: str, content: str = "", extra: dict | None = None) -> None:
     global _send_counter
     _send_counter += 1
@@ -2209,56 +2231,161 @@ async def _broadcast_local_sent_message(chat_id: str, msg_type: str, content: st
     })
 
 
+async def _broadcast_local_sent_for_agent(
+    agent_id: str,
+    chat_id: str,
+    msg_type: str,
+    content: str = "",
+    extra: dict | None = None,
+) -> None:
+    if agent_id:
+        async with _ACCOUNT_LOCK:
+            previous_agent = _active_agent_id or agent_manager.active_id() or ""
+            try:
+                _activate_runtime(agent_id)
+                await _broadcast_local_sent_message(chat_id, msg_type, content, extra)
+            finally:
+                if previous_agent and previous_agent != agent_id:
+                    _activate_runtime(previous_agent)
+        return
+    await _broadcast_local_sent_message(chat_id, msg_type, content, extra)
+
+
+def _queue_send_job(
+    label: str,
+    agent_id: str,
+    chat_id: str,
+    msg_type: str,
+    content: str,
+    extra: dict | None,
+    send_factory,
+) -> None:
+    async def _runner():
+        try:
+            with wechat_api.use_agent(agent_id):
+                result = await send_factory()
+            if _send_result_ok(result):
+                await _broadcast_local_sent_for_agent(agent_id, chat_id, msg_type, content, extra)
+            else:
+                _log(f"[SEND_BG] {label} failed for {chat_id}: {result}")
+        except Exception as e:
+            _log(f"[SEND_BG] {label} error for {chat_id}: {type(e).__name__}: {e}")
+
+    _track_background_send(asyncio.create_task(_runner()), label)
+
+
+def _send_queued_response(kind: str, wxid: str, **extra) -> dict:
+    data = {"queued": True, "kind": kind, "wxid": wxid}
+    data.update(extra)
+    return data
+
+
 @app.post("/api/send/text")
 async def send_text(req: SendTextRequest):
-    result = await wechat_api.send_text(req.wxid, req.msg)
-    await _broadcast_local_sent_message(req.wxid, "1", req.msg)
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "text",
+        agent_id,
+        req.wxid,
+        "1",
+        req.msg,
+        None,
+        lambda: wechat_api.send_text(req.wxid, req.msg),
+    )
+    return _send_queued_response("text", req.wxid)
 
 
 @app.post("/api/send/image")
 async def send_image(req: SendImageRequest):
-    result = await wechat_api.send_image(req.wxid, req.picpath, req.diyfilename, req.fileData)
-    await _broadcast_local_sent_message(req.wxid, "3", "", {"img_path": req.picpath})
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "image",
+        agent_id,
+        req.wxid,
+        "3",
+        "",
+        {"img_path": req.picpath},
+        lambda: wechat_api.send_image(req.wxid, req.picpath, req.diyfilename, req.fileData),
+    )
+    return _send_queued_response("image", req.wxid)
 
 
 @app.post("/api/send/file")
 async def send_file(req: SendFileRequest):
-    result = await wechat_api.send_file(req.wxid, req.filepath, req.fileData)
-    await _broadcast_local_sent_message(req.wxid, "49", "", {"file_path": req.filepath})
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "file",
+        agent_id,
+        req.wxid,
+        "49",
+        "",
+        {"file_path": req.filepath},
+        lambda: wechat_api.send_file(req.wxid, req.filepath, req.fileData),
+    )
+    return _send_queued_response("file", req.wxid)
 
 
 @app.post("/api/send/video")
 async def send_video(req: SendVideoRequest):
-    result = await wechat_api.send_video(req.wxid, req.videopath, req.fileData)
-    await _broadcast_local_sent_message(req.wxid, "43", "", {"video_path": req.videopath})
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "video",
+        agent_id,
+        req.wxid,
+        "43",
+        "",
+        {"video_path": req.videopath},
+        lambda: wechat_api.send_video(req.wxid, req.videopath, req.fileData),
+    )
+    return _send_queued_response("video", req.wxid)
 
 
 @app.post("/api/send/gif")
 async def send_gif(req: SendGifRequest):
-    result = await wechat_api.send_gif(req.wxid, req.gifpath, req.fileData)
-    await _broadcast_local_sent_message(req.wxid, "47", "", {"gif_path": req.gifpath})
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "gif",
+        agent_id,
+        req.wxid,
+        "47",
+        "",
+        {"gif_path": req.gifpath},
+        lambda: wechat_api.send_gif(req.wxid, req.gifpath, req.fileData),
+    )
+    return _send_queued_response("gif", req.wxid)
 
 
 @app.post("/api/send/quote")
 async def send_quote(req: SendQuoteRequest):
-    result = await wechat_api.send_quote(
-        req.towxid, req.title, req.svrid,
-        req.fromusr, req.displayname, req.chatusr
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "quote",
+        agent_id,
+        req.towxid,
+        "49",
+        req.title,
+        None,
+        lambda: wechat_api.send_quote(
+            req.towxid, req.title, req.svrid,
+            req.fromusr, req.displayname, req.chatusr
+        ),
     )
-    await _broadcast_local_sent_message(req.towxid, "49", req.title)
-    return result
+    return _send_queued_response("quote", req.towxid)
 
 
 @app.post("/api/send/at")
 async def send_at(req: SendAtRequest):
-    result = await wechat_api.send_at(req.gid, req.wxidlist, req.nicknamelist, req.msg)
-    await _broadcast_local_sent_message(req.gid, "1", req.msg)
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "at",
+        agent_id,
+        req.gid,
+        "1",
+        req.msg,
+        None,
+        lambda: wechat_api.send_at(req.gid, req.wxidlist, req.nicknamelist, req.msg),
+    )
+    return _send_queued_response("at", req.gid)
 
 
 _UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "_uploads")
@@ -2269,23 +2396,48 @@ os.makedirs(_UPLOAD_DIR, exist_ok=True)
 async def broadcast_text(req: BroadcastTextRequest):
     """Broadcast text using the low-level NoSrc endpoint and patch local UI cache."""
     wxids = [w for w in req.wxids if w]
-    results = []
-    sent = 0
-    failed = 0
-    for wxid in wxids:
-        try:
-            result = await wechat_api.send_text_no_src(wxid, req.msg)
-            ok = _send_result_ok(result)
-            if ok:
-                sent += 1
-                await _broadcast_local_sent_message(wxid, "1", req.msg)
-            else:
-                failed += 1
-            results.append({"wxid": wxid, "ok": ok, "result": result})
-        except Exception as e:
-            failed += 1
-            results.append({"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    sem = asyncio.Semaphore(_send_api_parallelism())
+
+    async def _send_one(wxid: str) -> dict:
+        async with sem:
+            try:
+                with wechat_api.use_agent(agent_id):
+                    result = await wechat_api.send_text_no_src(wxid, req.msg)
+                ok = _send_result_ok(result)
+                if ok:
+                    await _broadcast_local_sent_for_agent(agent_id, wxid, "1", req.msg)
+                return {"wxid": wxid, "ok": ok, "result": result}
+            except Exception as e:
+                return {"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    results = await asyncio.gather(*(_send_one(wxid) for wxid in wxids)) if wxids else []
+    sent = sum(1 for row in results if row.get("ok"))
+    failed = len(results) - sent
     return {"total": len(wxids), "sent": sent, "failed": failed, "results": results}
+
+
+async def _broadcast_image_to_targets(
+    target_wxids: list[str],
+    cdn: dict,
+    image_extra: dict,
+    agent_id: str = "",
+) -> list[dict]:
+    sem = asyncio.Semaphore(_send_api_parallelism())
+
+    async def _send_one(wxid: str) -> dict:
+        async with sem:
+            try:
+                with wechat_api.use_agent(agent_id):
+                    result = await wechat_api.send_image_no_src(wxid, cdn)
+                ok = _send_result_ok(result)
+                if ok:
+                    await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", image_extra)
+                return {"wxid": wxid, "ok": ok, "result": result}
+            except Exception as e:
+                return {"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    return await asyncio.gather(*(_send_one(wxid) for wxid in target_wxids)) if target_wxids else []
 
 
 @app.post("/api/broadcast/image-upload")
@@ -2334,7 +2486,9 @@ async def broadcast_image_upload(wxids: str = Form(...), file: UploadFile = File
     except Exception as e:
         _log(f"[BROADCAST] Image compression skipped: {e}")
 
-    cdn = await wechat_api.cdn_upload_image(send_path, target_wxids[0])
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    with wechat_api.use_agent(agent_id):
+        cdn = await wechat_api.cdn_upload_image(send_path, target_wxids[0])
     if cdn.get("error"):
         return {
             "total": len(target_wxids),
@@ -2344,22 +2498,9 @@ async def broadcast_image_upload(wxids: str = Form(...), file: UploadFile = File
             "cdn": {k: cdn.get(k) for k in _BROADCAST_IMG_CDN_KEYS},
         }
 
-    results = []
-    sent = 0
-    failed = 0
-    for wxid in target_wxids:
-        try:
-            result = await wechat_api.send_image_no_src(wxid, cdn)
-            ok = _send_result_ok(result)
-            if ok:
-                sent += 1
-                await _broadcast_local_sent_message(wxid, "3", "", {"img_path": filepath})
-            else:
-                failed += 1
-            results.append({"wxid": wxid, "ok": ok, "result": result})
-        except Exception as e:
-            failed += 1
-            results.append({"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+    results = await _broadcast_image_to_targets(target_wxids, cdn, {"img_path": filepath}, agent_id)
+    sent = sum(1 for row in results if row.get("ok"))
+    failed = len(results) - sent
 
     return {
         "total": len(target_wxids),
@@ -2483,11 +2624,9 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
         agent_ids = [a["id"] for a in agent_manager.agents() if a.get("id")]
     direct_targets = [w for w in req.wxids if w]
     target_types = _normalize_broadcast_target_types(req.target_types)
-    sent = 0
-    failed = 0
-    results = []
     total = 0
     account_targets: dict[str, int] = {}
+    work_items: list[tuple[str, str]] = []
 
     for agent_id in agent_ids:
         if direct_targets:
@@ -2496,27 +2635,25 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
             target_wxids = await _resolve_account_broadcast_targets(agent_id, target_types)
         account_targets[agent_id] = len(target_wxids)
         total += len(target_wxids)
-        if not target_wxids:
-            continue
-        async with _ACCOUNT_LOCK:
-            await agent_manager.set_active(agent_id)
-            _activate_runtime(agent_id)
-        with wechat_api.use_agent(agent_id):
-            for wxid in target_wxids:
-                try:
+        work_items.extend((agent_id, wxid) for wxid in target_wxids)
+
+    sem = asyncio.Semaphore(_send_api_parallelism())
+
+    async def _send_one(agent_id: str, wxid: str) -> dict:
+        async with sem:
+            try:
+                with wechat_api.use_agent(agent_id):
                     result = await wechat_api.send_text_no_src(wxid, req.msg)
-                    ok = _send_result_ok(result)
-                    if ok:
-                        sent += 1
-                        async with _ACCOUNT_LOCK:
-                            _activate_runtime(agent_id)
-                            await _broadcast_local_sent_message(wxid, "1", req.msg)
-                    else:
-                        failed += 1
-                    results.append({"agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result})
-                except Exception as e:
-                    failed += 1
-                    results.append({"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+                ok = _send_result_ok(result)
+                if ok:
+                    await _broadcast_local_sent_for_agent(agent_id, wxid, "1", req.msg)
+                return {"agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result}
+            except Exception as e:
+                return {"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    results = await asyncio.gather(*(_send_one(agent_id, wxid) for agent_id, wxid in work_items)) if work_items else []
+    sent = sum(1 for row in results if row.get("ok"))
+    failed = len(results) - sent
 
     return {"accounts": len(agent_ids), "targets": total, "account_targets": account_targets, "total": total, "sent": sent, "failed": failed, "results": results}
 
@@ -2600,21 +2737,24 @@ async def multi_account_broadcast_image_upload(
                 for wxid in agent_targets:
                     results.append({"agent_id": agent_id, "wxid": wxid, "ok": False, "error": cdn["error"]})
                 continue
-            for wxid in agent_targets:
-                try:
-                    result = await wechat_api.send_image_no_src(wxid, cdn)
-                    ok = _send_result_ok(result)
-                    if ok:
-                        sent += 1
-                        async with _ACCOUNT_LOCK:
-                            _activate_runtime(agent_id)
-                            await _broadcast_local_sent_message(wxid, "3", "", {"db_image_id": db_image_id})
-                    else:
-                        failed += 1
-                    results.append({"agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result})
-                except Exception as e:
-                    failed += 1
-                    results.append({"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+            sem = asyncio.Semaphore(_send_api_parallelism())
+
+            async def _send_one(wxid: str) -> dict:
+                async with sem:
+                    try:
+                        with wechat_api.use_agent(agent_id):
+                            result = await wechat_api.send_image_no_src(wxid, cdn)
+                        ok = _send_result_ok(result)
+                        if ok:
+                            await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", {"db_image_id": db_image_id})
+                        return {"agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result}
+                    except Exception as e:
+                        return {"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+            send_results = await asyncio.gather(*(_send_one(wxid) for wxid in agent_targets))
+            sent += sum(1 for row in send_results if row.get("ok"))
+            failed += sum(1 for row in send_results if not row.get("ok"))
+            results.extend(send_results)
 
     return {
         "accounts": len(selected_agents),
@@ -2674,9 +2814,17 @@ async def send_image_upload(wxid: str = Form(...), file: UploadFile = File(...))
     except Exception as e:
         _log(f"[UPLOAD] Image compression skipped: {e}")
 
-    result = await wechat_api.send_image(wxid, send_path)
-    await _broadcast_local_sent_message(wxid, "3", "", {"img_path": filepath})
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "image-upload",
+        agent_id,
+        wxid,
+        "3",
+        "",
+        {"img_path": filepath},
+        lambda: wechat_api.send_image(wxid, send_path),
+    )
+    return _send_queued_response("image-upload", wxid, path=filepath)
 
 
 @app.post("/api/send/file-upload")
@@ -2690,9 +2838,17 @@ async def send_file_upload(wxid: str = Form(...), file: UploadFile = File(...)):
         f.write(data)
     _log(f"[UPLOAD] Saved file: {filepath} ({len(data)} bytes)")
 
-    result = await wechat_api.send_file(wxid, filepath)
-    await _broadcast_local_sent_message(wxid, "49", safe_name, {"file_path": filepath})
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "file-upload",
+        agent_id,
+        wxid,
+        "49",
+        safe_name,
+        {"file_path": filepath},
+        lambda: wechat_api.send_file(wxid, filepath),
+    )
+    return _send_queued_response("file-upload", wxid, path=filepath)
 
 
 @app.post("/api/send/video-upload")
@@ -2706,9 +2862,17 @@ async def send_video_upload(wxid: str = Form(...), file: UploadFile = File(...))
         f.write(data)
     _log(f"[UPLOAD] Saved video: {filepath} ({len(data)} bytes)")
 
-    result = await wechat_api.send_video(wxid, filepath)
-    await _broadcast_local_sent_message(wxid, "43", "", {"video_path": filepath})
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "video-upload",
+        agent_id,
+        wxid,
+        "43",
+        "",
+        {"video_path": filepath},
+        lambda: wechat_api.send_video(wxid, filepath),
+    )
+    return _send_queued_response("video-upload", wxid, path=filepath)
 
 
 @app.post("/api/send/gif-upload")
@@ -2722,9 +2886,17 @@ async def send_gif_upload(wxid: str = Form(...), file: UploadFile = File(...)):
         f.write(data)
     _log(f"[UPLOAD] Saved GIF: {filepath} ({len(data)} bytes)")
 
-    result = await wechat_api.send_gif(wxid, filepath)
-    await _broadcast_local_sent_message(wxid, "47", "", {"gif_path": filepath})
-    return result
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "gif-upload",
+        agent_id,
+        wxid,
+        "47",
+        "",
+        {"gif_path": filepath},
+        lambda: wechat_api.send_gif(wxid, filepath),
+    )
+    return _send_queued_response("gif-upload", wxid, path=filepath)
 
 
 @app.post("/api/revoke")
