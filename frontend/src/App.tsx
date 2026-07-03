@@ -1180,25 +1180,8 @@ export default function App() {
         return sortSessionsForDisplay(Array.from(merged.values()));
       });
 
-      const regularNeedsBrief = enriched
-        .filter((s) => !s.is_group && (
-          !avatarMapRef.current[s.wxid] ||
-          (!contactMapRef.current[s.wxid] && (!s.nickname || s.nickname === s.wxid))
-        ))
-        .map((s) => s.wxid)
-        .filter((wxid) => !wxid.endsWith("@openim"));
-      const openimNeedsProfile = enriched
-        .filter((s) => !s.is_group && s.wxid.endsWith("@openim") && !avatarMapRef.current[s.wxid])
-        .map((s) => s.wxid);
-      const groupNeedsProfile = enriched
-        .filter((s) => s.is_group && !avatarMapRef.current[s.wxid])
-        .map((s) => s.wxid);
-
-      queueBriefLookup(regularNeedsBrief, selfWxid);
-      if (openimNeedsProfile.length > 0) {
-        ensureContactProfiles(openimNeedsProfile).catch((err) => console.error("[OPENIM_PROFILE]", err));
-      }
-      ensureGroupProfiles(groupNeedsProfile);
+      // Account entry should be cheap: load the Session table + local SQLite cache only.
+      // Missing avatars/details are resolved later from explicit profile or chat actions.
       setSessionsHydrated(true);
     } catch (err) {
       console.error("[SESSIONS] hydrate failed:", err);
@@ -1207,7 +1190,7 @@ export default function App() {
         setSessionsHydrating(false);
       }
     }
-  }, [ensureContactProfiles, ensureGroupProfiles, queueBriefLookup, selfWxid, sessionsHydrated, sessionsHydrating]);
+  }, [sessionsHydrated, sessionsHydrating]);
 
   // ─── Fetch group member names (fast) on entering a group ──────────
   const fetchGroupMemberNames = useCallback((gid: string) => {

@@ -2070,8 +2070,8 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
     """Load the directory from local SQLite, initializing it once via InitContact.
 
     GetFriendAndChatRoomList is intentionally not used here; on remote Hook it can
-    crash WeChat. InitContact provides the wxid/gid list, then GetContact fills
-    details in 100-id batches in the background.
+    crash WeChat. InitContact provides the wxid/gid list. Full profiles are loaded
+    on demand with /GetContact, never as an automatic all-contact background sweep.
     """
     owner_wxid = _contact_owner_wxid()
     if app_state.get("contacts_loaded"):
@@ -2124,29 +2124,12 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
             f"entries={len(raw_entries)} cached_before={len(cached_before)}"
         )
 
-        wxids = []
-        seen: set[str] = set()
-        for entry in raw_entries:
-            wxid = _contact_profile_wxid(entry)
-            if not wxid or wxid in seen:
-                continue
-            seen.add(wxid)
-            wxids.append(wxid)
-
-        if wxids:
-            hydrate_agent_id = _active_agent_id or agent_manager.active_id() or ""
-
-            async def _hydrate_details(owner: str, ids: list[str], agent_id: str) -> None:
-                try:
-                    with wechat_api.use_agent(agent_id):
-                        await _fetch_and_cache_contact_details(ids, broadcast_updates=True, owner_wxid=owner)
-                    app_state["contacts"] = _contacts_snapshot_from_db(owner)
-                    _log(f"[CONTACTS] GetContact hydration complete: {len(ids)} ids")
-                except Exception as e:
-                    _log(f"[CONTACTS] GetContact hydration task failed: {type(e).__name__}: {e}")
-
-            task = asyncio.create_task(_hydrate_details(owner_wxid, wxids, hydrate_agent_id))
-            _track_background_send(task, "contacts_getcontact")
+        detail_candidates = len({_contact_profile_wxid(entry) for entry in raw_entries if _contact_profile_wxid(entry)})
+        if detail_candidates:
+            _log(
+                f"[CONTACTS] skipped automatic GetContact hydration for {detail_candidates} contacts; "
+                "profiles refresh only on explicit profile/avatar open"
+            )
 
         return snapshot
 
