@@ -35,7 +35,7 @@ class SqliteMessageCache:
 
     def _init_db(self) -> None:
         with self._lock, self._connect() as conn:
-            for table_name in ("messages", "history_state", "last_messages", "contacts"):
+            for table_name in ("messages", "history_state", "last_messages", "contacts", "sessions"):
                 existing_cols = [
                     str(row["name"])
                     for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
@@ -102,6 +102,23 @@ class SqliteMessageCache:
                 );
                 CREATE INDEX IF NOT EXISTS idx_contacts_owner_group_name
                     ON contacts (owner_wxid, is_group, name);
+
+                CREATE TABLE IF NOT EXISTS sessions (
+                    owner_wxid TEXT NOT NULL DEFAULT '',
+                    wxid TEXT NOT NULL,
+                    nickname TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL DEFAULT '',
+                    msg_type TEXT NOT NULL DEFAULT '1',
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    others_at_me INTEGER NOT NULL DEFAULT 0,
+                    order_value INTEGER NOT NULL DEFAULT 0,
+                    timestamp INTEGER NOT NULL DEFAULT 0,
+                    raw_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (owner_wxid, wxid)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sessions_owner_order
+                    ON sessions (owner_wxid, order_value DESC, timestamp DESC);
 
                 CREATE TABLE IF NOT EXISTS group_members (
                     owner_wxid TEXT NOT NULL DEFAULT '',
@@ -449,6 +466,298 @@ class SqliteMessageCache:
 
     def mark_contact_init_done(self, *, owner_wxid: str = "") -> None:
         self.set_meta("contact_init_done", "1", owner_wxid=owner_wxid)
+
+    def has_contact_init_done_v2(self, *, owner_wxid: str = "") -> bool:
+        return self.get_meta("contact_init_done_v2", owner_wxid=owner_wxid) == "1"
+
+    def mark_contact_init_done_v2(self, *, owner_wxid: str = "") -> None:
+        self.set_meta("contact_init_done_v2", "1", owner_wxid=owner_wxid)
+
+    def has_session_init_done(self, *, owner_wxid: str = "") -> bool:
+        return self.get_meta("session_list_init_done", owner_wxid=owner_wxid) == "1"
+
+    def mark_session_init_done(self, *, owner_wxid: str = "") -> None:
+        self.set_meta("session_list_init_done", "1", owner_wxid=owner_wxid)
+
+    @staticmethod
+    def _row_value(row: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in row and row.get(key) is not None:
+                return row.get(key)
+        return ""
+
+    @staticmethod
+    def _to_int(value: Any) -> int:
+        try:
+            if value in (None, ""):
+                return 0
+            return int(float(value))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _session_wxid(row: dict[str, Any]) -> str:
+        return str(
+            SqliteMessageCache._row_value(
+                row,
+                "strUsrName",
+                "StrUsrName",
+                "UserName",
+                "userName",
+                "wxid",
+            )
+            or ""
+        ).strip()
+
+    @classmethod
+    def _normalized_session_row(cls, row: dict[str, Any]) -> dict[str, Any]:
+        wxid = cls._session_wxid(row)
+        nickname = str(cls._row_value(row, "strNickName", "StrNickName", "NickName", "nickname") or "")
+        content = str(cls._row_value(row, "strContent", "StrContent", "content", "lastMsg") or "")
+        unread = cls._to_int(cls._row_value(row, "nUnReadCount", "UnReadCount", "unread"))
+        at_me = cls._to_int(cls._row_value(row, "othersAtMe", "OthersAtMe", "atMe"))
+        order_value = cls._to_int(cls._row_value(row, "nOrder", "NOrder", "order"))
+        timestamp = cls._to_int(
+            cls._row_value(
+                row,
+                "nTime",
+                "NTime",
+                "nUpdateTime",
+                "nCreateTime",
+                "CreateTime",
+                "timestamp",
+                "lastTimestamp",
+            )
+        )
+        msg_type = str(cls._row_value(row, "nMsgType", "NMsgType", "msgType", "type") or "1")
+        normalized = dict(row)
+        normalized.update(
+            {
+                "strUsrName": wxid,
+                "strNickName": nickname,
+                "strContent": content,
+                "nUnReadCount": unread,
+                "othersAtMe": at_me,
+                "nOrder": order_value,
+                "order": order_value,
+                "nTime": timestamp,
+                "nMsgType": msg_type,
+            }
+        )
+        return normalized
+
+    def upsert_sessions(self, sessions: list[dict[str, Any]], *, owner_wxid: str = "") -> None:
+        if not sessions:
+            return
+        now = int(time.time())
+        owner_wxid = str(owner_wxid or "").strip()
+        rows = []
+        seen: set[str] = set()
+        for raw in sessions:
+            if not isinstance(raw, dict):
+                continue
+            row = self._normalized_session_row(raw)
+            wxid = row.get("strUsrName", "")
+            if not wxid or wxid in seen:
+                continue
+            seen.add(wxid)
+            rows.append(
+                (
+                    owner_wxid,
+                    wxid,
+                    str(row.get("strNickName") or ""),
+                    str(row.get("strContent") or ""),
+                    str(row.get("nMsgType") or "1"),
+                    self._to_int(row.get("nUnReadCount")),
+                    self._to_int(row.get("othersAtMe")),
+                    self._to_int(row.get("nOrder")),
+                    self._to_int(row.get("nTime")),
+                    json.dumps(row, ensure_ascii=False),
+                    now,
+                )
+            )
+        if not rows:
+            return
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO sessions (
+                    owner_wxid, wxid, nickname, content, msg_type, unread_count,
+                    others_at_me, order_value, timestamp, raw_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_wxid, wxid) DO UPDATE SET
+                    nickname=COALESCE(NULLIF(excluded.nickname, ''), sessions.nickname),
+                    content=COALESCE(NULLIF(excluded.content, ''), sessions.content),
+                    msg_type=COALESCE(NULLIF(excluded.msg_type, ''), sessions.msg_type),
+                    unread_count=excluded.unread_count,
+                    others_at_me=excluded.others_at_me,
+                    order_value=CASE
+                        WHEN sessions.order_value >= 1000000000000
+                             AND excluded.order_value < 1000000000000 THEN sessions.order_value
+                        WHEN excluded.order_value != 0 THEN excluded.order_value
+                        ELSE sessions.order_value
+                    END,
+                    timestamp=CASE
+                        WHEN excluded.timestamp != 0 THEN excluded.timestamp
+                        ELSE sessions.timestamp
+                    END,
+                    raw_json=excluded.raw_json,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+
+    def get_sessions(self, *, owner_wxid: str = "") -> list[dict[str, Any]]:
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT wxid, nickname, content, msg_type, unread_count, others_at_me,
+                       order_value, timestamp, raw_json
+                FROM sessions
+                WHERE owner_wxid = ?
+                ORDER BY order_value DESC, timestamp DESC, updated_at DESC
+                """,
+                (owner_wxid,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                raw = json.loads(row["raw_json"] or "{}")
+            except Exception:
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            raw.update(
+                {
+                    "strUsrName": row["wxid"],
+                    "strNickName": row["nickname"] or "",
+                    "strContent": row["content"] or "",
+                    "nMsgType": row["msg_type"] or "1",
+                    "nUnReadCount": int(row["unread_count"] or 0),
+                    "othersAtMe": int(row["others_at_me"] or 0),
+                    "nOrder": int(row["order_value"] or 0),
+                    "order": int(row["order_value"] or 0),
+                    "nTime": int(row["timestamp"] or 0),
+                }
+            )
+            out.append(raw)
+        return out
+
+    def upsert_session_preview(
+        self,
+        wxid: str,
+        *,
+        nickname: str = "",
+        content: str = "",
+        msg_type: str = "1",
+        timestamp: int = 0,
+        unread_delta: int = 0,
+        owner_wxid: str = "",
+    ) -> None:
+        wxid = str(wxid or "").strip()
+        if not wxid:
+            return
+        owner_wxid = str(owner_wxid or "").strip()
+        now = int(time.time())
+        timestamp = self._to_int(timestamp) or now
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT nickname, unread_count, others_at_me, order_value, timestamp, raw_json
+                FROM sessions
+                WHERE owner_wxid = ? AND wxid = ?
+                """,
+                (owner_wxid, wxid),
+            ).fetchone()
+            old_unread = int(existing["unread_count"] or 0) if existing else 0
+            old_order = int(existing["order_value"] or 0) if existing else 0
+            old_ts = int(existing["timestamp"] or 0) if existing else 0
+            try:
+                raw = json.loads(existing["raw_json"] or "{}") if existing else {}
+            except Exception:
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            next_unread = max(0, old_unread + max(0, int(unread_delta or 0)))
+            next_order = old_order if old_order >= 1000000000000 else max(old_order, timestamp)
+            next_ts = max(old_ts, timestamp)
+            next_name = nickname or (existing["nickname"] if existing else "") or ""
+            raw.update(
+                {
+                    "strUsrName": wxid,
+                    "strNickName": next_name,
+                    "strContent": content or raw.get("strContent", ""),
+                    "nMsgType": str(msg_type or raw.get("nMsgType") or "1"),
+                    "nUnReadCount": next_unread,
+                    "othersAtMe": int(raw.get("othersAtMe") or 0),
+                    "nOrder": next_order,
+                    "order": next_order,
+                    "nTime": next_ts,
+                }
+            )
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    owner_wxid, wxid, nickname, content, msg_type, unread_count,
+                    others_at_me, order_value, timestamp, raw_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_wxid, wxid) DO UPDATE SET
+                    nickname=COALESCE(NULLIF(excluded.nickname, ''), sessions.nickname),
+                    content=excluded.content,
+                    msg_type=excluded.msg_type,
+                    unread_count=excluded.unread_count,
+                    others_at_me=excluded.others_at_me,
+                    order_value=excluded.order_value,
+                    timestamp=excluded.timestamp,
+                    raw_json=excluded.raw_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    owner_wxid,
+                    wxid,
+                    next_name,
+                    content or "",
+                    str(msg_type or "1"),
+                    next_unread,
+                    int(raw.get("othersAtMe") or 0),
+                    next_order,
+                    next_ts,
+                    json.dumps(raw, ensure_ascii=False),
+                    now,
+                ),
+            )
+
+    def mark_session_read(self, wxid: str, *, owner_wxid: str = "") -> None:
+        wxid = str(wxid or "").strip()
+        if not wxid:
+            return
+        owner_wxid = str(owner_wxid or "").strip()
+        now = int(time.time())
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT raw_json FROM sessions WHERE owner_wxid = ? AND wxid = ?",
+                (owner_wxid, wxid),
+            ).fetchone()
+            if not row:
+                return
+            try:
+                raw = json.loads(row["raw_json"] or "{}")
+            except Exception:
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            raw["nUnReadCount"] = 0
+            conn.execute(
+                """
+                UPDATE sessions
+                SET unread_count = 0, raw_json = ?, updated_at = ?
+                WHERE owner_wxid = ? AND wxid = ?
+                """,
+                (json.dumps(raw, ensure_ascii=False), now, owner_wxid, wxid),
+            )
 
     def upsert_group_members(self, gid: str, members: list[dict[str, Any]] | dict[str, dict[str, Any]], *, owner_wxid: str = "") -> None:
         gid = str(gid or "").strip()

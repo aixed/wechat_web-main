@@ -15,6 +15,7 @@ import {
   getContactProfiles,
   getGroupMemberDetails,
   getGroupMemberNames,
+  getMultiAccountBroadcastTargets,
   loginWithKey,
   markAsRead,
   markSessionUnread,
@@ -82,6 +83,13 @@ interface BroadcastImageItem {
 type BroadcastPayloadPart =
   | { type: "text"; text: string }
   | { type: "image"; image: BroadcastImageItem };
+
+type BroadcastProgressState = {
+  total: number;
+  sent: number;
+  failed: number;
+  accountCounts: Record<string, { friends?: number; groups?: number; targets?: number; sent?: number; failed?: number }>;
+};
 
 function buildBroadcastParts(message: string, images: BroadcastImageItem[]): BroadcastPayloadPart[] {
   const parts: BroadcastPayloadPart[] = [];
@@ -797,6 +805,7 @@ export default function App() {
     }
     setActiveAgentId(agentId);
     setSelectedAccountId(agentId);
+    setSessionsRequested(true);
   }, [loadAccounts, resetChatState]);
 
   const handleLeaveAccount = useCallback(() => {
@@ -2426,6 +2435,7 @@ function MobileMultiAccountBroadcastPage({
   const [preview, setPreview] = useState("");
   const [sending, setSending] = useState(false);
   const [resultText, setResultText] = useState("");
+  const [progress, setProgress] = useState<BroadcastProgressState>({ total: 0, sent: 0, failed: 0, accountCounts: {} });
 
   useEffect(() => {
     const validIds = new Set(accounts.map((a) => a.id).filter(Boolean));
@@ -2472,25 +2482,61 @@ function MobileMultiAccountBroadcastPage({
     });
   };
 
-  const sendText = async () => {
+  const updateProgressFromResult = (res: any) => {
+    const rows = Array.isArray(res?.results) ? res.results : [];
+    const accountCounts: BroadcastProgressState["accountCounts"] = { ...(res?.account_counts || {}) };
+    for (const row of rows) {
+      const agentId = String(row?.agent_id || "");
+      if (!agentId) continue;
+      const current = accountCounts[agentId] || {};
+      if (row?.ok) current.sent = (current.sent || 0) + 1;
+      else current.failed = (current.failed || 0) + 1;
+      accountCounts[agentId] = current;
+    }
+    setProgress({
+      total: Number(res?.total || res?.targets || 0),
+      sent: Number(res?.sent || 0),
+      failed: Number(res?.failed || 0),
+      accountCounts,
+    });
+  };
+
+  const prepareProgress = async () => {
+    const plan = await getMultiAccountBroadcastTargets(agentIds, selectedTargetTypes);
+    setProgress({
+      total: Number(plan?.total || plan?.targets || 0),
+      sent: 0,
+      failed: 0,
+      accountCounts: plan?.account_counts || {},
+    });
+    return plan;
+  };
+
+  const sendText = async (mode = "nosrc") => {
     if (!message.trim() || agentIds.length === 0 || selectedTargetTypes.length === 0 || sending) return;
     setSending(true);
     setResultText("");
+    setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
-      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim());
-      setResultText(`文本完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+      await prepareProgress();
+      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode);
+      updateProgressFromResult(res);
+      setResultText(`${mode === "normal" ? "普通文本" : "文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
   };
 
-  const sendImage = async () => {
+  const sendImage = async (mode = "nosrc") => {
     if (!image || agentIds.length === 0 || selectedTargetTypes.length === 0 || sending) return;
     setSending(true);
     setResultText("");
+    setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
-      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image);
-      setResultText(`图片完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+      await prepareProgress();
+      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image, mode);
+      updateProgressFromResult(res);
+      setResultText(`${mode === "normal" ? "普通图片" : "图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -2570,14 +2616,24 @@ function MobileMultiAccountBroadcastPage({
             }`}
             placeholder="输入文本"
           />
-          <button
-            type="button"
-            disabled={sending || !message.trim() || agentIds.length === 0 || selectedTargetTypes.length === 0}
-            onClick={sendText}
-            className={`mt-[10px] w-full h-[42px] rounded-[10px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
-          >
-            {sending ? "发送中" : "群发文本"}
-          </button>
+          <div className="mt-[10px] grid grid-cols-2 gap-[8px]">
+            <button
+              type="button"
+              disabled={sending || !message.trim() || agentIds.length === 0 || selectedTargetTypes.length === 0}
+              onClick={() => sendText("nosrc")}
+              className={`h-[42px] rounded-[10px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
+            >
+              {sending ? "发送中" : "群发文本"}
+            </button>
+            <button
+              type="button"
+              disabled={sending || !message.trim() || agentIds.length === 0 || selectedTargetTypes.length === 0}
+              onClick={() => sendText("normal")}
+              className={`h-[42px] rounded-[10px] border ${dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#242424] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"}`}
+            >
+              普通文本
+            </button>
+          </div>
         </div>
 
         <div className={`mt-[12px] rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
@@ -2592,19 +2648,30 @@ function MobileMultiAccountBroadcastPage({
             选择图片
           </label>
           {preview && <img src={preview} alt="" className={`mt-[10px] max-h-[180px] rounded-[10px] object-contain mx-auto ${dark ? "bg-black/20" : "bg-[#f7f7f7] border border-[#e0e0e0]"}`} />}
-          <button
-            type="button"
-            disabled={sending || !image || agentIds.length === 0 || selectedTargetTypes.length === 0}
-            onClick={sendImage}
-            className={`mt-[10px] w-full h-[42px] rounded-[10px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
-          >
-            {sending ? "发送中" : "群发图片"}
-          </button>
+          <div className="mt-[10px] grid grid-cols-2 gap-[8px]">
+            <button
+              type="button"
+              disabled={sending || !image || agentIds.length === 0 || selectedTargetTypes.length === 0}
+              onClick={() => sendImage("nosrc")}
+              className={`h-[42px] rounded-[10px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
+            >
+              {sending ? "发送中" : "群发图片"}
+            </button>
+            <button
+              type="button"
+              disabled={sending || !image || agentIds.length === 0 || selectedTargetTypes.length === 0}
+              onClick={() => sendImage("normal")}
+              className={`h-[42px] rounded-[10px] border ${dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#242424] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"}`}
+            >
+              普通图片
+            </button>
+          </div>
         </div>
 
         <div className={`mt-[12px] text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
           已选账号 {agentIds.length} 个，目标类型 {selectedTargetTypes.length} 个。{resultText}
         </div>
+        <BroadcastProgressView accounts={accounts} progress={progress} dark={dark} compact />
       </div>
     </div>
   );
@@ -3047,6 +3114,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
   const [selectedAgents, setSelectedAgents] = useState<Set<string>>(new Set());
   const [sending, setSending] = useState(false);
   const [resultText, setResultText] = useState("");
+  const [progress, setProgress] = useState<BroadcastProgressState>({ total: 0, sent: 0, failed: 0, accountCounts: {} });
 
   useEffect(() => {
     const validIds = new Set(accounts.map((a) => a.id).filter(Boolean));
@@ -3089,25 +3157,61 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
     });
   };
 
-  const sendText = async () => {
+  const updateProgressFromResult = (res: any) => {
+    const rows = Array.isArray(res?.results) ? res.results : [];
+    const accountCounts: BroadcastProgressState["accountCounts"] = { ...(res?.account_counts || {}) };
+    for (const row of rows) {
+      const agentId = String(row?.agent_id || "");
+      if (!agentId) continue;
+      const current = accountCounts[agentId] || {};
+      if (row?.ok) current.sent = (current.sent || 0) + 1;
+      else current.failed = (current.failed || 0) + 1;
+      accountCounts[agentId] = current;
+    }
+    setProgress({
+      total: Number(res?.total || res?.targets || 0),
+      sent: Number(res?.sent || 0),
+      failed: Number(res?.failed || 0),
+      accountCounts,
+    });
+  };
+
+  const prepareProgress = async () => {
+    const plan = await getMultiAccountBroadcastTargets(agentIds, selectedTargetTypes);
+    setProgress({
+      total: Number(plan?.total || plan?.targets || 0),
+      sent: 0,
+      failed: 0,
+      accountCounts: plan?.account_counts || {},
+    });
+    return plan;
+  };
+
+  const sendText = async (mode = "nosrc") => {
     if (!message.trim() || selectedTargetTypes.length === 0 || agentIds.length === 0 || sending) return;
     setSending(true);
     setResultText("");
+    setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
-      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim());
-      setResultText(`文本完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+      await prepareProgress();
+      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode);
+      updateProgressFromResult(res);
+      setResultText(`${mode === "normal" ? "普通文本" : "文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
   };
 
-  const sendImage = async () => {
+  const sendImage = async (mode = "nosrc") => {
     if (!image || selectedTargetTypes.length === 0 || agentIds.length === 0 || sending) return;
     setSending(true);
     setResultText("");
+    setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
-      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image);
-      setResultText(`图片完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+      await prepareProgress();
+      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image, mode);
+      updateProgressFromResult(res);
+      setResultText(`${mode === "normal" ? "普通图片" : "图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -3191,14 +3295,26 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
               }`}
               placeholder="输入文本"
             />
-            <button
-              type="button"
-            disabled={sending || !message.trim() || selectedTargetTypes.length === 0 || agentIds.length === 0}
-            onClick={sendText}
-              className={`mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white active:opacity-85 ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
-            >
-              {sending ? "发送中" : "群发文本"}
-            </button>
+            <div className="mt-[10px] flex flex-wrap gap-[8px]">
+              <button
+                type="button"
+                disabled={sending || !message.trim() || selectedTargetTypes.length === 0 || agentIds.length === 0}
+                onClick={() => sendText("nosrc")}
+                className={`h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white active:opacity-85 ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
+              >
+                {sending ? "发送中" : "群发文本"}
+              </button>
+              <button
+                type="button"
+                disabled={sending || !message.trim() || selectedTargetTypes.length === 0 || agentIds.length === 0}
+                onClick={() => sendText("normal")}
+                className={`h-[36px] px-[18px] rounded-[4px] border active:opacity-85 ${
+                  dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#1d1d1d] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"
+                }`}
+              >
+                普通文本
+              </button>
+            </div>
           </div>
 
           <div>
@@ -3210,19 +3326,32 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
               className={`block text-[13px] ${dark ? "text-[#aaa]" : "text-[#555]"}`}
             />
             {preview && <img src={preview} alt="" className={`mt-[10px] max-w-[180px] max-h-[140px] rounded-[4px] object-contain ${dark ? "bg-[#1d1d1d]" : "bg-white border border-[#e0e0e0]"}`} />}
-            <button
-              type="button"
-              disabled={sending || !image || selectedTargetTypes.length === 0 || agentIds.length === 0}
-              onClick={sendImage}
-              className={`mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white active:opacity-85 ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
-            >
-              {sending ? "发送中" : "群发图片"}
-            </button>
+            <div className="mt-[10px] flex flex-wrap gap-[8px]">
+              <button
+                type="button"
+                disabled={sending || !image || selectedTargetTypes.length === 0 || agentIds.length === 0}
+                onClick={() => sendImage("nosrc")}
+                className={`h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white active:opacity-85 ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
+              >
+                {sending ? "发送中" : "群发图片"}
+              </button>
+              <button
+                type="button"
+                disabled={sending || !image || selectedTargetTypes.length === 0 || agentIds.length === 0}
+                onClick={() => sendImage("normal")}
+                className={`h-[36px] px-[18px] rounded-[4px] border active:opacity-85 ${
+                  dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#1d1d1d] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"
+                }`}
+              >
+                普通图片
+              </button>
+            </div>
           </div>
 
           <div className="text-[13px] text-[#888]">
             已选账号 {agentIds.length} 个，目标类型 {selectedTargetTypes.length} 个。{resultText}
           </div>
+          <BroadcastProgressView accounts={accounts} progress={progress} dark={dark} />
         </div>
       </div>
     </div>
@@ -3272,6 +3401,62 @@ function TargetTypeButton({
       </div>
       <div className={`mt-[7px] text-[12px] ${subtitleClass}`}>{subtitle}</div>
     </button>
+  );
+}
+
+function BroadcastProgressView({
+  accounts,
+  progress,
+  dark,
+  compact = false,
+}: {
+  accounts: WeChatAccount[];
+  progress: BroadcastProgressState;
+  dark: boolean;
+  compact?: boolean;
+}) {
+  const total = progress.total || 0;
+  const done = (progress.sent || 0) + (progress.failed || 0);
+  if (!total && Object.keys(progress.accountCounts || {}).length === 0) return null;
+  const ratio = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const accountName = (id: string) => {
+    const account = accounts.find((a) => a.id === id);
+    return (account?.nickname && account.nickname !== account.id ? account.nickname : "") || account?.wxid || id;
+  };
+
+  return (
+    <div className={`mt-[12px] rounded-[8px] border p-[10px] ${dark ? "border-[#303030] bg-[#181818]" : "border-[#e0e0e0] bg-white"}`}>
+      <div className="flex items-center justify-between text-[13px]">
+        <span className={dark ? "text-[#ccc]" : "text-[#333]"}>总进度</span>
+        <span className={dark ? "text-[#888]" : "text-[#777]"}>{done}/{total}</span>
+      </div>
+      <div className={`mt-[7px] h-[6px] rounded-full overflow-hidden ${dark ? "bg-[#2b2b2b]" : "bg-[#e8e8e8]"}`}>
+        <div className="h-full bg-[#07c160] transition-all" style={{ width: `${ratio}%` }} />
+      </div>
+      <div className={`mt-[9px] ${compact ? "space-y-[7px]" : "grid grid-cols-1 gap-[7px]"}`}>
+        {Object.entries(progress.accountCounts || {}).map(([agentId, item]) => {
+          const target = Number(item.targets || 0);
+          const accountDone = Number(item.sent || 0) + Number(item.failed || 0);
+          const accountRatio = target ? Math.min(100, Math.round((accountDone / target) * 100)) : 0;
+          return (
+            <div key={agentId}>
+              <div className="flex items-center justify-between text-[12px]">
+                <span className={`truncate pr-[10px] ${dark ? "text-[#aaa]" : "text-[#555]"}`}>{accountName(agentId)}</span>
+                <span className={dark ? "text-[#777]" : "text-[#888]"}>
+                  {accountDone}/{target}
+                  {typeof item.friends === "number" || typeof item.groups === "number"
+                    ? ` · 好友${item.friends || 0}/群${item.groups || 0}`
+                    : ""}
+                </span>
+              </div>
+              <div className={`mt-[5px] h-[4px] rounded-full overflow-hidden ${dark ? "bg-[#2b2b2b]" : "bg-[#ececec]"}`}>
+                <div className="h-full bg-[#2fd47a] transition-all" style={{ width: `${accountRatio}%` }} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -3597,7 +3782,7 @@ function BroadcastPanel({
     setMessage((prev) => prev.split(image.token).join(""));
   };
 
-  const sendBroadcast = async () => {
+  const sendBroadcast = async (mode = "nosrc") => {
     const parts = buildBroadcastParts(message, broadcastImages);
     const wxids = Array.from(selected).filter((wxid) => targetMap.has(wxid));
     if (parts.length === 0 || wxids.length === 0 || sending) return;
@@ -3638,8 +3823,8 @@ function BroadcastPanel({
         if (activeWxids.length === 0) break;
         try {
           const res = part.type === "text"
-            ? await broadcastText(activeWxids, part.text)
-            : await broadcastImageUpload(activeWxids, part.image.file);
+            ? await broadcastText(activeWxids, part.text, mode)
+            : await broadcastImageUpload(activeWxids, part.image.file, mode);
           applyResult(res, activeWxids);
         } catch {
           for (const wxid of activeWxids) status.set(wxid, false);
@@ -3706,16 +3891,28 @@ function BroadcastPanel({
             ))}
           </div>
         )}
-        <div className={`mt-[8px] flex items-center justify-between text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
+        <div className={`mt-[8px] flex items-center justify-between gap-[10px] text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
           <span>已选 {selected.size} 个对象{sending ? `，已发送 ${sent}，失败 ${failed}` : ""}</span>
-          <button
-            type="button"
-            disabled={sending || selected.size === 0 || !hasPayload}
-            onClick={sendBroadcast}
-            className="h-[34px] min-w-[92px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#b9d9c7] active:opacity-80"
-          >
-            {sending ? "发送中" : "发送"}
-          </button>
+          <div className="flex items-center gap-[8px]">
+            <button
+              type="button"
+              disabled={sending || selected.size === 0 || !hasPayload}
+              onClick={() => sendBroadcast("nosrc")}
+              className="h-[34px] min-w-[92px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#b9d9c7] active:opacity-80"
+            >
+              {sending ? "发送中" : "发送"}
+            </button>
+            <button
+              type="button"
+              disabled={sending || selected.size === 0 || !hasPayload}
+              onClick={() => sendBroadcast("normal")}
+              className={`h-[34px] min-w-[92px] rounded-[4px] border disabled:opacity-50 active:opacity-80 ${
+                dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9]" : "border-[#07c160] bg-white text-[#07a854]"
+              }`}
+            >
+              普通发送
+            </button>
+          </div>
         </div>
       </div>
 
