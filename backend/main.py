@@ -846,6 +846,15 @@ async def wechat_callback(request: Request):
     return {"status": "success"}
 
 
+if config.CALLBACK_PATH != "/api/callback":
+    app.add_api_route(
+        config.CALLBACK_PATH,
+        wechat_callback,
+        methods=["POST"],
+        include_in_schema=False,
+    )
+
+
 # ─── WebSocket (frontend connection) ───────────────────────────────
 
 @app.websocket(config.AGENT_WS_PATH)
@@ -2616,6 +2625,14 @@ def _run_callback_server():
         _log(f"[CALLBACK_SERVER] proxy failed after retries: "
              f"{type(last_err).__name__}: {last_err}")
         return {"error": str(last_err)}
+
+    if config.CALLBACK_PATH != "/api/callback":
+        cb_app.add_api_route(
+            config.CALLBACK_PATH,
+            _cb_proxy,
+            methods=["POST"],
+            include_in_schema=False,
+        )
 
     @cb_app.get("/api/media/image")
     async def _cb_serve_image(path: str):

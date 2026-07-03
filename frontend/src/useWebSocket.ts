@@ -9,12 +9,16 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
 
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const heartbeatTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const unmountedRef = useRef(false);
   const connectingRef = useRef(false);
 
   const clearTimers = useCallback(() => {
     if (reconnectTimer.current) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null; }
     if (connectTimeoutRef.current) { clearTimeout(connectTimeoutRef.current); connectTimeoutRef.current = null; }
+    if (heartbeatTimerRef.current) { clearInterval(heartbeatTimerRef.current); heartbeatTimerRef.current = null; }
+    if (heartbeatTimeoutRef.current) { clearTimeout(heartbeatTimeoutRef.current); heartbeatTimeoutRef.current = null; }
   }, []);
 
   const connect = useCallback(() => {
@@ -66,12 +70,47 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
       if (connectTimeoutRef.current) { clearTimeout(connectTimeoutRef.current); connectTimeoutRef.current = null; }
       connectingRef.current = false;
       setConnected(true);
+
+      const sendHeartbeat = () => {
+        if (unmountedRef.current || wsRef.current !== ws) return;
+        if (ws.readyState !== WebSocket.OPEN) {
+          try { ws.close(); } catch { /* ignore */ }
+          return;
+        }
+        if (heartbeatTimeoutRef.current) {
+          console.log("[WS] Previous ping still pending — reconnecting");
+          try { ws.close(); } catch { /* ignore */ }
+          return;
+        }
+        try {
+          ws.send(JSON.stringify({ type: "ping", ts: Date.now() }));
+        } catch {
+          try { ws.close(); } catch { /* ignore */ }
+          return;
+        }
+        heartbeatTimeoutRef.current = setTimeout(() => {
+          if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
+            console.log("[WS] Ping timeout — reconnecting");
+            try { ws.close(); } catch { /* ignore */ }
+          }
+        }, 8000);
+      };
+
+      heartbeatTimerRef.current = setInterval(sendHeartbeat, 25000);
+      setTimeout(sendHeartbeat, 1000);
     };
 
     ws.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data) as WSMessage;
-        onMessageRef.current(data);
+        const data = JSON.parse(event.data) as WSMessage | { type?: string };
+        if (data?.type === "pong") {
+          if (heartbeatTimeoutRef.current) {
+            clearTimeout(heartbeatTimeoutRef.current);
+            heartbeatTimeoutRef.current = null;
+          }
+          return;
+        }
+        onMessageRef.current(data as WSMessage);
       } catch (e) {
         console.error("[WS] Parse error:", e);
       }
@@ -117,18 +156,6 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
           forceReconnect();
         } else {
           try { ws.send(JSON.stringify({ type: "ping" })); } catch { forceReconnect(); return; }
-          const pingTimeout = setTimeout(() => {
-            if (wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
-              console.log("[WS] Ping timeout — reconnecting");
-              forceReconnect();
-            }
-          }, 4000);
-          const origHandler = ws.onmessage;
-          ws.onmessage = (event) => {
-            clearTimeout(pingTimeout);
-            ws.onmessage = origHandler;
-            if (origHandler) origHandler.call(ws, event);
-          };
         }
       }
     };

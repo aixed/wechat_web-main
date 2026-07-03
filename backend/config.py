@@ -124,7 +124,9 @@ CLIENT_WSS_URL = f"{CLIENT_WSS_SCHEME}://{CLIENT_WSS_HOST}{_client_wss_port_part
 
 # Callback (use public IP/domain so remote client DLLs can reach us outbound)
 CALLBACK_PORT = int(_cfg.get("callback_port", SERVER_PORT))
-CALLBACK_PATH = str(_cfg.get("callback_path", "/api/callback"))
+CALLBACK_PATH = str(_cfg.get("callback_path", "/api/callback") or "/api/callback")
+if not CALLBACK_PATH.startswith("/"):
+    CALLBACK_PATH = "/" + CALLBACK_PATH
 CALLBACK_URL = f"http://{PUBLIC_IP}:{CALLBACK_PORT}{CALLBACK_PATH}"
 RECV_TYPE = int(_cfg.get("recvtype", _cfg.get("recv_type", 2)))
 if RECV_TYPE not in (1, 2):
