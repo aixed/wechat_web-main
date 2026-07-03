@@ -1137,6 +1137,17 @@ async def get_chatroom_members(gid: str) -> dict:
     return safe_json(r)
 
 
+async def get_chatroom_member_detail(gid: str) -> dict:
+    """Get all chatroom members with nickname/avatar info."""
+    if IS_HOOK:
+        r = await _post("/GetChatrooMmemberDetail", json={"gid": gid}, timeout=60.0 if IS_LOCAL_HOOK else 90.0)
+    else:
+        r = await _post("/getchatroommemberdetail/", json={
+            "chatRoomUserName": gid, "memberInfoVersion": 0
+        }, timeout=60.0)
+    return safe_json(r)
+
+
 async def get_chatroom_member_nickname(gid: str, wxid: str) -> dict:
     """Get a member's nickname in chatroom.
 

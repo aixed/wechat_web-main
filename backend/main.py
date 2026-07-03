@@ -3719,15 +3719,121 @@ async def get_group_member_names(gid: str):
     return {"names": result}
 
 
-@app.get("/api/group/{gid}/member-details")
-async def get_group_member_details(gid: str):
-    """Fetch names + avatar URLs for all members of a group.
-    Step 1: GetFriendOrChatroomDetailInfo → member wxids + nicknames.
-    Step 2: BatchGetContactBriefInfo → avatar URLs.
-    Step 3: For members still missing avatars, provide /api/avatar/{wxid} URL."""
-    # 1. Get member list with nicknames via GetFriendOrChatroomDetailInfo
+def _extract_group_member_list(data: dict) -> list[dict]:
+    """Find a member list in direct or transport-wrapped Hook responses."""
+    if not isinstance(data, dict):
+        return []
+    stack = [data]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, dict):
+            continue
+        obj_id = id(current)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        members = current.get("member") or current.get("members") or current.get("Member")
+        if isinstance(members, list):
+            return [m for m in members if isinstance(m, dict)]
+        for key in ("data", "Data", "body", "Body", "result", "retdata", "payload"):
+            child = current.get(key)
+            if isinstance(child, dict):
+                stack.append(child)
+    return []
+
+
+def _normalize_group_member(member: dict, gid: str) -> dict:
+    wxid = str(
+        member.get("wxid")
+        or member.get("userName")
+        or member.get("username")
+        or member.get("UserName")
+        or ""
+    ).strip()
+    if not wxid:
+        return {}
+    name = str(
+        member.get("nickname")
+        or member.get("displayname")
+        or member.get("DisplayName")
+        or member.get("markname")
+        or member.get("name")
+        or wxid
+    ).strip()
+    avatar = str(
+        member.get("user_head_small")
+        or member.get("user_head_big")
+        or member.get("smallhead")
+        or member.get("bighead")
+        or member.get("SmallHeadImgUrl")
+        or member.get("BigHeadImgUrl")
+        or member.get("avatar")
+        or ""
+    ).strip()
+    profile = dict(member)
+    profile.update({
+        "wxid": wxid,
+        "UserName": wxid,
+        "nickname": name,
+        "NickName": name,
+        "SmallHeadImgUrl": avatar,
+        "BigHeadImgUrl": str(member.get("user_head_big") or avatar),
+        "ChatRoomId": gid,
+    })
+    return {"wxid": wxid, "name": name or wxid, "avatar": avatar, "profile": profile}
+
+
+def _frontend_group_members(members: dict[str, dict]) -> dict[str, dict]:
+    return {
+        wxid: {
+            "wxid": wxid,
+            "name": str(entry.get("name") or wxid),
+            "avatar": str(entry.get("avatar") or ""),
+        }
+        for wxid, entry in members.items()
+        if wxid
+    }
+
+
+async def _cache_group_member_details(gid: str, raw_members: list[dict]) -> dict[str, dict]:
+    owner_wxid = _contact_owner_wxid()
+    now = time.time()
+    normalized: dict[str, dict] = {}
+    contact_updates: dict[str, dict] = {}
+    async with _CONTACT_PROFILE_LOCK:
+        async with _CONTACT_BRIEF_LOCK:
+            avatar_urls = app_state.setdefault("avatar_urls", {})
+            for member in raw_members:
+                entry = _normalize_group_member(member, gid)
+                wxid = str(entry.get("wxid") or "")
+                if not wxid:
+                    continue
+                normalized[wxid] = entry
+                name = str(entry.get("name") or wxid)
+                avatar = str(entry.get("avatar") or "")
+                cache_key = _contact_cache_key(wxid, owner_wxid)
+                _CONTACT_BRIEF_CACHE[cache_key] = {"name": name, "avatar": avatar, "ts": now}
+                if avatar:
+                    avatar_urls[wxid] = avatar
+                message_store.set_contact(wxid, name=name, avatar=avatar)
+                contact_updates[wxid] = {
+                    "wxid": wxid,
+                    "name": name,
+                    "avatar": avatar,
+                    "is_group": False,
+                    "profile": entry.get("profile") or {"wxid": wxid},
+                }
+
+    if normalized:
+        sqlite_cache.upsert_group_members(gid, list(normalized.values()), owner_wxid=owner_wxid)
+        sqlite_cache.upsert_contacts(contact_updates, owner_wxid=owner_wxid)
+    return normalized
+
+
+async def _fallback_group_member_details(gid: str) -> dict[str, dict]:
     detail = await wechat_api.get_friend_detail_info(gid)
-    result: dict[str, dict] = {}  # wxid -> {name, avatar}
+    result: dict[str, dict] = {}
     member_wxids: list[str] = []
 
     if isinstance(detail, dict):
@@ -3737,51 +3843,74 @@ async def get_group_member_details(gid: str):
             nickname = m.get("nickname", "") if isinstance(m, dict) else ""
             if wxid:
                 member_wxids.append(wxid)
-                result[wxid] = {"name": nickname, "avatar": ""}
+                result[wxid] = {"wxid": wxid, "name": nickname or wxid, "avatar": "", "profile": {"wxid": wxid, "nickname": nickname}}
 
     if not member_wxids:
-        _log(f"[GROUP_DETAILS] {gid}: no members found in detail response")
-        return {"members": {}}
+        return {}
 
-    _log(f"[GROUP_DETAILS] {gid}: got {len(member_wxids)} members from detail, fetching avatars...")
-
-    # 2. Batch fetch avatar URLs via BatchGetContactBriefInfo — max 100 per call
     batch_size = 100
-    avatars_found = 0
     for i in range(0, len(member_wxids), batch_size):
         batch = member_wxids[i:i + batch_size]
         try:
-            wxid_str = ",".join(batch)
-            data = await wechat_api.batch_get_contact_brief_info(wxid_str)
+            data = await wechat_api.batch_get_contact_brief_info(",".join(batch))
             for info in data.get("info", []):
                 wxid = info.get("wxid", "")
                 if not wxid or wxid not in result:
                     continue
-                url = info.get("smallhead", "") or info.get("bighead", "")
-                if url:
-                    result[wxid]["avatar"] = url
-                    avatars_found += 1
-                # Also fill in name from brief info if detail didn't provide one
-                if not result[wxid]["name"]:
-                    name = info.get("nickname", "") or info.get("nick", "") or info.get("markname", "")
-                    if name:
-                        result[wxid]["name"] = name
+                avatar = info.get("smallhead", "") or info.get("bighead", "")
+                name = info.get("nickname", "") or info.get("nick", "") or info.get("markname", "")
+                if avatar:
+                    result[wxid]["avatar"] = avatar
+                if name and result[wxid]["name"] == wxid:
+                    result[wxid]["name"] = name
+                result[wxid]["profile"].update({
+                    "SmallHeadImgUrl": result[wxid]["avatar"],
+                    "BigHeadImgUrl": avatar,
+                    "nickname": result[wxid]["name"],
+                })
         except Exception as e:
-            _log(f"[GROUP_DETAILS] batch brief info failed: {e}")
+            _log(f"[GROUP_DETAILS] fallback batch brief info failed: {e}")
         await asyncio.sleep(0.05)
 
-    # 3. For members still missing an avatar, provide the /api/avatar/{wxid} proxy URL
-    missing_avatar_count = 0
-    for wxid, entry in result.items():
-        if not entry["avatar"]:
-            entry["avatar"] = f"/api/avatar/{wxid}"
-            missing_avatar_count += 1
+    await _cache_group_member_details(gid, [entry.get("profile") or entry for entry in result.values()])
+    return result
 
-    names_resolved = sum(1 for e in result.values() if e["name"])
-    _log(f"[GROUP_DETAILS] {gid}: {len(member_wxids)} members, "
-         f"{names_resolved} names, {avatars_found} avatar URLs, "
-         f"{missing_avatar_count} using /api/avatar proxy")
-    return {"members": result}
+
+@app.get("/api/group/{gid}/member-details")
+async def get_group_member_details(gid: str, force: bool = False):
+    """Fetch names + avatar URLs for all members of a group and cache by owner wxid."""
+    owner_wxid = _contact_owner_wxid()
+    cached = sqlite_cache.get_group_members(gid, owner_wxid=owner_wxid)
+    if cached and not force and all(entry.get("avatar") for entry in cached.values()):
+        _log(f"[GROUP_DETAILS] {gid}: cache hit ({len(cached)} members)")
+        return {"members": _frontend_group_members(cached), "cached": True}
+
+    raw_members: list[dict] = []
+    try:
+        data = await wechat_api.get_chatroom_member_detail(gid)
+        raw_members = _extract_group_member_list(data)
+    except Exception as e:
+        _log(f"[GROUP_DETAILS] GetChatrooMmemberDetail failed for {gid}: {type(e).__name__}: {e}")
+
+    if raw_members:
+        normalized = await _cache_group_member_details(gid, raw_members)
+        _log(f"[GROUP_DETAILS] {gid}: stored {len(normalized)} members from GetChatrooMmemberDetail")
+        return {"members": _frontend_group_members(normalized), "cached": False}
+
+    if cached:
+        _log(f"[GROUP_DETAILS] {gid}: returning sparse cache ({len(cached)} members)")
+        return {"members": _frontend_group_members(cached), "cached": True}
+
+    fallback = await _fallback_group_member_details(gid)
+    if not fallback:
+        _log(f"[GROUP_DETAILS] {gid}: no members found")
+        return {"members": {}}
+
+    for wxid, entry in fallback.items():
+        if not entry.get("avatar"):
+            entry["avatar"] = f"/api/avatar/{wxid}"
+    _log(f"[GROUP_DETAILS] {gid}: fallback resolved {len(fallback)} members")
+    return {"members": _frontend_group_members(fallback), "cached": False}
 
 
 # ─── Entry Point ──────────────────────────────────────────────────
