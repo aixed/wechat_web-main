@@ -2419,7 +2419,7 @@ function MobileMultiAccountBroadcastPage({
   onBack: () => void;
 }) {
   const dark = theme === "dark";
-  const [selectedAgents, setSelectedAgents] = useState<Set<string>>(() => new Set(accounts.map((a) => a.id).filter(Boolean)));
+  const [selectedAgents, setSelectedAgents] = useState<Set<string>>(new Set());
   const [targetTypes, setTargetTypes] = useState<Set<string>>(new Set(["friends"]));
   const [message, setMessage] = useState("");
   const [image, setImage] = useState<File | null>(null);
@@ -2428,7 +2428,8 @@ function MobileMultiAccountBroadcastPage({
   const [resultText, setResultText] = useState("");
 
   useEffect(() => {
-    setSelectedAgents(new Set(accounts.map((a) => a.id).filter(Boolean)));
+    const validIds = new Set(accounts.map((a) => a.id).filter(Boolean));
+    setSelectedAgents((prev) => new Set(Array.from(prev).filter((id) => validIds.has(id))));
   }, [accounts]);
 
   useEffect(() => {
@@ -2448,6 +2449,10 @@ function MobileMultiAccountBroadcastPage({
     "微信";
   const agentIds = Array.from(selectedAgents).filter(Boolean);
   const selectedTargetTypes = Array.from(targetTypes);
+  const accountIds = accounts.map((a) => a.id).filter(Boolean);
+  const allAccountsSelected = accountIds.length > 0 && accountIds.every((id) => selectedAgents.has(id));
+  const selectAllAgents = () => setSelectedAgents(new Set(accountIds));
+  const clearAgents = () => setSelectedAgents(new Set());
 
   const toggleAgent = (id: string) => {
     setSelectedAgents((prev) => {
@@ -2493,17 +2498,24 @@ function MobileMultiAccountBroadcastPage({
 
   return (
     <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
-      <MobileTopBar dark={dark} title="多号群发" leftLabel="返回" rightLabel="全选" onLeft={onBack} onRight={() => setSelectedAgents(new Set(accounts.map((a) => a.id).filter(Boolean)))} />
+      <MobileTopBar
+        dark={dark}
+        title="多号群发"
+        leftLabel="返回"
+        rightLabel={allAccountsSelected ? "取消全选" : "全选"}
+        onLeft={onBack}
+        onRight={allAccountsSelected ? clearAgents : selectAllAgents}
+      />
       <div className="flex-1 overflow-y-auto px-[14px] py-[14px] pb-[calc(20px+env(safe-area-inset-bottom))]">
         <div className={`rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
           <div className="flex items-center justify-between mb-[10px]">
             <div className="text-[15px] font-medium">发送账号</div>
             <button
               type="button"
-              onClick={() => setSelectedAgents(new Set())}
+              onClick={clearAgents}
               className={`text-[13px] ${dark ? "text-[#aaa]" : "text-[#666]"}`}
             >
-              清空
+              取消全选
             </button>
           </div>
           <div className="space-y-[8px]">
@@ -3037,7 +3049,8 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
   const [resultText, setResultText] = useState("");
 
   useEffect(() => {
-    setSelectedAgents(new Set(accounts.map((a) => a.id).filter(Boolean)));
+    const validIds = new Set(accounts.map((a) => a.id).filter(Boolean));
+    setSelectedAgents((prev) => new Set(Array.from(prev).filter((id) => validIds.has(id))));
   }, [accounts]);
 
   useEffect(() => {
@@ -3053,6 +3066,10 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
   const agentIds = Array.from(selectedAgents).filter(Boolean);
   const selectedTargetTypes = Array.from(targetTypes);
   const dark = theme === "dark";
+  const accountIds = accounts.map((a) => a.id).filter(Boolean);
+  const allAccountsSelected = accountIds.length > 0 && accountIds.every((id) => selectedAgents.has(id));
+  const selectAllAgents = () => setSelectedAgents(new Set(accountIds));
+  const clearAgents = () => setSelectedAgents(new Set());
 
   const toggleAgent = (id: string) => {
     setSelectedAgents((prev) => {
@@ -3102,7 +3119,29 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
         <div className="text-[22px] font-medium">多号群发</div>
         <div className="mt-[18px] grid grid-cols-1 gap-[14px]">
           <div>
-            <div className="text-[13px] text-[#888] mb-[8px]">发送账号</div>
+            <div className="mb-[8px] flex items-center gap-[10px]">
+              <div className="text-[13px] text-[#888]">发送账号</div>
+              <button
+                type="button"
+                onClick={selectAllAgents}
+                disabled={allAccountsSelected || accountIds.length === 0}
+                className={`h-[26px] px-[10px] rounded-[4px] border text-[12px] disabled:opacity-45 ${
+                  dark ? "border-[#333] bg-[#1d1d1d] text-[#ccc] active:bg-[#2a2a2a]" : "border-[#d8d8d8] bg-white text-[#333] active:bg-[#f1f1f1]"
+                }`}
+              >
+                全选
+              </button>
+              <button
+                type="button"
+                onClick={clearAgents}
+                disabled={agentIds.length === 0}
+                className={`h-[26px] px-[10px] rounded-[4px] border text-[12px] disabled:opacity-45 ${
+                  dark ? "border-[#333] bg-[#1d1d1d] text-[#ccc] active:bg-[#2a2a2a]" : "border-[#d8d8d8] bg-white text-[#333] active:bg-[#f1f1f1]"
+                }`}
+              >
+                取消全选
+              </button>
+            </div>
             <div className="flex flex-wrap gap-[8px]">
               {accounts.map((account) => (
                 <label key={account.id} className={`h-[34px] px-[10px] rounded-[4px] border flex items-center gap-[7px] cursor-pointer ${
