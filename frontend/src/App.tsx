@@ -11,6 +11,7 @@ import {
   clearAccessKey,
   getAccessKey,
   getAccounts,
+  getContacts,
   getContactProfiles,
   getGroupMemberDetails,
   getGroupMemberNames,
@@ -20,6 +21,7 @@ import {
   multiAccountBroadcastImageUpload,
   multiAccountBroadcastText,
   muteSession,
+  refreshSessions,
   setActiveAgentId,
   setAccessKey,
   stickyChat,
@@ -681,6 +683,8 @@ export default function App() {
   const [activeChat, setActiveChat] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<Record<string, ChatMessage[]>>({});
   const [viewMode, setViewMode] = useState<ViewMode>("chats");
+  const [sessionsHydrating, setSessionsHydrating] = useState(false);
+  const [sessionsHydrated, setSessionsHydrated] = useState(false);
   const [contactsHydrating, setContactsHydrating] = useState(false);
   const [contactsHydrated, setContactsHydrated] = useState(false);
   const [selfCardOpen, setSelfCardOpen] = useState(false);
@@ -724,6 +728,8 @@ export default function App() {
     setActiveChat(null);
     setChatMessages({});
     setViewMode("chats");
+    setSessionsHydrating(false);
+    setSessionsHydrated(false);
     setMobileTab("chats");
     setMobileProfileDetailOpen(false);
     setDirectoryProfileWxid(null);
@@ -915,19 +921,33 @@ export default function App() {
   const hydrateDirectoryContacts = useCallback(async () => {
     if (contactsHydrating || contactsHydrated) return;
     const requestAccountId = selectedAccountIdRef.current;
-    const friends = contactListFromRaw(rawContacts);
-    const rooms = chatroomListFromRaw(rawContacts);
-    const wxids = Array.from(new Set([
-      ...friends.map((c: any) => c.wxid || c.UserName || ""),
-      ...rooms.map((c: any) => c.wxid || c.UserName || c.strUsrName || ""),
-    ].filter(Boolean)));
-    if (wxids.length === 0) {
-      setContactsHydrated(true);
-      return;
-    }
     setContactsHydrating(true);
     try {
-      await ensureContactProfiles(wxids);
+      let contactsForDirectory = rawContacts;
+      const refreshed = await getContacts();
+      if (selectedAccountIdRef.current !== requestAccountId) return;
+      if (refreshed && typeof refreshed === "object" && !(refreshed as any).error) {
+        contactsForDirectory = refreshed;
+        setRawContacts(refreshed);
+        const names = buildContactMap(refreshed);
+        const avatars = buildAvatarMap(refreshed, undefined);
+        if (Object.keys(names).length > 0) {
+          setContactMap((prev) => ({ ...prev, ...names }));
+        }
+        if (Object.keys(avatars).length > 0) {
+          setAvatarMap((prev) => ({ ...prev, ...avatars }));
+        }
+      }
+
+      const friends = contactListFromRaw(contactsForDirectory);
+      const rooms = chatroomListFromRaw(contactsForDirectory);
+      const wxids = Array.from(new Set([
+        ...friends.map((c: any) => c.wxid || c.UserName || ""),
+        ...rooms.map((c: any) => c.wxid || c.UserName || c.strUsrName || ""),
+      ].filter(Boolean)));
+      if (wxids.length > 0) {
+        await ensureContactProfiles(wxids);
+      }
       if (selectedAccountIdRef.current !== requestAccountId) return;
       setContactsHydrated(true);
     } catch (err) {
@@ -1108,6 +1128,63 @@ export default function App() {
       });
     }
   }, [ensureContactProfiles, queueBriefLookup]);
+
+  const hydrateChatSessions = useCallback(async () => {
+    if (sessionsHydrating || sessionsHydrated) return;
+    const requestAccountId = selectedAccountIdRef.current;
+    setSessionsHydrating(true);
+    try {
+      const data = await refreshSessions();
+      if (selectedAccountIdRef.current !== requestAccountId) return;
+      const rawSessions = data?.sessions || data;
+      const lastMessages = data?.last_messages || {};
+      const parsed = parseSessions(rawSessions, contactMapRef.current, lastMessages);
+      const enriched: Session[] = parsed.map((s) => ({
+        ...s,
+        avatar: avatarMapRef.current[s.wxid] || s.avatar || "",
+      }));
+
+      setSessions((prev) => {
+        const merged = new Map<string, Session>();
+        for (const session of enriched) {
+          merged.set(session.wxid, session);
+        }
+        for (const existing of prev) {
+          if (!merged.has(existing.wxid)) {
+            merged.set(existing.wxid, existing);
+          }
+        }
+        return sortSessionsForDisplay(Array.from(merged.values()));
+      });
+
+      const regularNeedsBrief = enriched
+        .filter((s) => !s.is_group && (
+          !avatarMapRef.current[s.wxid] ||
+          (!contactMapRef.current[s.wxid] && (!s.nickname || s.nickname === s.wxid))
+        ))
+        .map((s) => s.wxid)
+        .filter((wxid) => !wxid.endsWith("@openim"));
+      const openimNeedsProfile = enriched
+        .filter((s) => !s.is_group && s.wxid.endsWith("@openim") && !avatarMapRef.current[s.wxid])
+        .map((s) => s.wxid);
+      const groupNeedsProfile = enriched
+        .filter((s) => s.is_group && !avatarMapRef.current[s.wxid])
+        .map((s) => s.wxid);
+
+      queueBriefLookup(regularNeedsBrief, selfWxid);
+      if (openimNeedsProfile.length > 0) {
+        ensureContactProfiles(openimNeedsProfile).catch((err) => console.error("[OPENIM_PROFILE]", err));
+      }
+      ensureGroupProfiles(groupNeedsProfile);
+      setSessionsHydrated(true);
+    } catch (err) {
+      console.error("[SESSIONS] hydrate failed:", err);
+    } finally {
+      if (selectedAccountIdRef.current === requestAccountId) {
+        setSessionsHydrating(false);
+      }
+    }
+  }, [ensureContactProfiles, ensureGroupProfiles, queueBriefLookup, selfWxid, sessionsHydrated, sessionsHydrating]);
 
   // ─── Fetch group member names (fast) on entering a group ──────────
   const fetchGroupMemberNames = useCallback((gid: string) => {
@@ -1458,6 +1535,13 @@ export default function App() {
   }, [selfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, hydrateGroupSenders, ensureContactProfiles, ensureGroupProfiles, applyContactProfileUpdates, selectedAccountId]);
 
   const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId));
+
+  useEffect(() => {
+    if (!authenticated || !selectedAccountId) return;
+    const wantsChats = isMobile ? mobileTab === "chats" : viewMode === "chats";
+    if (!wantsChats || activeChat) return;
+    hydrateChatSessions();
+  }, [activeChat, authenticated, hydrateChatSessions, isMobile, mobileTab, selectedAccountId, viewMode]);
 
   useEffect(() => {
     if (!authenticated || selectedAccountId) return;
