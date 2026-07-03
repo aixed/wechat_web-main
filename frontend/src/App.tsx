@@ -1434,17 +1434,35 @@ export default function App() {
     setViewMode("chats");
     setDirectoryProfileWxid(null);
     setSessions((prev) => {
-      if (prev.some((s) => s.wxid === wxid)) return prev;
+      const idx = prev.findIndex((s) => s.wxid === wxid);
+      if (idx >= 0 && !seed) return prev;
+      const nowTs = Math.floor(Date.now() / 1000);
+      if (idx >= 0) {
+        const existing = prev[idx];
+        const updated: Session = {
+          ...existing,
+          nickname: seed?.nickname || existing.nickname || contactMapRef.current[wxid] || wxid,
+          avatar: seed?.avatar || existing.avatar || avatarMapRef.current[wxid] || "",
+          is_group: Boolean(seed?.is_group ?? existing.is_group ?? wxid.includes("@chatroom")),
+          lastTimestamp: existing.lastTimestamp || nowTs,
+          lastTime: existing.lastTime || formatSessionTime(nowTs),
+          unread: 0,
+          order: Math.min(Number.isFinite(existing.order) ? Number(existing.order) : Number.MAX_SAFE_INTEGER, -1),
+        };
+        const rest = prev.filter((s) => s.wxid !== wxid);
+        return sortSessionsForDisplay([updated, ...rest]);
+      }
       const seeded: Session = {
         wxid,
         nickname: seed?.nickname || contactMapRef.current[wxid] || wxid,
         avatar: seed?.avatar || avatarMapRef.current[wxid] || "",
-        is_group: wxid.includes("@chatroom"),
+        is_group: Boolean(seed?.is_group ?? wxid.includes("@chatroom")),
         lastMsg: "",
-        lastTime: "",
-        lastTimestamp: 0,
+        lastTime: formatSessionTime(nowTs),
+        lastTimestamp: nowTs,
         unread: 0,
         muted: false,
+        order: -1,
       };
       return sortSessionsForDisplay([seeded, ...prev]);
     });
