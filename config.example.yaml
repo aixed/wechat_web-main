@@ -12,7 +12,7 @@ RDV: ""
 
 # 微信使用方式（三选一）
 #   1 = 本地 Hook（DLL 注入本地微信，127.0.0.1）
-#   2 = 远程客户端 Hook（客户端 DLL 无公网 IP，主动连本后端 WSS）
+#   2 = 远程客户端 Hook（客户端 DLL 无公网 IP，主动连本后端 WS/WSS）
 #   3 = 远程服务器协议（服务器上运行的微信协议）
 wechat_mode: 1
 
@@ -36,10 +36,11 @@ remote_protocol_mgr_port: 29999
 # --- 后端服务 ---
 server_port: 5000
 
-# --- 远程客户端 DLL 主动连接到本后端的 WSS 长连接 ---
-# 客户端 DLL 使用 RemoteWS="wss://<ip>:<client_wss_port><agent_ws_path>"
-# 默认 443 时 URL 可省略端口，例如 wss://1.14.149.2/agent。
-# 如果后端前面有 Nginx/Caddy，需让该公网 WSS 端口转发到 server_port。
+# --- 远程客户端 DLL 主动连接到本后端的 WS/WSS 长连接 ---
+# 无证书测试：client_wss_scheme="ws"，client_wss_port=5000，
+#   DLL 使用 RemoteWS="ws://1.14.149.2:5000/agent"，可直连 server_port。
+# 正式部署：client_wss_scheme="wss"，client_wss_port=443，
+#   DLL 使用 RemoteWS="wss://1.14.149.2/agent"，需 Nginx/Caddy 等提供 TLS 证书并转发到 server_port。
 agent_ws_enabled: true
 agent_ws_path: "/agent"
 client_wss_scheme: "wss"
