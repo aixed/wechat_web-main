@@ -1607,6 +1607,19 @@ def _contact_profile_name(profile: dict) -> str:
     )
 
 
+def _contact_profile_explicit_name(profile: dict) -> str:
+    return str(
+        profile.get("Remark")
+        or profile.get("remark")
+        or profile.get("markname")
+        or profile.get("NickName")
+        or profile.get("nickname")
+        or profile.get("nick")
+        or profile.get("strNickName")
+        or ""
+    )
+
+
 def _contact_profile_avatar(profile: dict) -> str:
     return str(
         profile.get("SmallHeadImgUrl")
@@ -2056,10 +2069,63 @@ async def _fetch_and_cache_contact_details(
             contacts = data.get("contacts") if isinstance(data, dict) else []
             if not isinstance(contacts, list):
                 contacts = [data] if isinstance(data, dict) and _contact_profile_wxid(data) else []
-            updates = await _cache_contact_profiles([c for c in contacts if isinstance(c, dict)], owner_wxid=owner_wxid)
+            useful_contacts: list[dict] = []
+            found: set[str] = set()
+            empty_updates: dict[str, dict] = {}
+            for contact in contacts:
+                if not isinstance(contact, dict):
+                    continue
+                wxid = _contact_profile_wxid(contact)
+                if not wxid:
+                    continue
+                found.add(wxid)
+                if _contact_profile_explicit_name(contact) or _contact_profile_avatar(contact):
+                    useful_contacts.append(contact)
+                    continue
+                empty_profile = {
+                    "wxid": wxid,
+                    "gid": wxid if wxid.endswith("@chatroom") else "",
+                    "type": "chatroom" if wxid.endswith("@chatroom") else str(contact.get("type") or ""),
+                }
+                empty_updates[wxid] = {
+                    "wxid": wxid,
+                    "name": "",
+                    "avatar": "",
+                    "is_group": wxid.endswith("@chatroom"),
+                    "profile": empty_profile,
+                }
+
+            for wxid in batch:
+                if wxid in found:
+                    continue
+                empty_updates[wxid] = {
+                    "wxid": wxid,
+                    "name": "",
+                    "avatar": "",
+                    "is_group": wxid.endswith("@chatroom"),
+                    "profile": {
+                        "wxid": wxid,
+                        "gid": wxid if wxid.endswith("@chatroom") else "",
+                        "type": "chatroom" if wxid.endswith("@chatroom") else "",
+                    },
+                }
+
+            updates = await _cache_contact_profiles(useful_contacts, owner_wxid=owner_wxid)
+            if empty_updates:
+                sqlite_cache.upsert_contacts(empty_updates, owner_wxid=owner_wxid)
+                updates.update({
+                    wxid: {
+                        "wxid": wxid,
+                        "name": "",
+                        "avatar": "",
+                        "profile": payload.get("profile") or {"wxid": wxid},
+                    }
+                    for wxid, payload in empty_updates.items()
+                })
             result.update(updates)
             if broadcast_updates and updates:
                 await _broadcast_contact_profile_updates(updates)
+            _log(f"[CONTACTS] GetContact hydrated batch {i // 100 + 1}: requested={len(batch)} updates={len(updates)}")
         except Exception as e:
             _log(f"[CONTACTS] GetContact detail batch failed ({len(batch)}): {type(e).__name__}: {e}")
         await asyncio.sleep(0.05)
@@ -2070,8 +2136,8 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
     """Load the directory from local SQLite, initializing it once via InitContact.
 
     GetFriendAndChatRoomList is intentionally not used here; on remote Hook it can
-    crash WeChat. InitContact provides the wxid/gid list. Full profiles are loaded
-    on demand with /GetContact, never as an automatic all-contact background sweep.
+    crash WeChat. InitContact provides the wxid/gid list, then this Contacts view
+    hydrates details with /GetContact in 100-id batches.
     """
     owner_wxid = _contact_owner_wxid()
     if app_state.get("contacts_loaded"):
@@ -2079,28 +2145,12 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
         app_state["contacts"] = snapshot
         return snapshot
 
-    cached_snapshot = _contacts_snapshot_from_db(owner_wxid)
-    if cached_snapshot.get("friend") or cached_snapshot.get("chatroom"):
-        app_state["contacts"] = cached_snapshot
-        app_state["contacts_loaded"] = True
-        _log(
-            f"[CONTACTS] served local SQLite directory: "
-            f"friends={len(cached_snapshot.get('friend') or [])} groups={len(cached_snapshot.get('chatroom') or [])}"
-        )
-        return cached_snapshot
-
     lock = _contact_init_lock(owner_wxid)
     async with lock:
         if app_state.get("contacts_loaded"):
             snapshot = _contacts_snapshot_from_db(owner_wxid)
             app_state["contacts"] = snapshot
             return snapshot
-
-        cached_snapshot = _contacts_snapshot_from_db(owner_wxid)
-        if cached_snapshot.get("friend") or cached_snapshot.get("chatroom"):
-            app_state["contacts"] = cached_snapshot
-            app_state["contacts_loaded"] = True
-            return cached_snapshot
 
         cached_before = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
         try:
@@ -2117,6 +2167,7 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
         raw_entries = _all_raw_contact_entries(contacts)
         friend_count, room_count = _cache_raw_contacts(contacts)
         app_state["contacts_loaded"] = True
+        sqlite_cache.mark_contact_init_done_v2(owner_wxid=owner_wxid)
         snapshot = _contacts_snapshot_from_db(owner_wxid)
         app_state["contacts"] = snapshot
         _log(
@@ -2126,10 +2177,28 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
 
         detail_candidates = len({_contact_profile_wxid(entry) for entry in raw_entries if _contact_profile_wxid(entry)})
         if detail_candidates:
-            _log(
-                f"[CONTACTS] skipped automatic GetContact hydration for {detail_candidates} contacts; "
-                "profiles refresh only on explicit profile/avatar open"
-            )
+            hydrate_agent_id = _active_agent_id or agent_manager.active_id() or ""
+            ids: list[str] = []
+            seen: set[str] = set()
+            for entry in raw_entries:
+                wxid = _contact_profile_wxid(entry)
+                if not wxid or wxid in seen:
+                    continue
+                seen.add(wxid)
+                ids.append(wxid)
+
+            async def _hydrate_details(owner: str, hydrate_ids: list[str], agent_id: str) -> None:
+                try:
+                    with wechat_api.use_agent(agent_id):
+                        await _fetch_and_cache_contact_details(hydrate_ids, broadcast_updates=True, owner_wxid=owner)
+                    app_state["contacts"] = _contacts_snapshot_from_db(owner)
+                    _log(f"[CONTACTS] GetContact hydration complete: {len(hydrate_ids)} ids")
+                except Exception as e:
+                    _log(f"[CONTACTS] GetContact hydration task failed: {type(e).__name__}: {e}")
+
+            _log(f"[CONTACTS] scheduling GetContact hydration: {len(ids)} ids, batch=100")
+            task = asyncio.create_task(_hydrate_details(owner_wxid, ids, hydrate_agent_id))
+            _track_background_send(task, "contacts_getcontact")
 
         return snapshot
 
