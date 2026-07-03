@@ -107,6 +107,13 @@ MGR_BASE_URL = f"http://{HOOK_HOST}:{MGR_PORT}"
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = int(_cfg.get("server_port", 5000))
 
+# Hook/API request concurrency. Local Hook keeps the conservative single-call
+# path by default; remote Hook/Protocol can handle parallel calls.
+HOOK_API_CONCURRENCY = int(_cfg.get("hook_api_concurrency", 1 if IS_LOCAL_HOOK else 10))
+if HOOK_API_CONCURRENCY < 1:
+    print(f"[CONFIG] ⚠ invalid hook_api_concurrency={HOOK_API_CONCURRENCY!r}, using 1", flush=True)
+    HOOK_API_CONCURRENCY = 1
+
 # DLL agent WebSocket. The DLL connects outward to this backend, usually through
 # TLS termination as wss://<public-ip>:<client_wss_port><agent_ws_path>.
 AGENT_WS_ENABLED = _to_bool(_cfg.get("agent_ws_enabled", False), False)
@@ -142,6 +149,7 @@ MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL = int(_cfg.get("max_restarts_after_button_l
 print(f"[CONFIG] wechat_mode={WECHAT_MODE}  mode={LOGIN_MODE}  host={HOOK_HOST}  "
       f"api_port={HOOK_PORT}  mgr_port={MGR_PORT}  "
       f"server_port={SERVER_PORT}  callback={CALLBACK_URL}  "
+      f"hook_api_concurrency={HOOK_API_CONCURRENCY}  "
       f"agent_ws={'on' if AGENT_WS_ENABLED else 'off'}  "
       f"client_wss={CLIENT_WSS_URL}  "
       f"recv_type={RECV_TYPE}  "
