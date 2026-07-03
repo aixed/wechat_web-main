@@ -155,4 +155,19 @@ export interface WSContactProfiles {
   };
 }
 
-export type WSMessage = WSInitMessage | WSCallbackMessage | WSMessageSent | WSMarkRead | WSContactProfiles;
+export interface WSContactsSnapshot {
+  type: "contacts_snapshot";
+  data: {
+    account_id?: string;
+    contacts: any;
+    contact_profiles?: Record<string, ContactProfile>;
+  };
+}
+
+export type WSMessage =
+  | WSInitMessage
+  | WSCallbackMessage
+  | WSMessageSent
+  | WSMarkRead
+  | WSContactProfiles
+  | WSContactsSnapshot;

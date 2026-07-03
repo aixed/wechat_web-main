@@ -293,8 +293,8 @@ function buildContactMap(raw: any): Record<string, string> {
     ...(Array.isArray(raw) ? raw : []),
   ];
   for (const c of list) {
-    const wxid = c.wxid || c.UserName || c.userName || c.strUsrName || "";
-    const name = c.markname || c.nickname || c.NickName || c.strNickName || "";
+    const wxid = contactWxid(c);
+    const name = pickFirstString(c.markname, c.Remark, c.remark, c.nickname, c.NickName, c.strNickName, c.name);
     if (wxid && name) map[wxid] = name;
   }
   return map;
@@ -334,6 +334,7 @@ function contactWxid(c: any): string {
   if (!c || typeof c !== "object") return "";
   return String(
     c.wxid ||
+    c.id ||
     c.UserName ||
     c.userName ||
     c.strUsrName ||
@@ -345,16 +346,75 @@ function contactWxid(c: any): string {
   );
 }
 
+function isChatroomContact(c: any): boolean {
+  const wxid = contactWxid(c);
+  const type = String(c?.type || c?.Type || "").toLowerCase();
+  return wxid.endsWith("@chatroom") || type.includes("chatroom") || type.includes("group");
+}
+
+function uniqueContacts(list: any[]): any[] {
+  const seen = new Set<string>();
+  const out: any[] = [];
+  for (const entry of list || []) {
+    if (!entry || typeof entry !== "object") continue;
+    const wxid = contactWxid(entry);
+    if (!wxid || seen.has(wxid)) continue;
+    seen.add(wxid);
+    out.push(entry);
+  }
+  return out;
+}
+
 function contactListFromRaw(raw: any): any[] {
   if (!raw) return [];
-  const list = raw.friend || raw.data || (Array.isArray(raw) ? raw : []);
-  return Array.isArray(list) ? list : [];
+  const list = [
+    ...(raw.friend || raw.friends || []),
+    ...(Array.isArray(raw.data) ? raw.data : []),
+    ...(Array.isArray(raw) ? raw : []),
+  ];
+  return uniqueContacts(list).filter((entry) => !isChatroomContact(entry));
 }
 
 function chatroomListFromRaw(raw: any): any[] {
   if (!raw) return [];
-  const list = raw.chatroom || raw.chatrooms || raw.group || raw.groups || [];
-  return Array.isArray(list) ? list : [];
+  const list = [
+    ...(raw.chatroom || raw.chatrooms || raw.chat_room || raw.chat_rooms || []),
+    ...(raw.group || raw.groups || raw.group_chat || raw.group_chats || []),
+    ...(raw.friend || raw.friends || []),
+    ...(Array.isArray(raw.data) ? raw.data : []),
+    ...(Array.isArray(raw) ? raw : []),
+  ];
+  return uniqueContacts(list).filter(isChatroomContact);
+}
+
+function mergeRawContactsWithProfiles(raw: any, members: Record<string, ContactProfile>): any {
+  if (!raw || !members || Object.keys(members).length === 0) return raw;
+
+  const mergeEntry = (entry: any) => {
+    if (!entry || typeof entry !== "object") return entry;
+    const wxid = contactWxid(entry);
+    const member = wxid ? members[wxid] : undefined;
+    if (!member) return entry;
+    const profile = member.profile || {};
+    return {
+      ...entry,
+      ...profile,
+      wxid,
+      nickname: pickFirstString(member.name, profile.NickName, profile.nickname, entry.nickname),
+      strNickName: pickFirstString(member.name, profile.strNickName, entry.strNickName),
+      smallhead: pickFirstString(member.avatar, profile.SmallHeadImgUrl, profile.smallhead, entry.smallhead),
+      bighead: pickFirstString(profile.BigHeadImgUrl, profile.bighead, member.avatar, entry.bighead),
+      avatar: pickFirstString(member.avatar, profile.avatar, entry.avatar),
+    };
+  };
+
+  if (Array.isArray(raw)) return raw.map(mergeEntry);
+  if (typeof raw !== "object") return raw;
+  const next = { ...raw };
+  for (const key of ["friend", "friends", "chatroom", "chatrooms", "chat_room", "chat_rooms", "group", "groups", "group_chat", "group_chats", "data"]) {
+    if (Array.isArray(next[key])) next[key] = next[key].map(mergeEntry);
+  }
+  return next;
 }
 
 function profileDisplayName(profile: ContactProfile | undefined, fallback: string): string {
@@ -1337,6 +1397,22 @@ export default function App() {
     if (wsMsg.type === "contact_profiles") {
       const members = (wsMsg.data as any)?.members || {};
       applyContactProfileUpdates(members);
+      setRawContacts((prev: any) => mergeRawContactsWithProfiles(prev, members));
+    }
+
+    if (wsMsg.type === "contacts_snapshot") {
+      const contacts = (wsMsg.data as any)?.contacts;
+      const profiles = (wsMsg.data as any)?.contact_profiles || {};
+      if (contacts) {
+        setRawContacts(contacts);
+        const names = buildContactMap(contacts);
+        const avatars = buildAvatarMap(contacts, undefined);
+        if (Object.keys(names).length > 0) setContactMap((prev) => ({ ...prev, ...names }));
+        if (Object.keys(avatars).length > 0) setAvatarMap((prev) => ({ ...prev, ...avatars }));
+      }
+      if (profiles && typeof profiles === "object") {
+        applyContactProfileUpdates(profiles);
+      }
     }
 
     if (wsMsg.type === "wechat_message") {
