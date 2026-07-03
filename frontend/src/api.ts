@@ -172,16 +172,16 @@ export const broadcastImageUpload = async (wxids: string[], file: File) => {
   return res.json();
 };
 
-export const multiAccountBroadcastText = (agentIds: string[], wxids: string[], msg: string) =>
+export const multiAccountBroadcastText = (agentIds: string[], targetTypes: string[], msg: string) =>
   fetchJSON("/api/accounts/broadcast/text", {
     method: "POST",
-    body: JSON.stringify({ agent_ids: agentIds, wxids, msg }),
+    body: JSON.stringify({ agent_ids: agentIds, target_types: targetTypes, msg }),
   });
 
-export const multiAccountBroadcastImageUpload = async (agentIds: string[], wxids: string[], file: File) => {
+export const multiAccountBroadcastImageUpload = async (agentIds: string[], targetTypes: string[], file: File) => {
   const form = new FormData();
   form.append("agent_ids", JSON.stringify(agentIds));
-  form.append("wxids", JSON.stringify(wxids));
+  form.append("target_types", JSON.stringify(targetTypes));
   form.append("file", file);
   const res = await fetchWithTimeout("/api/accounts/broadcast/image-upload", { method: "POST", body: form, headers: authHeaders() }, 600_000);
   return res.json();
