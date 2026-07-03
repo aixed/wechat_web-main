@@ -1454,8 +1454,8 @@ export default function App() {
         return sortSessionsForDisplay(Array.from(merged.values()));
       });
 
-      // Account entry should be cheap: load the Session table + local SQLite cache only.
-      // Missing avatars/details are resolved later from explicit profile or chat actions.
+      // Account entry is intentionally narrow: exactly one Session-table refresh
+      // to populate the recent conversation list. Contacts/profiles/history stay lazy.
       setSessionsHydrated(true);
     } catch (err) {
       console.error("[SESSIONS] hydrate failed:", err);
@@ -2573,7 +2573,7 @@ function accountStatusMeta(account: WeChatAccount, dark: boolean): { text: strin
   if (status === "3") {
     return account.initialized
       ? { text: "已就绪", className: success }
-      : { text: "初始化中", className: warning };
+      : { text: "已登录", className: success };
   }
   if (account.initialized) return { text: "已就绪", className: success };
   return { text: message || "等待登录", className: neutral };

@@ -558,6 +558,10 @@ def _contact_owner_wxid(self_wxid: str = "") -> str:
     if owner:
         return owner
     agent_id = str(_active_agent_id or agent_manager.active_id() or "").strip()
+    agent = agent_manager.get_agent(agent_id) if agent_id else None
+    agent_wxid = str((agent or {}).get("wxid") or (agent or {}).get("account_id") or "").strip()
+    if agent_wxid and agent_wxid != agent_id:
+        return agent_wxid
     return f"agent:{agent_id}" if agent_id else "default"
 
 
@@ -952,19 +956,15 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     return True
 
 async def _run_initialization_after_agent():
+    _log("[INIT] Automatic Hook initialization is disabled. Hook calls now run only from explicit UI actions.")
     while True:
-        _log(f"[INIT] Waiting for DLL agent on {config.AGENT_WS_PATH} ...")
         while not agent_manager.is_connected():
+            _log(f"[INIT] Waiting for DLL agent on {config.AGENT_WS_PATH} ...")
             await asyncio.sleep(1)
-        for agent_id in agent_manager.uninitialized_agent_ids():
-            async with _ACCOUNT_LOCK:
-                with wechat_api.use_agent(agent_id):
-                    login_status = await _refresh_agent_login_status(agent_id)
-                    if str(login_status.get("status") or "") != "3":
-                        continue
-                    _log(f"[INIT] WeChat logged in; starting Hook initialization for {agent_id}")
-                    await _run_backend_initialization(agent_id)
-        await asyncio.sleep(1)
+        # Do not call IsLoginStatus/GetSelfLoginInfo/CDN_Init/InitContact here.
+        # Account cards are refreshed by /api/accounts, and opening an account
+        # only performs the single Session QueryDB requested by the UI.
+        await asyncio.sleep(5)
 
 
 @asynccontextmanager
@@ -1102,19 +1102,25 @@ async def activate_account(req: ActivateAccountRequest):
     if not agent_id or not agent_manager.is_connected(agent_id):
         return {"ok": False, "error": "agent not connected"}
     async with _ACCOUNT_LOCK:
+        account = agent_manager.get_agent(agent_id) or {}
+        cached_status = str(account.get("login_status") or "").strip()
+        if cached_status and cached_status != "3":
+            return {
+                "ok": False,
+                "error": "wechat not logged in",
+                "login_status": {
+                    "status": cached_status,
+                    "message": str(account.get("login_message") or ""),
+                    "wxid": str(account.get("wxid") or account.get("account_id") or ""),
+                    "nickname": str(account.get("nickname") or ""),
+                    "avatar": str(account.get("avatar") or ""),
+                },
+                "account": account,
+            }
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
-        with wechat_api.use_agent(agent_id):
-            login_status = await _refresh_agent_login_status(agent_id)
-            if str(login_status.get("status") or "") != "3":
-                return {
-                    "ok": False,
-                    "error": "wechat not logged in",
-                    "login_status": login_status,
-                    "account": agent_manager.get_agent(agent_id),
-                }
-            if not app_state.get("initialized"):
-                await _run_backend_initialization(agent_id)
+        owner_wxid = _contact_owner_wxid()
+        _load_session_cache_into_state(owner_wxid)
     return {"ok": True, "active_id": agent_id, "account": agent_manager.get_agent(agent_id)}
 
 
