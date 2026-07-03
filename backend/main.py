@@ -789,11 +789,14 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         _log(f"[INIT 1/7] ✗ CDN init failed: {e}")
 
     try:
-        _log("[INIT 1/7] Initializing contacts (may take a while on remote)...")
-        await wechat_api.init_contact()
-        _log("[INIT 1/7] ✓ Contacts initialized")
+        owner_wxid = _contact_owner_wxid()
+        cached_contact_count = sqlite_cache.count_contacts(owner_wxid=owner_wxid)
+        if cached_contact_count > 0 and not sqlite_cache.has_contact_init_done(owner_wxid=owner_wxid):
+            sqlite_cache.mark_contact_init_done(owner_wxid=owner_wxid)
+        app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+        _log(f"[INIT 1/7] ✓ Contact init skipped during login; loaded {cached_contact_count} cached contacts")
     except Exception as e:
-        _log(f"[INIT 1/7] ✗ InitContact failed: {e}")
+        _log(f"[INIT 1/7] ✗ local contacts load failed: {e}")
 
     try:
         if selected_agent:
@@ -802,24 +805,24 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
                 _log(f"[INIT 1/7] ✓ Account brief loaded for {selected_agent}")
     except Exception as e:
         _log(f"[INIT 1/7] ✗ account brief lookup failed: {e}")
-    # Reset circuit breaker so a slow InitContact doesn't block subsequent requests
+    # Reset circuit breaker so a slow optional contact refresh doesn't block subsequent requests
     wechat_api._consecutive_failures = 0
     _log("[INIT 1/7] done")
 
     try:
-        _log("[INIT 2/4] Loading contacts...")
-        contacts = await wechat_api.get_friend_and_chatroom_list()
-        app_state["contacts"] = contacts
-        friend_count, room_count = _cache_raw_contacts(contacts)
-        _log(f"[INIT 2/4] ✓ Contacts loaded: {friend_count} friends, {room_count} groups")
+        owner_wxid = _contact_owner_wxid()
+        _log("[INIT 2/4] Loading contacts from local SQLite cache...")
+        contacts_snapshot = _contacts_snapshot_from_db(owner_wxid)
+        app_state["contacts"] = contacts_snapshot
+        friend_count = len(contacts_snapshot.get("friend") or [])
+        room_count = len(contacts_snapshot.get("chatroom") or [])
+        _log(f"[INIT 2/4] ✓ Cached contacts loaded: {friend_count} friends, {room_count} groups")
     except Exception as e:
         _log(f"[INIT 2/4] ✗ contacts load failed: {e}")
 
     try:
-        _log("[INIT 3/7] Loading sessions from MicroMsg.db Session...")
-        app_state["sessions"] = await _query_session_list_from_db()
-        count = len(app_state["sessions"].get("data", [])) if isinstance(app_state["sessions"], dict) else 0
-        _log(f"[INIT 3/7] ✓ Sessions loaded from Session table: {count}")
+        app_state["sessions"] = app_state.get("sessions") or {"data": []}
+        _log("[INIT 3/7] ✓ Session DB load skipped until Chats view opens")
     except Exception as e:
         _log(f"[INIT 3/7] ✗ sessions load failed: {e}")
 
@@ -843,80 +846,11 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     else:
         _log("[INIT 4/7] ⊘ No self_info available")
 
-    # 5. Batch-load avatars synchronously (before init fires)
-    session_wxids_for_avatars: list[str] = []
-    if app_state["sessions"] and isinstance(app_state["sessions"].get("data"), list):
-        session_wxids_for_avatars = [
-            s.get("strUsrName", "") for s in app_state["sessions"]["data"]
-            if s.get("strUsrName")
-        ]
-    if session_wxids_for_avatars:
-        batch_size = 100
-        _log(f"[INIT 5/7] Loading avatars for {len(session_wxids_for_avatars)} sessions...")
-        for i in range(0, len(session_wxids_for_avatars), batch_size):
-            batch = session_wxids_for_avatars[i:i + batch_size]
-            try:
-                wxid_str = ",".join(batch)
-                data = await wechat_api.batch_get_contact_brief_info(wxid_str)
-                info_list = data.get("info", []) if isinstance(data, dict) else []
-                for info in info_list:
-                    if not isinstance(info, dict):
-                        continue
-                    wxid = info.get("wxid", "")
-                    url = info.get("smallhead", "") or info.get("bighead", "")
-                    name = info.get("markname", "") or info.get("nickname", "") or info.get("nick", "") or ""
-                    if wxid and url:
-                        avatar_urls[wxid] = url
-                    if wxid:
-                        message_store.set_contact(wxid, name=name, avatar=url)
-                _log(f"[INIT 5/7]   batch {i//batch_size+1}: got {len(info_list)} avatars")
-            except Exception as e:
-                _log(f"[INIT 5/7]   batch {i//batch_size+1} failed: {e}")
-            await asyncio.sleep(0.1)
-        _log(f"[INIT 5/7] ✓ Got avatar URLs for {len(avatar_urls)} contacts.")
-    else:
-        _log("[INIT 5/7] ⊘ No sessions to load avatars for.")
+    _log("[INIT 5/7] ✓ Session avatar batch skipped until sessions are requested")
     app_state["avatar_urls"] = avatar_urls
 
-    # 6. Load last messages. Prefer local SQLite cache; only missings hit Hook DB.
-    if session_wxids_for_avatars:
-        cached_last = sqlite_cache.get_last_messages(session_wxids_for_avatars, owner_wxid=_contact_owner_wxid())
-        if cached_last:
-            app_state["last_messages"] = dict(cached_last)
-            _log(f"[INIT 6/7] ✓ Loaded {len(cached_last)} last messages from local SQLite cache.")
-        missing_last_wxids = [w for w in session_wxids_for_avatars if w not in cached_last]
-        try:
-            if missing_last_wxids:
-                _log(f"[INIT 6/7] Loading last messages for {len(missing_last_wxids)} uncached sessions...")
-                # Remote Hook servers can stall on QueryDB; don't block startup forever.
-                last_msgs = await asyncio.wait_for(
-                    wechat_api.get_last_messages_bulk(missing_last_wxids),
-                    timeout=35.0,
-                )
-                app_state["last_messages"].update(last_msgs)
-                sqlite_cache.upsert_last_messages(last_msgs, owner_wxid=_contact_owner_wxid())
-                _log(f"[INIT 6/7] ✓ Last messages loaded from Hook DB for {len(last_msgs)} sessions.")
-            else:
-                _log("[INIT 6/7] ✓ All session last messages came from local SQLite cache.")
-        except asyncio.TimeoutError:
-            _log("[INIT 6/7] ⚠ bulk last messages timed out, continuing without DB preload")
-        except Exception as e:
-            _log(f"[INIT 6/7] ✗ bulk last messages failed: {e}")
-
-        try:
-            preload_chats = 0
-            preload_msgs = 0
-            for wxid in session_wxids_for_avatars:
-                cached_msgs = sqlite_cache.get_messages(wxid, 50, owner_wxid=_contact_owner_wxid())
-                if cached_msgs:
-                    message_store.add_history(wxid, cached_msgs)
-                    preload_chats += 1
-                    preload_msgs += len(cached_msgs)
-            _log(f"[INIT 6/7] ✓ Preloaded {preload_msgs} cached messages for {preload_chats} chats from SQLite.")
-        except Exception as e:
-            _log(f"[INIT 6/7] ✗ SQLite message preload failed: {type(e).__name__}: {e}")
-    else:
-        _log("[INIT 6/7] ⊘ No sessions to load last messages for.")
+    app_state["last_messages"] = app_state.get("last_messages") or {}
+    _log("[INIT 6/7] ✓ Last-message and chat-history preload skipped")
 
     if config.AGENT_WS_ENABLED and not agent_manager.is_connected(selected_agent):
         _log("[INIT 7/7] Agent disconnected during initialization; will retry on next connection.")
@@ -1433,21 +1367,14 @@ async def get_self():
 
 @app.get("/api/contacts")
 async def get_contacts():
-    """Return cached contacts, or refresh from Hook."""
-    if not app_state["contacts"]:
-        await wechat_api.init_contact()
-        app_state["contacts"] = await wechat_api.get_friend_and_chatroom_list()
-        _cache_raw_contacts(app_state["contacts"])
-    return app_state["contacts"]
+    """Refresh contacts incrementally from Hook when the user opens Contacts."""
+    return await _refresh_contacts_incremental(list_type="0", init_if_empty=True)
 
 
 @app.get("/api/contacts/refresh")
 async def refresh_contacts():
-    """Force refresh contacts from Hook."""
-    await wechat_api.init_contact()
-    app_state["contacts"] = await wechat_api.get_friend_and_chatroom_list()
-    _cache_raw_contacts(app_state["contacts"])
-    return app_state["contacts"]
+    """Force refresh contacts from Hook without re-running InitContact."""
+    return await _refresh_contacts_incremental(list_type="0", init_if_empty=True)
 
 
 @app.get("/api/contacts/{wxid}")
@@ -1493,10 +1420,7 @@ def _normalize_wxids(wxids: list[str]) -> list[str]:
 
 async def _query_session_list_from_db() -> dict:
     """Read the native WeChat Session table ordered by nOrder."""
-    sql = (
-        "select strUsrName, strNickName, strContent, nUnReadCount, othersAtMe, nOrder "
-        "from Session order by nOrder desc"
-    )
+    sql = "select * from Session order by nOrder desc"
     data = await wechat_api.query_db("MicroMsg.db", sql, timeout=8.0)
     rows = data.get("data") if isinstance(data, dict) else []
     if isinstance(rows, dict):
@@ -1584,6 +1508,64 @@ def _contact_profile_avatar(profile: dict) -> str:
         or profile.get("avatar")
         or ""
     )
+
+
+def _all_raw_contact_entries(contacts: dict | list) -> list[dict]:
+    if isinstance(contacts, list):
+        source = contacts
+    elif isinstance(contacts, dict):
+        source = [
+            *(contacts.get("friend") or contacts.get("friends") or []),
+            *(contacts.get("chatroom") or contacts.get("chatrooms") or contacts.get("group") or contacts.get("groups") or []),
+            *(contacts.get("data") if isinstance(contacts.get("data"), list) else []),
+        ]
+    else:
+        source = []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for entry in source:
+        if not isinstance(entry, dict):
+            continue
+        wxid = _contact_profile_wxid(entry)
+        if not wxid or wxid in seen:
+            continue
+        seen.add(wxid)
+        out.append(entry)
+    return out
+
+
+def _contacts_snapshot_from_db(owner_wxid: str = "") -> dict:
+    owner_wxid = owner_wxid or _contact_owner_wxid()
+    cached = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+    friends: list[dict] = []
+    rooms: list[dict] = []
+    for wxid, entry in cached.items():
+        if not isinstance(entry, dict):
+            continue
+        profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
+        raw = dict(profile)
+        name = str(entry.get("name") or _contact_profile_name(raw) or wxid)
+        avatar = str(entry.get("avatar") or _contact_profile_avatar(raw) or "")
+        raw.update({
+            "wxid": wxid,
+            "nickname": raw.get("nickname") or raw.get("NickName") or name,
+            "strNickName": raw.get("strNickName") or name,
+            "smallhead": raw.get("smallhead") or raw.get("SmallHeadImgUrl") or avatar,
+            "bighead": raw.get("bighead") or raw.get("BigHeadImgUrl") or avatar,
+            "avatar": raw.get("avatar") or avatar,
+        })
+        if bool(entry.get("is_group")) or wxid.endswith("@chatroom"):
+            rooms.append(raw)
+        else:
+            friends.append(raw)
+    return {
+        "count_friend": str(len(friends)),
+        "count_chatroom": str(len(rooms)),
+        "friend": friends,
+        "chatroom": rooms,
+        "source": "sqlite",
+    }
 
 
 def _find_openim_payload(data: dict) -> dict:
@@ -1913,6 +1895,88 @@ async def _cache_contact_profiles(profiles: list[dict]) -> dict[str, dict]:
     return updates
 
 
+async def _fetch_and_cache_contact_details(wxids: list[str], *, broadcast_updates: bool = False) -> dict[str, dict]:
+    targets: list[str] = []
+    seen: set[str] = set()
+    for wxid in wxids or []:
+        wxid = str(wxid or "").strip()
+        if not wxid or wxid in seen:
+            continue
+        seen.add(wxid)
+        targets.append(wxid)
+    if not targets:
+        return {}
+
+    result: dict[str, dict] = {}
+    for i in range(0, len(targets), 100):
+        batch = targets[i:i + 100]
+        try:
+            data = await wechat_api.get_contact(batch)
+            contacts = data.get("contacts") if isinstance(data, dict) else []
+            if not isinstance(contacts, list):
+                contacts = [data] if isinstance(data, dict) and _contact_profile_wxid(data) else []
+            updates = await _cache_contact_profiles([c for c in contacts if isinstance(c, dict)])
+            result.update(updates)
+            if broadcast_updates and updates:
+                await _broadcast_contact_profile_updates(updates)
+        except Exception as e:
+            _log(f"[CONTACTS] GetContact detail batch failed ({len(batch)}): {type(e).__name__}: {e}")
+        await asyncio.sleep(0.05)
+    return result
+
+
+async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_empty: bool = False) -> dict:
+    owner_wxid = _contact_owner_wxid()
+    cached_before = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+    init_done = sqlite_cache.has_contact_init_done(owner_wxid=owner_wxid)
+    if cached_before and not init_done:
+        sqlite_cache.mark_contact_init_done(owner_wxid=owner_wxid)
+        init_done = True
+
+    contacts: dict = {}
+    raw_entries: list[dict] = []
+    first_error: Exception | None = None
+    try:
+        contacts = await wechat_api.get_friend_and_chatroom_list(list_type)
+        raw_entries = _all_raw_contact_entries(contacts)
+    except Exception as e:
+        first_error = e
+        _log(f"[CONTACTS] GetFriendAndChatRoomList type={list_type} failed: {type(e).__name__}: {e}")
+
+    if init_if_empty and not raw_entries and (not init_done or not cached_before):
+        _log("[CONTACTS] GetFriendAndChatRoomList returned no contacts; running InitContact fallback")
+        await wechat_api.init_contact()
+        sqlite_cache.mark_contact_init_done(owner_wxid=owner_wxid)
+        contacts = await wechat_api.get_friend_and_chatroom_list(list_type)
+        raw_entries = _all_raw_contact_entries(contacts)
+    elif raw_entries and not init_done:
+        sqlite_cache.mark_contact_init_done(owner_wxid=owner_wxid)
+
+    if not raw_entries:
+        snapshot = _contacts_snapshot_from_db(owner_wxid)
+        app_state["contacts"] = snapshot
+        if first_error and not cached_before:
+            raise first_error
+        _log("[CONTACTS] no remote contacts returned; served local SQLite snapshot")
+        return snapshot
+
+    raw_entries = _all_raw_contact_entries(contacts)
+    new_wxids: list[str] = []
+    for entry in raw_entries:
+        wxid = _contact_profile_wxid(entry)
+        if wxid and wxid not in cached_before:
+            new_wxids.append(wxid)
+    friend_count, room_count = _cache_raw_contacts(contacts)
+    _log(
+        f"[CONTACTS] refreshed type={list_type}: friends={friend_count} groups={room_count} "
+        f"new={len(new_wxids)}"
+    )
+    if new_wxids:
+        await _fetch_and_cache_contact_details(new_wxids, broadcast_updates=True)
+    app_state["contacts"] = contacts
+    return contacts
+
+
 async def _ensure_contact_profiles(
     wxids: list[str],
     *,
@@ -2240,43 +2304,28 @@ async def refresh_sessions():
 
     raw_sessions = app_state["sessions"]
     session_list = raw_sessions.get("data", []) if isinstance(raw_sessions, dict) else []
-    wxids = [s.get("strUsrName", "") for s in session_list if s.get("strUsrName")]
-
-    # Start with real-time callback data (always up-to-date for active chats)
-    last_messages = dict(app_state.get("last_messages", {}))
-
-    # Only query DB for sessions NOT already covered by callback data or SQLite.
-    missing_wxids = [w for w in wxids if w not in last_messages]
-    cache_count = 0
-    if missing_wxids:
+    last_messages: dict[str, dict] = {}
+    for session in session_list:
+        if not isinstance(session, dict):
+            continue
+        wxid = str(session.get("strUsrName") or session.get("StrUsrName") or "")
+        content = str(session.get("strContent") or session.get("StrContent") or "")
+        if not wxid or not content:
+            continue
         try:
-            cached_messages = sqlite_cache.get_last_messages(missing_wxids, owner_wxid=_contact_owner_wxid())
-            for wxid, msg in cached_messages.items():
-                if wxid not in last_messages:
-                    last_messages[wxid] = msg
-                    app_state["last_messages"][wxid] = msg
-                    cache_count += 1
-        except Exception as e:
-            _log(f"[REFRESH] SQLite last-message cache failed: {type(e).__name__}: {e}")
-    missing_wxids = [w for w in wxids if w not in last_messages]
-    db_count = 0
-    if missing_wxids:
-        try:
-            db_messages = await wechat_api.get_last_messages_bulk(missing_wxids)
-            for wxid, msg in db_messages.items():
-                if wxid not in last_messages:
-                    last_messages[wxid] = msg
-                    # Cache DB results so we don't re-query next time
-                    app_state["last_messages"][wxid] = msg
-                    db_count += 1
-            sqlite_cache.upsert_last_messages(db_messages, owner_wxid=_contact_owner_wxid())
+            msg_time = int(session.get("nTime") or session.get("NTime") or session.get("nUpdateTime") or 0)
         except Exception:
-            pass
+            msg_time = 0
+        last_messages[wxid] = {
+            "content": content,
+            "type": str(session.get("nMsgType") or session.get("NMsgType") or session.get("msgType") or "1"),
+            "is_sender": 0,
+            "time": msg_time,
+        }
+    app_state["last_messages"] = {**(app_state.get("last_messages") or {}), **last_messages}
 
     total_ms = int((time.time() - t0) * 1000)
-    _log(f"[REFRESH] ✓ {len(wxids)} sessions from Session table, {len(last_messages)} msgs "
-         f"(callback={len(last_messages) - cache_count - db_count}, sqlite={cache_count}, db={db_count}, "
-         f"skipped={len(wxids) - len(missing_wxids)}) — {total_ms}ms")
+    _log(f"[REFRESH] ✓ {len(session_list)} sessions from Session table; no per-session MSG query — {total_ms}ms")
     return {"sessions": raw_sessions, "last_messages": last_messages}
 
 
@@ -2872,8 +2921,7 @@ async def _ensure_account_contacts(agent_id: str):
         if cached_contacts:
             return cached_contacts
         with wechat_api.use_agent(agent_id):
-            await wechat_api.init_contact()
-            contacts = await wechat_api.get_friend_and_chatroom_list()
+            contacts = await _refresh_contacts_incremental(list_type="0", init_if_empty=True)
         app_state["contacts"] = contacts
         return contacts
 

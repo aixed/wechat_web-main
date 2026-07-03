@@ -116,6 +116,14 @@ class SqliteMessageCache:
                 );
                 CREATE INDEX IF NOT EXISTS idx_group_members_owner_gid_order
                     ON group_members (owner_wxid, gid, display_order);
+
+                CREATE TABLE IF NOT EXISTS cache_meta (
+                    owner_wxid TEXT NOT NULL DEFAULT '',
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (owner_wxid, key)
+                );
                 """
             )
 
@@ -396,6 +404,51 @@ class SqliteMessageCache:
                 "updated_at": int(row["updated_at"] or 0),
             }
         return out
+
+    def count_contacts(self, *, owner_wxid: str = "") -> int:
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM contacts WHERE owner_wxid = ?",
+                (owner_wxid,),
+            ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    def get_meta(self, key: str, *, owner_wxid: str = "") -> str:
+        key = str(key or "").strip()
+        if not key:
+            return ""
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM cache_meta WHERE owner_wxid = ? AND key = ?",
+                (owner_wxid, key),
+            ).fetchone()
+        return str(row["value"] or "") if row else ""
+
+    def set_meta(self, key: str, value: str, *, owner_wxid: str = "") -> None:
+        key = str(key or "").strip()
+        if not key:
+            return
+        owner_wxid = str(owner_wxid or "").strip()
+        now = int(time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO cache_meta (owner_wxid, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(owner_wxid, key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                (owner_wxid, key, str(value or ""), now),
+            )
+
+    def has_contact_init_done(self, *, owner_wxid: str = "") -> bool:
+        return self.get_meta("contact_init_done", owner_wxid=owner_wxid) == "1"
+
+    def mark_contact_init_done(self, *, owner_wxid: str = "") -> None:
+        self.set_meta("contact_init_done", "1", owner_wxid=owner_wxid)
 
     def upsert_group_members(self, gid: str, members: list[dict[str, Any]] | dict[str, dict[str, Any]], *, owner_wxid: str = "") -> None:
         gid = str(gid or "").strip()

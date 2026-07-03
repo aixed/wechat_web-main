@@ -292,10 +292,10 @@ async def init_contact() -> dict:
     return safe_json(r)
 
 
-async def get_friend_and_chatroom_list() -> dict:
+async def get_friend_and_chatroom_list(list_type: str | int = "1") -> dict:
     """Get all friends and chatrooms."""
     if IS_HOOK:
-        r = await _post("/GetFriendAndChatRoomList", json={"type": "1"})
+        r = await _post("/GetFriendAndChatRoomList", json={"type": str(list_type)})
         return safe_json(r)
     else:
         # Remote: initcontact returns the contact list directly
