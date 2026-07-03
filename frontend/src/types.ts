@@ -94,6 +94,7 @@ export interface WSInitMessage {
     }>;
     avatar_urls: Record<string, string>;
     contact_profiles?: Record<string, ContactProfile>;
+    hydration_progress?: ContactHydrationProgress;
     messages_cache?: Record<string, ChatMessage[]>;
     session_cache?: Record<string, {
       wxid: string;
@@ -155,12 +156,34 @@ export interface WSContactProfiles {
   };
 }
 
+export interface ContactHydrationProgress {
+  active?: boolean;
+  phase?: string;
+  batch?: number;
+  total_batches?: number;
+  processed?: number;
+  total?: number;
+  updated?: number;
+  failed?: number;
+  current_batch_count?: number;
+  current_batch_updated?: number;
+}
+
 export interface WSContactsSnapshot {
   type: "contacts_snapshot";
   data: {
     account_id?: string;
     contacts: any;
     contact_profiles?: Record<string, ContactProfile>;
+    hydration_progress?: ContactHydrationProgress;
+  };
+}
+
+export interface WSContactsHydrationProgress {
+  type: "contacts_hydration_progress";
+  data: ContactHydrationProgress & {
+    account_id?: string;
+    owner_wxid?: string;
   };
 }
 
@@ -170,4 +193,5 @@ export type WSMessage =
   | WSMessageSent
   | WSMarkRead
   | WSContactProfiles
-  | WSContactsSnapshot;
+  | WSContactsSnapshot
+  | WSContactsHydrationProgress;

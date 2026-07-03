@@ -224,6 +224,7 @@ _initializing_agents: set[str] = set()
 _agent_login_status_seen: dict[str, str] = {}
 _CONTACT_INIT_LOCKS: dict[str, asyncio.Lock] = {}
 _CONTACT_HYDRATING_OWNERS: set[str] = set()
+_CONTACT_HYDRATION_PROGRESS: dict[str, dict] = {}
 
 
 def _new_app_state() -> dict:
@@ -1425,7 +1426,7 @@ async def get_contacts():
 @app.get("/api/contacts/refresh")
 async def refresh_contacts():
     """Force refresh contacts from Hook without re-running InitContact."""
-    return await _refresh_contacts_incremental(list_type="0", init_if_empty=True)
+    return await _refresh_contacts_incremental(list_type="0", init_if_empty=True, force_details=True)
 
 
 @app.get("/api/contacts/{wxid}")
@@ -1452,7 +1453,7 @@ class ProfileBatchRequest(BaseModel):
 
 
 def _normalize_wxids(wxids: list[str]) -> list[str]:
-    """Normalize, de-dup, and filter out invalid/non-contact ids."""
+    """Normalize and de-dup contact ids, including chatroom gids."""
     out: list[str] = []
     seen: set[str] = set()
     for w in wxids or []:
@@ -1460,9 +1461,6 @@ def _normalize_wxids(wxids: list[str]) -> list[str]:
             continue
         w = w.strip()
         if not w or w in seen:
-            continue
-        # Not a contact
-        if w.endswith("@chatroom"):
             continue
         seen.add(w)
         out.append(w)
@@ -1785,6 +1783,12 @@ def _all_raw_contact_entries(contacts: dict | list) -> list[dict]:
     return out
 
 
+def _with_contact_hydration_progress(snapshot: dict, owner_wxid: str = "") -> dict:
+    payload = dict(snapshot or {})
+    payload["hydration_progress"] = _CONTACT_HYDRATION_PROGRESS.get(owner_wxid or _contact_owner_wxid()) or {}
+    return payload
+
+
 def _contacts_snapshot_from_db(owner_wxid: str = "") -> dict:
     owner_wxid = owner_wxid or _contact_owner_wxid()
     cached = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
@@ -2079,7 +2083,7 @@ def _contact_detail_missing_ids(owner_wxid: str = "", candidates: list[str] | No
     return missing
 
 
-def _cache_raw_contacts(contacts: dict) -> tuple[int, int]:
+def _cache_raw_contacts(contacts: dict, *, owner_wxid: str = "") -> tuple[int, int]:
     contacts = _contact_payload(contacts)
     if not isinstance(contacts, dict):
         return 0, 0
@@ -2129,7 +2133,7 @@ def _cache_raw_contacts(contacts: dict) -> tuple[int, int]:
             "profile": dict(c),
         }
     if raw_contact_updates:
-        sqlite_cache.upsert_contacts(raw_contact_updates, owner_wxid=_contact_owner_wxid())
+        sqlite_cache.upsert_contacts(raw_contact_updates, owner_wxid=owner_wxid or _contact_owner_wxid())
     return len(friend_list), len(room_list)
 
 
@@ -2146,12 +2150,26 @@ async def _broadcast_contact_profile_updates(updates: dict[str, dict], *, accoun
 
 
 async def _broadcast_contacts_snapshot(snapshot: dict, *, account_id: str = "", owner_wxid: str = "") -> None:
+    owner_wxid = owner_wxid or _contact_owner_wxid()
     await manager.broadcast({
         "type": "contacts_snapshot",
         "data": {
             "account_id": account_id or _active_agent_id or agent_manager.active_id(),
             "contacts": snapshot,
-            "contact_profiles": sqlite_cache.get_contacts(owner_wxid=owner_wxid or _contact_owner_wxid()),
+            "contact_profiles": sqlite_cache.get_contacts(owner_wxid=owner_wxid),
+            "hydration_progress": _CONTACT_HYDRATION_PROGRESS.get(owner_wxid) or {},
+        },
+    })
+
+
+async def _broadcast_contact_hydration_progress(owner_wxid: str, account_id: str = "") -> None:
+    owner_wxid = owner_wxid or _contact_owner_wxid()
+    await manager.broadcast({
+        "type": "contacts_hydration_progress",
+        "data": {
+            "account_id": account_id or _active_agent_id or agent_manager.active_id(),
+            "owner_wxid": owner_wxid,
+            **(_CONTACT_HYDRATION_PROGRESS.get(owner_wxid) or {}),
         },
     })
 
@@ -2190,6 +2208,7 @@ async def _fetch_and_cache_contact_details(
     wxids: list[str],
     *,
     broadcast_updates: bool = False,
+    broadcast_progress: bool = False,
     owner_wxid: str = "",
     account_id: str = "",
 ) -> dict[str, dict]:
@@ -2205,8 +2224,30 @@ async def _fetch_and_cache_contact_details(
         return {}
 
     result: dict[str, dict] = {}
+    owner_wxid = owner_wxid or _contact_owner_wxid()
+    total = len(targets)
+    total_batches = (total + 99) // 100
+    processed = 0
+    failed = 0
+    updated_total = 0
+
+    if broadcast_progress:
+        _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
+            "active": True,
+            "phase": "GetContact",
+            "batch": 0,
+            "total_batches": total_batches,
+            "processed": 0,
+            "total": total,
+            "updated": 0,
+            "failed": 0,
+        }
+        await _broadcast_contact_hydration_progress(owner_wxid, account_id)
+
     for i in range(0, len(targets), 100):
         batch = targets[i:i + 100]
+        batch_index = i // 100 + 1
+        batch_update_count = 0
         try:
             data = await wechat_api.get_contact(batch)
             contacts = _contacts_from_getcontact_response(data)
@@ -2266,12 +2307,48 @@ async def _fetch_and_cache_contact_details(
                     for wxid, payload in empty_updates.items()
                 })
             result.update(updates)
+            batch_update_count = len(updates)
+            updated_total += batch_update_count
             if broadcast_updates and updates:
                 await _broadcast_contact_profile_updates(updates, account_id=account_id)
-            _log(f"[CONTACTS] GetContact hydrated batch {i // 100 + 1}: requested={len(batch)} updates={len(updates)}")
+            _log(f"[CONTACTS] GetContact hydrated batch {batch_index}/{total_batches}: requested={len(batch)} updates={len(updates)}")
         except Exception as e:
+            failed += len(batch)
             _log(f"[CONTACTS] GetContact detail batch failed ({len(batch)}): {type(e).__name__}: {e}")
+        processed += len(batch)
+        if broadcast_progress:
+            _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
+                "active": True,
+                "phase": "GetContact",
+                "batch": batch_index,
+                "total_batches": total_batches,
+                "processed": min(processed, total),
+                "total": total,
+                "updated": updated_total,
+                "failed": failed,
+                "current_batch_count": len(batch),
+                "current_batch_updated": batch_update_count,
+            }
+            snapshot = _contacts_snapshot_from_db(owner_wxid)
+            if account_id:
+                _runtime_for(account_id)["app_state"]["contacts"] = snapshot
+            else:
+                app_state["contacts"] = snapshot
+            await _broadcast_contacts_snapshot(snapshot, account_id=account_id, owner_wxid=owner_wxid)
+            await _broadcast_contact_hydration_progress(owner_wxid, account_id)
         await asyncio.sleep(0.05)
+    if broadcast_progress:
+        _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
+            "active": False,
+            "phase": "GetContact",
+            "batch": total_batches,
+            "total_batches": total_batches,
+            "processed": total,
+            "total": total,
+            "updated": updated_total,
+            "failed": failed,
+        }
+        await _broadcast_contact_hydration_progress(owner_wxid, account_id)
     return result
 
 
@@ -2280,6 +2357,19 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
     if not ids or owner_wxid in _CONTACT_HYDRATING_OWNERS:
         return
 
+    total = len(ids)
+    total_batches = (total + 99) // 100
+    _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
+        "active": True,
+        "phase": "GetContact",
+        "batch": 0,
+        "total_batches": total_batches,
+        "processed": 0,
+        "total": total,
+        "updated": 0,
+        "failed": 0,
+    }
+
     async def _hydrate_details() -> None:
         _CONTACT_HYDRATING_OWNERS.add(owner_wxid)
         try:
@@ -2287,6 +2377,7 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
                 await _fetch_and_cache_contact_details(
                     ids,
                     broadcast_updates=True,
+                    broadcast_progress=True,
                     owner_wxid=owner_wxid,
                     account_id=account_id,
                 )
@@ -2307,7 +2398,7 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
     _track_background_send(task, "contacts_getcontact")
 
 
-async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_empty: bool = False) -> dict:
+async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_empty: bool = False, force_details: bool = False) -> dict:
     """Load the directory from local SQLite, initializing it once via InitContact.
 
     GetFriendAndChatRoomList is intentionally not used here; on remote Hook it can
@@ -2319,20 +2410,20 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
     if app_state.get("contacts_loaded"):
         snapshot = _contacts_snapshot_from_db(owner_wxid)
         app_state["contacts"] = snapshot
-        missing_ids = _contact_detail_missing_ids(owner_wxid)
-        if missing_ids:
-            _schedule_contact_detail_hydration(owner_wxid, missing_ids, account_id)
-        return snapshot
+        ids = list(sqlite_cache.get_contacts(owner_wxid=owner_wxid).keys()) if force_details else _contact_detail_missing_ids(owner_wxid)
+        if ids:
+            _schedule_contact_detail_hydration(owner_wxid, ids, account_id)
+        return _with_contact_hydration_progress(snapshot, owner_wxid)
 
     lock = _contact_init_lock(owner_wxid)
     async with lock:
         if app_state.get("contacts_loaded"):
             snapshot = _contacts_snapshot_from_db(owner_wxid)
             app_state["contacts"] = snapshot
-            missing_ids = _contact_detail_missing_ids(owner_wxid)
-            if missing_ids:
-                _schedule_contact_detail_hydration(owner_wxid, missing_ids, account_id)
-            return snapshot
+            ids = list(sqlite_cache.get_contacts(owner_wxid=owner_wxid).keys()) if force_details else _contact_detail_missing_ids(owner_wxid)
+            if ids:
+                _schedule_contact_detail_hydration(owner_wxid, ids, account_id)
+            return _with_contact_hydration_progress(snapshot, owner_wxid)
 
         cached_before = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
         try:
@@ -2343,7 +2434,7 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
             app_state["contacts"] = snapshot
             if snapshot.get("friend") or snapshot.get("chatroom"):
                 _log(f"[CONTACTS] InitContact failed; served local cache: {type(e).__name__}: {e}")
-                return snapshot
+                return _with_contact_hydration_progress(snapshot, owner_wxid)
             raise
 
         raw_entries = _all_raw_contact_entries(contacts)
@@ -2354,9 +2445,9 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
                 f"[CONTACTS] InitContact returned no parseable contacts; "
                 f"served local cache={len(cached_before)}"
             )
-            return snapshot
+            return _with_contact_hydration_progress(snapshot, owner_wxid)
 
-        friend_count, room_count = _cache_raw_contacts(contacts)
+        friend_count, room_count = _cache_raw_contacts(contacts, owner_wxid=owner_wxid)
         app_state["contacts_loaded"] = True
         sqlite_cache.mark_contact_init_done_v2(owner_wxid=owner_wxid)
         snapshot = _contacts_snapshot_from_db(owner_wxid)
@@ -2377,7 +2468,7 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
         if ids:
             _schedule_contact_detail_hydration(owner_wxid, ids, account_id)
 
-        return snapshot
+        return _with_contact_hydration_progress(snapshot, owner_wxid)
 
 
 async def _ensure_contact_profiles(

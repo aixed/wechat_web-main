@@ -396,8 +396,11 @@ class SqliteMessageCache:
                         WHEN excluded.profile_json IS NULL OR excluded.profile_json = '{}' THEN contacts.profile_json
                         WHEN contacts.profile_json IS NULL OR contacts.profile_json = '' OR contacts.profile_json = '{}' THEN excluded.profile_json
                         WHEN excluded.avatar != '' THEN excluded.profile_json
-                        WHEN instr(excluded.profile_json, '_getcontact_hydrated') > 0 THEN excluded.profile_json
                         WHEN instr(excluded.profile_json, 'SmallHeadImgUrl') > 0 OR instr(excluded.profile_json, 'smallhead') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, '_getcontact_hydrated') > 0
+                            AND contacts.avatar != ''
+                            THEN contacts.profile_json
+                        WHEN instr(excluded.profile_json, '_getcontact_hydrated') > 0 THEN excluded.profile_json
                         ELSE contacts.profile_json
                     END,
                     updated_at=excluded.updated_at
