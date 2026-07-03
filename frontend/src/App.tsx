@@ -33,6 +33,11 @@ type ViewMode = "chats" | "contacts" | "broadcast";
 type MobileTab = "chats" | "contacts" | "me";
 type PortalTheme = "dark" | "light";
 const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
+const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
+
+function clampSidePanelWidth(value: number): number {
+  return Math.min(460, Math.max(236, Math.round(value)));
+}
 
 function useIsMobileViewport() {
   const getValue = () => {
@@ -556,6 +561,10 @@ export default function App() {
   const [selfImageOpen, setSelfImageOpen] = useState(false);
   const [mobileTab, setMobileTab] = useState<MobileTab>("chats");
   const [mobileProfileDetailOpen, setMobileProfileDetailOpen] = useState(false);
+  const [sidePanelWidth, setSidePanelWidth] = useState(() => {
+    const stored = Number(window.localStorage.getItem(SIDE_PANEL_WIDTH_STORAGE));
+    return Number.isFinite(stored) && stored > 0 ? clampSidePanelWidth(stored) : 272;
+  });
 
   // ─── Resolve avatars for group senders (incremental) ─────────────
   // Instead of fetching ALL group members (slow BatchGetContactBriefInfo),
@@ -667,6 +676,30 @@ export default function App() {
     setPortalThemeState(theme);
     window.localStorage.setItem(PORTAL_THEME_STORAGE, theme);
   }, []);
+
+  const startSidePanelResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sidePanelWidth;
+    let latestWidth = startWidth;
+
+    const handleMove = (moveEvent: PointerEvent) => {
+      latestWidth = clampSidePanelWidth(startWidth + moveEvent.clientX - startX);
+      setSidePanelWidth(latestWidth);
+    };
+
+    const handleUp = () => {
+      window.removeEventListener("pointermove", handleMove);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.localStorage.setItem(SIDE_PANEL_WIDTH_STORAGE, String(latestWidth));
+    };
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp, { once: true });
+  }, [sidePanelWidth]);
 
   const applyContactProfileUpdates = useCallback((updates: Record<string, ContactProfile> | undefined) => {
     if (!updates || typeof updates !== "object" || Object.keys(updates).length === 0) return;
@@ -1526,6 +1559,7 @@ export default function App() {
   const selfAvatar =
     profileAvatar(selfProfile, avatarMap[selfWxid] || "") ||
     (selfProfile?.profile?.BigHeadImgUrl || selfProfile?.profile?.SmallHeadImgUrl || "");
+  const darkTheme = portalTheme === "dark";
   const activeSession = sessions.find((s) => s.wxid === activeChat) || (activeChat ? {
     wxid: activeChat,
     nickname: contactMap[activeChat] || activeChat,
@@ -1573,7 +1607,7 @@ export default function App() {
   if (isMobile) {
     if (activeChat && activeSession) {
       return (
-        <div className="h-dvh w-screen overflow-hidden bg-[#ededed]">
+        <div className={`h-dvh w-screen overflow-hidden ${darkTheme ? "bg-[#111111]" : "bg-[#ededed]"}`}>
           {!connected && (
             <div className="fixed top-0 left-0 right-0 bg-[#e6a23c] text-black text-center text-[12px] py-1 z-50">
               正在连接后端服务器...
@@ -1591,6 +1625,7 @@ export default function App() {
             contactProfiles={contactProfiles}
             onRequestContactProfile={ensureContactProfiles}
             onInputChange={setHasUnsavedInput}
+            dark={darkTheme}
           />
         </div>
       );
@@ -1606,6 +1641,7 @@ export default function App() {
             loading={selfProfileLoading}
             onBack={() => setMobileProfileDetailOpen(false)}
             onAvatarClick={() => setSelfImageOpen(true)}
+            dark={darkTheme}
           />
           {selfImageOpen && (
             <LargeAvatarOverlay
@@ -1615,6 +1651,7 @@ export default function App() {
                 selfAvatar
               }
               onClose={() => setSelfImageOpen(false)}
+              dark={darkTheme}
             />
           )}
         </>
@@ -1632,6 +1669,7 @@ export default function App() {
         selfAvatar={selfAvatar}
         selfProfile={selfProfile}
         contactsLoading={contactsHydrating}
+        dark={darkTheme}
         onSwitchTab={switchMobileTab}
         onSelectChat={handleSelectChat}
         onHydrateContacts={hydrateDirectoryContacts}
@@ -1642,7 +1680,7 @@ export default function App() {
   }
 
   return (
-    <div className="h-dvh w-screen bg-[#f5f5f5] overflow-hidden relative flex">
+    <div className={`h-dvh w-screen overflow-hidden relative flex ${darkTheme ? "bg-[#111111]" : "bg-[#f5f5f5]"}`}>
       {/* Connection status */}
       {!connected && (
         <div className="fixed top-0 left-0 right-0 bg-[#e6a23c] text-black text-center text-[12px] py-1 z-50">
@@ -1659,13 +1697,17 @@ export default function App() {
         onBackToAccounts={handleLeaveAccount}
       />
 
-      <div className="w-[272px] shrink-0 border-r border-[#d8d8d8] bg-[#e9e8e8] h-full">
+      <div
+        className={`relative shrink-0 border-r h-full ${darkTheme ? "border-[#2a2a2a] bg-[#191919]" : "border-[#d8d8d8] bg-[#e9e8e8]"}`}
+        style={{ width: sidePanelWidth }}
+      >
         {viewMode === "chats" && (
           <SessionList
             sessions={sessions}
             activeWxid={activeChat}
             onSelectChat={handleSelectChat}
             onSessionAction={handleSessionMenuAction}
+            theme={portalTheme}
           />
         )}
         {viewMode === "contacts" && (
@@ -1673,6 +1715,7 @@ export default function App() {
             friends={friendEntries}
             groups={groupEntries}
             loading={contactsHydrating}
+            dark={darkTheme}
             onHydrate={hydrateDirectoryContacts}
             onSelect={(entry) => handleSelectChat(entry.wxid, {
               nickname: entry.name,
@@ -1685,11 +1728,23 @@ export default function App() {
           <BroadcastPanel
             friends={friendEntries}
             groups={groupEntries}
+            dark={darkTheme}
           />
         )}
+        <div
+          role="separator"
+          aria-label="调整列表宽度"
+          aria-orientation="vertical"
+          onPointerDown={startSidePanelResize}
+          className={`absolute top-0 right-[-4px] z-30 h-full w-[8px] cursor-col-resize flex justify-center ${
+            darkTheme ? "hover:bg-[#1f1f1f]" : "hover:bg-[#e0e0e0]"
+          }`}
+        >
+          <div className={`h-full w-px ${darkTheme ? "bg-[#2a2a2a]" : "bg-[#d8d8d8]"}`} />
+        </div>
       </div>
 
-      <div className="flex-1 min-w-0 h-full bg-[#111111]">
+      <div className={`flex-1 min-w-0 h-full ${darkTheme ? "bg-[#111111]" : "bg-[#ededed]"}`}>
         {activeChat && activeSession ? (
           <ChatArea
             session={activeSession}
@@ -1702,9 +1757,10 @@ export default function App() {
             contactProfiles={contactProfiles}
             onRequestContactProfile={ensureContactProfiles}
             onInputChange={setHasUnsavedInput}
+            dark={darkTheme}
           />
         ) : (
-          <EmptyChatPane />
+          <EmptyChatPane dark={darkTheme} />
         )}
       </div>
 
@@ -1716,6 +1772,7 @@ export default function App() {
           loading={selfProfileLoading}
           onClose={() => setSelfCardOpen(false)}
           onAvatarClick={() => setSelfImageOpen(true)}
+          dark={darkTheme}
         />
       )}
 
@@ -1727,6 +1784,7 @@ export default function App() {
             selfAvatar
           }
           onClose={() => setSelfImageOpen(false)}
+          dark={darkTheme}
         />
       )}
     </div>
@@ -1855,7 +1913,9 @@ function AccountPortal({
                   <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#555]" : "text-[#aaa]"}`} title={account.id}>WS {account.id}</div>
                 </div>
                 <div className={`text-[12px] px-[7px] py-[3px] rounded-[4px] ${
-                  account.initialized ? "bg-[#123d27] text-[#49d17d]" : "bg-[#3d3112] text-[#e6bd51]"
+                  account.initialized
+                    ? (dark ? "bg-[#123d27] text-[#49d17d]" : "bg-[#e5f7ed] text-[#078f49]")
+                    : (dark ? "bg-[#3d3112] text-[#e6bd51]" : "bg-[#fff3d9] text-[#9a6b00]")
                 }`}>
                   {account.initialized ? "已就绪" : "初始化中"}
                 </div>
@@ -1877,17 +1937,34 @@ function ThemeSwitch({ theme, onChange }: { theme: PortalTheme; onChange: (theme
     <button
       type="button"
       onClick={() => onChange(dark ? "light" : "dark")}
-      className={`w-[116px] h-[32px] rounded-full p-[3px] flex items-center transition-colors ${
-        dark ? "bg-[#242424] border border-[#333]" : "bg-[#e7e7e7] border border-[#d2d2d2]"
+      className={`relative w-[54px] h-[28px] rounded-full p-[2px] flex items-center transition-colors ${
+        dark ? "bg-[#242424] border border-[#333]" : "bg-[#e8e8e8] border border-[#d2d2d2]"
       }`}
       aria-label="切换日夜模式"
+      title={dark ? "夜晚模式" : "白天模式"}
     >
+      <svg className={`absolute left-[7px] w-[13px] h-[13px] ${dark ? "text-[#777]" : "text-[#f0b429]"}`} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="4" />
+        <path strokeLinecap="round" d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+      </svg>
+      <svg className={`absolute right-[7px] w-[13px] h-[13px] ${dark ? "text-[#e5e7eb]" : "text-[#999]"}`} fill="currentColor" viewBox="0 0 24 24">
+        <path d="M21 14.4A7.7 7.7 0 0 1 9.6 3a8.8 8.8 0 1 0 11.4 11.4Z" />
+      </svg>
       <span
-        className={`h-[24px] w-[54px] rounded-full flex items-center justify-center text-[12px] transition-transform ${
-          dark ? "translate-x-[55px] bg-[#07c160] text-white" : "translate-x-0 bg-white text-[#333]"
+        className={`relative z-10 h-[22px] w-[22px] rounded-full flex items-center justify-center shadow-sm transition-transform ${
+          dark ? "translate-x-[26px] bg-[#07c160] text-white" : "translate-x-0 bg-white text-[#f0a500]"
         }`}
       >
-        {dark ? "夜晚" : "白天"}
+        {dark ? (
+          <svg className="w-[13px] h-[13px]" fill="currentColor" viewBox="0 0 24 24">
+            <path d="M21 14.4A7.7 7.7 0 0 1 9.6 3a8.8 8.8 0 1 0 11.4 11.4Z" />
+          </svg>
+        ) : (
+          <svg className="w-[13px] h-[13px]" fill="none" stroke="currentColor" strokeWidth={2.3} viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="4" />
+            <path strokeLinecap="round" d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+          </svg>
+        )}
       </span>
     </button>
   );
@@ -1978,7 +2055,9 @@ function MobileAccountPortal({
                 <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>WS {account.id}</div>
               </div>
               <span className={`text-[12px] px-[7px] py-[3px] rounded-full ${
-                account.initialized ? "bg-[#e5f7ed] text-[#07c160]" : "bg-[#fff3d9] text-[#b78200]"
+                account.initialized
+                  ? (dark ? "bg-[#123d27] text-[#49d17d]" : "bg-[#e5f7ed] text-[#07c160]")
+                  : (dark ? "bg-[#3d3112] text-[#e6bd51]" : "bg-[#fff3d9] text-[#b78200]")
               }`}>
                 {account.initialized ? "已就绪" : "初始化"}
               </span>
@@ -2095,12 +2174,14 @@ function MobileMultiAccountBroadcastPage({
                   key={account.id}
                   type="button"
                   onClick={() => toggleAgent(account.id)}
-                  className={`w-full h-[60px] rounded-[10px] px-[10px] flex items-center gap-[10px] text-left ${
-                    checked ? "bg-[#123d27]" : dark ? "bg-[#242424]" : "bg-[#f6f6f6]"
+                  className={`w-full h-[60px] rounded-[10px] px-[10px] flex items-center gap-[10px] text-left border ${
+                    checked
+                      ? (dark ? "bg-[#123d27] border-[#123d27]" : "bg-[#e9f8ef] border-[#07c160]")
+                      : (dark ? "bg-[#242424] border-transparent" : "bg-[#f6f6f6] border-transparent")
                   }`}
                 >
                   <span className={`w-[22px] h-[22px] rounded-full border flex items-center justify-center shrink-0 ${
-                    checked ? "bg-[#07c160] border-[#07c160]" : "border-[#777]"
+                    checked ? "bg-[#07c160] border-[#07c160]" : (dark ? "border-[#777]" : "border-[#aaa]")
                   }`}>
                     {checked && (
                       <svg className="w-[15px] h-[15px] text-white" fill="none" stroke="currentColor" strokeWidth={2.3} viewBox="0 0 24 24">
@@ -2141,7 +2222,7 @@ function MobileMultiAccountBroadcastPage({
             type="button"
             disabled={sending || !message.trim() || agentIds.length === 0 || selectedTargetTypes.length === 0}
             onClick={sendText}
-            className="mt-[10px] w-full h-[42px] rounded-[10px] bg-[#07c160] text-white disabled:bg-[#315541]"
+            className={`mt-[10px] w-full h-[42px] rounded-[10px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
           >
             {sending ? "发送中" : "群发文本"}
           </button>
@@ -2158,12 +2239,12 @@ function MobileMultiAccountBroadcastPage({
             />
             选择图片
           </label>
-          {preview && <img src={preview} alt="" className="mt-[10px] max-h-[180px] rounded-[10px] object-contain bg-black/20 mx-auto" />}
+          {preview && <img src={preview} alt="" className={`mt-[10px] max-h-[180px] rounded-[10px] object-contain mx-auto ${dark ? "bg-black/20" : "bg-[#f7f7f7] border border-[#e0e0e0]"}`} />}
           <button
             type="button"
             disabled={sending || !image || agentIds.length === 0 || selectedTargetTypes.length === 0}
             onClick={sendImage}
-            className="mt-[10px] w-full h-[42px] rounded-[10px] bg-[#07c160] text-white disabled:bg-[#315541]"
+            className={`mt-[10px] w-full h-[42px] rounded-[10px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
           >
             {sending ? "发送中" : "群发图片"}
           </button>
@@ -2217,6 +2298,7 @@ function MobileMainShell({
   selfAvatar,
   selfProfile,
   contactsLoading,
+  dark,
   onSwitchTab,
   onSelectChat,
   onHydrateContacts,
@@ -2232,6 +2314,7 @@ function MobileMainShell({
   selfAvatar: string;
   selfProfile?: ContactProfile;
   contactsLoading: boolean;
+  dark: boolean;
   onSwitchTab: (tab: MobileTab) => void;
   onSelectChat: (wxid: string, fallback?: Partial<Session>) => void;
   onHydrateContacts: () => void;
@@ -2239,13 +2322,14 @@ function MobileMainShell({
   onBackToAccounts: () => void;
 }) {
   return (
-    <div className="h-dvh w-screen bg-[#ededed] text-[#111] overflow-hidden flex flex-col">
-      {tab === "chats" && <MobileChatsView sessions={sessions} onSelectChat={onSelectChat} onBackToAccounts={onBackToAccounts} />}
+    <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+      {tab === "chats" && <MobileChatsView sessions={sessions} onSelectChat={onSelectChat} onBackToAccounts={onBackToAccounts} dark={dark} />}
       {tab === "contacts" && (
         <MobileContactsView
           friends={friends}
           groups={groups}
           loading={contactsLoading}
+          dark={dark}
           onHydrate={onHydrateContacts}
           onSelect={(entry) => onSelectChat(entry.wxid, { nickname: entry.name, avatar: entry.avatar, is_group: entry.is_group })}
         />
@@ -2256,18 +2340,19 @@ function MobileMainShell({
           selfWxid={selfWxid}
           selfAvatar={selfAvatar}
           profile={selfProfile}
+          dark={dark}
           onOpenSelfDetail={onOpenSelfDetail}
         />
       )}
-      <MobileTabBar active={tab} onChange={onSwitchTab} />
+      <MobileTabBar active={tab} onChange={onSwitchTab} dark={dark} />
     </div>
   );
 }
 
-function MobileSearchBar({ placeholder = "Search" }: { placeholder?: string }) {
+function MobileSearchBar({ placeholder = "Search", dark = false }: { placeholder?: string; dark?: boolean }) {
   return (
     <div className="h-[44px] px-[12px] flex items-center">
-      <div className="w-full h-[36px] rounded-[7px] bg-white flex items-center justify-center gap-[7px] text-[#b7b7b7]">
+      <div className={`w-full h-[36px] rounded-[7px] flex items-center justify-center gap-[7px] ${dark ? "bg-[#242424] text-[#777]" : "bg-white text-[#b7b7b7]"}`}>
         <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
         </svg>
@@ -2281,44 +2366,46 @@ function MobileChatsView({
   sessions,
   onSelectChat,
   onBackToAccounts,
+  dark,
 }: {
   sessions: Session[];
   onSelectChat: (wxid: string) => void;
   onBackToAccounts: () => void;
+  dark: boolean;
 }) {
   return (
     <div className="flex-1 min-h-0 overflow-y-auto pb-[10px]">
-      <MobileTopBar title="Weixin" leftLabel="账号" rightLabel="＋" onLeft={onBackToAccounts} />
-      <MobileSearchBar />
-      <div className="h-[48px] px-[22px] flex items-center gap-[14px] text-[#777] text-[14px] border-b border-[#dedede]">
+      <MobileTopBar dark={dark} title="Weixin" leftLabel="账号" rightLabel="＋" onLeft={onBackToAccounts} />
+      <MobileSearchBar dark={dark} />
+      <div className={`h-[48px] px-[22px] flex items-center gap-[14px] text-[14px] border-b ${dark ? "text-[#888] border-[#242424]" : "text-[#777] border-[#dedede]"}`}>
         <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
           <rect x="3" y="5" width="18" height="12" rx="1.5" />
           <path d="M8 21h8M12 17v4" />
         </svg>
         <span>Logged in to Weixin for Windows.</span>
       </div>
-      <div className="bg-white">
-        {sessions.length === 0 && <div className="text-center text-[#999] text-[14px] py-[48px]">暂无会话</div>}
+      <div className={dark ? "bg-[#111111]" : "bg-white"}>
+        {sessions.length === 0 && <div className={`text-center text-[14px] py-[48px] ${dark ? "text-[#666]" : "text-[#999]"}`}>暂无会话</div>}
         {sessions.map((session) => (
-          <MobileSessionRow key={session.wxid} session={session} onClick={() => onSelectChat(session.wxid)} />
+          <MobileSessionRow key={session.wxid} session={session} onClick={() => onSelectChat(session.wxid)} dark={dark} />
         ))}
       </div>
     </div>
   );
 }
 
-function MobileSessionRow({ session, onClick }: { session: Session; onClick: () => void }) {
+function MobileSessionRow({ session, onClick, dark }: { session: Session; onClick: () => void; dark: boolean }) {
   return (
-    <button type="button" onClick={onClick} className="w-full h-[74px] pl-[14px] pr-[12px] flex items-center gap-[12px] text-left active:bg-[#f4f4f4]">
+    <button type="button" onClick={onClick} className={`w-full h-[74px] pl-[14px] pr-[12px] flex items-center gap-[12px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
       <MobileAvatar name={session.nickname || session.wxid} avatar={session.avatar} group={session.is_group} size={52} />
-      <div className="min-w-0 flex-1 h-full border-b border-[#ededed] flex flex-col justify-center">
+      <div className={`min-w-0 flex-1 h-full border-b flex flex-col justify-center ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
         <div className="flex items-baseline gap-[8px]">
           <div className="text-[17px] leading-[23px] truncate flex-1">{session.nickname || session.wxid}</div>
-          <div className="text-[12px] text-[#b8b8b8] shrink-0">{session.lastTime || ""}</div>
+          <div className={`text-[12px] shrink-0 ${dark ? "text-[#666]" : "text-[#b8b8b8]"}`}>{session.lastTime || ""}</div>
         </div>
         <div className="mt-[3px] flex items-center gap-[6px]">
-          <div className="text-[14px] text-[#aaa] truncate flex-1">{session.lastMsg || ""}</div>
-          {session.muted && <span className="text-[#b8b8b8] text-[12px]">静音</span>}
+          <div className={`text-[14px] truncate flex-1 ${dark ? "text-[#777]" : "text-[#aaa]"}`}>{session.lastMsg || ""}</div>
+          {session.muted && <span className={`text-[12px] ${dark ? "text-[#666]" : "text-[#b8b8b8]"}`}>静音</span>}
           {!session.muted && session.unread && session.unread > 0 ? (
             <span className="min-w-[18px] h-[18px] rounded-full bg-[#fa5151] text-white text-[11px] flex items-center justify-center px-[5px]">
               {session.unread > 99 ? "99+" : session.unread}
@@ -2334,12 +2421,14 @@ function MobileContactsView({
   friends,
   groups,
   loading,
+  dark,
   onHydrate,
   onSelect,
 }: {
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
   loading: boolean;
+  dark: boolean;
   onHydrate: () => void;
   onSelect: (entry: DirectoryEntry) => void;
 }) {
@@ -2355,30 +2444,30 @@ function MobileContactsView({
 
   return (
     <div className="relative flex-1 min-h-0 overflow-y-auto pb-[10px]">
-      <MobileTopBar title="Contacts" rightLabel="＋" />
+      <MobileTopBar dark={dark} title="Contacts" rightLabel="＋" />
       <div className="h-[44px] px-[12px] flex items-center">
-        <div className="w-full h-[36px] rounded-[7px] bg-white flex items-center gap-[7px] px-[12px] text-[#b7b7b7]">
+        <div className={`w-full h-[36px] rounded-[7px] flex items-center gap-[7px] px-[12px] ${dark ? "bg-[#242424] text-[#777]" : "bg-white text-[#b7b7b7]"}`}>
           <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
           </svg>
-          <input value={query} onChange={(e) => setQuery(e.target.value)} className="bg-transparent outline-none flex-1 text-[16px] text-[#111] placeholder-[#b7b7b7]" placeholder="Search" />
+          <input value={query} onChange={(e) => setQuery(e.target.value)} className={`bg-transparent outline-none flex-1 text-[16px] ${dark ? "text-[#e8e8e8] placeholder-[#777]" : "text-[#111] placeholder-[#b7b7b7]"}`} placeholder="Search" />
         </div>
       </div>
-      {loading && <div className="px-[22px] py-[6px] text-[12px] text-[#999]">正在补全联系人资料...</div>}
-      <div className="bg-white">
-        <MobileContactStaticRow color="#ffad33" label="New Friends" icon="person+" />
-        <MobileContactStaticRow color="#ffad33" label="Chats Only Friends" icon="person" />
-        <MobileContactStaticRow color="#07c160" label="Group Chats" icon="group" />
-        <MobileContactStaticRow color="#1e9bf0" label="Tags" icon="tag" />
-        <MobileContactStaticRow color="#1688f0" label="Official Accounts" icon="leaf" />
-        <MobileContactStaticRow color="#21a8f4" label="Service Accounts" icon="diamond" />
+      {loading && <div className={`px-[22px] py-[6px] text-[12px] ${dark ? "text-[#777]" : "text-[#999]"}`}>正在补全联系人资料...</div>}
+      <div className={dark ? "bg-[#111111]" : "bg-white"}>
+        <MobileContactStaticRow dark={dark} color="#ffad33" label="New Friends" icon="person+" />
+        <MobileContactStaticRow dark={dark} color="#ffad33" label="Chats Only Friends" icon="person" />
+        <MobileContactStaticRow dark={dark} color="#07c160" label="Group Chats" icon="group" />
+        <MobileContactStaticRow dark={dark} color="#1e9bf0" label="Tags" icon="tag" />
+        <MobileContactStaticRow dark={dark} color="#1688f0" label="Official Accounts" icon="leaf" />
+        <MobileContactStaticRow dark={dark} color="#21a8f4" label="Service Accounts" icon="diamond" />
       </div>
-      {filteredGroups.length > 0 && <MobileContactSection title="群聊" entries={filteredGroups} onSelect={onSelect} />}
+      {filteredGroups.length > 0 && <MobileContactSection dark={dark} title="群聊" entries={filteredGroups} onSelect={onSelect} />}
       {friendSections.map((section) => (
-        <MobileContactSection key={section.title} title={section.title} entries={section.entries} onSelect={onSelect} />
+        <MobileContactSection key={section.title} dark={dark} title={section.title} entries={section.entries} onSelect={onSelect} />
       ))}
       {friendSections.length > 0 && (
-        <div className="fixed right-[5px] top-[34%] z-10 flex flex-col items-center gap-[2px] text-[11px] leading-[13px] text-[#444]">
+        <div className={`fixed right-[5px] top-[34%] z-10 flex flex-col items-center gap-[2px] text-[11px] leading-[13px] ${dark ? "text-[#888]" : "text-[#444]"}`}>
           {indexLetters.map((letter) => (
             <span key={letter}>{letter}</span>
           ))}
@@ -2388,7 +2477,7 @@ function MobileContactsView({
   );
 }
 
-function MobileContactStaticRow({ color, label, icon }: { color: string; label: string; icon: string }) {
+function MobileContactStaticRow({ color, label, icon, dark }: { color: string; label: string; icon: string; dark: boolean }) {
   return (
     <div className="h-[58px] pl-[22px] pr-[12px] flex items-center gap-[14px]">
       <div className="w-[38px] h-[38px] rounded-[5px] flex items-center justify-center text-white" style={{ backgroundColor: color }}>
@@ -2400,20 +2489,20 @@ function MobileContactStaticRow({ color, label, icon }: { color: string; label: 
           {icon !== "tag" && icon !== "leaf" && icon !== "diamond" && icon !== "group" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0ZM5 21c.8-4 3.1-6 7-6s6.2 2 7 6M18 6v4M20 8h-4" />}
         </svg>
       </div>
-      <div className="flex-1 h-full border-b border-[#ededed] flex items-center text-[17px]">{label}</div>
+      <div className={`flex-1 h-full border-b flex items-center text-[17px] ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>{label}</div>
     </div>
   );
 }
 
-function MobileContactSection({ title, entries, onSelect }: { title: string; entries: DirectoryEntry[]; onSelect: (entry: DirectoryEntry) => void }) {
+function MobileContactSection({ title, entries, onSelect, dark }: { title: string; entries: DirectoryEntry[]; onSelect: (entry: DirectoryEntry) => void; dark: boolean }) {
   return (
     <div>
-      <div className="h-[34px] px-[22px] flex items-center text-[14px] text-[#777]">{title}</div>
-      <div className="bg-white">
+      <div className={`h-[34px] px-[22px] flex items-center text-[14px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{title}</div>
+      <div className={dark ? "bg-[#111111]" : "bg-white"}>
         {entries.map((entry) => (
-          <button key={`${entry.source}_${entry.wxid}`} type="button" onClick={() => onSelect(entry)} className="w-full h-[62px] pl-[22px] pr-[12px] flex items-center gap-[12px] text-left active:bg-[#f4f4f4]">
+          <button key={`${entry.source}_${entry.wxid}`} type="button" onClick={() => onSelect(entry)} className={`w-full h-[62px] pl-[22px] pr-[12px] flex items-center gap-[12px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
             <MobileAvatar name={entry.name || entry.wxid} avatar={entry.avatar} group={entry.is_group} size={42} />
-            <div className="flex-1 min-w-0 h-full border-b border-[#ededed] flex items-center">
+            <div className={`flex-1 min-w-0 h-full border-b flex items-center ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
               <div className="text-[17px] truncate">{entry.name || entry.wxid}</div>
             </div>
           </button>
@@ -2428,46 +2517,48 @@ function MobileMeView({
   selfWxid,
   selfAvatar,
   profile,
+  dark,
   onOpenSelfDetail,
 }: {
   selfName: string;
   selfWxid: string;
   selfAvatar: string;
   profile?: ContactProfile;
+  dark: boolean;
   onOpenSelfDetail: () => void;
 }) {
   const raw = profile?.profile || {};
   const alias = raw.Alias || raw.alias || selfWxid;
   return (
     <div className="flex-1 min-h-0 overflow-y-auto pb-[10px]">
-      <div className="h-[76px] pt-[env(safe-area-inset-top)] bg-white" />
-      <button type="button" onClick={onOpenSelfDetail} className="w-full bg-white px-[34px] py-[26px] flex items-center gap-[22px] text-left active:bg-[#f7f7f7]">
+      <div className={`h-[76px] pt-[env(safe-area-inset-top)] ${dark ? "bg-[#111111]" : "bg-white"}`} />
+      <button type="button" onClick={onOpenSelfDetail} className={`w-full px-[34px] py-[26px] flex items-center gap-[22px] text-left ${dark ? "bg-[#111111] active:bg-[#242424]" : "bg-white active:bg-[#f7f7f7]"}`}>
         <MobileAvatar name={selfName} avatar={selfAvatar} size={78} />
         <div className="min-w-0 flex-1">
           <div className="text-[24px] font-semibold truncate">{selfName}</div>
-          <div className="text-[16px] text-[#777] mt-[7px] truncate">Weixin ID: {alias || selfWxid}</div>
+          <div className={`text-[16px] mt-[7px] truncate ${dark ? "text-[#888]" : "text-[#777]"}`}>Weixin ID: {alias || selfWxid}</div>
         </div>
-        <div className="text-[#b8b8b8] text-[24px]">›</div>
+        <div className={`text-[24px] ${dark ? "text-[#666]" : "text-[#b8b8b8]"}`}>›</div>
       </button>
-      <div className="h-[10px] bg-[#ededed]" />
-      <MobileMeRow label="Pay and Services" color="#07c160" />
-      <MobileMeRow label="Favorites" color="#ff7043" />
-      <MobileMeRow label="Moments" color="#1e9bf0" />
-      <MobileMeRow label="Works" color="#21a8f4" />
-      <MobileMeRow label="Stores and Cards" color="#ff6b6b" />
-      <MobileMeRow label="Sticker Gallery" color="#ffc300" />
-      <div className="h-[10px] bg-[#ededed]" />
-      <MobileMeRow label="Settings" color="#1e9bf0" />
+      <div className={`h-[10px] ${dark ? "bg-[#1a1a1a]" : "bg-[#ededed]"}`} />
+      <MobileMeRow dark={dark} label="Pay and Services" color="#07c160" />
+      <MobileMeRow dark={dark} label="Favorites" color="#ff7043" />
+      <MobileMeRow dark={dark} label="Moments" color="#1e9bf0" />
+      <MobileMeRow dark={dark} label="Works" color="#21a8f4" />
+      <MobileMeRow dark={dark} label="Stores and Cards" color="#ff6b6b" />
+      <MobileMeRow dark={dark} label="Sticker Gallery" color="#ffc300" />
+      <div className={`h-[10px] ${dark ? "bg-[#1a1a1a]" : "bg-[#ededed]"}`} />
+      <MobileMeRow dark={dark} label="Settings" color="#1e9bf0" />
     </div>
   );
 }
 
-function MobileMeRow({ label, color }: { label: string; color: string }) {
+function MobileMeRow({ label, color, dark }: { label: string; color: string; dark: boolean }) {
   return (
-    <div className="h-[56px] bg-white pl-[28px] pr-[18px] flex items-center gap-[18px]">
+    <div className={`h-[56px] pl-[28px] pr-[18px] flex items-center gap-[18px] ${dark ? "bg-[#111111]" : "bg-white"}`}>
       <div className="w-[22px] h-[22px] rounded-[5px] border-2" style={{ borderColor: color }} />
-      <div className="flex-1 h-full border-b border-[#ededed] flex items-center text-[17px]">{label}</div>
-      <div className="text-[#b8b8b8] text-[24px]">›</div>
+      <div className={`flex-1 h-full border-b flex items-center text-[17px] ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>{label}</div>
+      <div className={`text-[24px] ${dark ? "text-[#666]" : "text-[#b8b8b8]"}`}>›</div>
     </div>
   );
 }
@@ -2479,6 +2570,7 @@ function MobileProfileDetailPage({
   loading,
   onBack,
   onAvatarClick,
+  dark = false,
 }: {
   profile?: ContactProfile;
   fallbackName: string;
@@ -2486,6 +2578,7 @@ function MobileProfileDetailPage({
   loading: boolean;
   onBack: () => void;
   onAvatarClick: () => void;
+  dark?: boolean;
 }) {
   const raw = profile?.profile || {};
   const name = profileDisplayName(profile, fallbackName);
@@ -2496,54 +2589,54 @@ function MobileProfileDetailPage({
   const signature = raw.Signature || raw.signature || raw.Description || "";
   const area = profileArea(raw);
   return (
-    <div className="h-dvh w-screen bg-[#ededed] text-[#111] overflow-hidden flex flex-col">
-      <MobileTopBar title="Profile" leftLabel="‹" onLeft={onBack} />
+    <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+      <MobileTopBar dark={dark} title="Profile" leftLabel="‹" onLeft={onBack} />
       <div className="flex-1 overflow-y-auto">
-        <MobileProfileRow label="Profile Photo" value="" onClick={onAvatarClick} image={avatar} />
-        <MobileProfileRow label="Name" value={name} />
-        {gender && <MobileProfileRow label="Gender" value={gender} />}
-        <MobileProfileRow label="Region" value={area || ""} />
-        {phone && <MobileProfileRow label="Phone" value={phone} />}
-        <MobileProfileRow label="ID" value={alias} />
-        <MobileProfileRow label="My QR Code" value="▦" />
-        {profile?.wxid && <MobileProfileRow label="Tickle" value={profile.wxid} />}
-        <MobileProfileRow label="What's Up" value={signature} />
-        <div className="h-[10px] bg-[#ededed]" />
-        <MobileProfileRow label="Incoming Call Ringtones" value="" />
-        <div className="h-[10px] bg-[#ededed]" />
-        <MobileProfileRow label="My Address" value="" />
-        <MobileProfileRow label="My Fapiao Titles" value="" />
-        <div className="h-[10px] bg-[#ededed]" />
-        <MobileProfileRow label="WeBeans" value="" />
-        {loading && <div className="px-[22px] py-[14px] text-[13px] text-[#999]">正在加载资料...</div>}
+        <MobileProfileRow dark={dark} label="Profile Photo" value="" onClick={onAvatarClick} image={avatar} />
+        <MobileProfileRow dark={dark} label="Name" value={name} />
+        {gender && <MobileProfileRow dark={dark} label="Gender" value={gender} />}
+        <MobileProfileRow dark={dark} label="Region" value={area || ""} />
+        {phone && <MobileProfileRow dark={dark} label="Phone" value={phone} />}
+        <MobileProfileRow dark={dark} label="ID" value={alias} />
+        <MobileProfileRow dark={dark} label="My QR Code" value="▦" />
+        {profile?.wxid && <MobileProfileRow dark={dark} label="Tickle" value={profile.wxid} />}
+        <MobileProfileRow dark={dark} label="What's Up" value={signature} />
+        <div className={`h-[10px] ${dark ? "bg-[#1a1a1a]" : "bg-[#ededed]"}`} />
+        <MobileProfileRow dark={dark} label="Incoming Call Ringtones" value="" />
+        <div className={`h-[10px] ${dark ? "bg-[#1a1a1a]" : "bg-[#ededed]"}`} />
+        <MobileProfileRow dark={dark} label="My Address" value="" />
+        <MobileProfileRow dark={dark} label="My Fapiao Titles" value="" />
+        <div className={`h-[10px] ${dark ? "bg-[#1a1a1a]" : "bg-[#ededed]"}`} />
+        <MobileProfileRow dark={dark} label="WeBeans" value="" />
+        {loading && <div className={`px-[22px] py-[14px] text-[13px] ${dark ? "text-[#777]" : "text-[#999]"}`}>正在加载资料...</div>}
       </div>
     </div>
   );
 }
 
-function MobileProfileRow({ label, value, image, onClick }: { label: string; value?: string; image?: string; onClick?: () => void }) {
+function MobileProfileRow({ label, value, image, onClick, dark }: { label: string; value?: string; image?: string; onClick?: () => void; dark: boolean }) {
   return (
-    <button type="button" onClick={onClick} className="w-full min-h-[58px] bg-white pl-[22px] pr-[16px] flex items-center text-left active:bg-[#f7f7f7]">
+    <button type="button" onClick={onClick} className={`w-full min-h-[58px] pl-[22px] pr-[16px] flex items-center text-left ${dark ? "bg-[#111111] active:bg-[#242424]" : "bg-white active:bg-[#f7f7f7]"}`}>
       <div className="text-[17px] flex-1">{label}</div>
-      {image ? <img src={image} alt="" className="w-[38px] h-[38px] rounded-[4px] object-cover" /> : <div className="max-w-[58%] text-[16px] text-[#888] truncate">{value || ""}</div>}
-      <div className="text-[#b8b8b8] text-[24px] ml-[8px]">›</div>
+      {image ? <img src={image} alt="" className="w-[38px] h-[38px] rounded-[4px] object-cover" /> : <div className={`max-w-[58%] text-[16px] truncate ${dark ? "text-[#888]" : "text-[#888]"}`}>{value || ""}</div>}
+      <div className={`text-[24px] ml-[8px] ${dark ? "text-[#666]" : "text-[#b8b8b8]"}`}>›</div>
     </button>
   );
 }
 
-function MobileTabBar({ active, onChange }: { active: MobileTab; onChange: (tab: MobileTab) => void }) {
+function MobileTabBar({ active, onChange, dark }: { active: MobileTab; onChange: (tab: MobileTab) => void; dark: boolean }) {
   return (
-    <div className="shrink-0 h-[64px] pb-[env(safe-area-inset-bottom)] bg-white/95 border-t border-[#dedede] grid grid-cols-3">
-      <MobileTabButton active={active === "chats"} label="Chats" onClick={() => onChange("chats")} icon="chat" />
-      <MobileTabButton active={active === "contacts"} label="Contacts" onClick={() => onChange("contacts")} icon="contacts" />
-      <MobileTabButton active={active === "me"} label="Me" onClick={() => onChange("me")} icon="me" />
+    <div className={`shrink-0 h-[64px] pb-[env(safe-area-inset-bottom)] border-t grid grid-cols-3 ${dark ? "bg-[#111111]/95 border-[#242424]" : "bg-white/95 border-[#dedede]"}`}>
+      <MobileTabButton active={active === "chats"} label="Chats" onClick={() => onChange("chats")} icon="chat" dark={dark} />
+      <MobileTabButton active={active === "contacts"} label="Contacts" onClick={() => onChange("contacts")} icon="contacts" dark={dark} />
+      <MobileTabButton active={active === "me"} label="Me" onClick={() => onChange("me")} icon="me" dark={dark} />
     </div>
   );
 }
 
-function MobileTabButton({ active, label, icon, onClick }: { active: boolean; label: string; icon: string; onClick: () => void }) {
+function MobileTabButton({ active, label, icon, onClick, dark }: { active: boolean; label: string; icon: string; onClick: () => void; dark: boolean }) {
   return (
-    <button type="button" onClick={onClick} className={`flex flex-col items-center justify-center gap-[2px] ${active ? "text-[#07c160]" : "text-[#222]"}`}>
+    <button type="button" onClick={onClick} className={`flex flex-col items-center justify-center gap-[2px] ${active ? "text-[#07c160]" : (dark ? "text-[#cfcfcf]" : "text-[#222]")}`}>
       <svg className="w-[25px] h-[25px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
         {icon === "chat" && <path strokeLinecap="round" strokeLinejoin="round" d="M4 6.5A3.5 3.5 0 0 1 7.5 3h9A3.5 3.5 0 0 1 20 6.5v5A3.5 3.5 0 0 1 16.5 15H11l-5 4v-4.35A3.5 3.5 0 0 1 4 11.5v-5Z" />}
         {icon === "contacts" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 11a4 4 0 1 0-8 0 4 4 0 0 0 8 0ZM4.5 21c.8-4.2 3.3-6.3 7.5-6.3s6.7 2.1 7.5 6.3M18 6v4M20 8h-4" />}
@@ -2693,9 +2786,9 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
             />
             <button
               type="button"
-              disabled={sending || !message.trim() || selectedTargetTypes.length === 0 || agentIds.length === 0}
-              onClick={sendText}
-              className="mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#315541] active:opacity-85"
+            disabled={sending || !message.trim() || selectedTargetTypes.length === 0 || agentIds.length === 0}
+            onClick={sendText}
+              className={`mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white active:opacity-85 ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
             >
               {sending ? "发送中" : "群发文本"}
             </button>
@@ -2709,12 +2802,12 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
               onChange={(e) => setImage(e.target.files?.[0] || null)}
               className={`block text-[13px] ${dark ? "text-[#aaa]" : "text-[#555]"}`}
             />
-            {preview && <img src={preview} alt="" className="mt-[10px] max-w-[180px] max-h-[140px] rounded-[4px] object-contain bg-[#1d1d1d]" />}
+            {preview && <img src={preview} alt="" className={`mt-[10px] max-w-[180px] max-h-[140px] rounded-[4px] object-contain ${dark ? "bg-[#1d1d1d]" : "bg-white border border-[#e0e0e0]"}`} />}
             <button
               type="button"
               disabled={sending || !image || selectedTargetTypes.length === 0 || agentIds.length === 0}
               onClick={sendImage}
-              className="mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#315541] active:opacity-85"
+              className={`mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white active:opacity-85 ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
             >
               {sending ? "发送中" : "群发图片"}
             </button>
@@ -2743,17 +2836,24 @@ function TargetTypeButton({
   onClick: () => void;
 }) {
   const inactiveClass = dark ? "border-[#303030] bg-[#1d1d1d]" : "border-[#d8d8d8] bg-white";
+  const activeClass = dark ? "border-[#07c160] bg-[#123d27]" : "border-[#07c160] bg-[#e9f8ef]";
+  const titleClass = active
+    ? (dark ? "text-[#f2f2f2]" : "text-[#0d3f24]")
+    : (dark ? "text-[#f2f2f2]" : "text-[#111]");
+  const subtitleClass = active
+    ? (dark ? "text-[#9ab5a4]" : "text-[#4f7f63]")
+    : (dark ? "text-[#888]" : "text-[#777]");
   return (
     <button
       type="button"
       onClick={onClick}
       className={`min-h-[70px] rounded-[6px] border px-[12px] py-[10px] text-left active:opacity-85 ${
-        active ? "border-[#07c160] bg-[#123d27]" : inactiveClass
+        active ? activeClass : inactiveClass
       }`}
     >
       <div className="flex items-center gap-[8px]">
         <span className={`w-[18px] h-[18px] rounded-[4px] border flex items-center justify-center ${
-          active ? "bg-[#07c160] border-[#07c160]" : "border-[#555]"
+          active ? "bg-[#07c160] border-[#07c160]" : (dark ? "border-[#555]" : "border-[#aaa]")
         }`}>
           {active && (
             <svg className="w-[13px] h-[13px] text-white" fill="none" stroke="currentColor" strokeWidth={2.4} viewBox="0 0 24 24">
@@ -2761,9 +2861,9 @@ function TargetTypeButton({
             </svg>
           )}
         </span>
-        <span className={`text-[16px] ${dark || active ? "text-[#f2f2f2]" : "text-[#111]"}`}>{title}</span>
+        <span className={`text-[16px] ${titleClass}`}>{title}</span>
       </div>
-      <div className={`mt-[7px] text-[12px] ${dark || active ? "text-[#888]" : "text-[#777]"}`}>{subtitle}</div>
+      <div className={`mt-[7px] text-[12px] ${subtitleClass}`}>{subtitle}</div>
     </button>
   );
 }
@@ -2889,12 +2989,14 @@ function ContactsPanel({
   friends,
   groups,
   loading,
+  dark,
   onHydrate,
   onSelect,
 }: {
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
   loading: boolean;
+  dark: boolean;
   onHydrate: () => void;
   onSelect: (entry: DirectoryEntry) => void;
 }) {
@@ -2911,22 +3013,22 @@ function ContactsPanel({
   const friendSections = groupDirectoryEntries(visibleFriends);
 
   return (
-    <div className="h-full flex flex-col bg-[#e9e8e8] text-[#111]">
+    <div className={`h-full flex flex-col ${dark ? "bg-[#191919] text-[#e8e8e8]" : "bg-[#e9e8e8] text-[#111]"}`}>
       <div className="h-[92px] px-[18px] flex items-center gap-[12px] shrink-0">
-        <div className="flex-1 h-[38px] bg-[#dcdcdc] rounded-[4px] flex items-center px-[10px]">
-          <svg className="w-[18px] h-[18px] text-[#777] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <div className={`flex-1 h-[38px] rounded-[4px] flex items-center px-[10px] ${dark ? "bg-[#262626]" : "bg-[#dcdcdc]"}`}>
+          <svg className={`w-[18px] h-[18px] shrink-0 ${dark ? "text-[#666]" : "text-[#777]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
           </svg>
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            className="ml-[8px] bg-transparent outline-none text-[15px] w-full placeholder-[#888]"
+            className={`ml-[8px] bg-transparent outline-none text-[15px] w-full ${dark ? "text-[#ddd] placeholder-[#5c5c5c]" : "text-[#111] placeholder-[#888]"}`}
             placeholder="搜索"
           />
         </div>
         <button
           type="button"
-          className="w-[38px] h-[38px] rounded-[4px] bg-[#dcdcdc] text-[#555] flex items-center justify-center active:bg-[#d0d0d0]"
+          className={`w-[38px] h-[38px] rounded-[4px] flex items-center justify-center ${dark ? "bg-[#262626] text-[#999] active:bg-[#303030]" : "bg-[#dcdcdc] text-[#555] active:bg-[#d0d0d0]"}`}
           title="刷新详情"
           onClick={onHydrate}
         >
@@ -2937,15 +3039,15 @@ function ContactsPanel({
       </div>
 
       {loading && (
-        <div className="px-[18px] pb-[8px] text-[12px] text-[#888] shrink-0">
+        <div className={`px-[18px] pb-[8px] text-[12px] shrink-0 ${dark ? "text-[#777]" : "text-[#888]"}`}>
           正在通过 GetContact 批量补全联系人资料...
         </div>
       )}
 
       <div className="flex-1 overflow-y-auto">
-        <ContactSection title="群聊" entries={visibleGroups} onSelect={onSelect} />
+        <ContactSection dark={dark} title="群聊" entries={visibleGroups} onSelect={onSelect} />
         {friendSections.map((section) => (
-          <ContactSection key={section.title} title={section.title} entries={section.entries} onSelect={onSelect} />
+          <ContactSection key={section.title} dark={dark} title={section.title} entries={section.entries} onSelect={onSelect} />
         ))}
       </div>
     </div>
@@ -2956,27 +3058,29 @@ function ContactSection({
   title,
   entries,
   onSelect,
+  dark,
 }: {
   title: string;
   entries: DirectoryEntry[];
   onSelect: (entry: DirectoryEntry) => void;
+  dark: boolean;
 }) {
   if (entries.length === 0) return null;
   return (
     <div>
-      <div className="px-[18px] py-[10px] text-[14px] text-[#8a8a8a]">{title}</div>
+      <div className={`px-[18px] py-[10px] text-[14px] ${dark ? "text-[#777]" : "text-[#8a8a8a]"}`}>{title}</div>
       {entries.map((entry) => (
         <button
           key={`${entry.source}_${entry.wxid}`}
           type="button"
           onClick={() => onSelect(entry)}
-        className="w-full h-[64px] px-[14px] flex items-center gap-[12px] text-left hover:bg-[#dedede] active:bg-[#d3d3d3]"
+          className={`w-full h-[64px] px-[14px] flex items-center gap-[12px] text-left ${dark ? "hover:bg-[#242424] active:bg-[#2a2a2a]" : "hover:bg-[#dedede] active:bg-[#d3d3d3]"}`}
         >
           <EntryAvatar entry={entry} />
           <div className="min-w-0 flex-1">
-            <div className="text-[16px] text-[#111] truncate">{entry.name || entry.wxid}</div>
+            <div className={`text-[16px] truncate ${dark ? "text-[#e8e8e8]" : "text-[#111]"}`}>{entry.name || entry.wxid}</div>
             {entry.wxid && entry.wxid !== entry.name && (
-              <div className="text-[12px] text-[#999] truncate mt-[3px]">{entry.wxid}</div>
+              <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{entry.wxid}</div>
             )}
           </div>
         </button>
@@ -2988,9 +3092,11 @@ function ContactSection({
 function BroadcastPanel({
   friends,
   groups,
+  dark,
 }: {
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
+  dark: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -3141,25 +3247,25 @@ function BroadcastPanel({
   };
 
   return (
-    <div className="h-full bg-[#e9e8e8] text-[#111] flex flex-col" onPaste={handlePaste}>
+    <div className={`h-full flex flex-col ${dark ? "bg-[#191919] text-[#e8e8e8]" : "bg-[#e9e8e8] text-[#111]"}`} onPaste={handlePaste}>
       <div className="h-[92px] px-[18px] flex items-center">
-        <div className="flex-1 h-[38px] bg-[#dcdcdc] rounded-[4px] flex items-center px-[10px]">
-          <svg className="w-[18px] h-[18px] text-[#777] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <div className={`flex-1 h-[38px] rounded-[4px] flex items-center px-[10px] ${dark ? "bg-[#262626]" : "bg-[#dcdcdc]"}`}>
+          <svg className={`w-[18px] h-[18px] shrink-0 ${dark ? "text-[#666]" : "text-[#777]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
           </svg>
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            className="ml-[8px] bg-transparent outline-none text-[15px] w-full placeholder-[#888]"
+            className={`ml-[8px] bg-transparent outline-none text-[15px] w-full ${dark ? "text-[#ddd] placeholder-[#5c5c5c]" : "text-[#111] placeholder-[#888]"}`}
             placeholder="搜索群发对象"
           />
         </div>
       </div>
 
       <div className="px-[18px] flex flex-wrap gap-[8px] shrink-0">
-        <BroadcastSelectButton label={`全选好友 ${friends.length}`} onClick={() => selectEntries(friends)} />
-        <BroadcastSelectButton label={`全选群 ${groups.length}`} onClick={() => selectEntries(groups)} />
-        <BroadcastSelectButton label="清空" onClick={() => setSelected(new Set())} />
+        <BroadcastSelectButton dark={dark} label={`全选好友 ${friends.length}`} onClick={() => selectEntries(friends)} />
+        <BroadcastSelectButton dark={dark} label={`全选群 ${groups.length}`} onClick={() => selectEntries(groups)} />
+        <BroadcastSelectButton dark={dark} label="清空" onClick={() => setSelected(new Set())} />
       </div>
 
       <div className="px-[18px] py-[12px] shrink-0">
@@ -3167,7 +3273,7 @@ function BroadcastPanel({
           ref={messageInputRef}
           value={message}
           onChange={(e) => setMessage(e.target.value)}
-          className="w-full h-[94px] resize-none rounded-[4px] bg-white border border-[#d8d8d8] outline-none px-[10px] py-[8px] text-[15px]"
+          className={`w-full h-[94px] resize-none rounded-[4px] border outline-none px-[10px] py-[8px] text-[15px] ${dark ? "bg-[#1d1d1d] border-[#303030] text-[#eee] placeholder-[#666]" : "bg-white border-[#d8d8d8] text-[#111]"}`}
           placeholder="输入要群发的消息"
         />
         {broadcastImages.length > 0 && (
@@ -3175,17 +3281,17 @@ function BroadcastPanel({
             {broadcastImages.map((image) => (
               <div
                 key={image.id}
-                className="inline-flex items-center gap-[8px] rounded-[4px] border border-[#d8d8d8] bg-white p-[6px]"
+                className={`inline-flex items-center gap-[8px] rounded-[4px] border p-[6px] ${dark ? "border-[#303030] bg-[#1d1d1d]" : "border-[#d8d8d8] bg-white"}`}
               >
                 <img src={image.preview} alt="" className="w-[54px] h-[54px] rounded-[3px] object-cover" />
-                <div className="min-w-0 max-w-[160px] text-[13px] text-[#555]">
+                <div className={`min-w-0 max-w-[160px] text-[13px] ${dark ? "text-[#aaa]" : "text-[#555]"}`}>
                   <div className="truncate">{image.label}</div>
-                  <div className="mt-[3px] text-[#999] truncate">{image.token}</div>
+                  <div className={`mt-[3px] truncate ${dark ? "text-[#666]" : "text-[#999]"}`}>{image.token}</div>
                 </div>
                 <button
                   type="button"
                   onClick={() => removeBroadcastImage(image)}
-                  className="w-[26px] h-[26px] rounded-[4px] text-[#777] active:bg-[#f2f2f2]"
+                  className={`w-[26px] h-[26px] rounded-[4px] ${dark ? "text-[#888] active:bg-[#2a2a2a]" : "text-[#777] active:bg-[#f2f2f2]"}`}
                 >
                   ×
                 </button>
@@ -3193,7 +3299,7 @@ function BroadcastPanel({
             ))}
           </div>
         )}
-        <div className="mt-[8px] flex items-center justify-between text-[13px] text-[#777]">
+        <div className={`mt-[8px] flex items-center justify-between text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
           <span>已选 {selected.size} 个对象{sending ? `，已发送 ${sent}，失败 ${failed}` : ""}</span>
           <button
             type="button"
@@ -3206,11 +3312,11 @@ function BroadcastPanel({
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto border-t border-[#d8d8d8]">
+      <div className={`flex-1 overflow-y-auto border-t ${dark ? "border-[#2a2a2a]" : "border-[#d8d8d8]"}`}>
         {visible.map((entry) => (
           <label
             key={`${entry.source}_${entry.wxid}`}
-            className="h-[60px] px-[14px] flex items-center gap-[10px] hover:bg-[#dedede] cursor-pointer"
+            className={`h-[60px] px-[14px] flex items-center gap-[10px] cursor-pointer ${dark ? "hover:bg-[#242424]" : "hover:bg-[#dedede]"}`}
           >
             <input
               type="checkbox"
@@ -3221,7 +3327,7 @@ function BroadcastPanel({
             <EntryAvatar entry={entry} />
             <div className="min-w-0 flex-1">
               <div className="text-[16px] truncate">{entry.name || entry.wxid}</div>
-              <div className="text-[12px] text-[#999] truncate">{entry.is_group ? "群聊" : "好友"} · {entry.wxid}</div>
+              <div className={`text-[12px] truncate ${dark ? "text-[#666]" : "text-[#999]"}`}>{entry.is_group ? "群聊" : "好友"} · {entry.wxid}</div>
             </div>
           </label>
         ))}
@@ -3230,12 +3336,12 @@ function BroadcastPanel({
   );
 }
 
-function BroadcastSelectButton({ label, onClick }: { label: string; onClick: () => void }) {
+function BroadcastSelectButton({ label, onClick, dark }: { label: string; onClick: () => void; dark: boolean }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="h-[30px] px-[10px] rounded-[4px] bg-white border border-[#d4d4d4] text-[13px] text-[#333] active:bg-[#f2f2f2]"
+      className={`h-[30px] px-[10px] rounded-[4px] border text-[13px] ${dark ? "bg-[#1d1d1d] border-[#303030] text-[#ddd] active:bg-[#2a2a2a]" : "bg-white border-[#d4d4d4] text-[#333] active:bg-[#f2f2f2]"}`}
     >
       {label}
     </button>
@@ -3249,6 +3355,7 @@ function SelfProfileCard({
   loading,
   onClose,
   onAvatarClick,
+  dark = true,
 }: {
   profile?: ContactProfile;
   fallbackName: string;
@@ -3256,6 +3363,7 @@ function SelfProfileCard({
   loading: boolean;
   onClose: () => void;
   onAvatarClick: () => void;
+  dark?: boolean;
 }) {
   const raw = profile?.profile || {};
   const name = profileDisplayName(profile, fallbackName);
@@ -3267,7 +3375,7 @@ function SelfProfileCard({
   return (
     <div className="fixed inset-0 z-[9998]" onClick={onClose}>
       <div
-        className="absolute left-[24px] top-[86px] w-[420px] bg-white text-[#111] rounded-[2px] shadow-2xl border border-[#ddd]"
+        className={`absolute left-[24px] top-[86px] w-[420px] rounded-[2px] shadow-2xl border ${dark ? "bg-[#1f1f1f] text-[#e8e8e8] border-[#333]" : "bg-white text-[#111] border-[#ddd]"}`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-[36px] pt-[34px] pb-[28px]">
@@ -3299,7 +3407,7 @@ function SelfProfileCard({
               {loading && <div className="mt-[12px] text-[13px] text-[#999]">正在加载资料...</div>}
             </div>
           </div>
-          <div className="h-px bg-[#e8e8e8] my-[26px]" />
+          <div className={`h-px my-[26px] ${dark ? "bg-[#333]" : "bg-[#e8e8e8]"}`} />
           <button
             type="button"
             className="mx-auto w-[166px] h-[48px] rounded-[4px] bg-[#07c160] text-white text-[19px] flex items-center justify-center active:opacity-85"
@@ -3314,10 +3422,10 @@ function SelfProfileCard({
   );
 }
 
-function LargeAvatarOverlay({ src, onClose }: { src: string; onClose: () => void }) {
+function LargeAvatarOverlay({ src, onClose, dark = true }: { src: string; onClose: () => void; dark?: boolean }) {
   return (
-    <div className="fixed inset-0 z-[9999] bg-white flex flex-col" onClick={onClose}>
-      <div className="h-[54px] shrink-0 border-b border-[#e5e5e5] flex items-center px-[18px] text-[#555]">
+    <div className={`fixed inset-0 z-[9999] flex flex-col ${dark ? "bg-[#111111]" : "bg-white"}`} onClick={onClose}>
+      <div className={`h-[54px] shrink-0 border-b flex items-center px-[18px] ${dark ? "border-[#242424] text-[#ddd]" : "border-[#e5e5e5] text-[#555]"}`}>
         <button type="button" className="w-[38px] h-[38px] flex items-center justify-center active:opacity-70" onClick={onClose}>
           <svg className="w-[24px] h-[24px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" d="M15 18 9 12l6-6" />
@@ -3328,17 +3436,17 @@ function LargeAvatarOverlay({ src, onClose }: { src: string; onClose: () => void
         {src ? (
           <img src={src} alt="" className="max-w-full max-h-full object-contain" />
         ) : (
-          <div className="text-[#999]">暂无头像</div>
+          <div className={dark ? "text-[#777]" : "text-[#999]"}>暂无头像</div>
         )}
       </div>
     </div>
   );
 }
 
-function EmptyChatPane() {
+function EmptyChatPane({ dark = true }: { dark?: boolean }) {
   return (
-    <div className="h-full flex items-center justify-center bg-[#111111]">
-      <div className="text-[#2a2a2a]">
+    <div className={`h-full flex items-center justify-center ${dark ? "bg-[#111111]" : "bg-[#f5f5f5]"}`}>
+      <div className={dark ? "text-[#2a2a2a]" : "text-[#e0e0e0]"}>
         <svg className="w-[128px] h-[96px]" viewBox="0 0 160 120" fill="currentColor">
           <path opacity=".42" d="M65 22c-25 0-45 16-45 36 0 12 7 23 19 29l-4 17 19-11c4 1 7 1 11 1 25 0 45-16 45-36S90 22 65 22Zm-17 32a7 7 0 1 1 0-14 7 7 0 0 1 0 14Zm34 0a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z" />
           <path opacity=".28" d="M105 54c20 0 36 13 36 29 0 10-6 18-16 23l3 13-15-8c-3 .5-6 1-9 1-20 0-36-13-36-29s16-29 37-29Zm-12 25a5 5 0 1 0 0-10 5 5 0 0 0 0 10Zm27 0a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z" />

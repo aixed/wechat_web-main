@@ -12,6 +12,7 @@ interface MessageBubbleProps {
   avatarUrl?: string;
   onAvatarClick?: (wxid: string) => void;
   mobile?: boolean;
+  dark?: boolean;
 }
 
 function parseRefermsg(xml: string) {
@@ -192,7 +193,7 @@ function linkHref(url: string): string {
   return /^https?:\/\//i.test(url) ? url : `https://${url}`;
 }
 
-function renderTextWithLinks(text: string, isSelf: boolean, mobile: boolean) {
+function renderTextWithLinks(text: string, isSelf: boolean, mobile: boolean, dark: boolean) {
   const normalized = (text || "").replace(/\r\n/g, "\n");
   const nodes: ReactNode[] = [];
   let lastIndex = 0;
@@ -216,7 +217,7 @@ function renderTextWithLinks(text: string, isSelf: boolean, mobile: boolean) {
           href={linkHref(urlText)}
           target="_blank"
           rel="noreferrer"
-          className={`break-all ${isSelf || mobile ? "text-[#576b95]" : "text-[#7ea6d9]"} hover:underline`}
+          className={`break-all ${isSelf || (mobile && !dark) ? "text-[#576b95]" : "text-[#7ea6d9]"} hover:underline`}
           onClick={(event) => event.stopPropagation()}
         >
           {urlText}
@@ -323,7 +324,7 @@ function ChatImage({ message, onEnlarge }: { message: ChatMessage; onEnlarge: (u
 }
 
 export default function MessageBubble({
-  message, isSelf, selfWxid, isGroup, senderName, avatarUrl, onAvatarClick, mobile = false,
+  message, isSelf, selfWxid, isGroup, senderName, avatarUrl, onAvatarClick, mobile = false, dark = true,
 }: MessageBubbleProps) {
   const msgtype = String(message.msgtype);
   const [enlargedImg, setEnlargedImg] = useState<string | null>(null);
@@ -333,7 +334,7 @@ export default function MessageBubble({
       case "1":
         return (
           <div style={{ fontSize: 17, lineHeight: "20px", wordBreak: "break-word", whiteSpace: "pre-wrap", margin: 0, padding: 0 }}>
-            {renderTextWithLinks(message.msg || "", isSelf, mobile)}
+            {renderTextWithLinks(message.msg || "", isSelf, mobile, dark)}
           </div>
         );
 
@@ -502,7 +503,7 @@ export default function MessageBubble({
   if (msgtype === "10000" || msgtype === "10002") {
     return (
       <div className="flex justify-center py-2 px-4">
-        <div className={`text-[12px] text-[#888] rounded px-2.5 py-1 ${mobile ? "bg-[#dedede]" : "bg-[#1e1e1e]"}`}>
+        <div className={`text-[12px] rounded px-2.5 py-1 ${dark ? "bg-[#1e1e1e] text-[#888]" : "bg-[#dedede] text-[#999]"}`}>
           {replaceWechatEmojis(extractSystemText(message.msg))}
         </div>
       </div>
@@ -568,7 +569,7 @@ export default function MessageBubble({
             className={`text-[17px] ${
               isSelf
                 ? "bg-[#95ec69] text-[#111]"
-                : mobile ? "bg-white text-[#111]" : "bg-[#2d2d2d] text-[#e0e0e0]"
+                : dark ? "bg-[#2d2d2d] text-[#e0e0e0]" : "bg-white text-[#111]"
             }`}
             style={{
               padding: "8px 10px",
