@@ -1032,7 +1032,8 @@ async def get_last_messages_bulk(wxids: list[str]) -> dict:
     """Get the last message for each session from DB (across all DB files).
     Uses lightweight queries (no BytesExtra, no nested subquery) to avoid
     overloading the Hook DLL which can crash WeChat.
-    Local: sequential with bail-on-error.  Remote: fully parallel."""
+    Local: sequential with bail-on-error. Remote: limited parallelism to avoid
+    hammering freshly logged-in Hook clients during startup."""
     if IS_PROTOCOL:
         _log("[API] Remote mode: get_last_messages_bulk via QueryDB not available")
         return {}
@@ -1067,11 +1068,15 @@ async def get_last_messages_bulk(wxids: list[str]) -> dict:
                 results[talker] = parsed
 
     if not IS_LOCAL_HOOK:
-        # ─── Remote: fire ALL (batch × db) queries in parallel ─────
-        # Guard each query with a hard timeout to avoid hanging startup.
+        # ─── Remote: bounded parallel QueryDB ───────────────────────
+        # The WS transport can handle concurrent calls, but a fresh WeChat
+        # process may disappear if we blast every MSG DB query at once.
+        query_sem = asyncio.Semaphore(max(1, min(4, HOOK_API_CONCURRENCY)))
+
         async def _q_with_timeout(db: str, sql: str):
             try:
-                return await asyncio.wait_for(query_db(db, sql), timeout=18.0)
+                async with query_sem:
+                    return await asyncio.wait_for(query_db(db, sql), timeout=18.0)
             except Exception:
                 return {}
 
