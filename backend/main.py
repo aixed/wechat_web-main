@@ -976,9 +976,10 @@ class ActivateAccountRequest(BaseModel):
 
 
 class MultiBroadcastTextRequest(BaseModel):
-    wxids: list[str]
+    wxids: list[str] = []
     msg: str
     agent_ids: list[str] = []
+    target_types: list[str] = []
 
 
 @app.post("/api/auth/login")
@@ -2369,18 +2370,134 @@ async def broadcast_image_upload(wxids: str = Form(...), file: UploadFile = File
     }
 
 
+def _normalize_broadcast_target_types(raw_types) -> set[str]:
+    aliases = {
+        "friend": "friends",
+        "friends": "friends",
+        "personal": "friends",
+        "person": "friends",
+        "contacts": "friends",
+        "contact": "friends",
+        "好友": "friends",
+        "个人": "friends",
+        "group": "groups",
+        "groups": "groups",
+        "chatroom": "groups",
+        "chatrooms": "groups",
+        "群": "groups",
+        "群聊": "groups",
+    }
+    out: set[str] = set()
+    for value in raw_types or []:
+        key = str(value or "").strip().lower()
+        normalized = aliases.get(key)
+        if normalized:
+            out.add(normalized)
+    return out
+
+
+def _raw_contact_list(raw_contacts: dict | list, key: str) -> list:
+    if not raw_contacts:
+        return []
+    if isinstance(raw_contacts, list):
+        return raw_contacts if key == "friend" else []
+    if not isinstance(raw_contacts, dict):
+        return []
+    if key == "friend":
+        value = raw_contacts.get("friend") or raw_contacts.get("friends") or raw_contacts.get("data") or []
+    else:
+        value = (
+            raw_contacts.get("chatroom")
+            or raw_contacts.get("chatrooms")
+            or raw_contacts.get("group")
+            or raw_contacts.get("groups")
+            or []
+        )
+    return value if isinstance(value, list) else []
+
+
+def _contact_wxid(entry) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return str(
+        entry.get("wxid")
+        or entry.get("UserName")
+        or entry.get("userName")
+        or entry.get("strUsrName")
+        or entry.get("username")
+        or ""
+    ).strip()
+
+
+def _dedupe_targets(wxids: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for wxid in wxids:
+        wxid = str(wxid or "").strip()
+        if not wxid or wxid in seen:
+            continue
+        seen.add(wxid)
+        out.append(wxid)
+    return out
+
+
+async def _ensure_account_contacts(agent_id: str):
+    async with _ACCOUNT_LOCK:
+        await agent_manager.set_active(agent_id)
+        _activate_runtime(agent_id)
+        if not app_state.get("initialized"):
+            with wechat_api.use_agent(agent_id):
+                await _run_backend_initialization(agent_id)
+        cached_contacts = app_state.get("contacts")
+        if cached_contacts:
+            return cached_contacts
+        with wechat_api.use_agent(agent_id):
+            await wechat_api.init_contact()
+            contacts = await wechat_api.get_friend_and_chatroom_list()
+        app_state["contacts"] = contacts
+        return contacts
+
+
+async def _resolve_account_broadcast_targets(agent_id: str, target_types: set[str]) -> list[str]:
+    if not target_types:
+        return []
+    contacts = await _ensure_account_contacts(agent_id)
+    targets: list[str] = []
+    if "friends" in target_types:
+        for entry in _raw_contact_list(contacts, "friend"):
+            wxid = _contact_wxid(entry)
+            if wxid and not wxid.endswith("@chatroom"):
+                targets.append(wxid)
+    if "groups" in target_types:
+        for entry in _raw_contact_list(contacts, "chatroom"):
+            wxid = _contact_wxid(entry)
+            if wxid and wxid.endswith("@chatroom"):
+                targets.append(wxid)
+    return _dedupe_targets(targets)
+
+
 @app.post("/api/accounts/broadcast/text")
 async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
-    target_wxids = [w for w in req.wxids if w]
     agent_ids = [a for a in (req.agent_ids or []) if agent_manager.is_connected(a)]
     if not agent_ids:
         agent_ids = [a["id"] for a in agent_manager.agents() if a.get("id")]
-    total = len(agent_ids) * len(target_wxids)
+    direct_targets = [w for w in req.wxids if w]
+    target_types = _normalize_broadcast_target_types(req.target_types)
     sent = 0
     failed = 0
     results = []
+    total = 0
+    account_targets: dict[str, int] = {}
 
     for agent_id in agent_ids:
+        if direct_targets:
+            target_wxids = direct_targets
+        else:
+            target_wxids = await _resolve_account_broadcast_targets(agent_id, target_types)
+        account_targets[agent_id] = len(target_wxids)
+        total += len(target_wxids)
+        if not target_wxids:
+            continue
         async with _ACCOUNT_LOCK:
             await agent_manager.set_active(agent_id)
             _activate_runtime(agent_id)
@@ -2401,13 +2518,14 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
                     failed += 1
                     results.append({"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"})
 
-    return {"accounts": len(agent_ids), "targets": len(target_wxids), "total": total, "sent": sent, "failed": failed, "results": results}
+    return {"accounts": len(agent_ids), "targets": total, "account_targets": account_targets, "total": total, "sent": sent, "failed": failed, "results": results}
 
 
 @app.post("/api/accounts/broadcast/image-upload")
 async def multi_account_broadcast_image_upload(
-    wxids: str = Form(...),
+    wxids: str = Form("[]"),
     agent_ids: str = Form("[]"),
+    target_types: str = Form("[]"),
     file: UploadFile = File(...),
 ):
     try:
@@ -2421,7 +2539,11 @@ async def multi_account_broadcast_image_upload(
     selected_agents = [a for a in requested_agents if agent_manager.is_connected(a)]
     if not selected_agents:
         selected_agents = [a["id"] for a in agent_manager.agents() if a.get("id")]
-    if not target_wxids:
+    try:
+        parsed_target_types = _normalize_broadcast_target_types(json.loads(target_types or "[]"))
+    except Exception:
+        parsed_target_types = _normalize_broadcast_target_types([x.strip() for x in str(target_types or "").split(",") if x.strip()])
+    if not target_wxids and not parsed_target_types:
         return {"accounts": len(selected_agents), "targets": 0, "total": 0, "sent": 0, "failed": 0, "results": [], "error": "no targets"}
 
     data = await file.read()
@@ -2456,22 +2578,29 @@ async def multi_account_broadcast_image_upload(
     sent = 0
     failed = 0
     results = []
+    total_targets = 0
+    account_targets: dict[str, int] = {}
     for agent_id in selected_agents:
+        agent_targets = target_wxids or await _resolve_account_broadcast_targets(agent_id, parsed_target_types)
+        account_targets[agent_id] = len(agent_targets)
+        total_targets += len(agent_targets)
+        if not agent_targets:
+            continue
         async with _ACCOUNT_LOCK:
             await agent_manager.set_active(agent_id)
             _activate_runtime(agent_id)
             db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
         with wechat_api.use_agent(agent_id):
             try:
-                cdn = await wechat_api.cdn_upload_image(upload_name, target_wxids[0], file_data=file_hex)
+                cdn = await wechat_api.cdn_upload_image(upload_name, agent_targets[0], file_data=file_hex)
             except Exception as e:
                 cdn = {"error": f"{type(e).__name__}: {e}"}
             if cdn.get("error"):
-                failed += len(target_wxids)
-                for wxid in target_wxids:
+                failed += len(agent_targets)
+                for wxid in agent_targets:
                     results.append({"agent_id": agent_id, "wxid": wxid, "ok": False, "error": cdn["error"]})
                 continue
-            for wxid in target_wxids:
+            for wxid in agent_targets:
                 try:
                     result = await wechat_api.send_image_no_src(wxid, cdn)
                     ok = _send_result_ok(result)
@@ -2489,8 +2618,9 @@ async def multi_account_broadcast_image_upload(
 
     return {
         "accounts": len(selected_agents),
-        "targets": len(target_wxids),
-        "total": len(selected_agents) * len(target_wxids),
+        "targets": total_targets,
+        "account_targets": account_targets,
+        "total": total_targets,
         "sent": sent,
         "failed": failed,
         "results": results,

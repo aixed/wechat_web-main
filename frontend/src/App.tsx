@@ -31,6 +31,8 @@ import { replaceWechatEmojis } from "./utils/wechatEmoji";
 
 type ViewMode = "chats" | "contacts" | "broadcast";
 type MobileTab = "chats" | "contacts" | "me";
+type PortalTheme = "dark" | "light";
+const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 
 function useIsMobileViewport() {
   const getValue = () => {
@@ -268,6 +270,50 @@ function profileArea(raw: Record<string, any> | undefined): string {
   return [displayCountry, area, province].filter(Boolean).join(" ");
 }
 
+const contactNameCollator = new Intl.Collator("zh-Hans-CN-u-co-pinyin", {
+  sensitivity: "base",
+  numeric: true,
+});
+
+function contactSortName(entry: DirectoryEntry): string {
+  return (entry.name || entry.wxid || "").trim();
+}
+
+function sortDirectoryEntries(entries: DirectoryEntry[]): DirectoryEntry[] {
+  return [...entries].sort((a, b) => {
+    const byName = contactNameCollator.compare(contactSortName(a), contactSortName(b));
+    if (byName !== 0) return byName;
+    return a.wxid.localeCompare(b.wxid);
+  });
+}
+
+function contactInitial(entry: DirectoryEntry): string {
+  const ch = contactSortName(entry).charAt(0).toUpperCase();
+  if (/^[A-Z]$/.test(ch)) return ch;
+  if (/^[0-9]$/.test(ch)) return "#";
+  return "#";
+}
+
+function groupDirectoryEntries(entries: DirectoryEntry[]): Array<{ title: string; entries: DirectoryEntry[] }> {
+  const sorted = sortDirectoryEntries(entries);
+  const groups = new Map<string, DirectoryEntry[]>();
+  for (const entry of sorted) {
+    const key = contactInitial(entry);
+    const list = groups.get(key) || [];
+    list.push(entry);
+    groups.set(key, list);
+  }
+  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+  const result: Array<{ title: string; entries: DirectoryEntry[] }> = [];
+  for (const letter of letters) {
+    const list = groups.get(letter);
+    if (list?.length) result.push({ title: letter, entries: list });
+  }
+  const other = groups.get("#");
+  if (other?.length) result.push({ title: "#", entries: other });
+  return result;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────
 function extractChatId(msg: any, selfWxid: string): string {
   if (msg.fromgid) return msg.fromgid;
@@ -487,6 +533,9 @@ function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessag
 export default function App() {
   const isMobile = useIsMobileViewport();
   const [authenticated, setAuthenticated] = useState(() => Boolean(getAccessKey()));
+  const [portalTheme, setPortalThemeState] = useState<PortalTheme>(() =>
+    window.localStorage.getItem(PORTAL_THEME_STORAGE) === "light" ? "light" : "dark"
+  );
   const [selectedAccountId, setSelectedAccountId] = useState("");
   const [accounts, setAccounts] = useState<WeChatAccount[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(false);
@@ -613,6 +662,11 @@ export default function App() {
     setAccounts([]);
     resetChatState();
   }, [resetChatState]);
+
+  const setPortalTheme = useCallback((theme: PortalTheme) => {
+    setPortalThemeState(theme);
+    window.localStorage.setItem(PORTAL_THEME_STORAGE, theme);
+  }, []);
 
   const applyContactProfileUpdates = useCallback((updates: Record<string, ContactProfile> | undefined) => {
     if (!updates || typeof updates !== "object" || Object.keys(updates).length === 0) return;
@@ -1419,7 +1473,7 @@ export default function App() {
     }
   };
 
-  const friendEntries: DirectoryEntry[] = contactListFromRaw(rawContacts)
+  const friendEntries: DirectoryEntry[] = sortDirectoryEntries(contactListFromRaw(rawContacts)
     .map((c: any) => {
       const wxid = c.wxid || c.UserName || "";
       if (!wxid || shouldFilterSession(wxid)) return null;
@@ -1442,7 +1496,7 @@ export default function App() {
         source: "friend" as const,
       };
     })
-    .filter(Boolean) as DirectoryEntry[];
+    .filter(Boolean) as DirectoryEntry[]);
 
   const rawRoomEntries = chatroomListFromRaw(rawContacts)
     .map((c: any) => ({
@@ -1466,7 +1520,7 @@ export default function App() {
       source: "group",
     });
   }
-  const groupEntries = Array.from(groupEntryMap.values());
+  const groupEntries = sortDirectoryEntries(Array.from(groupEntryMap.values()));
   const selfProfile = selfWxid ? contactProfiles[selfWxid] : undefined;
   const selfInfoName = contactMap[selfWxid] || (selfProfile ? profileDisplayName(selfProfile, "") : "") || "我";
   const selfAvatar =
@@ -1495,6 +1549,8 @@ export default function App() {
         <MobileAccountPortal
           accounts={accounts}
           loading={accountsLoading}
+          theme={portalTheme}
+          onThemeChange={setPortalTheme}
           onRefresh={loadAccounts}
           onSelectAccount={handleSelectAccount}
           onLogout={handleLogout}
@@ -1505,6 +1561,8 @@ export default function App() {
       <AccountPortal
         accounts={accounts}
         loading={accountsLoading}
+        theme={portalTheme}
+        onThemeChange={setPortalTheme}
         onRefresh={loadAccounts}
         onSelectAccount={handleSelectAccount}
         onLogout={handleLogout}
@@ -1723,16 +1781,21 @@ function AccessGate({
 function AccountPortal({
   accounts,
   loading,
+  theme,
+  onThemeChange,
   onRefresh,
   onSelectAccount,
   onLogout,
 }: {
   accounts: WeChatAccount[];
   loading: boolean;
+  theme: PortalTheme;
+  onThemeChange: (theme: PortalTheme) => void;
   onRefresh: () => void;
   onSelectAccount: (account: WeChatAccount) => void;
   onLogout: () => void;
 }) {
+  const dark = theme === "dark";
   const accountDisplayName = (account: WeChatAccount) =>
     (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
     account.wxid ||
@@ -1740,25 +1803,28 @@ function AccountPortal({
     "微信";
 
   return (
-    <div className="h-dvh w-screen bg-[#111111] text-[#e8e8e8] overflow-hidden flex">
-      <div className="w-[420px] max-w-[44vw] min-w-[340px] border-r border-[#2b2b2b] h-full flex flex-col">
-        <div className="h-[78px] px-[24px] flex items-center justify-between border-b border-[#242424]">
+    <div className={`h-dvh w-screen overflow-hidden flex ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#f4f4f4] text-[#111]"}`}>
+      <div className={`w-[420px] max-w-[44vw] min-w-[340px] border-r h-full flex flex-col ${dark ? "border-[#2b2b2b]" : "border-[#d9d9d9]"}`}>
+        <div className={`h-[96px] px-[24px] flex items-center justify-between border-b ${dark ? "border-[#242424]" : "border-[#e0e0e0]"}`}>
           <div>
             <div className="text-[22px] font-medium">微信账号</div>
-            <div className="text-[12px] text-[#777] mt-[3px]">在线 {accounts.length} 个</div>
+            <div className={`text-[12px] mt-[3px] ${dark ? "text-[#777]" : "text-[#888]"}`}>在线 {accounts.length} 个</div>
+            <div className="mt-[9px]">
+              <ThemeSwitch theme={theme} onChange={onThemeChange} />
+            </div>
           </div>
           <div className="flex items-center gap-[8px]">
             <button
               type="button"
               onClick={onRefresh}
-              className="h-[32px] px-[10px] rounded-[4px] bg-[#242424] text-[#cfcfcf] active:bg-[#303030]"
+              className={`h-[32px] px-[10px] rounded-[4px] active:opacity-85 ${dark ? "bg-[#242424] text-[#cfcfcf]" : "bg-white text-[#333] border border-[#d8d8d8]"}`}
             >
               刷新
             </button>
             <button
               type="button"
               onClick={onLogout}
-              className="h-[32px] px-[10px] rounded-[4px] bg-[#242424] text-[#cfcfcf] active:bg-[#303030]"
+              className={`h-[32px] px-[10px] rounded-[4px] active:opacity-85 ${dark ? "bg-[#242424] text-[#cfcfcf]" : "bg-white text-[#333] border border-[#d8d8d8]"}`}
             >
               退出
             </button>
@@ -1773,18 +1839,20 @@ function AccountPortal({
           )}
           <div className="space-y-[12px]">
             {accounts.map((account) => (
-              <button
+            <button
                 key={account.id}
                 type="button"
                 onClick={() => onSelectAccount(account)}
-                className="w-full min-h-[100px] rounded-[6px] bg-[#1b1b1b] hover:bg-[#242424] active:bg-[#2b2b2b] border border-[#2b2b2b] p-[14px] flex items-center gap-[14px] text-left"
+                className={`w-full min-h-[100px] rounded-[6px] border p-[14px] flex items-center gap-[14px] text-left active:opacity-90 ${
+                  dark ? "bg-[#1b1b1b] hover:bg-[#242424] border-[#2b2b2b]" : "bg-white hover:bg-[#f7f7f7] border-[#e3e3e3]"
+                }`}
               >
                 <AccountAvatar account={account} />
                 <div className="min-w-0 flex-1">
                   <div className="text-[18px] truncate">{accountDisplayName(account)}</div>
-                  <div className="text-[12px] text-[#888] truncate mt-[5px]">{account.wxid || account.account_id || account.id}</div>
-                  <div className="text-[12px] text-[#666] truncate mt-[3px]">{account.peer || "connected"}</div>
-                  <div className="text-[11px] text-[#555] truncate mt-[3px]" title={account.id}>WS {account.id}</div>
+                  <div className={`text-[12px] truncate mt-[5px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{account.wxid || account.account_id || account.id}</div>
+                  <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{account.peer || "connected"}</div>
+                  <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#555]" : "text-[#aaa]"}`} title={account.id}>WS {account.id}</div>
                 </div>
                 <div className={`text-[12px] px-[7px] py-[3px] rounded-[4px] ${
                   account.initialized ? "bg-[#123d27] text-[#49d17d]" : "bg-[#3d3112] text-[#e6bd51]"
@@ -1797,9 +1865,31 @@ function AccountPortal({
         </div>
       </div>
       <div className="flex-1 min-w-0 h-full">
-        <MultiAccountBroadcastPanel accounts={accounts} />
+        <MultiAccountBroadcastPanel accounts={accounts} theme={theme} />
       </div>
     </div>
+  );
+}
+
+function ThemeSwitch({ theme, onChange }: { theme: PortalTheme; onChange: (theme: PortalTheme) => void }) {
+  const dark = theme === "dark";
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(dark ? "light" : "dark")}
+      className={`w-[116px] h-[32px] rounded-full p-[3px] flex items-center transition-colors ${
+        dark ? "bg-[#242424] border border-[#333]" : "bg-[#e7e7e7] border border-[#d2d2d2]"
+      }`}
+      aria-label="切换日夜模式"
+    >
+      <span
+        className={`h-[24px] w-[54px] rounded-full flex items-center justify-center text-[12px] transition-transform ${
+          dark ? "translate-x-[55px] bg-[#07c160] text-white" : "translate-x-0 bg-white text-[#333]"
+        }`}
+      >
+        {dark ? "夜晚" : "白天"}
+      </span>
+    </button>
   );
 }
 
@@ -1819,25 +1909,51 @@ function AccountAvatar({ account }: { account: WeChatAccount }) {
 function MobileAccountPortal({
   accounts,
   loading,
+  theme,
+  onThemeChange,
   onRefresh,
   onSelectAccount,
   onLogout,
 }: {
   accounts: WeChatAccount[];
   loading: boolean;
+  theme: PortalTheme;
+  onThemeChange: (theme: PortalTheme) => void;
   onRefresh: () => void;
   onSelectAccount: (account: WeChatAccount) => void;
   onLogout: () => void;
 }) {
+  const [showBroadcast, setShowBroadcast] = useState(false);
+  const dark = theme === "dark";
   const displayName = (account: WeChatAccount) =>
     (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
     account.wxid ||
     account.account_id ||
     "微信";
 
+  if (showBroadcast) {
+    return (
+      <MobileMultiAccountBroadcastPage
+        accounts={accounts}
+        theme={theme}
+        onBack={() => setShowBroadcast(false)}
+      />
+    );
+  }
+
   return (
-    <div className="h-dvh w-screen bg-[#ededed] text-[#111] overflow-hidden flex flex-col">
-      <MobileTopBar title="微信账号" rightLabel="刷新" onRight={onRefresh} leftLabel="退出" onLeft={onLogout} />
+    <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+      <MobileTopBar dark={dark} title="微信账号" rightLabel="刷新" onRight={onRefresh} leftLabel="退出" onLeft={onLogout} />
+      <div className={`px-[14px] py-[12px] border-b flex items-center justify-between ${dark ? "border-[#242424]" : "border-[#dedede]"}`}>
+        <button
+          type="button"
+          onClick={() => setShowBroadcast(true)}
+          className="h-[36px] px-[14px] rounded-full bg-[#07c160] text-white text-[14px] active:opacity-85"
+        >
+          多号群发
+        </button>
+        <ThemeSwitch theme={theme} onChange={onThemeChange} />
+      </div>
       <div className="flex-1 overflow-y-auto px-[14px] py-[14px] pb-[calc(18px+env(safe-area-inset-bottom))]">
         {loading && accounts.length === 0 && <div className="text-center text-[#888] text-[14px] mt-[40px]">正在读取在线微信...</div>}
         {!loading && accounts.length === 0 && (
@@ -1851,13 +1967,15 @@ function MobileAccountPortal({
               key={account.id}
               type="button"
               onClick={() => onSelectAccount(account)}
-              className="w-full min-h-[86px] rounded-[12px] bg-white active:bg-[#f4f4f4] shadow-sm px-[14px] py-[12px] flex items-center gap-[12px] text-left"
+              className={`w-full min-h-[86px] rounded-[12px] shadow-sm px-[14px] py-[12px] flex items-center gap-[12px] text-left active:opacity-90 ${
+                dark ? "bg-[#1b1b1b]" : "bg-white active:bg-[#f4f4f4]"
+              }`}
             >
               <AccountAvatar account={account} />
               <div className="min-w-0 flex-1">
                 <div className="text-[18px] font-medium truncate">{displayName(account)}</div>
-                <div className="text-[13px] text-[#888] truncate mt-[4px]">{account.wxid || account.account_id || account.id}</div>
-                <div className="text-[11px] text-[#aaa] truncate mt-[3px]">WS {account.id}</div>
+                <div className={`text-[13px] truncate mt-[4px] ${dark ? "text-[#888]" : "text-[#888]"}`}>{account.wxid || account.account_id || account.id}</div>
+                <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>WS {account.id}</div>
               </div>
               <span className={`text-[12px] px-[7px] py-[3px] rounded-full ${
                 account.initialized ? "bg-[#e5f7ed] text-[#07c160]" : "bg-[#fff3d9] text-[#b78200]"
@@ -1872,27 +1990,216 @@ function MobileAccountPortal({
   );
 }
 
+function MobileMultiAccountBroadcastPage({
+  accounts,
+  theme,
+  onBack,
+}: {
+  accounts: WeChatAccount[];
+  theme: PortalTheme;
+  onBack: () => void;
+}) {
+  const dark = theme === "dark";
+  const [selectedAgents, setSelectedAgents] = useState<Set<string>>(() => new Set(accounts.map((a) => a.id).filter(Boolean)));
+  const [targetTypes, setTargetTypes] = useState<Set<string>>(new Set(["friends"]));
+  const [message, setMessage] = useState("");
+  const [image, setImage] = useState<File | null>(null);
+  const [preview, setPreview] = useState("");
+  const [sending, setSending] = useState(false);
+  const [resultText, setResultText] = useState("");
+
+  useEffect(() => {
+    setSelectedAgents(new Set(accounts.map((a) => a.id).filter(Boolean)));
+  }, [accounts]);
+
+  useEffect(() => {
+    if (!image) {
+      setPreview("");
+      return;
+    }
+    const url = URL.createObjectURL(image);
+    setPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [image]);
+
+  const displayName = (account: WeChatAccount) =>
+    (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
+    account.wxid ||
+    account.account_id ||
+    "微信";
+  const agentIds = Array.from(selectedAgents).filter(Boolean);
+  const selectedTargetTypes = Array.from(targetTypes);
+
+  const toggleAgent = (id: string) => {
+    setSelectedAgents((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleTargetType = (type: string) => {
+    setTargetTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      return next;
+    });
+  };
+
+  const sendText = async () => {
+    if (!message.trim() || agentIds.length === 0 || selectedTargetTypes.length === 0 || sending) return;
+    setSending(true);
+    setResultText("");
+    try {
+      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim());
+      setResultText(`文本完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const sendImage = async () => {
+    if (!image || agentIds.length === 0 || selectedTargetTypes.length === 0 || sending) return;
+    setSending(true);
+    setResultText("");
+    try {
+      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image);
+      setResultText(`图片完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+      <MobileTopBar dark={dark} title="多号群发" leftLabel="返回" rightLabel="全选" onLeft={onBack} onRight={() => setSelectedAgents(new Set(accounts.map((a) => a.id).filter(Boolean)))} />
+      <div className="flex-1 overflow-y-auto px-[14px] py-[14px] pb-[calc(20px+env(safe-area-inset-bottom))]">
+        <div className={`rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
+          <div className="flex items-center justify-between mb-[10px]">
+            <div className="text-[15px] font-medium">发送账号</div>
+            <button
+              type="button"
+              onClick={() => setSelectedAgents(new Set())}
+              className={`text-[13px] ${dark ? "text-[#aaa]" : "text-[#666]"}`}
+            >
+              清空
+            </button>
+          </div>
+          <div className="space-y-[8px]">
+            {accounts.map((account) => {
+              const checked = selectedAgents.has(account.id);
+              return (
+                <button
+                  key={account.id}
+                  type="button"
+                  onClick={() => toggleAgent(account.id)}
+                  className={`w-full h-[60px] rounded-[10px] px-[10px] flex items-center gap-[10px] text-left ${
+                    checked ? "bg-[#123d27]" : dark ? "bg-[#242424]" : "bg-[#f6f6f6]"
+                  }`}
+                >
+                  <span className={`w-[22px] h-[22px] rounded-full border flex items-center justify-center shrink-0 ${
+                    checked ? "bg-[#07c160] border-[#07c160]" : "border-[#777]"
+                  }`}>
+                    {checked && (
+                      <svg className="w-[15px] h-[15px] text-white" fill="none" stroke="currentColor" strokeWidth={2.3} viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="m5 13 4 4L19 7" />
+                      </svg>
+                    )}
+                  </span>
+                  <AccountAvatar account={account} />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[16px] truncate">{displayName(account)}</div>
+                    <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#888]" : "text-[#888]"}`}>{account.wxid || account.id}</div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className={`mt-[12px] rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
+          <div className="text-[15px] font-medium mb-[10px]">目标类型</div>
+          <div className="grid grid-cols-2 gap-[10px]">
+            <TargetTypeButton active={targetTypes.has("friends")} dark={dark} title="所有个人" subtitle="按账号展开" onClick={() => toggleTargetType("friends")} />
+            <TargetTypeButton active={targetTypes.has("groups")} dark={dark} title="所有群" subtitle="按账号展开" onClick={() => toggleTargetType("groups")} />
+          </div>
+        </div>
+
+        <div className={`mt-[12px] rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
+          <div className="text-[15px] font-medium mb-[10px]">文本消息</div>
+          <textarea
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            className={`w-full h-[106px] resize-none rounded-[10px] border outline-none px-[10px] py-[8px] text-[15px] ${
+              dark ? "bg-[#242424] border-[#333] text-[#eee]" : "bg-[#f7f7f7] border-[#e0e0e0]"
+            }`}
+            placeholder="输入文本"
+          />
+          <button
+            type="button"
+            disabled={sending || !message.trim() || agentIds.length === 0 || selectedTargetTypes.length === 0}
+            onClick={sendText}
+            className="mt-[10px] w-full h-[42px] rounded-[10px] bg-[#07c160] text-white disabled:bg-[#315541]"
+          >
+            {sending ? "发送中" : "群发文本"}
+          </button>
+        </div>
+
+        <div className={`mt-[12px] rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
+          <div className="text-[15px] font-medium mb-[10px]">图片消息</div>
+          <label className={`h-[42px] rounded-[10px] flex items-center justify-center border ${dark ? "border-[#333] bg-[#242424]" : "border-[#e0e0e0] bg-[#f7f7f7]"}`}>
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => setImage(e.target.files?.[0] || null)}
+            />
+            选择图片
+          </label>
+          {preview && <img src={preview} alt="" className="mt-[10px] max-h-[180px] rounded-[10px] object-contain bg-black/20 mx-auto" />}
+          <button
+            type="button"
+            disabled={sending || !image || agentIds.length === 0 || selectedTargetTypes.length === 0}
+            onClick={sendImage}
+            className="mt-[10px] w-full h-[42px] rounded-[10px] bg-[#07c160] text-white disabled:bg-[#315541]"
+          >
+            {sending ? "发送中" : "群发图片"}
+          </button>
+        </div>
+
+        <div className={`mt-[12px] text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
+          已选账号 {agentIds.length} 个，目标类型 {selectedTargetTypes.length} 个。{resultText}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MobileTopBar({
   title,
   leftLabel,
   rightLabel,
   onLeft,
   onRight,
+  dark = false,
 }: {
   title: string;
   leftLabel?: string;
   rightLabel?: string;
   onLeft?: () => void;
   onRight?: () => void;
+  dark?: boolean;
 }) {
   return (
-    <div className="shrink-0 bg-[#ededed] border-b border-[#dedede] pt-[env(safe-area-inset-top)]">
+    <div className={`shrink-0 border-b pt-[env(safe-area-inset-top)] ${dark ? "bg-[#111111] border-[#242424] text-[#e8e8e8]" : "bg-[#ededed] border-[#dedede]"}`}>
       <div className="h-[54px] px-[14px] grid grid-cols-[72px_1fr_72px] items-center">
-        <button type="button" onClick={onLeft} className="text-left text-[15px] text-[#333] active:opacity-60">
+        <button type="button" onClick={onLeft} className={`text-left text-[15px] active:opacity-60 ${dark ? "text-[#d0d0d0]" : "text-[#333]"}`}>
           {leftLabel || ""}
         </button>
         <div className="text-center text-[17px] font-semibold truncate">{title}</div>
-        <button type="button" onClick={onRight} className="text-right text-[15px] text-[#333] active:opacity-60">
+        <button type="button" onClick={onRight} className={`text-right text-[15px] active:opacity-60 ${dark ? "text-[#d0d0d0]" : "text-[#333]"}`}>
           {rightLabel || ""}
         </button>
       </div>
@@ -2043,9 +2350,11 @@ function MobileContactsView({
   const q = query.trim().toLowerCase();
   const filteredFriends = friends.filter((entry) => !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q));
   const filteredGroups = groups.filter((entry) => !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q));
+  const friendSections = groupDirectoryEntries(filteredFriends);
+  const indexLetters = ["⌕", ...friendSections.map((section) => section.title)];
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto pb-[10px]">
+    <div className="relative flex-1 min-h-0 overflow-y-auto pb-[10px]">
       <MobileTopBar title="Contacts" rightLabel="＋" />
       <div className="h-[44px] px-[12px] flex items-center">
         <div className="w-full h-[36px] rounded-[7px] bg-white flex items-center gap-[7px] px-[12px] text-[#b7b7b7]">
@@ -2065,7 +2374,16 @@ function MobileContactsView({
         <MobileContactStaticRow color="#21a8f4" label="Service Accounts" icon="diamond" />
       </div>
       {filteredGroups.length > 0 && <MobileContactSection title="群聊" entries={filteredGroups} onSelect={onSelect} />}
-      {filteredFriends.length > 0 && <MobileContactSection title="A" entries={filteredFriends} onSelect={onSelect} />}
+      {friendSections.map((section) => (
+        <MobileContactSection key={section.title} title={section.title} entries={section.entries} onSelect={onSelect} />
+      ))}
+      {friendSections.length > 0 && (
+        <div className="fixed right-[5px] top-[34%] z-10 flex flex-col items-center gap-[2px] text-[11px] leading-[13px] text-[#444]">
+          {indexLetters.map((letter) => (
+            <span key={letter}>{letter}</span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -2248,8 +2566,8 @@ function MobileAvatar({ name, avatar, group, size = 42 }: { name: string; avatar
   );
 }
 
-function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] }) {
-  const [targetText, setTargetText] = useState("");
+function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccount[]; theme: PortalTheme }) {
+  const [targetTypes, setTargetTypes] = useState<Set<string>>(new Set(["friends"]));
   const [message, setMessage] = useState("");
   const [image, setImage] = useState<File | null>(null);
   const [preview, setPreview] = useState("");
@@ -2271,11 +2589,9 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
     return () => URL.revokeObjectURL(url);
   }, [image]);
 
-  const targets = targetText
-    .split(/[\s,，;；]+/)
-    .map((x) => x.trim())
-    .filter(Boolean);
   const agentIds = Array.from(selectedAgents).filter(Boolean);
+  const selectedTargetTypes = Array.from(targetTypes);
+  const dark = theme === "dark";
 
   const toggleAgent = (id: string) => {
     setSelectedAgents((prev) => {
@@ -2286,12 +2602,21 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
     });
   };
 
+  const toggleTargetType = (type: string) => {
+    setTargetTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      return next;
+    });
+  };
+
   const sendText = async () => {
-    if (!message.trim() || targets.length === 0 || agentIds.length === 0 || sending) return;
+    if (!message.trim() || selectedTargetTypes.length === 0 || agentIds.length === 0 || sending) return;
     setSending(true);
     setResultText("");
     try {
-      const res = await multiAccountBroadcastText(agentIds, targets, message.trim());
+      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim());
       setResultText(`文本完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
@@ -2299,11 +2624,11 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
   };
 
   const sendImage = async () => {
-    if (!image || targets.length === 0 || agentIds.length === 0 || sending) return;
+    if (!image || selectedTargetTypes.length === 0 || agentIds.length === 0 || sending) return;
     setSending(true);
     setResultText("");
     try {
-      const res = await multiAccountBroadcastImageUpload(agentIds, targets, image);
+      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image);
       setResultText(`图片完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
@@ -2311,7 +2636,7 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
   };
 
   return (
-    <div className="h-full overflow-y-auto p-[28px]">
+    <div className={`h-full overflow-y-auto p-[28px] ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#f4f4f4] text-[#111]"}`}>
       <div className="max-w-[760px]">
         <div className="text-[22px] font-medium">多号群发</div>
         <div className="mt-[18px] grid grid-cols-1 gap-[14px]">
@@ -2319,7 +2644,9 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
             <div className="text-[13px] text-[#888] mb-[8px]">发送账号</div>
             <div className="flex flex-wrap gap-[8px]">
               {accounts.map((account) => (
-                <label key={account.id} className="h-[34px] px-[10px] rounded-[4px] bg-[#1d1d1d] border border-[#303030] flex items-center gap-[7px] cursor-pointer">
+                <label key={account.id} className={`h-[34px] px-[10px] rounded-[4px] border flex items-center gap-[7px] cursor-pointer ${
+                  dark ? "bg-[#1d1d1d] border-[#303030]" : "bg-white border-[#d8d8d8]"
+                }`}>
                   <input
                     type="checkbox"
                     checked={selectedAgents.has(account.id)}
@@ -2335,13 +2662,23 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
           </div>
 
           <div>
-            <div className="text-[13px] text-[#888] mb-[8px]">目标 wxid / 群 id</div>
-            <textarea
-              value={targetText}
-              onChange={(e) => setTargetText(e.target.value)}
-              className="w-full h-[92px] resize-none rounded-[4px] bg-[#1d1d1d] border border-[#303030] outline-none px-[10px] py-[8px] text-[14px] focus:border-[#07c160]"
-              placeholder="每行一个，或用逗号分隔"
-            />
+            <div className="text-[13px] text-[#888] mb-[8px]">目标类型</div>
+            <div className="grid grid-cols-2 gap-[10px] max-w-[420px]">
+              <TargetTypeButton
+                active={targetTypes.has("friends")}
+                dark={dark}
+                title="所有个人"
+                subtitle="每个账号的好友"
+                onClick={() => toggleTargetType("friends")}
+              />
+              <TargetTypeButton
+                active={targetTypes.has("groups")}
+                dark={dark}
+                title="所有群"
+                subtitle="每个账号的群聊"
+                onClick={() => toggleTargetType("groups")}
+              />
+            </div>
           </div>
 
           <div>
@@ -2349,12 +2686,14 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
             <textarea
               value={message}
               onChange={(e) => setMessage(e.target.value)}
-              className="w-full h-[100px] resize-none rounded-[4px] bg-[#1d1d1d] border border-[#303030] outline-none px-[10px] py-[8px] text-[14px] focus:border-[#07c160]"
+              className={`w-full h-[100px] resize-none rounded-[4px] border outline-none px-[10px] py-[8px] text-[14px] focus:border-[#07c160] ${
+                dark ? "bg-[#1d1d1d] border-[#303030] text-[#eee]" : "bg-white border-[#d8d8d8] text-[#111]"
+              }`}
               placeholder="输入文本"
             />
             <button
               type="button"
-              disabled={sending || !message.trim() || targets.length === 0 || agentIds.length === 0}
+              disabled={sending || !message.trim() || selectedTargetTypes.length === 0 || agentIds.length === 0}
               onClick={sendText}
               className="mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#315541] active:opacity-85"
             >
@@ -2368,12 +2707,12 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
               type="file"
               accept="image/*"
               onChange={(e) => setImage(e.target.files?.[0] || null)}
-              className="block text-[13px] text-[#aaa]"
+              className={`block text-[13px] ${dark ? "text-[#aaa]" : "text-[#555]"}`}
             />
             {preview && <img src={preview} alt="" className="mt-[10px] max-w-[180px] max-h-[140px] rounded-[4px] object-contain bg-[#1d1d1d]" />}
             <button
               type="button"
-              disabled={sending || !image || targets.length === 0 || agentIds.length === 0}
+              disabled={sending || !image || selectedTargetTypes.length === 0 || agentIds.length === 0}
               onClick={sendImage}
               className="mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#315541] active:opacity-85"
             >
@@ -2382,11 +2721,50 @@ function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] })
           </div>
 
           <div className="text-[13px] text-[#888]">
-            已选账号 {agentIds.length} 个，目标 {targets.length} 个。{resultText}
+            已选账号 {agentIds.length} 个，目标类型 {selectedTargetTypes.length} 个。{resultText}
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+function TargetTypeButton({
+  active,
+  dark = true,
+  title,
+  subtitle,
+  onClick,
+}: {
+  active: boolean;
+  dark?: boolean;
+  title: string;
+  subtitle: string;
+  onClick: () => void;
+}) {
+  const inactiveClass = dark ? "border-[#303030] bg-[#1d1d1d]" : "border-[#d8d8d8] bg-white";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`min-h-[70px] rounded-[6px] border px-[12px] py-[10px] text-left active:opacity-85 ${
+        active ? "border-[#07c160] bg-[#123d27]" : inactiveClass
+      }`}
+    >
+      <div className="flex items-center gap-[8px]">
+        <span className={`w-[18px] h-[18px] rounded-[4px] border flex items-center justify-center ${
+          active ? "bg-[#07c160] border-[#07c160]" : "border-[#555]"
+        }`}>
+          {active && (
+            <svg className="w-[13px] h-[13px] text-white" fill="none" stroke="currentColor" strokeWidth={2.4} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="m5 13 4 4L19 7" />
+            </svg>
+          )}
+        </span>
+        <span className={`text-[16px] ${dark || active ? "text-[#f2f2f2]" : "text-[#111]"}`}>{title}</span>
+      </div>
+      <div className={`mt-[7px] text-[12px] ${dark || active ? "text-[#888]" : "text-[#777]"}`}>{subtitle}</div>
+    </button>
   );
 }
 
@@ -2530,6 +2908,7 @@ function ContactsPanel({
     !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q);
   const visibleFriends = friends.filter(filterEntry);
   const visibleGroups = groups.filter(filterEntry);
+  const friendSections = groupDirectoryEntries(visibleFriends);
 
   return (
     <div className="h-full flex flex-col bg-[#e9e8e8] text-[#111]">
@@ -2564,8 +2943,10 @@ function ContactsPanel({
       )}
 
       <div className="flex-1 overflow-y-auto">
-        <ContactSection title="好友" entries={visibleFriends} onSelect={onSelect} />
         <ContactSection title="群聊" entries={visibleGroups} onSelect={onSelect} />
+        {friendSections.map((section) => (
+          <ContactSection key={section.title} title={section.title} entries={section.entries} onSelect={onSelect} />
+        ))}
       </div>
     </div>
   );
