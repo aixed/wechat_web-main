@@ -1493,7 +1493,10 @@ def _normalize_wxids(wxids: list[str]) -> list[str]:
 
 async def _query_session_list_from_db() -> dict:
     """Read the native WeChat Session table ordered by nOrder."""
-    sql = "select * from Session order by nOrder desc"
+    sql = (
+        "select strUsrName, strNickName, strContent, nUnReadCount, othersAtMe, nOrder "
+        "from Session order by nOrder desc"
+    )
     data = await wechat_api.query_db("MicroMsg.db", sql, timeout=8.0)
     rows = data.get("data") if isinstance(data, dict) else []
     if isinstance(rows, dict):
