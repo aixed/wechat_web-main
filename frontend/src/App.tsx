@@ -43,6 +43,12 @@ function clampSidePanelWidth(value: number): number {
   return Math.min(460, Math.max(236, Math.round(value)));
 }
 
+function normalizeConcurrencyLimit(value: number | string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 10;
+  return Math.min(100, Math.max(1, Math.trunc(parsed)));
+}
+
 function useIsMobileViewport() {
   const getValue = () => {
     if (typeof window === "undefined") return false;
@@ -2436,6 +2442,7 @@ function MobileMultiAccountBroadcastPage({
   const [sending, setSending] = useState(false);
   const [resultText, setResultText] = useState("");
   const [progress, setProgress] = useState<BroadcastProgressState>({ total: 0, sent: 0, failed: 0, accountCounts: {} });
+  const [concurrencyLimit, setConcurrencyLimit] = useState(10);
 
   useEffect(() => {
     const validIds = new Set(accounts.map((a) => a.id).filter(Boolean));
@@ -2519,7 +2526,7 @@ function MobileMultiAccountBroadcastPage({
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode);
+      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode, concurrencyLimit);
       updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "普通文本" : "文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
@@ -2534,7 +2541,7 @@ function MobileMultiAccountBroadcastPage({
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image, mode);
+      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image, mode, concurrencyLimit);
       updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "普通图片" : "图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
@@ -2604,6 +2611,23 @@ function MobileMultiAccountBroadcastPage({
             <TargetTypeButton active={targetTypes.has("friends")} dark={dark} title="所有个人" subtitle="按账号展开" onClick={() => toggleTargetType("friends")} />
             <TargetTypeButton active={targetTypes.has("groups")} dark={dark} title="所有群" subtitle="按账号展开" onClick={() => toggleTargetType("groups")} />
           </div>
+        </div>
+
+        <div className={`mt-[12px] rounded-[14px] p-[12px] flex items-center justify-between gap-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
+          <div>
+            <div className="text-[15px] font-medium">并发上限</div>
+            <div className={`mt-[3px] text-[12px] ${dark ? "text-[#888]" : "text-[#777]"}`}>同时发送请求数量</div>
+          </div>
+          <input
+            type="number"
+            min={1}
+            max={100}
+            value={concurrencyLimit}
+            onChange={(e) => setConcurrencyLimit(normalizeConcurrencyLimit(e.target.value))}
+            className={`w-[86px] h-[38px] rounded-[8px] border px-[10px] text-right outline-none ${
+              dark ? "bg-[#242424] border-[#333] text-[#eee]" : "bg-[#f7f7f7] border-[#e0e0e0]"
+            }`}
+          />
         </div>
 
         <div className={`mt-[12px] rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
@@ -3115,6 +3139,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
   const [sending, setSending] = useState(false);
   const [resultText, setResultText] = useState("");
   const [progress, setProgress] = useState<BroadcastProgressState>({ total: 0, sent: 0, failed: 0, accountCounts: {} });
+  const [concurrencyLimit, setConcurrencyLimit] = useState(10);
 
   useEffect(() => {
     const validIds = new Set(accounts.map((a) => a.id).filter(Boolean));
@@ -3194,7 +3219,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode);
+      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode, concurrencyLimit);
       updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "普通文本" : "文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
@@ -3209,7 +3234,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image, mode);
+      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image, mode, concurrencyLimit);
       updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "普通图片" : "图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
@@ -3281,6 +3306,25 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
                 title="所有群"
                 subtitle="每个账号的群聊"
                 onClick={() => toggleTargetType("groups")}
+              />
+            </div>
+          </div>
+
+          <div className="max-w-[420px]">
+            <div className="text-[13px] text-[#888] mb-[8px]">并发上限</div>
+            <div className={`h-[42px] rounded-[4px] border flex items-center justify-between px-[10px] ${
+              dark ? "bg-[#1d1d1d] border-[#303030]" : "bg-white border-[#d8d8d8]"
+            }`}>
+              <span className={`text-[13px] ${dark ? "text-[#aaa]" : "text-[#666]"}`}>同时发送请求数量</span>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={concurrencyLimit}
+                onChange={(e) => setConcurrencyLimit(normalizeConcurrencyLimit(e.target.value))}
+                className={`w-[82px] h-[30px] rounded-[4px] border px-[8px] text-right outline-none ${
+                  dark ? "bg-[#111] border-[#333] text-[#eee]" : "bg-[#f7f7f7] border-[#ddd]"
+                }`}
               />
             </div>
           </div>
@@ -3697,6 +3741,7 @@ function BroadcastPanel({
   const [sending, setSending] = useState(false);
   const [sent, setSent] = useState(0);
   const [failed, setFailed] = useState(0);
+  const [concurrencyLimit, setConcurrencyLimit] = useState(10);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const imageOrdinalRef = useRef(1);
   const previewUrlsRef = useRef<string[]>([]);
@@ -3823,8 +3868,8 @@ function BroadcastPanel({
         if (activeWxids.length === 0) break;
         try {
           const res = part.type === "text"
-            ? await broadcastText(activeWxids, part.text, mode)
-            : await broadcastImageUpload(activeWxids, part.image.file, mode);
+            ? await broadcastText(activeWxids, part.text, mode, concurrencyLimit)
+            : await broadcastImageUpload(activeWxids, part.image.file, mode, concurrencyLimit);
           applyResult(res, activeWxids);
         } catch {
           for (const wxid of activeWxids) status.set(wxid, false);
@@ -3858,6 +3903,24 @@ function BroadcastPanel({
         <BroadcastSelectButton dark={dark} label={`全选好友 ${friends.length}`} onClick={() => selectEntries(friends)} />
         <BroadcastSelectButton dark={dark} label={`全选群 ${groups.length}`} onClick={() => selectEntries(groups)} />
         <BroadcastSelectButton dark={dark} label="清空" onClick={() => setSelected(new Set())} />
+      </div>
+
+      <div className="px-[18px] pt-[10px] shrink-0">
+        <div className={`h-[36px] rounded-[4px] border flex items-center justify-between px-[10px] ${
+          dark ? "bg-[#1d1d1d] border-[#303030]" : "bg-white border-[#d8d8d8]"
+        }`}>
+          <span className={`text-[13px] ${dark ? "text-[#aaa]" : "text-[#666]"}`}>并发上限</span>
+          <input
+            type="number"
+            min={1}
+            max={100}
+            value={concurrencyLimit}
+            onChange={(e) => setConcurrencyLimit(normalizeConcurrencyLimit(e.target.value))}
+            className={`w-[76px] h-[26px] rounded-[4px] border px-[8px] text-right outline-none ${
+              dark ? "bg-[#111] border-[#333] text-[#eee]" : "bg-[#f7f7f7] border-[#ddd]"
+            }`}
+          />
+        </div>
       </div>
 
       <div className="px-[18px] py-[12px] shrink-0">

@@ -1067,6 +1067,7 @@ class MultiBroadcastTextRequest(BaseModel):
     agent_ids: list[str] = []
     target_types: list[str] = []
     mode: str = "nosrc"
+    concurrency_limit: int = 0
 
 
 class MultiBroadcastTargetsRequest(BaseModel):
@@ -2623,6 +2624,7 @@ class BroadcastTextRequest(BaseModel):
     wxids: list[str]
     msg: str
     mode: str = "nosrc"
+    concurrency_limit: int = 0
 
 class RevokeRequest(BaseModel):
     msg_svrid: int
@@ -2680,12 +2682,19 @@ def _send_result_ok(result: dict) -> bool:
     return True
 
 
-def _send_api_parallelism() -> int:
+def _send_api_parallelism(limit_override: int | None = None) -> int:
     try:
-        limit = int(getattr(config, "HOOK_API_CONCURRENCY", 10) or 10)
+        override = int(limit_override or 0)
     except Exception:
-        limit = 10
-    return max(1, min(limit, 50))
+        override = 0
+    if override > 0:
+        limit = override
+    else:
+        try:
+            limit = int(getattr(config, "HOOK_API_CONCURRENCY", 10) or 10)
+        except Exception:
+            limit = 10
+    return max(1, min(limit, 100))
 
 
 def _track_background_send(task: asyncio.Task, label: str) -> None:
@@ -2903,7 +2912,7 @@ async def broadcast_text(req: BroadcastTextRequest):
     wxids = [w for w in req.wxids if w]
     agent_id = _active_agent_id or agent_manager.active_id() or ""
     normal_mode = str(req.mode or "").lower() in {"normal", "src", "regular"}
-    sem = asyncio.Semaphore(_send_api_parallelism())
+    sem = asyncio.Semaphore(_send_api_parallelism(req.concurrency_limit))
 
     async def _send_one(wxid: str) -> dict:
         async with sem:
@@ -2928,8 +2937,9 @@ async def _broadcast_image_to_targets(
     cdn: dict,
     image_extra: dict,
     agent_id: str = "",
+    concurrency_limit: int = 0,
 ) -> list[dict]:
-    sem = asyncio.Semaphore(_send_api_parallelism())
+    sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
     async def _send_one(wxid: str) -> dict:
         async with sem:
@@ -2947,7 +2957,12 @@ async def _broadcast_image_to_targets(
 
 
 @app.post("/api/broadcast/image-upload")
-async def broadcast_image_upload(wxids: str = Form(...), mode: str = Form("nosrc"), file: UploadFile = File(...)):
+async def broadcast_image_upload(
+    wxids: str = Form(...),
+    mode: str = Form("nosrc"),
+    concurrency_limit: int = Form(0),
+    file: UploadFile = File(...),
+):
     """Broadcast an uploaded image through NoSrc CDN or normal SendPicMsg(fileData)."""
     try:
         target_wxids = [w for w in json.loads(wxids) if w]
@@ -2967,7 +2982,7 @@ async def broadcast_image_upload(wxids: str = Form(...), mode: str = Form("nosrc
     agent_id = _active_agent_id or agent_manager.active_id() or ""
     if str(mode or "").lower() in {"normal", "src", "regular"}:
         db_image_id = sqlite_cache.put_media_blob(data, file.content_type or "image/*", file.filename or filename)
-        sem = asyncio.Semaphore(_send_api_parallelism())
+        sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
         async def _send_normal(wxid: str) -> dict:
             async with sem:
@@ -3025,7 +3040,7 @@ async def broadcast_image_upload(wxids: str = Form(...), mode: str = Form("nosrc
             "cdn": {k: cdn.get(k) for k in _BROADCAST_IMG_CDN_KEYS},
         }
 
-    results = await _broadcast_image_to_targets(target_wxids, cdn, {"img_path": filepath}, agent_id)
+    results = await _broadcast_image_to_targets(target_wxids, cdn, {"img_path": filepath}, agent_id, concurrency_limit)
     sent = sum(1 for row in results if row.get("ok"))
     failed = len(results) - sent
 
@@ -3246,7 +3261,7 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
     )
     total = len(work_items)
 
-    sem = asyncio.Semaphore(_send_api_parallelism())
+    sem = asyncio.Semaphore(_send_api_parallelism(req.concurrency_limit))
 
     async def _send_one(agent_id: str, wxid: str) -> dict:
         async with sem:
@@ -3283,6 +3298,7 @@ async def multi_account_broadcast_image_upload(
     agent_ids: str = Form("[]"),
     target_types: str = Form("[]"),
     mode: str = Form("nosrc"),
+    concurrency_limit: int = Form(0),
     file: UploadFile = File(...),
 ):
     try:
@@ -3351,7 +3367,7 @@ async def multi_account_broadcast_image_upload(
             _activate_runtime(agent_id)
             db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
         if normal_mode:
-            sem = asyncio.Semaphore(_send_api_parallelism())
+            sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
             async def _send_normal(wxid: str) -> dict:
                 async with sem:
@@ -3380,7 +3396,7 @@ async def multi_account_broadcast_image_upload(
                 for wxid in agent_targets:
                     results.append({"agent_id": agent_id, "wxid": wxid, "ok": False, "error": cdn["error"]})
                 continue
-            sem = asyncio.Semaphore(_send_api_parallelism())
+            sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
             async def _send_one(wxid: str) -> dict:
                 async with sem:
