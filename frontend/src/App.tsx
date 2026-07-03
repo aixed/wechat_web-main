@@ -2662,18 +2662,18 @@ function MobileChatsView({
 
 function MobileSessionRow({ session, onClick, dark }: { session: Session; onClick: () => void; dark: boolean }) {
   return (
-    <button type="button" onClick={onClick} className={`w-full h-[74px] pl-[14px] pr-[12px] flex items-center gap-[12px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
-      <MobileAvatar name={session.nickname || session.wxid} avatar={session.avatar} group={session.is_group} size={52} pinned={session.pinned} />
+    <button type="button" onClick={onClick} className={`w-full h-[64px] pl-[12px] pr-[10px] flex items-center gap-[10px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
+      <MobileAvatar name={session.nickname || session.wxid} avatar={session.avatar} group={session.is_group} size={44} pinned={session.pinned} />
       <div className={`min-w-0 flex-1 h-full border-b flex flex-col justify-center ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
-        <div className="flex items-baseline gap-[8px]">
-          <div className="text-[17px] leading-[23px] truncate flex-1">{session.nickname || session.wxid}</div>
+        <div className="flex items-baseline gap-[7px]">
+          <div className="text-[16px] leading-[21px] truncate flex-1">{session.nickname || session.wxid}</div>
           <div className={`text-[12px] shrink-0 ${dark ? "text-[#666]" : "text-[#b8b8b8]"}`}>{session.lastTime || ""}</div>
         </div>
-        <div className="mt-[3px] flex items-center gap-[6px]">
-          <div className={`text-[14px] truncate flex-1 ${dark ? "text-[#777]" : "text-[#aaa]"}`}>{session.lastMsg || ""}</div>
+        <div className="mt-[2px] flex items-center gap-[6px]">
+          <div className={`text-[13px] truncate flex-1 ${dark ? "text-[#777]" : "text-[#aaa]"}`}>{session.lastMsg || ""}</div>
           {session.muted && <span className={`text-[12px] ${dark ? "text-[#666]" : "text-[#b8b8b8]"}`}>静音</span>}
           {!session.muted && session.unread && session.unread > 0 ? (
-            <span className="min-w-[18px] h-[18px] rounded-full bg-[#fa5151] text-white text-[11px] flex items-center justify-center px-[5px]">
+            <span className="min-w-[16px] h-[16px] rounded-full bg-[#fa5151] text-white text-[10px] flex items-center justify-center px-[5px]">
               {session.unread > 99 ? "99+" : session.unread}
             </span>
           ) : null}
@@ -2745,9 +2745,9 @@ function MobileContactsView({
 
 function MobileContactStaticRow({ color, label, icon, dark }: { color: string; label: string; icon: string; dark: boolean }) {
   return (
-    <div className="h-[58px] pl-[22px] pr-[12px] flex items-center gap-[14px]">
-      <div className="w-[38px] h-[38px] rounded-[5px] flex items-center justify-center text-white" style={{ backgroundColor: color }}>
-        <svg className="w-[23px] h-[23px]" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+    <div className="h-[52px] pl-[18px] pr-[10px] flex items-center gap-[12px]">
+      <div className="w-[34px] h-[34px] rounded-[5px] flex items-center justify-center text-white" style={{ backgroundColor: color }}>
+        <svg className="w-[20px] h-[20px]" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
           {icon === "tag" && <path strokeLinecap="round" strokeLinejoin="round" d="m4 12 8-8h7v7l-8 8-7-7Zm12-5h.01" />}
           {icon === "leaf" && <path strokeLinecap="round" strokeLinejoin="round" d="M5 5c8 0 13 5 14 14-8-1-14-6-14-14Zm0 0c4 5 8 9 14 14" />}
           {icon === "diamond" && <path strokeLinecap="round" strokeLinejoin="round" d="m12 4 7 8-7 8-7-8 7-8Zm-7 8h14" />}
@@ -2755,7 +2755,7 @@ function MobileContactStaticRow({ color, label, icon, dark }: { color: string; l
           {icon !== "tag" && icon !== "leaf" && icon !== "diamond" && icon !== "group" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0ZM5 21c.8-4 3.1-6 7-6s6.2 2 7 6M18 6v4M20 8h-4" />}
         </svg>
       </div>
-      <div className={`flex-1 h-full border-b flex items-center text-[17px] ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>{label}</div>
+      <div className={`flex-1 h-full border-b flex items-center text-[16px] ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>{label}</div>
     </div>
   );
 }
@@ -2763,13 +2763,13 @@ function MobileContactStaticRow({ color, label, icon, dark }: { color: string; l
 function MobileContactSection({ title, entries, onSelect, dark }: { title: string; entries: DirectoryEntry[]; onSelect: (entry: DirectoryEntry) => void; dark: boolean }) {
   return (
     <div>
-      <div className={`h-[34px] px-[22px] flex items-center text-[14px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{title}</div>
+      <div className={`h-[30px] px-[18px] flex items-center text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{title}</div>
       <div className={dark ? "bg-[#111111]" : "bg-white"}>
         {entries.map((entry) => (
-          <button key={`${entry.source}_${entry.wxid}`} type="button" onClick={() => onSelect(entry)} className={`w-full h-[62px] pl-[22px] pr-[12px] flex items-center gap-[12px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
-            <MobileAvatar name={entry.name || entry.wxid} avatar={entry.avatar} group={entry.is_group} size={42} />
+          <button key={`${entry.source}_${entry.wxid}`} type="button" onClick={() => onSelect(entry)} className={`w-full h-[54px] pl-[18px] pr-[10px] flex items-center gap-[11px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
+            <MobileAvatar name={entry.name || entry.wxid} avatar={entry.avatar} group={entry.is_group} size={36} />
             <div className={`flex-1 min-w-0 h-full border-b flex items-center ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
-              <div className="text-[17px] truncate">{entry.name || entry.wxid}</div>
+              <div className="text-[16px] truncate">{entry.name || entry.wxid}</div>
             </div>
           </button>
         ))}
