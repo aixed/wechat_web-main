@@ -8,6 +8,7 @@ interface SessionListProps {
   activeWxid?: string | null;
   onSelectChat: (wxid: string) => void;
   onSessionAction: (action: SessionMenuAction, session: Session) => void;
+  theme?: "dark" | "light";
 }
 
 /**
@@ -52,8 +53,9 @@ function MuteIcon() {
   );
 }
 
-export default function SessionList({ sessions, activeWxid, onSelectChat, onSessionAction }: SessionListProps) {
+export default function SessionList({ sessions, activeWxid, onSelectChat, onSessionAction, theme = "dark" }: SessionListProps) {
   const [menu, setMenu] = useState<{ x: number; y: number; session: Session } | null>(null);
+  const dark = theme !== "light";
 
   useEffect(() => {
     if (!menu) return;
@@ -83,18 +85,18 @@ export default function SessionList({ sessions, activeWxid, onSelectChat, onSess
   };
 
   return (
-    <div className="h-full w-full bg-[#191919] flex flex-col no-select">
+    <div className={`h-full w-full flex flex-col no-select ${dark ? "bg-[#191919]" : "bg-[#e9e8e8]"}`}>
       {/* Search bar */}
       <div className="px-[8px] pt-[8px] pb-[6px] shrink-0">
-        <div className="bg-[#262626] rounded-[6px] flex items-center pr-[8px] h-[34px] sessionlist-searchbar">
+        <div className={`rounded-[6px] flex items-center pr-[8px] h-[34px] sessionlist-searchbar ${dark ? "bg-[#262626]" : "bg-[#dcdcdc]"}`}>
           <span aria-hidden style={{ width: 5 }} className="shrink-0" />
-          <svg className="w-[14px] h-[14px] text-[#5c5c5c] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <svg className={`w-[14px] h-[14px] shrink-0 ${dark ? "text-[#5c5c5c]" : "text-[#777]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
           </svg>
           <input
             type="text"
             placeholder="搜索"
-            className="bg-transparent border-none outline-none text-[14px] text-[#999] placeholder-[#5c5c5c] ml-[6px] w-full min-w-0"
+            className={`bg-transparent border-none outline-none text-[14px] ml-[6px] w-full min-w-0 ${dark ? "text-[#999] placeholder-[#5c5c5c]" : "text-[#333] placeholder-[#888]"}`}
           />
         </div>
       </div>
@@ -102,7 +104,7 @@ export default function SessionList({ sessions, activeWxid, onSelectChat, onSess
       {/* Session list */}
       <div className="flex-1 overflow-y-auto">
         {sessions.length === 0 && (
-          <div className="text-center text-[#5c5c5c] text-[14px] mt-20">暂无会话</div>
+          <div className={`text-center text-[14px] mt-20 ${dark ? "text-[#5c5c5c]" : "text-[#999]"}`}>暂无会话</div>
         )}
         {sessions.map((session) => {
           const isActive = session.wxid === activeWxid;
@@ -112,7 +114,9 @@ export default function SessionList({ sessions, activeWxid, onSelectChat, onSess
               onClick={() => onSelectChat(session.wxid)}
               onContextMenu={(e) => openContextMenu(e, session)}
               className={`flex items-center px-0 py-0 cursor-pointer transition-colors ${
-                isActive ? "bg-[#2f2f2f] hover:bg-[#2f2f2f]" : "hover:bg-[#242424] active:bg-[#2a2a2a]"
+                dark
+                  ? (isActive ? "bg-[#2f2f2f] hover:bg-[#2f2f2f]" : "hover:bg-[#242424] active:bg-[#2a2a2a]")
+                  : (isActive ? "bg-[#d0d0d0] hover:bg-[#d0d0d0]" : "hover:bg-[#dedede] active:bg-[#d3d3d3]")
               }`}
             >
               {/* Avatar — keyed to prevent React reuse issues */}
@@ -126,19 +130,19 @@ export default function SessionList({ sessions, activeWxid, onSelectChat, onSess
               {/* Info */}
               <div className="flex-1 min-w-0 ml-[4px] pb-[10px] pr-[4px]">
                 <div className="flex justify-between items-baseline">
-                  <span className="text-[16px] text-[#e5e5e5] truncate font-normal leading-[21px]" style={{ paddingLeft: '3px' }}>
+                  <span className={`text-[16px] truncate font-normal leading-[21px] ${dark ? "text-[#e5e5e5]" : "text-[#111]"}`} style={{ paddingLeft: '3px' }}>
                     {session.nickname || session.wxid}
                   </span>
                   <span className="flex items-center gap-[4px] shrink-0 ml-[8px]">
                     {/* Mute icon (before time) */}
                     {session.muted && <MuteIcon />}
-                    <span className="text-[13px] text-[#666666] leading-[21px] mr-[3px]">
+                    <span className={`text-[13px] leading-[21px] mr-[3px] ${dark ? "text-[#666666]" : "text-[#999]"}`}>
                       {session.lastTime || ""}
                     </span>
                   </span>
                 </div>
                 <div className="flex justify-between items-center mt-[3px]">
-                  <span className="text-[14px] text-[#666666] truncate leading-[18px]" style={{ paddingLeft: '3px' }}>
+                  <span className={`text-[14px] truncate leading-[18px] ${dark ? "text-[#666666]" : "text-[#999]"}`} style={{ paddingLeft: '3px' }}>
                     {session.lastMsg || ""}
                   </span>
                   {/* Unread badge — only if NOT muted */}
@@ -160,20 +164,20 @@ export default function SessionList({ sessions, activeWxid, onSelectChat, onSess
 
       {menu && (
         <div
-          className="fixed z-[9999] w-[180px] bg-[#f8f8f8] text-[#111] border border-[#cfcfcf] shadow-xl py-[4px] text-[14px]"
+          className={`fixed z-[9999] w-[180px] border shadow-xl py-[4px] text-[14px] ${dark ? "bg-[#2a2a2a] text-[#eee] border-[#444]" : "bg-[#f8f8f8] text-[#111] border-[#cfcfcf]"}`}
           style={{ left: menu.x, top: menu.y }}
           onClick={(e) => e.stopPropagation()}
           onContextMenu={(e) => e.preventDefault()}
         >
-          <ContextMenuItem onClick={() => runAction(menu.session.pinned ? "unpin" : "pin")}>
+          <ContextMenuItem dark={dark} onClick={() => runAction(menu.session.pinned ? "unpin" : "pin")}>
             {menu.session.pinned ? "取消置顶" : "置顶"}
           </ContextMenuItem>
-          <ContextMenuItem onClick={() => runAction("mark_unread")}>标记未读</ContextMenuItem>
-          <ContextMenuItem onClick={() => runAction(menu.session.muted ? "unmute" : "mute")}>
+          <ContextMenuItem dark={dark} onClick={() => runAction("mark_unread")}>标记未读</ContextMenuItem>
+          <ContextMenuItem dark={dark} onClick={() => runAction(menu.session.muted ? "unmute" : "mute")}>
             {menu.session.muted ? "开启新消息提醒" : "消息免打扰"}
           </ContextMenuItem>
-          <div className="h-px bg-[#e2e2e2] my-[4px]" />
-          <ContextMenuItem danger onClick={() => runAction("delete")}>删除聊天</ContextMenuItem>
+          <div className={`h-px my-[4px] ${dark ? "bg-[#3a3a3a]" : "bg-[#e2e2e2]"}`} />
+          <ContextMenuItem dark={dark} danger onClick={() => runAction("delete")}>删除聊天</ContextMenuItem>
         </div>
       )}
     </div>
@@ -183,18 +187,22 @@ export default function SessionList({ sessions, activeWxid, onSelectChat, onSess
 function ContextMenuItem({
   children,
   danger,
+  dark,
   onClick,
 }: {
   children: React.ReactNode;
   danger?: boolean;
+  dark: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className={`block w-full h-[36px] px-[18px] text-left hover:bg-[#e5e5e5] active:bg-[#dadada] ${
-        danger ? "text-[#222]" : "text-[#111]"
+      className={`block w-full h-[36px] px-[18px] text-left ${
+        dark ? "hover:bg-[#373737] active:bg-[#404040]" : "hover:bg-[#e5e5e5] active:bg-[#dadada]"
+      } ${
+        danger ? (dark ? "text-[#f1f1f1]" : "text-[#222]") : (dark ? "text-[#eee]" : "text-[#111]")
       }`}
     >
       {children}

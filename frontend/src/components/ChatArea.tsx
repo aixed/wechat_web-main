@@ -15,6 +15,7 @@ interface ChatAreaProps {
   onRequestContactProfile: (wxids: string[], gid?: string) => Promise<Record<string, ContactProfile>>;
   onInputChange?: (hasText: boolean) => void;
   mobile?: boolean;
+  dark?: boolean;
 }
 
 /* Group sender parsing removed — WeChat 4.x stores sender in BytesExtra, backend extracts it */
@@ -40,7 +41,7 @@ function imageFilesFromClipboardData(data: DataTransfer | null): File[] {
 
 export default function ChatArea({
   session, messages, selfWxid, onBack, onNewMessages, avatarMap, contactMap,
-  contactProfiles, onRequestContactProfile, onInputChange, mobile = false,
+  contactProfiles, onRequestContactProfile, onInputChange, mobile = false, dark = true,
 }: ChatAreaProps) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -538,26 +539,29 @@ export default function ChatArea({
   };
 
   // ─── Render ─────────────────────────────────────────────────────
+  const topBarClass = mobile
+    ? (dark ? "h-[56px] pt-[env(safe-area-inset-top)] border-b border-[#242424] bg-[#111111]" : "h-[56px] pt-[env(safe-area-inset-top)] border-b border-[#dedede] bg-[#ededed]")
+    : (dark ? "h-[48px] border-b border-[#2a2a2a] bg-[#191919]" : "h-[48px] border-b border-[#dedede] bg-[#f5f5f5]");
+  const pageBg = dark ? "bg-[#111111]" : "bg-[#ededed]";
+  const titleText = dark ? "text-[#e5e5e5]" : "text-[#111]";
+  const mutedText = dark ? "text-[#5c5c5c]" : "text-[#999]";
+
   return (
-    <div className={`h-full w-full flex flex-col ${mobile ? "bg-[#ededed]" : "bg-[#191919]"}`}>
+    <div className={`h-full w-full flex flex-col ${dark ? "bg-[#191919]" : "bg-[#ededed]"}`}>
       {/* ─── Top bar ─── */}
-      <div className={`px-[10px] flex items-center shrink-0 z-10 ${
-        mobile
-          ? "h-[56px] pt-[env(safe-area-inset-top)] border-b border-[#dedede] bg-[#ededed]"
-          : "h-[48px] border-b border-[#2a2a2a] bg-[#191919]"
-      }`}>
+      <div className={`px-[10px] flex items-center shrink-0 z-10 ${topBarClass}`}>
         <button
           onClick={onBack}
-          className={`w-[36px] h-[36px] flex items-center justify-center ${mobile ? "text-[#111]" : "text-[#e5e5e5]"}`}
+          className={`w-[36px] h-[36px] flex items-center justify-center ${titleText}`}
         >
           <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
           </svg>
         </button>
-        <h2 className={`flex-1 text-center text-[17px] font-medium truncate pr-[36px] ${mobile ? "text-[#111]" : "text-[#e5e5e5]"}`}>
+        <h2 className={`flex-1 text-center text-[17px] font-medium truncate pr-[36px] ${titleText}`}>
           {session.nickname || session.wxid}
         </h2>
-        <button className={`w-[36px] h-[36px] flex items-center justify-center ${mobile ? "text-[#111]" : "text-[#e5e5e5]"}`}>
+        <button className={`w-[36px] h-[36px] flex items-center justify-center ${titleText}`}>
           <svg className="w-[20px] h-[20px]" fill="currentColor" viewBox="0 0 24 24">
             <circle cx="5" cy="12" r="1.5" />
             <circle cx="12" cy="12" r="1.5" />
@@ -570,29 +574,29 @@ export default function ChatArea({
       {loadingHistory && messages.length === 0 ? (
         /* While fetching initial history, show a stable placeholder
            instead of an empty chat that flashes before messages appear */
-        <div className={`flex-1 flex items-end justify-center pb-6 ${mobile ? "bg-[#ededed]" : "bg-[#111111]"}`}>
-          <span className="text-[12px] text-[#5c5c5c]">加载历史消息...</span>
+        <div className={`flex-1 flex items-end justify-center pb-6 ${pageBg}`}>
+          <span className={`text-[12px] ${mutedText}`}>加载历史消息...</span>
         </div>
       ) : (
         <div
           ref={messagesContainerRef}
-          className={`flex-1 overflow-y-auto min-h-0 ${mobile ? "bg-[#ededed]" : "bg-[#111111]"}`}
+          className={`flex-1 overflow-y-auto min-h-0 ${pageBg}`}
         >
           <div className="py-2 pb-1">
             {/* Load older messages indicator */}
             {messages.length > 0 && (
               <div className="flex justify-center py-2">
                 {loadingOlder ? (
-                  <span className="text-[12px] text-[#5c5c5c]">加载更多消息...</span>
+                  <span className={`text-[12px] ${mutedText}`}>加载更多消息...</span>
                 ) : hasMoreOlder ? (
                   <button
                     onClick={loadOlderMessagesHandler}
-                    className="text-[12px] text-[#5c5c5c] hover:text-[#888] active:text-[#888]"
+                    className={`text-[12px] ${mutedText} hover:text-[#888] active:text-[#888]`}
                   >
                     ↑ 查看更早的消息
                   </button>
                 ) : (
-                  <span className="text-[12px] text-[#3a3a3a]">— 没有更多消息了 —</span>
+                  <span className={`text-[12px] ${dark ? "text-[#3a3a3a]" : "text-[#bbb]"}`}>— 没有更多消息了 —</span>
                 )}
               </div>
             )}
@@ -616,6 +620,7 @@ export default function ChatArea({
                   avatarUrl={isSelf ? (avatarMap[selfWxid] || "") : senderAvatarUrl}
                   onAvatarClick={handleAvatarClick}
                   mobile={mobile}
+                  dark={dark}
                 />
               );
             })}
@@ -645,6 +650,7 @@ export default function ChatArea({
           onToggleVoice={() => { setInputMode(inputMode === "text" ? "voice" : "text"); setShowPlusMenu(false); }}
           onTogglePlus={() => setShowPlusMenu((v) => !v)}
           onFocus={() => setShowPlusMenu(false)}
+          dark={dark}
         />
       ) : (
       <div className="shrink-0 min-h-[176px] border-t border-[#2a2a2a] bg-[#1e1e1e] px-[16px] py-[8px] pb-[max(8px,env(safe-area-inset-bottom))]">
@@ -829,6 +835,7 @@ export default function ChatArea({
           loading={profileLoading}
           error={profileError}
           onClose={() => setProfileWxid(null)}
+          dark={dark}
         />
       )}
     </div>
@@ -853,6 +860,7 @@ function MobileChatInput({
   onToggleVoice,
   onTogglePlus,
   onFocus,
+  dark,
 }: {
   input: string;
   inputMode: "text" | "voice";
@@ -871,13 +879,14 @@ function MobileChatInput({
   onToggleVoice: () => void;
   onTogglePlus: () => void;
   onFocus: () => void;
+  dark: boolean;
 }) {
   return (
-    <div className="shrink-0 border-t border-[#dedede] bg-[#f7f7f7] pb-[env(safe-area-inset-bottom)]">
+    <div className={`shrink-0 border-t pb-[env(safe-area-inset-bottom)] ${dark ? "border-[#242424] bg-[#1e1e1e]" : "border-[#dedede] bg-[#f7f7f7]"}`}>
       {pendingImages.length > 0 && (
         <div className="px-[12px] pt-[8px] flex gap-[8px] overflow-x-auto">
           {pendingImages.map((image) => (
-            <div key={image.id} className="relative w-[58px] h-[58px] shrink-0 rounded-[6px] overflow-hidden bg-white border border-[#ddd]">
+            <div key={image.id} className={`relative w-[58px] h-[58px] shrink-0 rounded-[6px] overflow-hidden border ${dark ? "bg-[#111] border-[#333]" : "bg-white border-[#ddd]"}`}>
               <img src={image.url} alt="" className="w-full h-full object-cover" draggable={false} />
               <button
                 type="button"
@@ -892,7 +901,7 @@ function MobileChatInput({
       )}
 
       <div className="h-[58px] px-[10px] flex items-center gap-[8px]">
-        <button type="button" onClick={onToggleVoice} className="w-[34px] h-[34px] rounded-full border border-[#222] flex items-center justify-center text-[#222] active:bg-[#e8e8e8]">
+        <button type="button" onClick={onToggleVoice} className={`w-[34px] h-[34px] rounded-full border flex items-center justify-center ${dark ? "border-[#d6d6d6] text-[#d6d6d6] active:bg-[#2a2a2a]" : "border-[#222] text-[#222] active:bg-[#e8e8e8]"}`}>
           {inputMode === "text" ? (
             <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 0 0 6-6v-1.5m-6 7.5a6 6 0 0 1-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 0 1-3-3V4.5a3 3 0 1 1 6 0v8.25a3 3 0 0 1-3 3Z" />
@@ -904,7 +913,7 @@ function MobileChatInput({
           )}
         </button>
 
-        <div className="flex-1 min-w-0 h-[38px] bg-white rounded-[4px] flex items-center px-[10px]">
+        <div className={`flex-1 min-w-0 h-[38px] rounded-[4px] flex items-center px-[10px] ${dark ? "bg-[#2a2a2a]" : "bg-white"}`}>
           {inputMode === "text" ? (
             <>
               <textarea
@@ -914,18 +923,18 @@ function MobileChatInput({
                 onKeyDown={onKeyDown}
                 onFocus={onFocus}
                 rows={1}
-                className="flex-1 h-[24px] leading-[24px] resize-none outline-none bg-transparent text-[16px] text-[#111] overflow-hidden"
+                className={`flex-1 h-[24px] leading-[24px] resize-none outline-none bg-transparent text-[16px] overflow-hidden ${dark ? "text-[#e8e8e8]" : "text-[#111]"}`}
               />
-              <svg className="w-[22px] h-[22px] text-[#777] shrink-0" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+              <svg className={`w-[22px] h-[22px] shrink-0 ${dark ? "text-[#999]" : "text-[#777]"}`} fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 0 0 6-6v-1.5m-6 7.5a6 6 0 0 1-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 0 1-3-3V4.5a3 3 0 1 1 6 0v8.25a3 3 0 0 1-3 3Z" />
               </svg>
             </>
           ) : (
-            <button type="button" className="w-full h-full text-[16px] text-[#444] active:bg-[#f2f2f2]">按住 说话</button>
+            <button type="button" className={`w-full h-full text-[16px] ${dark ? "text-[#ddd] active:bg-[#333]" : "text-[#444] active:bg-[#f2f2f2]"}`}>按住 说话</button>
           )}
         </div>
 
-        <button type="button" className="w-[34px] h-[34px] rounded-full border border-[#222] flex items-center justify-center text-[#222] active:bg-[#e8e8e8]">
+        <button type="button" className={`w-[34px] h-[34px] rounded-full border flex items-center justify-center ${dark ? "border-[#d6d6d6] text-[#d6d6d6] active:bg-[#2a2a2a]" : "border-[#222] text-[#222] active:bg-[#e8e8e8]"}`}>
           <svg className="w-[24px] h-[24px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" d="M15.2 15.2a4.5 4.5 0 0 1-6.4 0M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM9.2 9.8h.01M14.8 9.8h.01" />
           </svg>
@@ -941,7 +950,7 @@ function MobileChatInput({
             {sending ? "发送中" : "发送"}
           </button>
         ) : (
-          <button type="button" onClick={onTogglePlus} className="w-[34px] h-[34px] rounded-full border border-[#222] flex items-center justify-center text-[#222] active:bg-[#e8e8e8]">
+          <button type="button" onClick={onTogglePlus} className={`w-[34px] h-[34px] rounded-full border flex items-center justify-center ${dark ? "border-[#d6d6d6] text-[#d6d6d6] active:bg-[#2a2a2a]" : "border-[#222] text-[#222] active:bg-[#e8e8e8]"}`}>
             <svg className={`w-[25px] h-[25px] transition-transform ${showPlusMenu ? "rotate-45" : ""}`} fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 5v14M5 12h14" />
             </svg>
@@ -950,16 +959,16 @@ function MobileChatInput({
       </div>
 
       {showPlusMenu && (
-        <div className="h-[330px] bg-[#f7f7f7] border-t border-[#e5e5e5] px-[20px] pt-[18px]">
+        <div className={`h-[330px] border-t px-[20px] pt-[18px] ${dark ? "bg-[#1e1e1e] border-[#242424]" : "bg-[#f7f7f7] border-[#e5e5e5]"}`}>
           <div className="grid grid-cols-4 gap-y-[20px] gap-x-[18px]">
-            <MobilePlusItem label="Album" onClick={() => albumInputRef.current?.click()} icon={<path d="M4 17 9.5 11.5 13 15l2-2 5 5M5 5h14v14H5zM8.5 9a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" />} />
-            <MobilePlusItem label="Camera" onClick={() => cameraInputRef.current?.click()} icon={<path d="M5 8h3l1.4-2h5.2L16 8h3v10H5zM12 16a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />} />
-            <MobilePlusItem label="Video Call" disabled icon={<path d="M4 7h10v10H4zM14 10l6-3v10l-6-3z" />} />
-            <MobilePlusItem label="Location" disabled icon={<path d="M12 21s6-5.4 6-11a6 6 0 1 0-12 0c0 5.6 6 11 6 11ZM12 12.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4Z" />} />
-            <MobilePlusItem label="Red Packet" disabled icon={<path d="M5 7h14v12H5zM5 7l7 5 7-5M9 4h6v3H9z" />} />
-            <MobilePlusItem label="Gift" disabled icon={<path d="M4 10h16v10H4zM12 10v10M4 14h16M7 6c0-1.2 1-2 2-2 2 0 3 3 3 3s1-3 3-3c1 0 2 .8 2 2s-1 2-2 2H9c-1 0-2-.8-2-2Z" />} />
-            <MobilePlusItem label="Transfer" disabled icon={<path d="M6 8h12M6 16h12M9 5 6 8l3 3M15 13l3 3-3 3" />} />
-            <MobilePlusItem label="Voice Input" onClick={() => fileInputRef.current?.click()} icon={<path d="M12 15a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v7a3 3 0 0 0 3 3ZM5 11a7 7 0 0 0 14 0M12 18v4" />} />
+            <MobilePlusItem dark={dark} label="Album" onClick={() => albumInputRef.current?.click()} icon={<path d="M4 17 9.5 11.5 13 15l2-2 5 5M5 5h14v14H5zM8.5 9a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" />} />
+            <MobilePlusItem dark={dark} label="Camera" onClick={() => cameraInputRef.current?.click()} icon={<path d="M5 8h3l1.4-2h5.2L16 8h3v10H5zM12 16a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />} />
+            <MobilePlusItem dark={dark} label="Video Call" disabled icon={<path d="M4 7h10v10H4zM14 10l6-3v10l-6-3z" />} />
+            <MobilePlusItem dark={dark} label="Location" disabled icon={<path d="M12 21s6-5.4 6-11a6 6 0 1 0-12 0c0 5.6 6 11 6 11ZM12 12.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4Z" />} />
+            <MobilePlusItem dark={dark} label="Red Packet" disabled icon={<path d="M5 7h14v12H5zM5 7l7 5 7-5M9 4h6v3H9z" />} />
+            <MobilePlusItem dark={dark} label="Gift" disabled icon={<path d="M4 10h16v10H4zM12 10v10M4 14h16M7 6c0-1.2 1-2 2-2 2 0 3 3 3 3s1-3 3-3c1 0 2 .8 2 2s-1 2-2 2H9c-1 0-2-.8-2-2Z" />} />
+            <MobilePlusItem dark={dark} label="Transfer" disabled icon={<path d="M6 8h12M6 16h12M9 5 6 8l3 3M15 13l3 3-3 3" />} />
+            <MobilePlusItem dark={dark} label="Voice Input" onClick={() => fileInputRef.current?.click()} icon={<path d="M12 15a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v7a3 3 0 0 0 3 3ZM5 11a7 7 0 0 0 14 0M12 18v4" />} />
           </div>
           <div className="mt-[22px] flex justify-center gap-[8px]">
             <span className="w-[8px] h-[8px] rounded-full bg-[#888]" />
@@ -971,15 +980,15 @@ function MobileChatInput({
   );
 }
 
-function MobilePlusItem({ icon, label, onClick, disabled }: { icon: React.ReactNode; label: string; onClick?: () => void; disabled?: boolean }) {
+function MobilePlusItem({ icon, label, onClick, disabled, dark }: { icon: React.ReactNode; label: string; onClick?: () => void; disabled?: boolean; dark: boolean }) {
   return (
     <button type="button" onClick={disabled ? undefined : onClick} className={`flex flex-col items-center gap-[8px] ${disabled ? "opacity-60" : "active:opacity-70"}`}>
-      <div className="w-[58px] h-[58px] rounded-[12px] bg-white flex items-center justify-center text-[#555] shadow-sm">
+      <div className={`w-[58px] h-[58px] rounded-[12px] flex items-center justify-center shadow-sm ${dark ? "bg-[#2a2a2a] text-[#d6d6d6]" : "bg-white text-[#555]"}`}>
         <svg className="w-[30px] h-[30px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
           {icon}
         </svg>
       </div>
-      <span className="text-[12px] leading-[15px] text-[#777] text-center whitespace-nowrap">{label}</span>
+      <span className={`text-[12px] leading-[15px] text-center whitespace-nowrap ${dark ? "text-[#999]" : "text-[#777]"}`}>{label}</span>
     </button>
   );
 }
@@ -1014,6 +1023,7 @@ function ContactProfileCard({
   loading,
   error,
   onClose,
+  dark = true,
 }: {
   wxid: string;
   profile?: ContactProfile;
@@ -1022,6 +1032,7 @@ function ContactProfileCard({
   loading: boolean;
   error: string;
   onClose: () => void;
+  dark?: boolean;
 }) {
   const raw = profile?.profile || {};
   const isOpenIM = Boolean(raw.OpenIM || wxid.endsWith("@openim"));
@@ -1035,6 +1046,7 @@ function ContactProfileCard({
         loading={loading}
         error={error}
         onClose={onClose}
+        dark={dark}
       />
     );
   }
@@ -1059,7 +1071,7 @@ function ContactProfileCard({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-[420px] bg-[#f7f7f7] text-[#111] rounded-[2px] shadow-2xl overflow-hidden"
+        className={`w-full max-w-[420px] rounded-[2px] shadow-2xl overflow-hidden ${dark ? "bg-[#1f1f1f] text-[#e8e8e8]" : "bg-[#f7f7f7] text-[#111]"}`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-[36px] pt-[34px] pb-[20px]">
@@ -1081,15 +1093,15 @@ function ContactProfileCard({
                 {sex > 0 && <SexIcon sex={sex} />}
               </div>
               {showNickname && (
-                <div className="mt-[7px] text-[16px] leading-[24px] text-[#888] truncate">
+                <div className={`mt-[7px] text-[16px] leading-[24px] truncate ${dark ? "text-[#888]" : "text-[#888]"}`}>
                   昵称：{nickName}
                 </div>
               )}
-              <div className="mt-[7px] text-[16px] leading-[24px] text-[#888] truncate">
+              <div className={`mt-[7px] text-[16px] leading-[24px] truncate ${dark ? "text-[#888]" : "text-[#888]"}`}>
                 微信号：{alias || wxid}
               </div>
               {area && (
-                <div className="text-[16px] leading-[24px] text-[#888] truncate">
+                <div className={`text-[16px] leading-[24px] truncate ${dark ? "text-[#888]" : "text-[#888]"}`}>
                   地区：{area}
                 </div>
               )}
@@ -1097,7 +1109,7 @@ function ContactProfileCard({
             <button
               type="button"
               onClick={onClose}
-              className="w-[28px] h-[28px] shrink-0 text-[#777] flex items-center justify-center active:opacity-60"
+              className={`w-[28px] h-[28px] shrink-0 flex items-center justify-center active:opacity-60 ${dark ? "text-[#999]" : "text-[#777]"}`}
               aria-label="关闭"
             >
               <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
@@ -1106,18 +1118,18 @@ function ContactProfileCard({
             </button>
           </div>
 
-          <div className="h-px bg-[#e6e6e6] my-[28px]" />
+          <div className={`h-px my-[28px] ${dark ? "bg-[#333]" : "bg-[#e6e6e6]"}`} />
 
-          {remark && <ProfileRow label="备注" value={remark} />}
-          {phone && <ProfileRow label="电话" value={phone} />}
-          {labelText && <ProfileRow label="标签" value={labelText} />}
+          {remark && <ProfileRow dark={dark} label="备注" value={remark} />}
+          {phone && <ProfileRow dark={dark} label="电话" value={phone} />}
+          {labelText && <ProfileRow dark={dark} label="标签" value={labelText} />}
 
-          <div className="h-px bg-[#e6e6e6] my-[24px]" />
+          <div className={`h-px my-[24px] ${dark ? "bg-[#333]" : "bg-[#e6e6e6]"}`} />
 
-          <ProfileRow label="共同群聊" value={`${roomCount}个`} />
-          {sign && <ProfileRow label="个性签名" value={sign} />}
-          {sourceText && <ProfileRow label="来源" value={sourceText} />}
-          <ProfileRow label="wxid" value={wxid} mono />
+          <ProfileRow dark={dark} label="共同群聊" value={`${roomCount}个`} />
+          {sign && <ProfileRow dark={dark} label="个性签名" value={sign} />}
+          {sourceText && <ProfileRow dark={dark} label="来源" value={sourceText} />}
+          <ProfileRow dark={dark} label="wxid" value={wxid} mono />
 
           {(loading || error) && (
             <div className={`mt-[18px] text-[13px] ${error ? "text-[#c44545]" : "text-[#888]"}`}>
@@ -1126,18 +1138,21 @@ function ContactProfileCard({
           )}
         </div>
 
-        <div className="h-px bg-[#e6e6e6]" />
-        <div className="grid grid-cols-3 h-[104px] bg-white">
+        <div className={`h-px ${dark ? "bg-[#333]" : "bg-[#e6e6e6]"}`} />
+        <div className={`grid grid-cols-3 h-[104px] ${dark ? "bg-[#1f1f1f]" : "bg-white"}`}>
           <ProfileAction
+            dark={dark}
             label="发消息"
             icon={<path d="M4 6.5A3.5 3.5 0 0 1 7.5 3h9A3.5 3.5 0 0 1 20 6.5v5A3.5 3.5 0 0 1 16.5 15H11l-5 4v-4.35A3.5 3.5 0 0 1 4 11.5v-5Z" />}
             onClick={onClose}
           />
           <ProfileAction
+            dark={dark}
             label="语音聊天"
             icon={<path d="M6.6 4.2 9 3.6l2 4-1.5 1.5a10.2 10.2 0 0 0 5.4 5.4L16.4 13l4 2-.6 2.4c-.2.8-.9 1.4-1.8 1.3C10.7 18.2 5.8 13.3 5.3 6c-.1-.9.5-1.6 1.3-1.8Z" />}
           />
           <ProfileAction
+            dark={dark}
             label="视频聊天"
             icon={<path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h7A2.5 2.5 0 0 1 16 6.5v7A2.5 2.5 0 0 1 13.5 16h-7A2.5 2.5 0 0 1 4 13.5v-7Zm12.5 2.2 3.5-2.1v6.8l-3.5-2.1V8.7Z" />}
           />
@@ -1162,6 +1177,7 @@ function OpenIMContactProfileCard({
   loading,
   error,
   onClose,
+  dark = true,
 }: {
   wxid: string;
   profile?: ContactProfile;
@@ -1170,6 +1186,7 @@ function OpenIMContactProfileCard({
   loading: boolean;
   error: string;
   onClose: () => void;
+  dark?: boolean;
 }) {
   const raw = profile?.profile || {};
   const remark = profileField(raw, ["Remark", "remark", "markname"]);
@@ -1213,7 +1230,7 @@ function OpenIMContactProfileCard({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-[420px] bg-[#f7f7f7] text-[#111] rounded-[2px] shadow-2xl overflow-hidden"
+        className={`w-full max-w-[420px] rounded-[2px] shadow-2xl overflow-hidden ${dark ? "bg-[#1f1f1f] text-[#e8e8e8]" : "bg-[#f7f7f7] text-[#111]"}`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-[36px] pt-[34px] pb-[24px]">
@@ -1240,7 +1257,7 @@ function OpenIMContactProfileCard({
                 </div>
               )}
               {showNickname && (
-                <div className="mt-[4px] text-[16px] leading-[22px] text-[#888] truncate">
+                <div className={`mt-[4px] text-[16px] leading-[22px] truncate ${dark ? "text-[#888]" : "text-[#888]"}`}>
                   昵称：{nickName}
                 </div>
               )}
@@ -1248,7 +1265,7 @@ function OpenIMContactProfileCard({
             <button
               type="button"
               onClick={onClose}
-              className="w-[28px] h-[28px] shrink-0 text-[#777] flex items-center justify-center active:opacity-60"
+              className={`w-[28px] h-[28px] shrink-0 flex items-center justify-center active:opacity-60 ${dark ? "text-[#999]" : "text-[#777]"}`}
               aria-label="关闭"
             >
               <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
@@ -1257,15 +1274,15 @@ function OpenIMContactProfileCard({
             </button>
           </div>
 
-          <div className="h-px bg-[#e6e6e6] my-[28px]" />
+          <div className={`h-px my-[28px] ${dark ? "bg-[#333]" : "bg-[#e6e6e6]"}`} />
 
-          {isFriend && remark && <ProfileRow label="备注" value={remark} />}
-          {isFriend && remark && <div className="h-px bg-[#e6e6e6] my-[24px]" />}
+          {isFriend && remark && <ProfileRow dark={dark} label="备注" value={remark} />}
+          {isFriend && remark && <div className={`h-px my-[24px] ${dark ? "bg-[#333]" : "bg-[#e6e6e6]"}`} />}
 
-          <div className="text-[17px] leading-[24px] text-[#8a8a8a] mb-[12px]">企业信息</div>
-          {sourceRow.desc && <OpenIMInfoRow item={sourceRow} />}
-          {companyRow.desc && <OpenIMInfoRow item={companyRow} />}
-          {realNameRow.desc && <OpenIMInfoRow item={realNameRow} />}
+          <div className={`text-[17px] leading-[24px] mb-[12px] ${dark ? "text-[#888]" : "text-[#8a8a8a]"}`}>企业信息</div>
+          {sourceRow.desc && <OpenIMInfoRow dark={dark} item={sourceRow} />}
+          {companyRow.desc && <OpenIMInfoRow dark={dark} item={companyRow} />}
+          {realNameRow.desc && <OpenIMInfoRow dark={dark} item={realNameRow} />}
 
           {(loading || error) && (
             <div className={`mt-[18px] text-[13px] ${error ? "text-[#c44545]" : "text-[#888]"}`}>
@@ -1274,25 +1291,28 @@ function OpenIMContactProfileCard({
           )}
         </div>
 
-        <div className="h-px bg-[#e6e6e6]" />
+        <div className={`h-px ${dark ? "bg-[#333]" : "bg-[#e6e6e6]"}`} />
         {isFriend ? (
-          <div className="grid grid-cols-3 h-[104px] bg-white">
+          <div className={`grid grid-cols-3 h-[104px] ${dark ? "bg-[#1f1f1f]" : "bg-white"}`}>
             <ProfileAction
+              dark={dark}
               label="发消息"
               icon={<path d="M4 6.5A3.5 3.5 0 0 1 7.5 3h9A3.5 3.5 0 0 1 20 6.5v5A3.5 3.5 0 0 1 16.5 15H11l-5 4v-4.35A3.5 3.5 0 0 1 4 11.5v-5Z" />}
               onClick={onClose}
             />
             <ProfileAction
+              dark={dark}
               label="语音聊天"
               icon={<path d="M6.6 4.2 9 3.6l2 4-1.5 1.5a10.2 10.2 0 0 0 5.4 5.4L16.4 13l4 2-.6 2.4c-.2.8-.9 1.4-1.8 1.3C10.7 18.2 5.8 13.3 5.3 6c-.1-.9.5-1.6 1.3-1.8Z" />}
             />
             <ProfileAction
+              dark={dark}
               label="视频聊天"
               icon={<path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h7A2.5 2.5 0 0 1 16 6.5v7A2.5 2.5 0 0 1 13.5 16h-7A2.5 2.5 0 0 1 4 13.5v-7Zm12.5 2.2 3.5-2.1v6.8l-3.5-2.1V8.7Z" />}
             />
           </div>
         ) : (
-          <div className="h-[104px] bg-white flex items-center justify-center">
+          <div className={`h-[104px] flex items-center justify-center ${dark ? "bg-[#1f1f1f]" : "bg-white"}`}>
             <button
               type="button"
               className="h-[46px] px-[28px] rounded-[5px] bg-[#07c160] text-white text-[18px] active:bg-[#06ad56]"
@@ -1332,11 +1352,11 @@ function openimInfoRows(raw: Record<string, any>): OpenIMInfoItem[] {
   return rows;
 }
 
-function OpenIMInfoRow({ item }: { item: OpenIMInfoItem }) {
+function OpenIMInfoRow({ item, dark = true }: { item: OpenIMInfoItem; dark?: boolean }) {
   const content = (
     <div className="grid grid-cols-[96px_minmax(0,1fr)] gap-[12px] py-[4px] text-[18px] leading-[28px]">
-      <div className="text-[#8a8a8a]">{item.title}</div>
-      <div className="min-w-0 flex items-center gap-[6px] text-[#111]">
+      <div className={dark ? "text-[#888]" : "text-[#8a8a8a]"}>{item.title}</div>
+      <div className={`min-w-0 flex items-center gap-[6px] ${dark ? "text-[#e8e8e8]" : "text-[#111]"}`}>
         {item.icon && <img src={item.icon} alt="" className="w-[20px] h-[20px] object-contain shrink-0" />}
         <span className="truncate">{item.desc}</span>
         {item.url && (
@@ -1356,32 +1376,34 @@ function OpenIMInfoRow({ item }: { item: OpenIMInfoItem }) {
   );
 }
 
-function ProfileRow({ label, value, muted, mono }: {
+function ProfileRow({ label, value, muted, mono, dark = true }: {
   label: string;
   value: string;
   muted?: boolean;
   mono?: boolean;
+  dark?: boolean;
 }) {
   return (
     <div className="grid grid-cols-[96px_minmax(0,1fr)] gap-[12px] py-[3px] text-[18px] leading-[28px]">
-      <div className="text-[#8a8a8a]">{label}</div>
-      <div className={`${muted ? "text-[#999]" : "text-[#111]"} ${mono ? "font-mono text-[14px] leading-[24px]" : ""} break-words`}>
+      <div className={dark ? "text-[#888]" : "text-[#8a8a8a]"}>{label}</div>
+      <div className={`${muted ? "text-[#999]" : (dark ? "text-[#e8e8e8]" : "text-[#111]")} ${mono ? "font-mono text-[14px] leading-[24px]" : ""} break-words`}>
         {value}
       </div>
     </div>
   );
 }
 
-function ProfileAction({ icon, label, onClick }: {
+function ProfileAction({ icon, label, onClick, dark = true }: {
   icon: React.ReactNode;
   label: string;
   onClick?: () => void;
+  dark?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="flex flex-col items-center justify-center gap-[8px] text-[#576b95] active:bg-[#f2f2f2]"
+      className={`flex flex-col items-center justify-center gap-[8px] text-[#576b95] ${dark ? "active:bg-[#2a2a2a]" : "active:bg-[#f2f2f2]"}`}
     >
       <svg className="w-[31px] h-[31px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
         {icon}
