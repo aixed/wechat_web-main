@@ -1652,6 +1652,7 @@ def _contact_payload(raw: dict | list) -> dict | list:
             "friend", "friends", "contact", "contacts",
             "chatroom", "chatrooms", "chat_room", "chat_rooms",
             "group", "groups", "group_chat", "group_chats",
+            "batch", "batches",
         )):
             return current
         nested = current.get("data")
@@ -1690,6 +1691,48 @@ def _extract_contact_list(payload: dict | list, *keys: str) -> list:
     return out
 
 
+def _extract_batch_contact_entries(payload: dict | list) -> list[dict]:
+    payload = _contact_payload(payload)
+    if not isinstance(payload, dict):
+        return []
+    batches = payload.get("batch") or payload.get("batches") or payload.get("Batch") or []
+    if isinstance(batches, dict):
+        batches = [batches]
+    if not isinstance(batches, list):
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for batch in batches:
+        if not isinstance(batch, dict):
+            continue
+        raw_values = (
+            batch.get("list")
+            or batch.get("wxids")
+            or batch.get("wxidlist")
+            or batch.get("usernames")
+            or batch.get("users")
+            or ""
+        )
+        if isinstance(raw_values, str):
+            parts = raw_values.replace("\r", "\n").replace(";", ",").replace("\n", ",").split(",")
+        elif isinstance(raw_values, list):
+            parts = raw_values
+        else:
+            parts = []
+        for raw_wxid in parts:
+            wxid = str(raw_wxid or "").strip()
+            if not wxid or wxid in seen:
+                continue
+            seen.add(wxid)
+            out.append({
+                "wxid": wxid,
+                "gid": wxid if wxid.endswith("@chatroom") else "",
+                "type": "chatroom" if wxid.endswith("@chatroom") else "friend",
+            })
+    return out
+
+
 def _contacts_from_getcontact_response(data) -> list[dict]:
     """Normalize GetContact envelopes from local/remote Hook into contact rows."""
     if isinstance(data, list):
@@ -1724,6 +1767,7 @@ def _all_raw_contact_entries(contacts: dict | list) -> list[dict]:
             *_extract_contact_list(contacts, "friend", "friends", "contact", "contacts"),
             *_extract_contact_list(contacts, "chatroom", "chatrooms", "chat_room", "chat_rooms", "group", "groups", "group_chat", "group_chats"),
             *_extract_contact_list(contacts, "data"),
+            *_extract_batch_contact_entries(contacts),
         ]
     else:
         source = []
@@ -2048,7 +2092,10 @@ def _cache_raw_contacts(contacts: dict) -> tuple[int, int]:
         "chatroom", "chatrooms", "chat_room", "chat_rooms",
         "group", "groups", "group_chat", "group_chats",
     )
-    data_list = _extract_contact_list(contacts, "data")
+    data_list = [
+        *_extract_contact_list(contacts, "data"),
+        *_extract_batch_contact_entries(contacts),
+    ]
     if data_list:
         friend_wxids = {_contact_profile_wxid(c) for c in friend_list if isinstance(c, dict)}
         room_wxids = {_contact_profile_wxid(c) for c in room_list if isinstance(c, dict)}
@@ -2300,6 +2347,15 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
             raise
 
         raw_entries = _all_raw_contact_entries(contacts)
+        if not raw_entries:
+            snapshot = _contacts_snapshot_from_db(owner_wxid)
+            app_state["contacts"] = snapshot
+            _log(
+                f"[CONTACTS] InitContact returned no parseable contacts; "
+                f"served local cache={len(cached_before)}"
+            )
+            return snapshot
+
         friend_count, room_count = _cache_raw_contacts(contacts)
         app_state["contacts_loaded"] = True
         sqlite_cache.mark_contact_init_done_v2(owner_wxid=owner_wxid)
@@ -3259,6 +3315,7 @@ def _raw_contact_list(raw_contacts: dict | list, key: str) -> list:
         value = [
             *_extract_contact_list(raw_contacts, "friend", "friends", "contact", "contacts"),
             *_extract_contact_list(raw_contacts, "data"),
+            *_extract_batch_contact_entries(raw_contacts),
         ]
         value = [entry for entry in value if not _contact_wxid(entry).endswith("@chatroom")]
     else:
@@ -3269,6 +3326,7 @@ def _raw_contact_list(raw_contacts: dict | list, key: str) -> list:
                 "group", "groups", "group_chat", "group_chats",
             ),
             *_extract_contact_list(raw_contacts, "friend", "friends", "contact", "contacts", "data"),
+            *_extract_batch_contact_entries(raw_contacts),
         ]
         value = [entry for entry in value if _contact_wxid(entry).endswith("@chatroom")]
     seen: set[str] = set()
