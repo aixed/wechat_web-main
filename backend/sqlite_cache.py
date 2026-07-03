@@ -353,7 +353,24 @@ class SqliteMessageCache:
                 or profile.get("nickname")
                 or ""
             )
-            avatar = str(contact.get("avatar") or "")
+            avatar = str(
+                contact.get("avatar")
+                or profile.get("SmallHeadImgUrl")
+                or profile.get("BigHeadImgUrl")
+                or profile.get("smallhead")
+                or profile.get("bighead")
+                or profile.get("headimgurl")
+                or profile.get("head_img")
+                or profile.get("head_big")
+                or profile.get("head_small")
+                or profile.get("HeadImgUrl")
+                or profile.get("HeadUrl")
+                or profile.get("smallHeadUrl")
+                or profile.get("bigHeadUrl")
+                or profile.get("smallheadimgurl")
+                or profile.get("bigheadimgurl")
+                or ""
+            )
             is_group = 1 if wxid.endswith("@chatroom") or contact.get("is_group") else 0
             rows.append((
                 owner_wxid,
@@ -376,7 +393,11 @@ class SqliteMessageCache:
                     avatar=COALESCE(NULLIF(excluded.avatar, ''), contacts.avatar),
                     is_group=excluded.is_group,
                     profile_json=CASE
-                        WHEN excluded.profile_json IS NOT NULL AND excluded.profile_json != '{}' THEN excluded.profile_json
+                        WHEN excluded.profile_json IS NULL OR excluded.profile_json = '{}' THEN contacts.profile_json
+                        WHEN contacts.profile_json IS NULL OR contacts.profile_json = '' OR contacts.profile_json = '{}' THEN excluded.profile_json
+                        WHEN excluded.avatar != '' THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, '_getcontact_hydrated') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, 'SmallHeadImgUrl') > 0 OR instr(excluded.profile_json, 'smallhead') > 0 THEN excluded.profile_json
                         ELSE contacts.profile_json
                     END,
                     updated_at=excluded.updated_at
