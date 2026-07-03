@@ -25,64 +25,182 @@ class AgentCallResponse:
     reason: str = ""
 
 
+@dataclass
+class AgentConnection:
+    id: str
+    websocket: WebSocket
+    peer: str
+    connected_at: float
+    last_seen_at: float
+    pending: dict[str, asyncio.Future[dict[str, Any]]]
+    send_lock: asyncio.Lock
+    account_id: str = ""
+    nickname: str = ""
+    wxid: str = ""
+    avatar: str = ""
+    initialized: bool = False
+    registered: bool = False
+
+
 class AgentWebSocketManager:
     def __init__(self) -> None:
-        self._websocket: WebSocket | None = None
-        self._peer: str = ""
-        self._connected_at: float = 0.0
-        self._last_seen_at: float = 0.0
-        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._connections: dict[str, AgentConnection] = {}
+        self._active_id: str = ""
         self._lock = asyncio.Lock()
-        self._send_lock = asyncio.Lock()
 
-    def is_connected(self) -> bool:
-        return self._websocket is not None
+    def is_connected(self, agent_id: str | None = None) -> bool:
+        if agent_id:
+            conn = self._connections.get(agent_id)
+            return bool(conn and conn.registered)
+        return any(conn.registered for conn in self._connections.values())
+
+    def active_id(self) -> str:
+        conn = self._connections.get(self._active_id)
+        return self._active_id if conn and conn.registered else ""
+
+    async def set_active(self, agent_id: str) -> bool:
+        async with self._lock:
+            conn = self._connections.get(agent_id)
+            if not conn or not conn.registered:
+                return False
+            self._active_id = agent_id
+            return True
+
+    async def update_account(
+        self,
+        agent_id: str,
+        *,
+        wxid: str = "",
+        nickname: str = "",
+        avatar: str = "",
+        initialized: bool | None = None,
+    ) -> None:
+        async with self._lock:
+            conn = self._connections.get(agent_id)
+            if not conn:
+                return
+            if wxid:
+                conn.wxid = wxid
+                conn.account_id = wxid
+            if nickname:
+                conn.nickname = nickname
+            if avatar:
+                conn.avatar = avatar
+            if initialized is not None:
+                conn.initialized = initialized
 
     def status(self) -> dict[str, Any]:
+        agents = self.agents()
+        active_conn = self._connections.get(self._active_id)
+        active = self._active_id if active_conn and active_conn.registered else (agents[0]["id"] if agents else "")
         return {
             "connected": self.is_connected(),
-            "peer": self._peer,
-            "connected_at": self._connected_at,
-            "last_seen_at": self._last_seen_at,
-            "pending": len(self._pending),
+            "peer": agents[0]["peer"] if agents else "",
+            "connected_at": agents[0]["connected_at"] if agents else 0.0,
+            "last_seen_at": max((a["last_seen_at"] for a in agents), default=0.0),
+            "pending": sum(int(a["pending"]) for a in agents),
+            "active_id": active,
+            "count": len(agents),
+            "pending_registration": sum(1 for conn in self._connections.values() if not conn.registered),
+            "agents": agents,
         }
+
+    def agents(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for conn in self._connections.values():
+            if not conn.registered:
+                continue
+            rows.append({
+                "id": conn.id,
+                "account_id": conn.account_id or conn.wxid or conn.id,
+                "wxid": conn.wxid,
+                "nickname": conn.nickname,
+                "avatar": conn.avatar,
+                "peer": conn.peer,
+                "connected_at": conn.connected_at,
+                "last_seen_at": conn.last_seen_at,
+                "pending": len(conn.pending),
+                "initialized": conn.initialized,
+                "active": conn.id == self._active_id,
+            })
+        rows.sort(key=lambda x: x.get("connected_at", 0))
+        return rows
+
+    def get_agent(self, agent_id: str) -> dict[str, Any] | None:
+        conn = self._connections.get(agent_id)
+        if not conn or not conn.registered:
+            return None
+        return {
+            "id": conn.id,
+            "account_id": conn.account_id or conn.wxid or conn.id,
+            "wxid": conn.wxid,
+            "nickname": conn.nickname,
+            "avatar": conn.avatar,
+            "peer": conn.peer,
+            "connected_at": conn.connected_at,
+            "last_seen_at": conn.last_seen_at,
+            "pending": len(conn.pending),
+            "initialized": conn.initialized,
+            "active": conn.id == self._active_id,
+        }
+
+    def agent_id_for_wxid(self, wxid: str) -> str:
+        wxid = str(wxid or "").strip()
+        if not wxid:
+            return ""
+        for conn in self._connections.values():
+            if conn.registered and conn.wxid == wxid:
+                return conn.id
+        return ""
+
+    def uninitialized_agent_ids(self) -> list[str]:
+        return [conn.id for conn in self._connections.values() if conn.registered and not conn.initialized]
 
     async def handle(self, websocket: WebSocket) -> None:
         await websocket.accept()
         peer = self._peer_name(websocket)
-        old_websocket: WebSocket | None = None
-        old_pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        query_id = str(websocket.query_params.get("agent_id") or "").strip()
+        conn_id = query_id or f"agent-{uuid.uuid4().hex[:12]}"
+        now = time.time()
+        conn = AgentConnection(
+            id=conn_id,
+            websocket=websocket,
+            peer=peer,
+            connected_at=now,
+            last_seen_at=now,
+            pending={},
+            send_lock=asyncio.Lock(),
+            registered=True,
+        )
+        old_conn: AgentConnection | None = None
 
         async with self._lock:
-            old_websocket = self._websocket
-            old_pending = self._pending
-            self._pending = {}
-            self._websocket = websocket
-            self._peer = peer
-            self._connected_at = time.time()
-            self._last_seen_at = self._connected_at
+            old_conn = self._connections.get(conn_id)
+            self._connections[conn_id] = conn
+            if conn.registered and (not self._active_id or self._active_id not in self._connections):
+                self._active_id = conn_id
 
-        for future in old_pending.values():
-            if not future.done():
-                future.set_exception(ConnectionError("agent websocket was replaced"))
-        if old_websocket is not None and old_websocket is not websocket:
-            await self._close_socket(old_websocket, code=1012, reason="agent reconnected")
+        if old_conn is not None and old_conn.websocket is not websocket:
+            for future in old_conn.pending.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("agent websocket was replaced"))
+            await self._close_socket(old_conn.websocket, code=1012, reason="agent reconnected")
 
-        print(f"[AGENT_WS] connected peer={peer}", flush=True)
+        print(f"[AGENT_WS] connected id={conn_id} peer={peer}", flush=True)
         try:
             while True:
                 payload = await self._receive_payload(websocket)
                 if payload is None:
                     break
-                self._last_seen_at = time.time()
-                await self._handle_message(websocket, payload)
+                conn.last_seen_at = time.time()
+                await self._handle_message(conn, payload)
         except WebSocketDisconnect:
             pass
         except Exception as exc:
             print(f"[AGENT_WS] receive loop error: {type(exc).__name__}: {exc}", flush=True)
         finally:
-            await self._detach(websocket, "agent websocket disconnected")
-            print(f"[AGENT_WS] disconnected peer={peer}", flush=True)
+            await self._detach(conn, "agent websocket disconnected")
+            print(f"[AGENT_WS] disconnected id={conn.id} peer={peer}", flush=True)
 
     async def request(
         self,
@@ -91,6 +209,7 @@ class AgentWebSocketManager:
         *,
         method: str = "POST",
         timeout: float = 30.0,
+        agent_id: str | None = None,
     ) -> AgentCallResponse:
         request_id = f"req-{uuid.uuid4().hex}"
         route_name = route.strip("/")
@@ -98,52 +217,63 @@ class AgentWebSocketManager:
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
 
         async with self._lock:
-            websocket = self._websocket
-            if websocket is None:
+            body_agent_id = self._agent_id_from_body(body)
+            target_id = agent_id or body_agent_id or self._active_id
+            explicit_target = bool(agent_id or body_agent_id)
+            if target_id not in self._connections or not self._connections[target_id].registered:
+                if explicit_target:
+                    target_id = ""
+                else:
+                    registered_ids = [cid for cid, c in self._connections.items() if c.registered]
+                    target_id = registered_ids[0] if registered_ids else ""
+            conn = self._connections.get(target_id)
+            if conn is None or not conn.registered:
                 raise ConnectionError("agent websocket is not connected")
-            self._pending[request_id] = future
+            conn.pending[request_id] = future
+
+        request_body = body if body is not None else {}
+        if isinstance(request_body, dict):
+            request_body = dict(request_body)
+            request_body.setdefault("agent_id", target_id)
 
         message = {
             "type": "request",
             "id": request_id,
             "route": route_name,
             "method": method,
-            "body": body if body is not None else {},
+            "agent_id": target_id,
+            "body": request_body,
         }
 
         try:
-            async with self._send_lock:
-                await websocket.send_text(json.dumps(message, ensure_ascii=False))
+            async with conn.send_lock:
+                await conn.websocket.send_text(json.dumps(message, ensure_ascii=False))
             raw_response = await asyncio.wait_for(future, timeout=timeout)
             return self._coerce_response(raw_response)
         except Exception:
             async with self._lock:
-                self._pending.pop(request_id, None)
+                conn.pending.pop(request_id, None)
             raise
 
     async def close(self) -> None:
         async with self._lock:
-            websocket = self._websocket
-            self._websocket = None
-            pending = self._pending
-            self._pending = {}
-            self._peer = ""
-            self._connected_at = 0.0
-            self._last_seen_at = 0.0
+            conns = list(self._connections.values())
+            self._connections = {}
+            self._active_id = ""
 
-        for future in pending.values():
-            if not future.done():
-                future.set_exception(ConnectionError("agent websocket closed"))
-        if websocket is not None:
-            await self._close_socket(websocket, code=1001, reason="server shutdown")
+        for conn in conns:
+            for future in conn.pending.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("agent websocket closed"))
+            await self._close_socket(conn.websocket, code=1001, reason="server shutdown")
 
-    async def _handle_message(self, websocket: WebSocket, payload: str | bytes) -> None:
+    async def _handle_message(self, conn: AgentConnection, payload: str | bytes) -> None:
         try:
             if isinstance(payload, bytes):
                 payload = payload.decode("utf-8")
             message = json.loads(payload)
         except Exception:
-            await websocket.send_text(json.dumps({
+            await conn.websocket.send_text(json.dumps({
                 "type": "error",
                 "ok": False,
                 "status": 400,
@@ -155,11 +285,26 @@ class AgentWebSocketManager:
             return
 
         msg_type = str(message.get("type", "")).lower()
+        message_agent_id = self._agent_id_from_message(message)
+        if message_agent_id:
+            await self._bind_agent_id(conn, message_agent_id)
+
+        if msg_type == "hello" or (msg_type in {"", "register"} and message_agent_id):
+            await conn.websocket.send_text(json.dumps({
+                "type": "hello_ack" if msg_type != "register" else "register_ack",
+                "agent_id": conn.id,
+                "body": {"agent_id": conn.id},
+            }, ensure_ascii=False))
+            return
         if msg_type == "ping":
-            pong = {"type": "pong"}
+            pong = {
+                "type": "pong",
+                "agent_id": conn.id,
+                "body": {"agent_id": conn.id},
+            }
             if message.get("id"):
                 pong["id"] = message.get("id")
-            await websocket.send_text(json.dumps(pong, ensure_ascii=False))
+            await conn.websocket.send_text(json.dumps(pong, ensure_ascii=False))
             return
         if msg_type == "pong":
             return
@@ -173,7 +318,7 @@ class AgentWebSocketManager:
             return
 
         async with self._lock:
-            future = self._pending.pop(request_id, None)
+            future = conn.pending.pop(request_id, None)
 
         if future is None:
             print(f"[AGENT_WS] late/unknown response id={request_id}", flush=True)
@@ -181,16 +326,79 @@ class AgentWebSocketManager:
         if not future.done():
             future.set_result(message)
 
-    async def _detach(self, websocket: WebSocket, reason: str) -> None:
+    def _agent_id_from_body(self, body: Any) -> str:
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except Exception:
+                return ""
+        if not isinstance(body, dict):
+            return ""
+        return str(
+            body.get("agent_id")
+            or body.get("AgentId")
+            or body.get("agentId")
+            or body.get("account_id")
+            or self._agent_id_from_body(body.get("body"))
+            or self._agent_id_from_body(body.get("data"))
+            or self._agent_id_from_body(body.get("payload"))
+            or self._agent_id_from_body(body.get("params"))
+            or ""
+        ).strip()
+
+    def _agent_id_from_message(self, message: dict[str, Any]) -> str:
+        direct = str(
+            message.get("agent_id")
+            or message.get("AgentId")
+            or message.get("agentId")
+            or message.get("account_id")
+            or ""
+        ).strip()
+        if direct:
+            return direct
+        return self._agent_id_from_body(message.get("body"))
+
+    async def _bind_agent_id(self, conn: AgentConnection, agent_id: str) -> None:
+        agent_id = str(agent_id or "").strip()
+        if not agent_id or agent_id == conn.id:
+            return
+
+        old_conn: AgentConnection | None = None
         async with self._lock:
-            if self._websocket is not websocket:
+            if self._connections.get(conn.id) is conn:
+                self._connections.pop(conn.id, None)
+
+            old_conn = self._connections.get(agent_id)
+            if old_conn is not None and old_conn is not conn:
+                self._connections.pop(agent_id, None)
+
+            old_id = conn.id
+            conn.id = agent_id
+            conn.registered = True
+            self._connections[agent_id] = conn
+            if not self._active_id or self._active_id == old_id or self._active_id not in self._connections:
+                self._active_id = agent_id
+
+        if old_conn is not None and old_conn is not conn:
+            for future in old_conn.pending.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("agent websocket was replaced"))
+            old_conn.pending = {}
+            await self._close_socket(old_conn.websocket, code=1012, reason="agent reconnected")
+            print(f"[AGENT_WS] replaced id={agent_id} peer={old_conn.peer}", flush=True)
+
+        print(f"[AGENT_WS] registered id={agent_id} peer={conn.peer}", flush=True)
+
+    async def _detach(self, conn: AgentConnection, reason: str) -> None:
+        async with self._lock:
+            current = self._connections.get(conn.id)
+            if current is not conn:
                 return
-            self._websocket = None
-            self._peer = ""
-            self._connected_at = 0.0
-            self._last_seen_at = 0.0
-            pending = self._pending
-            self._pending = {}
+            self._connections.pop(conn.id, None)
+            if self._active_id == conn.id:
+                self._active_id = next((cid for cid, item in self._connections.items() if item.registered), "")
+            pending = conn.pending
+            conn.pending = {}
 
         for future in pending.values():
             if not future.done():

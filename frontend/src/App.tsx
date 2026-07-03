@@ -1,22 +1,32 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, type FormEvent } from "react";
 import { useWebSocket } from "./useWebSocket";
 import SessionList, { type SessionMenuAction } from "./components/SessionList";
 import ChatArea from "./components/ChatArea";
 import {
+  activateAccount,
   batchGetContactBrief,
   broadcastImageUpload,
   broadcastText,
+  clearActiveAgentId,
+  clearAccessKey,
+  getAccessKey,
+  getAccounts,
   getContactProfiles,
   getGroupMemberNames,
+  loginWithKey,
   markAsRead,
   markSessionUnread,
+  multiAccountBroadcastImageUpload,
+  multiAccountBroadcastText,
   muteSession,
   refreshSessions,
+  setActiveAgentId,
+  setAccessKey,
   stickyChat,
   unmuteSession,
   unpinChat,
 } from "./api";
-import type { ContactProfile, Session, ChatMessage, WSMessage } from "./types";
+import type { ContactProfile, Session, ChatMessage, WSMessage, WeChatAccount } from "./types";
 import { replaceWechatEmojis } from "./utils/wechatEmoji";
 
 type ViewMode = "chats" | "contacts" | "broadcast";
@@ -323,6 +333,7 @@ function isBareImageHashMessage(msg: ChatMessage): boolean {
     String(msg.msgtype || "") === "3"
     && /^[a-f0-9]{32}$/i.test(String(msg.msg || "").trim())
     && !msg.img_path
+    && !msg.db_image_id
     && !msg.bytesExtraHex
   );
 }
@@ -372,7 +383,7 @@ function removeCallbackEchoes(msgs: ChatMessage[]): ChatMessage[] {
         return String(other.msg || "") === String(msg.msg || "");
       }
       if (msgType === "3") {
-        return Boolean(other.img_path || other.bytesExtraHex || String(other.msg || "").includes("<img"));
+        return Boolean(other.img_path || other.db_image_id || other.bytesExtraHex || String(other.msg || "").includes("<img"));
       }
       return false;
     });
@@ -437,6 +448,7 @@ function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessag
     sendorrecv,
     isSender: sendorrecv === "1" ? 1 : 0,
     img_path: msg.img_path,
+    db_image_id: msg.db_image_id,
     img_len: msg.img_len,
     video_path: msg.video_path,
     voice_len: msg.voice_len,
@@ -451,6 +463,11 @@ function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessag
 
 // ─── App Component ───────────────────────────────────────────────
 export default function App() {
+  const [authenticated, setAuthenticated] = useState(() => Boolean(getAccessKey()));
+  const [selectedAccountId, setSelectedAccountId] = useState("");
+  const [accounts, setAccounts] = useState<WeChatAccount[]>([]);
+  const [accountsLoading, setAccountsLoading] = useState(false);
+  const [authError, setAuthError] = useState("");
   const [selfWxid, setSelfWxid] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [rawContacts, setRawContacts] = useState<any>(null);
@@ -473,6 +490,7 @@ export default function App() {
   const briefTimer = useRef<number | null>(null);
   const briefInFlight = useRef(false);
   const briefRequestedWxids = useRef<Set<string>>(new Set());
+  const groupNamesFetched = useRef<Set<string>>(new Set());
   // Keep a live ref to avatarMap so flushBriefQueue always sees the latest
   const avatarMapRef = useRef(avatarMap);
   avatarMapRef.current = avatarMap;
@@ -480,6 +498,85 @@ export default function App() {
   contactMapRef.current = contactMap;
   const contactProfilesRef = useRef(contactProfiles);
   contactProfilesRef.current = contactProfiles;
+
+  const resetChatState = useCallback(() => {
+    setSelfWxid("");
+    setSessions([]);
+    setRawContacts(null);
+    setContactMap({});
+    setAvatarMap({});
+    setContactProfiles({});
+    setActiveChat(null);
+    setChatMessages({});
+    setViewMode("chats");
+    setContactsHydrating(false);
+    setContactsHydrated(false);
+    pendingBriefWxids.current.clear();
+    briefRequestedWxids.current.clear();
+    groupNamesFetched.current.clear();
+  }, []);
+
+  const loadAccounts = useCallback(async () => {
+    setAccountsLoading(true);
+    try {
+      const data = await getAccounts();
+      const rows = Array.isArray(data?.accounts) ? data.accounts : [];
+      setAccounts(rows);
+    } catch (err) {
+      console.error("[ACCOUNTS] load failed:", err);
+    } finally {
+      setAccountsLoading(false);
+    }
+  }, []);
+
+  const handleLogin = useCallback(async (key: string) => {
+    setAuthError("");
+    try {
+      setAccessKey(key);
+      const data = await loginWithKey(key);
+      if (!data?.ok) {
+        clearAccessKey();
+        setAuthError("密钥不正确");
+        return false;
+      }
+      setAuthenticated(true);
+      await loadAccounts();
+      return true;
+    } catch {
+      clearAccessKey();
+      setAuthError("登录失败");
+      return false;
+    }
+  }, [loadAccounts]);
+
+  const handleSelectAccount = useCallback(async (account: WeChatAccount) => {
+    const agentId = account.id;
+    if (!agentId) return;
+    resetChatState();
+    const data = await activateAccount(agentId);
+    if (!data?.ok) {
+      await loadAccounts();
+      return;
+    }
+    setActiveAgentId(agentId);
+    setSelectedAccountId(agentId);
+  }, [loadAccounts, resetChatState]);
+
+  const handleLeaveAccount = useCallback(() => {
+    clearActiveAgentId();
+    resetChatState();
+    setSelectedAccountId("");
+    loadAccounts();
+  }, [loadAccounts, resetChatState]);
+
+  const handleLogout = useCallback(() => {
+    clearActiveAgentId();
+    clearAccessKey();
+    setAuthenticated(false);
+    setSelectedAccountId("");
+    setAccounts([]);
+    resetChatState();
+  }, [resetChatState]);
 
   const applyContactProfileUpdates = useCallback((updates: Record<string, ContactProfile> | undefined) => {
     if (!updates || typeof updates !== "object" || Object.keys(updates).length === 0) return;
@@ -673,8 +770,6 @@ export default function App() {
   }, [selfWxid, scheduleBriefFlush]);
 
   // ─── Fetch group member names (fast) on entering a group ──────────
-  const groupNamesFetched = useRef<Set<string>>(new Set());
-
   const fetchGroupMemberNames = useCallback((gid: string) => {
     if (groupNamesFetched.current.has(gid)) return;
     groupNamesFetched.current.add(gid);
@@ -699,6 +794,8 @@ export default function App() {
 
   // ─── WebSocket message handler ──────────────────────────────────
   const handleWSMessage = useCallback((wsMsg: WSMessage) => {
+    const eventAccountId = String((wsMsg as any)?.data?.account_id || "");
+    if (selectedAccountId && eventAccountId && eventAccountId !== selectedAccountId) return;
     if (wsMsg.type === "init") {
       const {
         self_info,
@@ -962,9 +1059,16 @@ export default function App() {
         );
       }
     }
-  }, [selfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, applyContactProfileUpdates]);
+  }, [selfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, applyContactProfileUpdates, selectedAccountId]);
 
-  const { connected } = useWebSocket(handleWSMessage);
+  const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId));
+
+  useEffect(() => {
+    if (!authenticated || selectedAccountId) return;
+    loadAccounts();
+    const timer = window.setInterval(loadAccounts, 3000);
+    return () => window.clearInterval(timer);
+  }, [authenticated, selectedAccountId, loadAccounts]);
 
   // ─── Periodic session refresh (picks up PC-sent messages missed by hook) ──
   useEffect(() => {
@@ -1287,6 +1391,22 @@ export default function App() {
   } as Session : null);
   const activeMsgs = activeChat ? (chatMessages[activeChat] || []) : [];
 
+  if (!authenticated) {
+    return <AccessGate onLogin={handleLogin} error={authError} />;
+  }
+
+  if (!selectedAccountId) {
+    return (
+      <AccountPortal
+        accounts={accounts}
+        loading={accountsLoading}
+        onRefresh={loadAccounts}
+        onSelectAccount={handleSelectAccount}
+        onLogout={handleLogout}
+      />
+    );
+  }
+
   return (
     <div className="h-dvh w-screen bg-[#f5f5f5] overflow-hidden relative flex">
       {/* Connection status */}
@@ -1302,6 +1422,7 @@ export default function App() {
         selfAvatar={selfAvatar}
         onSelfClick={openSelfProfileCard}
         onModeChange={switchMode}
+        onBackToAccounts={handleLeaveAccount}
       />
 
       <div className="w-[272px] shrink-0 border-r border-[#d8d8d8] bg-[#e9e8e8] h-full">
@@ -1378,18 +1499,294 @@ export default function App() {
   );
 }
 
+function AccessGate({
+  onLogin,
+  error,
+}: {
+  onLogin: (key: string) => Promise<boolean>;
+  error: string;
+}) {
+  const [key, setKey] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!key.trim() || submitting) return;
+    setSubmitting(true);
+    try {
+      await onLogin(key.trim());
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="h-dvh w-screen bg-[#111111] text-[#e8e8e8] flex items-center justify-center">
+      <form onSubmit={submit} className="w-[360px] max-w-[calc(100vw-40px)]">
+        <div className="text-[24px] font-medium mb-[22px]">访问密钥</div>
+        <input
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          autoFocus
+          type="password"
+          className="w-full h-[44px] rounded-[4px] bg-[#222] border border-[#3a3a3a] px-[12px] outline-none focus:border-[#07c160]"
+          placeholder="请输入 key"
+        />
+        {error && <div className="mt-[10px] text-[13px] text-[#f56c6c]">{error}</div>}
+        <button
+          type="submit"
+          disabled={submitting || !key.trim()}
+          className="mt-[16px] w-full h-[42px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#315541] active:opacity-85"
+        >
+          {submitting ? "验证中" : "进入"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function AccountPortal({
+  accounts,
+  loading,
+  onRefresh,
+  onSelectAccount,
+  onLogout,
+}: {
+  accounts: WeChatAccount[];
+  loading: boolean;
+  onRefresh: () => void;
+  onSelectAccount: (account: WeChatAccount) => void;
+  onLogout: () => void;
+}) {
+  return (
+    <div className="h-dvh w-screen bg-[#111111] text-[#e8e8e8] overflow-hidden flex">
+      <div className="w-[420px] max-w-[44vw] min-w-[340px] border-r border-[#2b2b2b] h-full flex flex-col">
+        <div className="h-[78px] px-[24px] flex items-center justify-between border-b border-[#242424]">
+          <div>
+            <div className="text-[22px] font-medium">微信账号</div>
+            <div className="text-[12px] text-[#777] mt-[3px]">在线 {accounts.length} 个</div>
+          </div>
+          <div className="flex items-center gap-[8px]">
+            <button
+              type="button"
+              onClick={onRefresh}
+              className="h-[32px] px-[10px] rounded-[4px] bg-[#242424] text-[#cfcfcf] active:bg-[#303030]"
+            >
+              刷新
+            </button>
+            <button
+              type="button"
+              onClick={onLogout}
+              className="h-[32px] px-[10px] rounded-[4px] bg-[#242424] text-[#cfcfcf] active:bg-[#303030]"
+            >
+              退出
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto p-[18px]">
+          {loading && accounts.length === 0 && <div className="text-[#777] text-[14px]">正在读取在线微信...</div>}
+          {accounts.length === 0 && !loading && (
+            <div className="text-[#777] text-[14px] leading-[24px]">
+              暂无在线微信。请让客户端 DLL 连接到当前后端 `/agent`。
+            </div>
+          )}
+          <div className="space-y-[12px]">
+            {accounts.map((account) => (
+              <button
+                key={account.id}
+                type="button"
+                onClick={() => onSelectAccount(account)}
+                className="w-full min-h-[82px] rounded-[6px] bg-[#1b1b1b] hover:bg-[#242424] active:bg-[#2b2b2b] border border-[#2b2b2b] p-[14px] flex items-center gap-[14px] text-left"
+              >
+                <AccountAvatar account={account} />
+                <div className="min-w-0 flex-1">
+                  <div className="text-[18px] truncate">{account.nickname || account.wxid || account.id}</div>
+                  <div className="text-[12px] text-[#888] truncate mt-[5px]">{account.wxid || account.account_id || account.id}</div>
+                  <div className="text-[12px] text-[#666] truncate mt-[3px]">{account.peer || "connected"}</div>
+                </div>
+                <div className={`text-[12px] px-[7px] py-[3px] rounded-[4px] ${
+                  account.initialized ? "bg-[#123d27] text-[#49d17d]" : "bg-[#3d3112] text-[#e6bd51]"
+                }`}>
+                  {account.initialized ? "已就绪" : "初始化中"}
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="flex-1 min-w-0 h-full">
+        <MultiAccountBroadcastPanel accounts={accounts} />
+      </div>
+    </div>
+  );
+}
+
+function AccountAvatar({ account }: { account: WeChatAccount }) {
+  const [failed, setFailed] = useState(false);
+  const name = account.nickname || account.wxid || account.id || "?";
+  if (account.avatar && !failed) {
+    return <img src={account.avatar} alt="" className="w-[54px] h-[54px] rounded-[5px] object-cover bg-[#333]" onError={() => setFailed(true)} />;
+  }
+  return (
+    <div className="w-[54px] h-[54px] rounded-[5px] bg-[#07c160] text-white flex items-center justify-center text-[22px] shrink-0">
+      {name[0]}
+    </div>
+  );
+}
+
+function MultiAccountBroadcastPanel({ accounts }: { accounts: WeChatAccount[] }) {
+  const [targetText, setTargetText] = useState("");
+  const [message, setMessage] = useState("");
+  const [image, setImage] = useState<File | null>(null);
+  const [preview, setPreview] = useState("");
+  const [selectedAgents, setSelectedAgents] = useState<Set<string>>(new Set());
+  const [sending, setSending] = useState(false);
+  const [resultText, setResultText] = useState("");
+
+  useEffect(() => {
+    setSelectedAgents(new Set(accounts.map((a) => a.id).filter(Boolean)));
+  }, [accounts]);
+
+  useEffect(() => {
+    if (!image) {
+      setPreview("");
+      return;
+    }
+    const url = URL.createObjectURL(image);
+    setPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [image]);
+
+  const targets = targetText
+    .split(/[\s,，;；]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const agentIds = Array.from(selectedAgents).filter(Boolean);
+
+  const toggleAgent = (id: string) => {
+    setSelectedAgents((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const sendText = async () => {
+    if (!message.trim() || targets.length === 0 || agentIds.length === 0 || sending) return;
+    setSending(true);
+    setResultText("");
+    try {
+      const res = await multiAccountBroadcastText(agentIds, targets, message.trim());
+      setResultText(`文本完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const sendImage = async () => {
+    if (!image || targets.length === 0 || agentIds.length === 0 || sending) return;
+    setSending(true);
+    setResultText("");
+    try {
+      const res = await multiAccountBroadcastImageUpload(agentIds, targets, image);
+      setResultText(`图片完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="h-full overflow-y-auto p-[28px]">
+      <div className="max-w-[760px]">
+        <div className="text-[22px] font-medium">多号群发</div>
+        <div className="mt-[18px] grid grid-cols-1 gap-[14px]">
+          <div>
+            <div className="text-[13px] text-[#888] mb-[8px]">发送账号</div>
+            <div className="flex flex-wrap gap-[8px]">
+              {accounts.map((account) => (
+                <label key={account.id} className="h-[34px] px-[10px] rounded-[4px] bg-[#1d1d1d] border border-[#303030] flex items-center gap-[7px] cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selectedAgents.has(account.id)}
+                    onChange={() => toggleAgent(account.id)}
+                    className="accent-[#07c160]"
+                  />
+                  <span className="text-[13px]">{account.nickname || account.wxid || account.id}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[13px] text-[#888] mb-[8px]">目标 wxid / 群 id</div>
+            <textarea
+              value={targetText}
+              onChange={(e) => setTargetText(e.target.value)}
+              className="w-full h-[92px] resize-none rounded-[4px] bg-[#1d1d1d] border border-[#303030] outline-none px-[10px] py-[8px] text-[14px] focus:border-[#07c160]"
+              placeholder="每行一个，或用逗号分隔"
+            />
+          </div>
+
+          <div>
+            <div className="text-[13px] text-[#888] mb-[8px]">文本消息</div>
+            <textarea
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              className="w-full h-[100px] resize-none rounded-[4px] bg-[#1d1d1d] border border-[#303030] outline-none px-[10px] py-[8px] text-[14px] focus:border-[#07c160]"
+              placeholder="输入文本"
+            />
+            <button
+              type="button"
+              disabled={sending || !message.trim() || targets.length === 0 || agentIds.length === 0}
+              onClick={sendText}
+              className="mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#315541] active:opacity-85"
+            >
+              {sending ? "发送中" : "群发文本"}
+            </button>
+          </div>
+
+          <div>
+            <div className="text-[13px] text-[#888] mb-[8px]">图片消息</div>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => setImage(e.target.files?.[0] || null)}
+              className="block text-[13px] text-[#aaa]"
+            />
+            {preview && <img src={preview} alt="" className="mt-[10px] max-w-[180px] max-h-[140px] rounded-[4px] object-contain bg-[#1d1d1d]" />}
+            <button
+              type="button"
+              disabled={sending || !image || targets.length === 0 || agentIds.length === 0}
+              onClick={sendImage}
+              className="mt-[10px] h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#315541] active:opacity-85"
+            >
+              {sending ? "发送中" : "群发图片"}
+            </button>
+          </div>
+
+          <div className="text-[13px] text-[#888]">
+            已选账号 {agentIds.length} 个，目标 {targets.length} 个。{resultText}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function WorkspaceSidebar({
   mode,
   selfName,
   selfAvatar,
   onSelfClick,
   onModeChange,
+  onBackToAccounts,
 }: {
   mode: ViewMode;
   selfName: string;
   selfAvatar: string;
   onSelfClick: () => void;
   onModeChange: (mode: ViewMode) => void;
+  onBackToAccounts: () => void;
 }) {
   return (
     <div className="w-[56px] shrink-0 h-full bg-[#2e2e2e] flex flex-col items-center py-[14px]">
@@ -1428,6 +1825,18 @@ function WorkspaceSidebar({
           icon={<path d="M5 7.5h8.5a3.5 3.5 0 0 1 0 7H8l-4 3v-6A4 4 0 0 1 5 7.5Zm11.5 2.2 3.5-2.2v7l-3.5-2.2V9.7Z" />}
         />
       </div>
+
+      <button
+        type="button"
+        title="返回账号"
+        onClick={onBackToAccounts}
+        className="mt-auto mb-[12px] w-[40px] h-[40px] flex items-center justify-center text-[#9b9b9b] hover:text-[#07c160] active:opacity-75"
+      >
+        <svg className="w-[25px] h-[25px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M15 18 9 12l6-6" />
+          <path strokeLinecap="round" strokeLinejoin="round" d="M10 12h10" />
+        </svg>
+      </button>
     </div>
   );
 }

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { WSMessage } from "./types";
+import { getAccessKey, getActiveAgentId } from "./api";
 
-export function useWebSocket(onMessage: (msg: WSMessage) => void) {
+export function useWebSocket(onMessage: (msg: WSMessage) => void, enabled = true) {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const onMessageRef = useRef(onMessage);
@@ -22,6 +23,7 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
   }, []);
 
   const connect = useCallback(() => {
+    if (!enabled) return;
     if (unmountedRef.current) return;
     if (connectingRef.current) return;
     connectingRef.current = true;
@@ -36,7 +38,11 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
     }
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/api/ws`;
+    const params = new URLSearchParams();
+    params.set("key", getAccessKey());
+    const agentId = getActiveAgentId();
+    if (agentId) params.set("agent_id", agentId);
+    const wsUrl = `${protocol}//${window.location.host}/api/ws?${params.toString()}`;
     console.log("[WS] Connecting to", wsUrl);
 
     let ws: WebSocket;
@@ -133,7 +139,7 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
     };
 
     wsRef.current = ws;
-  }, [clearTimers]);
+  }, [clearTimers, enabled]);
 
   const forceReconnect = useCallback(() => {
     console.log("[WS] Force reconnect");
@@ -143,6 +149,17 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
 
   useEffect(() => {
     unmountedRef.current = false;
+    if (!enabled) {
+      clearTimers();
+      if (wsRef.current) {
+        const ws = wsRef.current;
+        ws.onclose = null; ws.onerror = null; ws.onmessage = null; ws.onopen = null;
+        try { ws.close(); } catch { /* ignore */ }
+        wsRef.current = null;
+      }
+      setConnected(false);
+      return;
+    }
 
     // Small delay so React strict-mode cleanup finishes before we connect
     const initTimer = setTimeout(() => {
@@ -181,7 +198,7 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void) {
         wsRef.current = null;
       }
     };
-  }, [connect, forceReconnect, clearTimers]);
+  }, [connect, forceReconnect, clearTimers, enabled]);
 
   return { connected, ws: wsRef };
 }

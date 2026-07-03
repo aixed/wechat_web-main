@@ -1,4 +1,32 @@
 const BASE = "";  // Same origin via Vite proxy
+export const ACCESS_KEY_STORAGE = "wechat_web_access_key";
+export const ACTIVE_AGENT_STORAGE = "wechat_web_active_agent_id";
+
+export const getAccessKey = () => window.localStorage.getItem(ACCESS_KEY_STORAGE) || "";
+export const setAccessKey = (key: string) => window.localStorage.setItem(ACCESS_KEY_STORAGE, key);
+export const clearAccessKey = () => window.localStorage.removeItem(ACCESS_KEY_STORAGE);
+export const getActiveAgentId = () => window.localStorage.getItem(ACTIVE_AGENT_STORAGE) || "";
+export const setActiveAgentId = (agentId: string) => window.localStorage.setItem(ACTIVE_AGENT_STORAGE, agentId);
+export const clearActiveAgentId = () => window.localStorage.removeItem(ACTIVE_AGENT_STORAGE);
+
+export const authQuery = () => {
+  const params = new URLSearchParams();
+  const key = getAccessKey();
+  const agentId = getActiveAgentId();
+  if (key) params.set("key", key);
+  if (agentId) params.set("agent_id", agentId);
+  return params.toString();
+};
+
+function authHeaders(extra?: HeadersInit): HeadersInit {
+  const key = getAccessKey();
+  const agentId = getActiveAgentId();
+  return {
+    ...(extra || {}),
+    ...(key ? { "X-Access-Key": key } : {}),
+    ...(agentId ? { "X-Agent-Id": agentId } : {}),
+  };
+}
 
 async function fetchWithTimeout(url: string, options?: RequestInit, timeoutMs = 30_000) {
   const controller = new AbortController();
@@ -15,11 +43,25 @@ async function fetchWithTimeout(url: string, options?: RequestInit, timeoutMs = 
 
 export async function fetchJSON(url: string, options?: RequestInit) {
   const res = await fetchWithTimeout(BASE + url, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers: authHeaders({ "Content-Type": "application/json", ...(options?.headers || {}) }),
   });
   return res.json();
 }
+
+export const loginWithKey = (key: string) =>
+  fetchJSON("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ key }),
+    headers: { "Content-Type": "application/json" },
+  });
+
+export const getAccounts = () => fetchJSON("/api/accounts");
+export const activateAccount = (agentId: string) =>
+  fetchJSON("/api/accounts/activate", {
+    method: "POST",
+    body: JSON.stringify({ agent_id: agentId }),
+  });
 
 // ─── Contacts & Sessions ─────────────────────────────────────────
 
@@ -88,7 +130,7 @@ export const sendImageUpload = async (wxid: string, file: File) => {
   const form = new FormData();
   form.append("wxid", wxid);
   form.append("file", file);
-  const res = await fetchWithTimeout("/api/send/image-upload", { method: "POST", body: form }, 60_000);
+  const res = await fetchWithTimeout("/api/send/image-upload", { method: "POST", body: form, headers: authHeaders() }, 60_000);
   return res.json();
 };
 
@@ -96,7 +138,7 @@ export const sendFileUpload = async (wxid: string, file: File) => {
   const form = new FormData();
   form.append("wxid", wxid);
   form.append("file", file);
-  const res = await fetchWithTimeout("/api/send/file-upload", { method: "POST", body: form }, 120_000);
+  const res = await fetchWithTimeout("/api/send/file-upload", { method: "POST", body: form, headers: authHeaders() }, 120_000);
   return res.json();
 };
 
@@ -104,7 +146,7 @@ export const sendVideoUpload = async (wxid: string, file: File) => {
   const form = new FormData();
   form.append("wxid", wxid);
   form.append("file", file);
-  const res = await fetchWithTimeout("/api/send/video-upload", { method: "POST", body: form }, 180_000);
+  const res = await fetchWithTimeout("/api/send/video-upload", { method: "POST", body: form, headers: authHeaders() }, 180_000);
   return res.json();
 };
 
@@ -112,7 +154,7 @@ export const sendGifUpload = async (wxid: string, file: File) => {
   const form = new FormData();
   form.append("wxid", wxid);
   form.append("file", file);
-  const res = await fetchWithTimeout("/api/send/gif-upload", { method: "POST", body: form }, 120_000);
+  const res = await fetchWithTimeout("/api/send/gif-upload", { method: "POST", body: form, headers: authHeaders() }, 120_000);
   return res.json();
 };
 
@@ -126,7 +168,22 @@ export const broadcastImageUpload = async (wxids: string[], file: File) => {
   const form = new FormData();
   form.append("wxids", JSON.stringify(wxids));
   form.append("file", file);
-  const res = await fetchWithTimeout("/api/broadcast/image-upload", { method: "POST", body: form }, 300_000);
+  const res = await fetchWithTimeout("/api/broadcast/image-upload", { method: "POST", body: form, headers: authHeaders() }, 300_000);
+  return res.json();
+};
+
+export const multiAccountBroadcastText = (agentIds: string[], wxids: string[], msg: string) =>
+  fetchJSON("/api/accounts/broadcast/text", {
+    method: "POST",
+    body: JSON.stringify({ agent_ids: agentIds, wxids, msg }),
+  });
+
+export const multiAccountBroadcastImageUpload = async (agentIds: string[], wxids: string[], file: File) => {
+  const form = new FormData();
+  form.append("agent_ids", JSON.stringify(agentIds));
+  form.append("wxids", JSON.stringify(wxids));
+  form.append("file", file);
+  const res = await fetchWithTimeout("/api/accounts/broadcast/image-upload", { method: "POST", body: form, headers: authHeaders() }, 600_000);
   return res.json();
 };
 
@@ -172,7 +229,10 @@ export const unmuteSession = (wxid: string) =>
 // ─── Media ───────────────────────────────────────────────────────
 
 export const getImageUrl = (path: string) =>
-  `/api/media/image?path=${encodeURIComponent(path)}`;
+  `/api/media/image?path=${encodeURIComponent(path)}${authQuery() ? `&${authQuery()}` : ""}`;
+
+export const getDbImageUrl = (mediaId: string) =>
+  `/api/media/db-image/${encodeURIComponent(mediaId)}${authQuery() ? `?${authQuery()}` : ""}`;
 
 export const getGifUrl = (msgXml: string) =>
   fetchJSON("/api/media/gif-url", {
@@ -183,7 +243,7 @@ export const getGifUrl = (msgXml: string) =>
 export const downloadImage = async (bytesExtraHex: string, msgXml: string, msgId?: string): Promise<string> => {
   const res = await fetchWithTimeout("/api/media/download-image", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ bytes_extra_hex: bytesExtraHex, msg_xml: msgXml, msg_id: msgId || "" }),
   }, 60_000);
   if (!res.ok) return "";
