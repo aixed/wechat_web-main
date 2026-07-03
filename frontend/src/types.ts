@@ -36,6 +36,11 @@ export interface WeChatAccount {
   wxid?: string;
   nickname?: string;
   avatar?: string;
+  phone?: string;
+  region?: string;
+  signature?: string;
+  wechat_account?: string;
+  profile?: Record<string, any>;
   peer?: string;
   connected_at?: number;
   last_seen_at?: number;

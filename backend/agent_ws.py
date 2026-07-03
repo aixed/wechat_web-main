@@ -11,7 +11,7 @@ import base64
 import json
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -38,6 +38,11 @@ class AgentConnection:
     nickname: str = ""
     wxid: str = ""
     avatar: str = ""
+    phone: str = ""
+    region: str = ""
+    signature: str = ""
+    wechat_account: str = ""
+    profile: dict[str, Any] = field(default_factory=dict)
     server_port: str = ""
     initialized: bool = False
     login_status: str = ""
@@ -77,6 +82,11 @@ class AgentWebSocketManager:
         wxid: str = "",
         nickname: str = "",
         avatar: str = "",
+        phone: str = "",
+        region: str = "",
+        signature: str = "",
+        wechat_account: str = "",
+        profile: dict[str, Any] | None = None,
         login_status: str = "",
         login_message: str = "",
         initialized: bool | None = None,
@@ -94,6 +104,16 @@ class AgentWebSocketManager:
                 conn.nickname = nickname
             if avatar:
                 conn.avatar = avatar
+            if phone:
+                conn.phone = phone
+            if region:
+                conn.region = region
+            if signature:
+                conn.signature = signature
+            if wechat_account:
+                conn.wechat_account = wechat_account
+            if profile:
+                conn.profile = {**conn.profile, **profile}
             if login_status:
                 conn.login_status = str(login_status)
                 conn.login_status_updated_at = time.time()
@@ -129,6 +149,11 @@ class AgentWebSocketManager:
                 "wxid": conn.wxid,
                 "nickname": conn.nickname,
                 "avatar": conn.avatar,
+                "phone": conn.phone,
+                "region": conn.region,
+                "signature": conn.signature,
+                "wechat_account": conn.wechat_account,
+                "profile": dict(conn.profile),
                 "server_port": conn.server_port,
                 "peer": conn.peer,
                 "connected_at": conn.connected_at,
@@ -153,6 +178,11 @@ class AgentWebSocketManager:
             "wxid": conn.wxid,
             "nickname": conn.nickname,
             "avatar": conn.avatar,
+            "phone": conn.phone,
+            "region": conn.region,
+            "signature": conn.signature,
+            "wechat_account": conn.wechat_account,
+            "profile": dict(conn.profile),
             "server_port": conn.server_port,
             "peer": conn.peer,
             "connected_at": conn.connected_at,

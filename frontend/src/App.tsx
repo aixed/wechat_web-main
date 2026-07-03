@@ -2579,6 +2579,18 @@ function accountStatusMeta(account: WeChatAccount, dark: boolean): { text: strin
   return { text: message || "等待登录", className: neutral };
 }
 
+function accountProfileLine(account: WeChatAccount, keys: string[]): string {
+  const raw = account.profile || {};
+  const values = keys.map((key) => {
+    if (key === "wechat_account") return account.wechat_account || profileField(raw, ["account", "alias", "Alias", "wechat_account", "userName"]);
+    if (key === "phone") return account.phone || profileField(raw, ["tel", "Tel", "phone", "Phone", "mobile", "Mobile"]);
+    if (key === "region") return account.region || profileArea(raw);
+    if (key === "signature") return account.signature || profileField(raw, ["diy_sign", "signature", "Signature", "sign"]);
+    return "";
+  });
+  return values.filter(Boolean).join(" · ");
+}
+
 function AccountPortal({
   accounts,
   loading,
@@ -2654,6 +2666,16 @@ function AccountPortal({
                 <div className="min-w-0 flex-1">
                   <div className="text-[18px] truncate">{accountDisplayName(account)}</div>
                   <div className={`text-[12px] truncate mt-[5px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{account.wxid || account.account_id || account.id}</div>
+                  {accountProfileLine(account, ["wechat_account", "phone"]) && (
+                    <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#777]" : "text-[#888]"}`}>
+                      {accountProfileLine(account, ["wechat_account", "phone"])}
+                    </div>
+                  )}
+                  {accountProfileLine(account, ["region", "signature"]) && (
+                    <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>
+                      {accountProfileLine(account, ["region", "signature"])}
+                    </div>
+                  )}
                   <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{account.peer || "connected"}</div>
                   <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#555]" : "text-[#aaa]"}`} title={account.id}>WS {account.id}</div>
                 </div>
@@ -2800,6 +2822,11 @@ function MobileAccountPortal({
                 <div className="min-w-0 flex-1">
                   <div className="text-[18px] font-medium truncate">{displayName(account)}</div>
                   <div className={`text-[13px] truncate mt-[4px] ${dark ? "text-[#888]" : "text-[#888]"}`}>{account.wxid || account.account_id || account.id}</div>
+                  {accountProfileLine(account, ["wechat_account", "phone", "region"]) && (
+                    <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#777]" : "text-[#888]"}`}>
+                      {accountProfileLine(account, ["wechat_account", "phone", "region"])}
+                    </div>
+                  )}
                   <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>WS {account.id}</div>
                 </div>
                 <span className={`text-[12px] px-[7px] py-[3px] rounded-full ${meta.className}`}>
