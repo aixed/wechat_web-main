@@ -155,6 +155,9 @@ _active_agent_id = ""
 _account_runtimes: dict[str, dict] = {}
 _self_wxid_to_agent_id: dict[str, str] = {}
 _ACCOUNT_LOCK = asyncio.Lock()
+_ACCOUNT_CARD_REFRESH_INTERVAL_SEC = 20.0
+_account_card_refresh_at: dict[str, float] = {}
+_account_card_refreshing: set[str] = set()
 
 
 def _new_app_state() -> dict:
@@ -215,6 +218,186 @@ def _extract_self_wxid(data: dict) -> str:
         or nested.get("wxid")
         or ""
     )
+
+
+def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid: str = "") -> dict[str, str]:
+    if not isinstance(data, dict):
+        data = {}
+    nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+    source = nested or data
+    wxid = str(
+        source.get("wxid")
+        or source.get("Wxid")
+        or source.get("selfwxid")
+        or source.get("selfWxid")
+        or source.get("self_wxid")
+        or data.get("wxid")
+        or data.get("selfwxid")
+        or current_wxid
+        or ""
+    ).strip()
+    nickname = str(
+        source.get("nickname")
+        or source.get("NickName")
+        or source.get("name")
+        or data.get("nickname")
+        or data.get("NickName")
+        or ""
+    ).strip()
+    if nickname in {agent_id, wxid}:
+        nickname = ""
+    avatar = str(
+        source.get("head_big")
+        or source.get("headimgurl")
+        or source.get("head_img")
+        or source.get("head_small")
+        or data.get("head_big")
+        or data.get("headimgurl")
+        or data.get("head_img")
+        or ""
+    ).strip()
+    return {"wxid": wxid, "nickname": nickname, "avatar": avatar}
+
+
+def _put_self_info_field(key: str, value: str) -> None:
+    value = str(value or "").strip()
+    if not value or not isinstance(app_state.get("self_info"), dict):
+        return
+    self_info = app_state["self_info"]
+    data = self_info.get("data")
+    if isinstance(data, dict):
+        if not data.get(key):
+            data[key] = value
+    if not self_info.get(key):
+        self_info[key] = value
+
+
+def _brief_entry_from_response(data: dict, wxid: str) -> dict:
+    if not isinstance(data, dict) or not wxid:
+        return {}
+
+    members = data.get("members")
+    if isinstance(members, dict):
+        entry = members.get(wxid)
+        if isinstance(entry, dict):
+            return {
+                "name": str(entry.get("name") or entry.get("nickname") or ""),
+                "avatar": str(entry.get("avatar") or ""),
+            }
+
+    info_list = data.get("info") or data.get("data") or data.get("list") or []
+    if isinstance(info_list, dict):
+        info_list = info_list.get("info") or info_list.get("list") or []
+    if not isinstance(info_list, list):
+        return {}
+
+    for info in info_list:
+        if not isinstance(info, dict):
+            continue
+        item_wxid = str(info.get("wxid") or info.get("UserName") or info.get("userName") or "").strip()
+        if item_wxid != wxid:
+            continue
+        return {
+            "name": str(
+                info.get("markname")
+                or info.get("nickname")
+                or info.get("NickName")
+                or info.get("nick")
+                or info.get("Remark")
+                or ""
+            ),
+            "avatar": str(
+                info.get("smallhead")
+                or info.get("bighead")
+                or info.get("SmallHeadImgUrl")
+                or info.get("BigHeadImgUrl")
+                or info.get("headimgurl")
+                or info.get("avatar")
+                or ""
+            ),
+        }
+    return {}
+
+
+async def _refresh_agent_account_brief(agent_id: str, wxid: str = "") -> dict:
+    agent_id = str(agent_id or "").strip()
+    agent = agent_manager.get_agent(agent_id) if agent_id else None
+    wxid = str(wxid or (agent or {}).get("wxid") or _get_self_wxid() or "").strip()
+    if not agent_id or not wxid:
+        return {}
+
+    try:
+        data = await wechat_api.batch_get_contact_brief_info(wxid)
+    except Exception as e:
+        _log(f"[ACCOUNT] brief lookup failed wxid={wxid}: {type(e).__name__}: {e}")
+        return {}
+
+    entry = _brief_entry_from_response(data, wxid)
+    name = str(entry.get("name") or "").strip()
+    avatar = str(entry.get("avatar") or "").strip()
+    if name == wxid or name == agent_id:
+        name = ""
+
+    if name or avatar:
+        await agent_manager.update_account(agent_id, wxid=wxid, nickname=name, avatar=avatar)
+        if name:
+            _put_self_info_field("nickname", name)
+            message_store.set_contact(wxid, name=name, avatar=avatar)
+        if avatar:
+            _put_self_info_field("head_big", avatar)
+            app_state.setdefault("avatar_urls", {})[wxid] = avatar
+            message_store.set_contact(wxid, name=name, avatar=avatar)
+
+    return {"name": name, "avatar": avatar}
+
+
+async def _refresh_account_card(agent_id: str) -> None:
+    agent_id = str(agent_id or "").strip()
+    if not agent_id or not agent_manager.is_connected(agent_id):
+        return
+
+    try:
+        agent = agent_manager.get_agent(agent_id) or {}
+        current_wxid = str(agent.get("wxid") or agent.get("account_id") or "")
+        with wechat_api.use_agent(agent_id):
+            self_info = await wechat_api.get_self_info()
+            identity = _self_identity_from_response(self_info, agent_id=agent_id, current_wxid=current_wxid)
+            wxid = identity["wxid"]
+            nickname = identity["nickname"]
+            avatar = identity["avatar"]
+
+            if wxid and (not nickname or not avatar):
+                brief = _brief_entry_from_response(await wechat_api.batch_get_contact_brief_info(wxid), wxid)
+                if not nickname:
+                    nickname = str(brief.get("name") or "").strip()
+                if not avatar:
+                    avatar = str(brief.get("avatar") or "").strip()
+                if nickname in {agent_id, wxid}:
+                    nickname = ""
+
+            if wxid:
+                _self_wxid_to_agent_id[wxid] = agent_id
+            if wxid or nickname or avatar:
+                await agent_manager.update_account(agent_id, wxid=wxid, nickname=nickname, avatar=avatar)
+    except Exception as e:
+        _log(f"[ACCOUNT] card refresh failed agent={agent_id}: {type(e).__name__}: {e}")
+    finally:
+        _account_card_refresh_at[agent_id] = time.time()
+        _account_card_refreshing.discard(agent_id)
+
+
+def _schedule_account_card_refresh() -> None:
+    now = time.time()
+    for account in agent_manager.agents():
+        agent_id = str(account.get("id") or "")
+        if not agent_id or agent_id in _account_card_refreshing:
+            continue
+        last = _account_card_refresh_at.get(agent_id, 0.0)
+        if now - last < _ACCOUNT_CARD_REFRESH_INTERVAL_SEC:
+            continue
+        _account_card_refreshing.add(agent_id)
+        _account_card_refresh_at[agent_id] = now
+        asyncio.create_task(_refresh_account_card(agent_id))
 
 
 # ─── Contact brief cache (name + avatar URL) ─────────────────────────
@@ -478,30 +661,19 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     try:
         _log("[INIT 1/7] Loading self info...")
         app_state["self_info"] = await wechat_api.get_self_info()
-        si = app_state["self_info"] if isinstance(app_state["self_info"], dict) else {}
-        si_data = si.get("data", {}) if isinstance(si.get("data"), dict) else si
-        wxid = str(
-            si_data.get("wxid")
-            or si_data.get("Wxid")
-            or si_data.get("selfwxid")
-            or si_data.get("selfWxid")
-            or si_data.get("self_wxid")
-            or si.get("wxid")
-            or si.get("selfwxid")
-            or si.get("selfWxid")
-            or si.get("self_wxid")
-            or ""
+        existing_agent = agent_manager.get_agent(selected_agent) or {}
+        identity = _self_identity_from_response(
+            app_state["self_info"] if isinstance(app_state["self_info"], dict) else {},
+            agent_id=selected_agent,
+            current_wxid=str(existing_agent.get("wxid") or existing_agent.get("account_id") or ""),
         )
-        nickname = str(
-            si_data.get("nickname") or si_data.get("NickName") or si_data.get("name") or
-            si.get("nickname") or si.get("NickName") or wxid or selected_agent
-        )
-        avatar = str(
-            si_data.get("head_big") or si_data.get("headimgurl") or si_data.get("head_img") or
-            si_data.get("head_small") or si.get("head_big") or si.get("headimgurl") or ""
-        )
+        wxid = identity["wxid"]
+        nickname = identity["nickname"]
+        avatar = identity["avatar"]
         if wxid:
             _self_wxid_to_agent_id[wxid] = selected_agent
+            _put_self_info_field("wxid", wxid)
+            _put_self_info_field("selfwxid", wxid)
         await agent_manager.update_account(selected_agent, wxid=wxid, nickname=nickname, avatar=avatar)
         _log("[INIT 1/7] ✓ Self info loaded")
     except Exception as e:
@@ -541,6 +713,14 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         _log("[INIT 1/7] ✓ Contacts initialized")
     except Exception as e:
         _log(f"[INIT 1/7] ✗ InitContact failed: {e}")
+
+    try:
+        if selected_agent:
+            brief = await _refresh_agent_account_brief(selected_agent)
+            if brief.get("name") or brief.get("avatar"):
+                _log(f"[INIT 1/7] ✓ Account brief loaded for {selected_agent}")
+    except Exception as e:
+        _log(f"[INIT 1/7] ✗ account brief lookup failed: {e}")
     # Reset circuit breaker so a slow InitContact doesn't block subsequent requests
     wechat_api._consecutive_failures = 0
     _log("[INIT 1/7] done")
@@ -812,6 +992,7 @@ async def auth_login(req: AuthLoginRequest):
 
 @app.get("/api/accounts")
 async def list_accounts():
+    _schedule_account_card_refresh()
     return {
         "active_id": _active_agent_id or agent_manager.active_id(),
         "accounts": agent_manager.agents(),
