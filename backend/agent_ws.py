@@ -38,6 +38,7 @@ class AgentConnection:
     nickname: str = ""
     wxid: str = ""
     avatar: str = ""
+    server_port: str = ""
     initialized: bool = False
     registered: bool = False
 
@@ -116,6 +117,7 @@ class AgentWebSocketManager:
                 "wxid": conn.wxid,
                 "nickname": conn.nickname,
                 "avatar": conn.avatar,
+                "server_port": conn.server_port,
                 "peer": conn.peer,
                 "connected_at": conn.connected_at,
                 "last_seen_at": conn.last_seen_at,
@@ -136,6 +138,7 @@ class AgentWebSocketManager:
             "wxid": conn.wxid,
             "nickname": conn.nickname,
             "avatar": conn.avatar,
+            "server_port": conn.server_port,
             "peer": conn.peer,
             "connected_at": conn.connected_at,
             "last_seen_at": conn.last_seen_at,
@@ -288,19 +291,22 @@ class AgentWebSocketManager:
         message_agent_id = self._agent_id_from_message(message)
         if message_agent_id:
             await self._bind_agent_id(conn, message_agent_id)
+        self._update_metadata_from_message(conn, message)
 
         if msg_type == "hello" or (msg_type in {"", "register"} and message_agent_id):
+            body = self._metadata_for_connection(conn)
             await conn.websocket.send_text(json.dumps({
                 "type": "hello_ack" if msg_type != "register" else "register_ack",
                 "agent_id": conn.id,
-                "body": {"agent_id": conn.id},
+                "body": body,
             }, ensure_ascii=False))
             return
         if msg_type == "ping":
+            body = self._metadata_for_connection(conn)
             pong = {
                 "type": "pong",
                 "agent_id": conn.id,
-                "body": {"agent_id": conn.id},
+                "body": body,
             }
             if message.get("id"):
                 pong["id"] = message.get("id")
@@ -357,6 +363,53 @@ class AgentWebSocketManager:
         if direct:
             return direct
         return self._agent_id_from_body(message.get("body"))
+
+    def _metadata_value_from_body(self, body: Any, *keys: str) -> str:
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except Exception:
+                return ""
+        if not isinstance(body, dict):
+            return ""
+        for key in keys:
+            value = body.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+        for nested_key in ("body", "data", "payload", "params"):
+            value = self._metadata_value_from_body(body.get(nested_key), *keys)
+            if value:
+                return value
+        return ""
+
+    def _update_metadata_from_message(self, conn: AgentConnection, message: dict[str, Any]) -> None:
+        self_wxid = str(
+            message.get("selfwxid")
+            or message.get("selfWxid")
+            or message.get("self_wxid")
+            or self._metadata_value_from_body(message.get("body"), "selfwxid", "selfWxid", "self_wxid")
+            or ""
+        ).strip()
+        if self_wxid:
+            conn.wxid = self_wxid
+            conn.account_id = self_wxid
+
+        server_port = str(
+            message.get("ServerPort")
+            or message.get("server_port")
+            or self._metadata_value_from_body(message.get("body"), "ServerPort", "server_port")
+            or ""
+        ).strip()
+        if server_port:
+            conn.server_port = server_port
+
+    def _metadata_for_connection(self, conn: AgentConnection) -> dict[str, Any]:
+        body: dict[str, Any] = {"agent_id": conn.id}
+        if conn.wxid:
+            body["selfwxid"] = conn.wxid
+        if conn.server_port:
+            body["ServerPort"] = conn.server_port
+        return body
 
     async def _bind_agent_id(self, conn: AgentConnection, agent_id: str) -> None:
         agent_id = str(agent_id or "").strip()
