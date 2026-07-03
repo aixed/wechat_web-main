@@ -106,6 +106,7 @@ MGR_BASE_URL = f"http://{HOOK_HOST}:{MGR_PORT}"
 # Backend server — bind to 0.0.0.0 so remote Hook callbacks can reach us
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = int(_cfg.get("server_port", 5000))
+WEB_ACCESS_KEY = str(_cfg.get("web_access_key", os.environ.get("WECHAT_WEB_ACCESS_KEY", ""))).strip()
 
 # Hook/API request concurrency. Local Hook keeps the conservative single-call
 # path by default; remote Hook/Protocol can handle parallel calls.

@@ -66,6 +66,15 @@ class SqliteMessageCache:
                     time INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS media_blobs (
+                    media_id TEXT PRIMARY KEY,
+                    mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+                    filename TEXT NOT NULL DEFAULT '',
+                    size INTEGER NOT NULL DEFAULT 0,
+                    data BLOB NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
                 """
             )
 
@@ -194,6 +203,51 @@ class SqliteMessageCache:
                 )
                 updated += 1
         return updated
+
+    def put_media_blob(self, data: bytes, mime_type: str = "", filename: str = "") -> str:
+        if not data:
+            return ""
+        digest = hashlib.sha256(data).hexdigest()
+        media_id = f"blob_{digest}"
+        now = int(time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO media_blobs (media_id, mime_type, filename, size, data, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(media_id) DO UPDATE SET
+                    mime_type=excluded.mime_type,
+                    filename=excluded.filename,
+                    size=excluded.size
+                """,
+                (
+                    media_id,
+                    mime_type or "application/octet-stream",
+                    filename or "",
+                    len(data),
+                    sqlite3.Binary(data),
+                    now,
+                ),
+            )
+        return media_id
+
+    def get_media_blob(self, media_id: str) -> dict[str, Any] | None:
+        if not media_id:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT media_id, mime_type, filename, size, data FROM media_blobs WHERE media_id = ?",
+                (media_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "media_id": row["media_id"],
+            "mime_type": row["mime_type"] or "application/octet-stream",
+            "filename": row["filename"] or "",
+            "size": int(row["size"] or 0),
+            "data": bytes(row["data"]),
+        }
 
     def get_last_messages(self, wxids: list[str]) -> dict[str, dict[str, Any]]:
         if not wxids:

@@ -35,6 +35,9 @@ remote_protocol_mgr_port: 29999
 
 # --- 后端服务 ---
 server_port: 5000
+# Web 前端访问密钥；浏览器需先输入该 key 才能访问聊天页和 API。
+# 不要把真实密钥提交到 Git，可在 config.yaml 或 WECHAT_WEB_ACCESS_KEY 中配置。
+web_access_key: ""
 # Hook/API 并发数：本地 Hook 建议 1；远程 Hook/远程协议可设为 5-20。
 # 不配置时本地 Hook 默认 1，远程模式默认 10。
 hook_api_concurrency: 10

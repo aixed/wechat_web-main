@@ -6,7 +6,7 @@ FastAPI server that bridges the WeChat Hook API with the frontend.
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from datetime import datetime
 
@@ -151,6 +151,70 @@ app_state = {
 
 message_store = MessageStore()
 sqlite_cache = SqliteMessageCache()
+_active_agent_id = ""
+_account_runtimes: dict[str, dict] = {}
+_self_wxid_to_agent_id: dict[str, str] = {}
+_ACCOUNT_LOCK = asyncio.Lock()
+
+
+def _new_app_state() -> dict:
+    return {
+        "self_info": None,
+        "contacts": None,
+        "sessions": None,
+        "last_messages": {},
+        "avatar_urls": {},
+        "initialized": False,
+    }
+
+
+def _safe_runtime_id(agent_id: str) -> str:
+    safe = "".join(c for c in str(agent_id or "default") if c.isalnum() or c in ("_", "-", "."))
+    return safe[:80] or "default"
+
+
+def _runtime_for(agent_id: str) -> dict:
+    key = str(agent_id or "default")
+    if key not in _account_runtimes:
+        cache_path = os.path.join(os.path.dirname(__file__), ".sqlite_cache", f"{_safe_runtime_id(key)}.sqlite3")
+        _account_runtimes[key] = {
+            "app_state": _new_app_state(),
+            "message_store": MessageStore(),
+            "sqlite_cache": SqliteMessageCache(cache_path),
+        }
+    return _account_runtimes[key]
+
+
+def _activate_runtime(agent_id: str) -> str:
+    global app_state, message_store, sqlite_cache, _active_agent_id
+    selected = str(agent_id or agent_manager.active_id() or _active_agent_id or "default")
+    runtime = _runtime_for(selected)
+    app_state = runtime["app_state"]
+    message_store = runtime["message_store"]
+    sqlite_cache = runtime["sqlite_cache"]
+    _active_agent_id = selected
+    return selected
+
+
+def _agent_id_for_self_wxid(wxid: str) -> str:
+    return _self_wxid_to_agent_id.get(str(wxid or ""), "")
+
+
+def _extract_self_wxid(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+    nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+    return str(
+        data.get("selfwxid")
+        or data.get("selfWxid")
+        or data.get("self_wxid")
+        or data.get("wxid")
+        or nested.get("selfwxid")
+        or nested.get("selfWxid")
+        or nested.get("self_wxid")
+        or nested.get("wxid")
+        or ""
+    )
 
 
 # ─── Contact brief cache (name + avatar URL) ─────────────────────────
@@ -383,10 +447,13 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
 
 # ─── Startup / Shutdown ────────────────────────────────────────────
 
-async def _run_backend_initialization() -> bool:
+async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     """Initialize cached state from the Hook/Protocol API."""
+    selected_agent = _activate_runtime(agent_id or agent_manager.active_id())
+    if selected_agent:
+        await agent_manager.set_active(selected_agent)
     _log("=" * 60)
-    _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}]")
+    _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}] agent={selected_agent or 'default'}")
     _log("=" * 60)
 
     # Phase 0 — wait for Hook/Protocol API to be reachable
@@ -411,6 +478,31 @@ async def _run_backend_initialization() -> bool:
     try:
         _log("[INIT 1/7] Loading self info...")
         app_state["self_info"] = await wechat_api.get_self_info()
+        si = app_state["self_info"] if isinstance(app_state["self_info"], dict) else {}
+        si_data = si.get("data", {}) if isinstance(si.get("data"), dict) else si
+        wxid = str(
+            si_data.get("wxid")
+            or si_data.get("Wxid")
+            or si_data.get("selfwxid")
+            or si_data.get("selfWxid")
+            or si_data.get("self_wxid")
+            or si.get("wxid")
+            or si.get("selfwxid")
+            or si.get("selfWxid")
+            or si.get("self_wxid")
+            or ""
+        )
+        nickname = str(
+            si_data.get("nickname") or si_data.get("NickName") or si_data.get("name") or
+            si.get("nickname") or si.get("NickName") or wxid or selected_agent
+        )
+        avatar = str(
+            si_data.get("head_big") or si_data.get("headimgurl") or si_data.get("head_img") or
+            si_data.get("head_small") or si.get("head_big") or si.get("headimgurl") or ""
+        )
+        if wxid:
+            _self_wxid_to_agent_id[wxid] = selected_agent
+        await agent_manager.update_account(selected_agent, wxid=wxid, nickname=nickname, avatar=avatar)
         _log("[INIT 1/7] ✓ Self info loaded")
     except Exception as e:
         _log(f"[INIT 1/7] ✗ self info failed: {e}")
@@ -576,13 +668,15 @@ async def _run_backend_initialization() -> bool:
     else:
         _log("[INIT 6/7] ⊘ No sessions to load last messages for.")
 
-    if config.AGENT_WS_ENABLED and not agent_manager.is_connected():
+    if config.AGENT_WS_ENABLED and not agent_manager.is_connected(selected_agent):
         _log("[INIT 7/7] Agent disconnected during initialization; will retry on next connection.")
         app_state["initialized"] = False
+        await agent_manager.update_account(selected_agent, initialized=False)
         return False
 
     _log("[INIT 7/7] ✓ Initialization complete.")
     app_state["initialized"] = True
+    await agent_manager.update_account(selected_agent, initialized=True)
     _log("=" * 60)
     _log(f"Backend ready at http://{config.SERVER_HOST}:{config.SERVER_PORT}")
     _log(f"Login mode: {config.LOGIN_MODE}  |  API: {config.HOOK_BASE_URL}")
@@ -597,9 +691,11 @@ async def _run_initialization_after_agent():
         _log(f"[INIT] Waiting for DLL agent on {config.AGENT_WS_PATH} ...")
         while not agent_manager.is_connected():
             await asyncio.sleep(1)
-        _log("[INIT] DLL agent connected; starting Hook initialization")
-        if await _run_backend_initialization():
-            return
+        for agent_id in agent_manager.uninitialized_agent_ids():
+            _log(f"[INIT] DLL agent connected; starting Hook initialization for {agent_id}")
+            async with _ACCOUNT_LOCK:
+                with wechat_api.use_agent(agent_id):
+                    await _run_backend_initialization(agent_id)
         await asyncio.sleep(1)
 
 
@@ -648,6 +744,92 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _request_access_ok(request: Request) -> bool:
+    if not config.WEB_ACCESS_KEY:
+        return False
+    key = (
+        request.headers.get("X-Access-Key")
+        or request.query_params.get("key")
+        or request.cookies.get("wechat_web_key")
+        or ""
+    )
+    return str(key) == config.WEB_ACCESS_KEY
+
+
+def _request_agent_id(request: Request) -> str:
+    return str(request.headers.get("X-Agent-Id") or request.query_params.get("agent_id") or "").strip()
+
+
+def _is_public_http_path(path: str) -> bool:
+    return (
+        path in {"/api/auth/login", "/api/callback", config.CALLBACK_PATH}
+        or path == config.AGENT_WS_PATH
+        or path.startswith("/uploads/")
+    )
+
+
+@app.middleware("http")
+async def require_access_key(request: Request, call_next):
+    if request.method.upper() == "OPTIONS":
+        return await call_next(request)
+    path = request.url.path
+    if path.startswith("/api/") and not _is_public_http_path(path) and not _request_access_ok(request):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    agent_id = _request_agent_id(request)
+    if agent_id and agent_manager.is_connected(agent_id):
+        await agent_manager.set_active(agent_id)
+        _activate_runtime(agent_id)
+        with wechat_api.use_agent(agent_id):
+            return await call_next(request)
+    return await call_next(request)
+
+
+class AuthLoginRequest(BaseModel):
+    key: str
+
+
+class ActivateAccountRequest(BaseModel):
+    agent_id: str
+
+
+class MultiBroadcastTextRequest(BaseModel):
+    wxids: list[str]
+    msg: str
+    agent_ids: list[str] = []
+
+
+@app.post("/api/auth/login")
+async def auth_login(req: AuthLoginRequest):
+    if not config.WEB_ACCESS_KEY:
+        return {"ok": False, "error": "access key is not configured"}
+    if str(req.key or "") != config.WEB_ACCESS_KEY:
+        return {"ok": False}
+    return {"ok": True}
+
+
+@app.get("/api/accounts")
+async def list_accounts():
+    return {
+        "active_id": _active_agent_id or agent_manager.active_id(),
+        "accounts": agent_manager.agents(),
+    }
+
+
+@app.post("/api/accounts/activate")
+async def activate_account(req: ActivateAccountRequest):
+    agent_id = str(req.agent_id or "").strip()
+    if not agent_id or not agent_manager.is_connected(agent_id):
+        return {"ok": False, "error": "agent not connected"}
+    async with _ACCOUNT_LOCK:
+        await agent_manager.set_active(agent_id)
+        _activate_runtime(agent_id)
+        if not app_state.get("initialized"):
+            with wechat_api.use_agent(agent_id):
+                await _run_backend_initialization(agent_id)
+    return {"ok": True, "active_id": agent_id, "account": agent_manager.get_agent(agent_id)}
 
 
 # ─── Direction verification (DB-based) ────────────────────────────
@@ -736,7 +918,21 @@ async def wechat_callback(request: Request):
     _log(f"[CALLBACK] top_keys={top_keys}")
 
     sendorrecv = str(data.get("sendorrecv", "") or "")
-    self_wxid = str(data.get("selfwxid", "") or _get_self_wxid())
+    self_wxid = _extract_self_wxid(data) or _get_self_wxid()
+    callback_agent_id = str(
+        data.get("agent_id", "")
+        or data.get("agentId", "")
+        or _agent_id_for_self_wxid(self_wxid)
+        or agent_manager.agent_id_for_wxid(self_wxid)
+        or ""
+    )
+    if not callback_agent_id and self_wxid:
+        callback_agent_id = f"selfwxid_{self_wxid}"
+        _log(f"[CALLBACK] selfwxid={self_wxid} has no agent mapping yet; using isolated runtime {callback_agent_id}")
+    if not callback_agent_id and not self_wxid:
+        callback_agent_id = _active_agent_id or agent_manager.active_id()
+    if callback_agent_id:
+        _activate_runtime(callback_agent_id)
 
     # ── RecvType=2: raw protobuf → parse into msglist ──────────
     pb_msg = data.get("pb_msg")
@@ -862,6 +1058,7 @@ async def wechat_callback(request: Request):
     await manager.broadcast({
         "type": "wechat_message",
         "data": {
+            "account_id": callback_agent_id,
             "sendorrecv": sendorrecv,
             "selfwxid": self_wxid,
             "messages": normalized_messages,
@@ -903,12 +1100,21 @@ async def agent_status():
 
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    ws_key = str(websocket.query_params.get("key") or "")
+    if not config.WEB_ACCESS_KEY or ws_key != config.WEB_ACCESS_KEY:
+        await websocket.close(code=1008, reason="unauthorized")
+        return
+    agent_id = str(websocket.query_params.get("agent_id") or "").strip()
+    if agent_id and agent_manager.is_connected(agent_id):
+        await agent_manager.set_active(agent_id)
+        _activate_runtime(agent_id)
     await manager.connect(websocket)
 
     # Send initial state on connect
     await websocket.send_text(json.dumps({
         "type": "init",
         "data": {
+            "account_id": _active_agent_id or agent_manager.active_id(),
             "self_info": app_state["self_info"],
             "contacts": app_state["contacts"],
             "sessions": app_state["sessions"],
@@ -1687,6 +1893,7 @@ async def _broadcast_local_sent_message(chat_id: str, msg_type: str, content: st
     await manager.broadcast({
         "type": "message_sent",
         "data": {
+            "account_id": _active_agent_id or agent_manager.active_id(),
             "chat_id": chat_id,
             "message": msg,
             "session_update": session_update,
@@ -1855,6 +2062,134 @@ async def broadcast_image_upload(wxids: str = Form(...), file: UploadFile = File
     }
 
 
+@app.post("/api/accounts/broadcast/text")
+async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
+    target_wxids = [w for w in req.wxids if w]
+    agent_ids = [a for a in (req.agent_ids or []) if agent_manager.is_connected(a)]
+    if not agent_ids:
+        agent_ids = [a["id"] for a in agent_manager.agents() if a.get("id")]
+    total = len(agent_ids) * len(target_wxids)
+    sent = 0
+    failed = 0
+    results = []
+
+    for agent_id in agent_ids:
+        async with _ACCOUNT_LOCK:
+            await agent_manager.set_active(agent_id)
+            _activate_runtime(agent_id)
+        with wechat_api.use_agent(agent_id):
+            for wxid in target_wxids:
+                try:
+                    result = await wechat_api.send_text_no_src(wxid, req.msg)
+                    ok = _send_result_ok(result)
+                    if ok:
+                        sent += 1
+                        async with _ACCOUNT_LOCK:
+                            _activate_runtime(agent_id)
+                            await _broadcast_local_sent_message(wxid, "1", req.msg)
+                    else:
+                        failed += 1
+                    results.append({"agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result})
+                except Exception as e:
+                    failed += 1
+                    results.append({"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    return {"accounts": len(agent_ids), "targets": len(target_wxids), "total": total, "sent": sent, "failed": failed, "results": results}
+
+
+@app.post("/api/accounts/broadcast/image-upload")
+async def multi_account_broadcast_image_upload(
+    wxids: str = Form(...),
+    agent_ids: str = Form("[]"),
+    file: UploadFile = File(...),
+):
+    try:
+        target_wxids = [w for w in json.loads(wxids) if w]
+    except Exception:
+        target_wxids = [w.strip() for w in wxids.split(",") if w.strip()]
+    try:
+        requested_agents = [a for a in json.loads(agent_ids or "[]") if a]
+    except Exception:
+        requested_agents = [a.strip() for a in str(agent_ids or "").split(",") if a.strip()]
+    selected_agents = [a for a in requested_agents if agent_manager.is_connected(a)]
+    if not selected_agents:
+        selected_agents = [a["id"] for a in agent_manager.agents() if a.get("id")]
+    if not target_wxids:
+        return {"accounts": len(selected_agents), "targets": 0, "total": 0, "sent": 0, "failed": 0, "results": [], "error": "no targets"}
+
+    data = await file.read()
+    original_name = os.path.basename(file.filename or "multi_broadcast.png") or "multi_broadcast.png"
+    ext = os.path.splitext(original_name)[1] or ".png"
+    upload_name = original_name
+    upload_bytes = data
+    upload_mime = file.content_type or f"image/{ext.lstrip('.').lower() or 'png'}"
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(io.BytesIO(data))
+        max_dim = 1920
+        max_bytes = 500_000
+        if img.mode == "RGBA" or ext.lower() == ".png" or len(data) > max_bytes or max(img.size) > max_dim:
+            rgb = img.convert("RGB") if img.mode != "RGB" else img
+            w, h = rgb.size
+            if max(w, h) > max_dim:
+                ratio = max_dim / max(w, h)
+                rgb = rgb.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
+            upload_name = os.path.splitext(original_name)[0] + ".jpg"
+            for quality in (85, 70, 55):
+                output = io.BytesIO()
+                rgb.save(output, "JPEG", quality=quality)
+                upload_bytes = output.getvalue()
+                upload_mime = "image/jpeg"
+                if len(upload_bytes) <= max_bytes:
+                    break
+    except Exception as e:
+        _log(f"[MULTI_BROADCAST] Image compression skipped: {e}")
+    file_hex = upload_bytes.hex()
+
+    sent = 0
+    failed = 0
+    results = []
+    for agent_id in selected_agents:
+        async with _ACCOUNT_LOCK:
+            await agent_manager.set_active(agent_id)
+            _activate_runtime(agent_id)
+            db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
+        with wechat_api.use_agent(agent_id):
+            try:
+                cdn = await wechat_api.cdn_upload_image(upload_name, target_wxids[0], file_data=file_hex)
+            except Exception as e:
+                cdn = {"error": f"{type(e).__name__}: {e}"}
+            if cdn.get("error"):
+                failed += len(target_wxids)
+                for wxid in target_wxids:
+                    results.append({"agent_id": agent_id, "wxid": wxid, "ok": False, "error": cdn["error"]})
+                continue
+            for wxid in target_wxids:
+                try:
+                    result = await wechat_api.send_image_no_src(wxid, cdn)
+                    ok = _send_result_ok(result)
+                    if ok:
+                        sent += 1
+                        async with _ACCOUNT_LOCK:
+                            _activate_runtime(agent_id)
+                            await _broadcast_local_sent_message(wxid, "3", "", {"db_image_id": db_image_id})
+                    else:
+                        failed += 1
+                    results.append({"agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result})
+                except Exception as e:
+                    failed += 1
+                    results.append({"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    return {
+        "accounts": len(selected_agents),
+        "targets": len(target_wxids),
+        "total": len(selected_agents) * len(target_wxids),
+        "sent": sent,
+        "failed": failed,
+        "results": results,
+    }
+
+
 @app.post("/api/send/image-upload")
 async def send_image_upload(wxid: str = Form(...), file: UploadFile = File(...)):
     """Upload an image from the browser and send it via WeChat."""
@@ -2012,6 +2347,19 @@ async def serve_image(path: str):
     if os.path.exists(path):
         return FileResponse(path)
     return {"error": "File not found"}
+
+
+@app.get("/api/media/db-image/{media_id}")
+async def serve_db_image(media_id: str):
+    """Serve an image blob stored in the per-account SQLite cache."""
+    row = sqlite_cache.get_media_blob(media_id)
+    if not row:
+        return Response("not found", status_code=404)
+    return Response(
+        content=row["data"],
+        media_type=row.get("mime_type") or "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=31536000"},
+    )
 
 
 # ─── WeChat image file resolution ─────────────────────────────

@@ -8,6 +8,8 @@ Supports three modes via config.yaml:
 
 import httpx
 import asyncio
+import contextvars
+from contextlib import contextmanager
 import time
 import sys
 import os
@@ -33,6 +35,16 @@ client = httpx.AsyncClient(base_url=HOOK_BASE_URL, timeout=_DEFAULT_TIMEOUT)
 
 # Request counter
 _req_id = 0
+_CURRENT_AGENT_ID: contextvars.ContextVar[str] = contextvars.ContextVar("wechat_agent_id", default="")
+
+
+@contextmanager
+def use_agent(agent_id: str | None):
+    token = _CURRENT_AGENT_ID.set(str(agent_id or ""))
+    try:
+        yield
+    finally:
+        _CURRENT_AGENT_ID.reset(token)
 
 # Concurrency control:
 #  - Local Hook defaults to 1 (serialize everything — DLL injection can be fragile)
@@ -200,6 +212,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
                     route,
                     json or {},
                     timeout=timeout or AGENT_WS_REQUEST_TIMEOUT,
+                    agent_id=_CURRENT_AGENT_ID.get() or None,
                 )
                 r = httpx.Response(
                     status_code=agent_response.status,

@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from "react";
 import type { ChatMessage } from "../types";
-import { getImageUrl, downloadImage } from "../api";
+import { getImageUrl, getDbImageUrl, downloadImage, authQuery } from "../api";
 import { replaceWechatEmojis } from "../utils/wechatEmoji";
 
 interface MessageBubbleProps {
@@ -151,6 +151,10 @@ function EmojiSticker({ msgXml }: { msgXml: string }) {
         const params = new URLSearchParams();
         if (cdnurl) params.set("cdnurl", cdnurl);
         if (thumburl) params.set("thumburl", thumburl);
+        const keyQuery = authQuery();
+        if (keyQuery) {
+          new URLSearchParams(keyQuery).forEach((value, key) => params.set(key, value));
+        }
         const qs = params.toString();
         url = `/api/media/sticker/${hash}${qs ? `?${qs}` : ""}`;
       }
@@ -188,6 +192,10 @@ function ChatImage({ message, onEnlarge }: { message: ChatMessage; onEnlarge: (u
   const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
+    if (message.db_image_id) {
+      setSrc(getDbImageUrl(message.db_image_id));
+      return;
+    }
     if (message.img_path) {
       setSrc(getImageUrl(message.img_path));
       return;
@@ -233,7 +241,7 @@ function ChatImage({ message, onEnlarge }: { message: ChatMessage; onEnlarge: (u
       }
     });
     return () => { cancelled = true; };
-  }, [message.img_path, message.bytesExtraHex, message.msg, retryCount]);
+  }, [message.db_image_id, message.img_path, message.bytesExtraHex, message.msg, retryCount]);
 
   if (loading) {
     const retryMsg = retryCount > 0 ? ` (重试 ${retryCount}/${IMAGE_RETRY_DELAYS.length})` : "";

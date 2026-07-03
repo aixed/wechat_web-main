@@ -29,6 +29,20 @@ export interface ContactProfile {
   profile?: Record<string, any>;
 }
 
+export interface WeChatAccount {
+  id: string;
+  account_id?: string;
+  wxid?: string;
+  nickname?: string;
+  avatar?: string;
+  peer?: string;
+  connected_at?: number;
+  last_seen_at?: number;
+  pending?: number;
+  initialized?: boolean;
+  active?: boolean;
+}
+
 // ─── Messages ────────────────────────────────────────────────────
 
 export interface ChatMessage {
@@ -45,6 +59,7 @@ export interface ChatMessage {
   isSender?: number;    // from DB: 1 = self sent, 0 = received
   // Extra fields by type
   img_path?: string;
+  db_image_id?: string;
   img_len?: number;
   bytesExtraHex?: string;  // hex(BytesExtra) for type 3 images — used to find local file
   video_path?: string;
@@ -62,6 +77,7 @@ export interface ChatMessage {
 export interface WSInitMessage {
   type: "init";
   data: {
+    account_id?: string;
     self_info: any;
     contacts: any;
     sessions: any;
@@ -87,6 +103,7 @@ export interface WSInitMessage {
 export interface WSCallbackMessage {
   type: "wechat_message";
   data: {
+    account_id?: string;
     selfwxid?: string;
     sendorrecv: string;
     messages?: ChatMessage[];
@@ -105,6 +122,7 @@ export interface WSCallbackMessage {
 export interface WSMessageSent {
   type: "message_sent";
   data: {
+    account_id?: string;
     chat_id: string;
     message: ChatMessage;
     session_update?: {
