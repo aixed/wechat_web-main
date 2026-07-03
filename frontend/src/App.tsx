@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, type FormEvent } from "react";
+import { useState, useCallback, useEffect, useRef, type FormEvent, type TouchEvent } from "react";
 import { useWebSocket } from "./useWebSocket";
 import SessionList, { type SessionMenuAction } from "./components/SessionList";
 import ChatArea from "./components/ChatArea";
@@ -2623,17 +2623,33 @@ function MobileChatsView({
   onBackToAccounts: () => void;
   dark: boolean;
 }) {
+  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
+
+  const handleTouchStart = (event: TouchEvent<HTMLDivElement>) => {
+    const touch = event.touches[0];
+    if (!touch) return;
+    touchStartRef.current = { x: touch.clientX, y: touch.clientY };
+  };
+
+  const handleTouchEnd = (event: TouchEvent<HTMLDivElement>) => {
+    const start = touchStartRef.current;
+    touchStartRef.current = null;
+    const touch = event.changedTouches[0];
+    if (!start || !touch) return;
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (dx > 90 && Math.abs(dx) > Math.abs(dy) * 1.35) {
+      onBackToAccounts();
+    }
+  };
+
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto pb-[10px]">
-      <MobileTopBar dark={dark} title="Weixin" leftLabel="账号" rightLabel="＋" onLeft={onBackToAccounts} />
+    <div
+      className="flex-1 min-h-0 overflow-y-auto pt-[calc(env(safe-area-inset-top)+8px)] pb-[10px]"
+      onTouchStart={handleTouchStart}
+      onTouchEnd={handleTouchEnd}
+    >
       <MobileSearchBar dark={dark} />
-      <div className={`h-[48px] px-[22px] flex items-center gap-[14px] text-[14px] border-b ${dark ? "text-[#888] border-[#242424]" : "text-[#777] border-[#dedede]"}`}>
-        <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
-          <rect x="3" y="5" width="18" height="12" rx="1.5" />
-          <path d="M8 21h8M12 17v4" />
-        </svg>
-        <span>Logged in to Weixin for Windows.</span>
-      </div>
       <div className={dark ? "bg-[#111111]" : "bg-white"}>
         {sessions.length === 0 && <div className={`text-center text-[14px] py-[48px] ${dark ? "text-[#666]" : "text-[#999]"}`}>暂无会话</div>}
         {sessions.map((session) => (
