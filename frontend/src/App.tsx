@@ -22,6 +22,7 @@ import {
   multiAccountBroadcastImageUpload,
   multiAccountBroadcastText,
   muteSession,
+  refreshContacts,
   refreshSessions,
   setActiveAgentId,
   setAccessKey,
@@ -35,6 +36,7 @@ import { replaceWechatEmojis } from "./utils/wechatEmoji";
 type ViewMode = "chats" | "contacts" | "broadcast";
 type MobileTab = "chats" | "contacts" | "me";
 type PortalTheme = "dark" | "light";
+type ContactCategoryKey = "groups" | "official" | "service" | "openim";
 const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
 const PINNED_ORDER_THRESHOLD = 1_000_000_000_000;
@@ -169,26 +171,25 @@ function MobileSwipeFrame({
     finishGesture();
   };
 
-  const progress = Math.min(1, Math.abs(dragX) / Math.max(1, window.innerWidth || 1));
-
   return (
     <div
-      className={`mobile-swipe-stage h-dvh w-screen overflow-hidden ${dark ? "bg-[#050505]" : "bg-[#dcdcdc]"}`}
+      className="mobile-swipe-stage relative h-dvh w-screen overflow-hidden"
+      style={{ backgroundColor: dark ? "#111111" : "#ededed" }}
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
       onTouchCancel={() => finishGesture()}
     >
       <div
-        className="mobile-swipe-backdrop"
-        style={{ opacity: progress * 0.62 }}
+        className="pointer-events-none absolute inset-0"
+        style={{ backgroundColor: dark ? "#111111" : "#ededed" }}
       />
       <div
-        className="mobile-swipe-page h-full w-full"
+        className="mobile-swipe-page relative z-10 h-full w-full"
         style={{
+          backgroundColor: dark ? "#111111" : "#ededed",
           transform: `translate3d(${dragX}px, 0, 0)`,
           transition: settling ? "transform 180ms cubic-bezier(.22, .8, .22, 1)" : "none",
-          boxShadow: dragX === 0 ? "none" : `${dragX > 0 ? "-18px" : "18px"} 0 34px rgba(0,0,0,${0.18 + progress * 0.28})`,
         }}
       >
         {children}
@@ -203,6 +204,29 @@ interface DirectoryEntry {
   avatar: string;
   is_group: boolean;
   source: "friend" | "group";
+  category?: ContactCategoryKey | "personal";
+  badge?: string;
+}
+
+interface ContactHydrationProgress {
+  active?: boolean;
+  phase?: string;
+  batch?: number;
+  total_batches?: number;
+  processed?: number;
+  total?: number;
+  updated?: number;
+  failed?: number;
+  current_batch_count?: number;
+  current_batch_updated?: number;
+}
+
+interface ContactCounts {
+  friends: number;
+  groups: number;
+  official: number;
+  service: number;
+  openim: number;
 }
 
 interface BroadcastImageItem {
@@ -258,7 +282,6 @@ const FILTERED_WXIDS = new Set([
 function shouldFilterSession(wxid: string): boolean {
   if (!wxid) return true;
   if (FILTERED_WXIDS.has(wxid)) return true;
-  if (wxid.includes("@openim")) return true;      // OpenIM
   return false;
 }
 
@@ -664,6 +687,48 @@ function groupDirectoryEntries(entries: DirectoryEntry[]): Array<{ title: string
   return result;
 }
 
+function rawContactCategory(raw: any, wxid: string): ContactCategoryKey | "personal" {
+  const id = String(wxid || "").trim();
+  if (id.endsWith("@chatroom")) return "groups";
+  if (id.endsWith("@openim")) return "openim";
+  if (id.startsWith("gh_")) {
+    const marker = String(
+      raw?.ServiceType ??
+      raw?.service_type ??
+      raw?.ServiceFlag ??
+      raw?.serviceFlag ??
+      raw?.AccountType ??
+      raw?.account_type ??
+      raw?.TypeName ??
+      raw?.typeName ??
+      raw?.type ??
+      raw?.Type ??
+      "",
+    ).toLowerCase();
+    if (marker.includes("service") || marker.includes("服务")) return "service";
+    return "official";
+  }
+  return "personal";
+}
+
+function categoryTitle(category: ContactCategoryKey): string {
+  switch (category) {
+    case "groups": return "Group Chats";
+    case "official": return "Official Accounts";
+    case "service": return "Service Accounts";
+    case "openim": return "WeCom Contacts";
+  }
+}
+
+function categoryCountLabel(category: ContactCategoryKey, count: number): string {
+  switch (category) {
+    case "groups": return `${count} group(s)`;
+    case "official": return `${count} official account(s)`;
+    case "service": return `${count} service account(s)`;
+    case "openim": return `${count} WeCom contact(s)`;
+  }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────
 function extractChatId(msg: any, selfWxid: string): string {
   if (msg.fromgid) return msg.fromgid;
@@ -904,10 +969,13 @@ export default function App() {
   const [sessionsRequested, setSessionsRequested] = useState(false);
   const [contactsHydrating, setContactsHydrating] = useState(false);
   const [contactsHydrated, setContactsHydrated] = useState(false);
+  const [contactHydrationProgress, setContactHydrationProgress] = useState<ContactHydrationProgress | null>(null);
   const [selfCardOpen, setSelfCardOpen] = useState(false);
   const [selfProfileLoading, setSelfProfileLoading] = useState(false);
   const [selfImageOpen, setSelfImageOpen] = useState(false);
   const [mobileTab, setMobileTab] = useState<MobileTab>("chats");
+  const [mobileContactCategory, setMobileContactCategory] = useState<ContactCategoryKey | null>(null);
+  const [desktopContactCategory, setDesktopContactCategory] = useState<ContactCategoryKey | null>(null);
   const [mobileProfileDetailOpen, setMobileProfileDetailOpen] = useState(false);
   const [directoryProfileWxid, setDirectoryProfileWxid] = useState<string | null>(null);
   const [directoryProfileLoading, setDirectoryProfileLoading] = useState(false);
@@ -954,6 +1022,9 @@ export default function App() {
     setDirectoryProfileLoading(false);
     setContactsHydrating(false);
     setContactsHydrated(false);
+    setContactHydrationProgress(null);
+    setMobileContactCategory(null);
+    setDesktopContactCategory(null);
     pendingBriefWxids.current.clear();
     briefRequestedWxids.current.clear();
     groupProfileRequestedWxids.current.clear();
@@ -1137,15 +1208,23 @@ export default function App() {
     });
   }, [ensureContactProfiles]);
 
-  const hydrateDirectoryContacts = useCallback(async () => {
-    if (contactsHydrating || contactsHydrated) return;
+  const hydrateDirectoryContacts = useCallback(async (force = false) => {
+    if (contactsHydrating && !force) return;
+    if (contactsHydrated && !force) return;
     const requestAccountId = selectedAccountIdRef.current;
+    let keepHydrating = false;
     setContactsHydrating(true);
     try {
-      const refreshed = await getContacts();
+      const refreshed = force ? await refreshContacts() : await getContacts();
       if (selectedAccountIdRef.current !== requestAccountId) return;
       if (refreshed && typeof refreshed === "object" && !(refreshed as any).error) {
         setRawContacts(refreshed);
+        const progress = (refreshed as any).hydration_progress;
+        if (progress && typeof progress === "object") {
+          setContactHydrationProgress(progress);
+          keepHydrating = Boolean(progress.active);
+          setContactsHydrating(keepHydrating);
+        }
         const names = buildContactMap(refreshed);
         const avatars = buildAvatarMap(refreshed, undefined);
         if (Object.keys(names).length > 0) {
@@ -1162,7 +1241,7 @@ export default function App() {
       console.error("[CONTACTS] hydrate failed:", err);
     } finally {
       if (selectedAccountIdRef.current === requestAccountId) {
-        setContactsHydrating(false);
+        setContactsHydrating(keepHydrating);
       }
     }
   }, [contactsHydrated, contactsHydrating]);
@@ -1196,10 +1275,12 @@ export default function App() {
   const switchMode = useCallback((mode: ViewMode) => {
     setViewMode(mode);
     setActiveChat(null);
+    if (mode !== "contacts") setDesktopContactCategory(null);
     if (mode === "chats") {
       setSessionsRequested(true);
     }
     if (mode === "contacts") {
+      setDesktopContactCategory(null);
       hydrateDirectoryContacts();
     }
   }, [hydrateDirectoryContacts]);
@@ -1208,6 +1289,7 @@ export default function App() {
     setMobileTab(tab);
     setActiveChat(null);
     setDirectoryProfileWxid(null);
+    setMobileContactCategory(null);
     setMobileProfileDetailOpen(false);
     if (tab === "chats") {
       setSessionsRequested(true);
@@ -1221,6 +1303,7 @@ export default function App() {
     if (!entry?.wxid) return;
     setViewMode("contacts");
     setActiveChat(null);
+    setDesktopContactCategory(null);
     setDirectoryProfileWxid(entry.wxid);
     setDirectoryProfileLoading(true);
     try {
@@ -1420,6 +1503,7 @@ export default function App() {
         last_messages,
         avatar_urls,
         contact_profiles,
+        hydration_progress,
         messages_cache,
         session_cache,
       } = wsMsg.data as any;
@@ -1441,6 +1525,10 @@ export default function App() {
       setAvatarMap(avatars);
       if (Object.keys(cachedProfiles).length > 0) {
         setContactProfiles((prev) => ({ ...prev, ...cachedProfiles }));
+      }
+      if (hydration_progress && typeof hydration_progress === "object") {
+        setContactHydrationProgress(hydration_progress);
+        setContactsHydrating(Boolean(hydration_progress.active));
       }
 
       const parsed = parseSessions(rawSessions, nameMap, last_messages || {});
@@ -1530,6 +1618,7 @@ export default function App() {
     if (wsMsg.type === "contacts_snapshot") {
       const contacts = (wsMsg.data as any)?.contacts;
       const profiles = (wsMsg.data as any)?.contact_profiles || {};
+      const progress = (wsMsg.data as any)?.hydration_progress;
       if (contacts) {
         setRawContacts(contacts);
         const names = buildContactMap(contacts);
@@ -1540,6 +1629,16 @@ export default function App() {
       if (profiles && typeof profiles === "object") {
         applyContactProfileUpdates(profiles);
       }
+      if (progress && typeof progress === "object") {
+        setContactHydrationProgress(progress);
+        setContactsHydrating(Boolean(progress.active));
+      }
+    }
+
+    if (wsMsg.type === "contacts_hydration_progress") {
+      const progress = (wsMsg.data || {}) as ContactHydrationProgress;
+      setContactHydrationProgress(progress);
+      setContactsHydrating(Boolean(progress.active));
     }
 
     if (wsMsg.type === "wechat_message") {
@@ -1993,7 +2092,7 @@ export default function App() {
     }
   };
 
-  const friendEntries: DirectoryEntry[] = sortDirectoryEntries(contactListFromRaw(rawContacts)
+  const allNonGroupEntries: DirectoryEntry[] = sortDirectoryEntries(contactListFromRaw(rawContacts)
     .map((c: any) => {
       const wxid = contactWxid(c);
       if (!wxid || shouldFilterSession(wxid)) return null;
@@ -2015,12 +2114,15 @@ export default function App() {
         c.bigHeadUrl ||
         c.avatar ||
         "";
+      const category = rawContactCategory(c, wxid);
       return {
         wxid,
         name: profileDisplayName(profile, fallbackName),
         avatar: profileAvatar(profile, fallbackAvatar),
         is_group: false,
         source: "friend" as const,
+        category,
+        badge: category === "openim" ? "企微" : "",
       };
     })
     .filter(Boolean) as DirectoryEntry[]);
@@ -2047,11 +2149,29 @@ export default function App() {
       avatar: profileAvatar(profile, room.avatar || avatarMap[room.wxid] || ""),
       is_group: true,
       source: "group",
+      category: "groups",
     });
   }
   const groupEntries = sortDirectoryEntries(Array.from(groupEntryMap.values()));
+  const friendEntries = allNonGroupEntries.filter((entry) => entry.category === "personal");
+  const officialEntries = allNonGroupEntries.filter((entry) => entry.category === "official");
+  const serviceEntries = allNonGroupEntries.filter((entry) => entry.category === "service");
+  const openimEntries = allNonGroupEntries.filter((entry) => entry.category === "openim");
+  const contactCategoryEntries: Record<ContactCategoryKey, DirectoryEntry[]> = {
+    groups: groupEntries,
+    official: officialEntries,
+    service: serviceEntries,
+    openim: openimEntries,
+  };
+  const contactCounts = {
+    friends: friendEntries.length,
+    groups: groupEntries.length,
+    official: officialEntries.length,
+    service: serviceEntries.length,
+    openim: openimEntries.length,
+  };
   const directoryEntryMap = new Map<string, DirectoryEntry>();
-  for (const entry of [...friendEntries, ...groupEntries]) {
+  for (const entry of [...friendEntries, ...groupEntries, ...officialEntries, ...serviceEntries, ...openimEntries]) {
     directoryEntryMap.set(entry.wxid, entry);
   }
   const directoryProfileEntry = directoryProfileWxid ? directoryEntryMap.get(directoryProfileWxid) || null : null;
@@ -2107,7 +2227,7 @@ export default function App() {
 
   if (isMobile) {
     const firstMobileSession = sessions[0];
-    const firstMobileContact = mobileTab === "contacts" ? (friendEntries[0] || groupEntries[0]) : null;
+    const firstMobileContact = mobileTab === "contacts" ? (friendEntries[0] || groupEntries[0] || officialEntries[0] || serviceEntries[0] || openimEntries[0]) : null;
     const canMobileForward = Boolean(
       (mobileTab === "chats" && firstMobileSession) ||
       (mobileTab === "contacts" && firstMobileContact) ||
@@ -2209,6 +2329,21 @@ export default function App() {
       );
     }
 
+    if (mobileTab === "contacts" && mobileContactCategory) {
+      const entries = contactCategoryEntries[mobileContactCategory] || [];
+      return (
+        <MobileSwipeFrame dark={darkTheme} onBack={() => setMobileContactCategory(null)}>
+          <MobileContactCategoryPage
+            category={mobileContactCategory}
+            entries={entries}
+            dark={darkTheme}
+            onBack={() => setMobileContactCategory(null)}
+            onSelect={openDirectoryProfile}
+          />
+        </MobileSwipeFrame>
+      );
+    }
+
     return (
       <MobileSwipeFrame
         dark={darkTheme}
@@ -2220,6 +2355,11 @@ export default function App() {
           sessions={sessions}
           friends={friendEntries}
           groups={groupEntries}
+          official={officialEntries}
+          service={serviceEntries}
+          openim={openimEntries}
+          counts={contactCounts}
+          contactProgress={contactHydrationProgress}
           selfName={selfInfoName}
           selfWxid={selfWxid}
           selfAvatar={selfAvatar}
@@ -2229,6 +2369,7 @@ export default function App() {
           onSwitchTab={switchMobileTab}
           onSelectChat={handleSelectChat}
           onSelectContact={openDirectoryProfile}
+          onSelectContactCategory={setMobileContactCategory}
           onHydrateContacts={hydrateDirectoryContacts}
           onOpenSelfDetail={openMobileSelfProfileDetail}
         />
@@ -2271,10 +2412,17 @@ export default function App() {
           <ContactsPanel
             friends={friendEntries}
             groups={groupEntries}
+            official={officialEntries}
+            service={serviceEntries}
+            openim={openimEntries}
+            counts={contactCounts}
+            progress={contactHydrationProgress}
+            selectedCategory={desktopContactCategory}
             loading={contactsHydrating}
             dark={darkTheme}
             onHydrate={hydrateDirectoryContacts}
             onSelect={openDirectoryProfile}
+            onSelectCategory={setDesktopContactCategory}
           />
         )}
         {viewMode === "broadcast" && (
@@ -2298,7 +2446,18 @@ export default function App() {
       </div>
 
       <div className={`flex-1 min-w-0 h-full ${darkTheme ? "bg-[#111111]" : "bg-[#ededed]"}`}>
-        {viewMode === "contacts" && directoryProfileEntry ? (
+        {viewMode === "contacts" && desktopContactCategory ? (
+          <DirectoryCategoryPane
+            title={categoryTitle(desktopContactCategory)}
+            countLabel={categoryCountLabel(desktopContactCategory, contactCategoryEntries[desktopContactCategory].length)}
+            entries={contactCategoryEntries[desktopContactCategory]}
+            dark={darkTheme}
+            onSelect={(entry) => {
+              setDesktopContactCategory(null);
+              openDirectoryProfile(entry);
+            }}
+          />
+        ) : viewMode === "contacts" && directoryProfileEntry ? (
           <DirectoryProfilePane
             entry={directoryProfileEntry}
             profile={contactProfiles[directoryProfileEntry.wxid]}
@@ -2968,6 +3127,11 @@ function MobileMainShell({
   sessions,
   friends,
   groups,
+  official,
+  service,
+  openim,
+  counts,
+  contactProgress,
   selfName,
   selfWxid,
   selfAvatar,
@@ -2977,6 +3141,7 @@ function MobileMainShell({
   onSwitchTab,
   onSelectChat,
   onSelectContact,
+  onSelectContactCategory,
   onHydrateContacts,
   onOpenSelfDetail,
 }: {
@@ -2984,6 +3149,11 @@ function MobileMainShell({
   sessions: Session[];
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
+  official: DirectoryEntry[];
+  service: DirectoryEntry[];
+  openim: DirectoryEntry[];
+  counts: ContactCounts;
+  contactProgress: ContactHydrationProgress | null;
   selfName: string;
   selfWxid: string;
   selfAvatar: string;
@@ -2993,7 +3163,8 @@ function MobileMainShell({
   onSwitchTab: (tab: MobileTab) => void;
   onSelectChat: (wxid: string, fallback?: Partial<Session>) => void;
   onSelectContact: (entry: DirectoryEntry) => void;
-  onHydrateContacts: () => void;
+  onSelectContactCategory: (category: ContactCategoryKey) => void;
+  onHydrateContacts: (force?: boolean) => void;
   onOpenSelfDetail: () => void;
 }) {
   return (
@@ -3003,10 +3174,16 @@ function MobileMainShell({
         <MobileContactsView
           friends={friends}
           groups={groups}
+          official={official}
+          service={service}
+          openim={openim}
+          counts={counts}
+          progress={contactProgress}
           loading={contactsLoading}
           dark={dark}
           onHydrate={onHydrateContacts}
           onSelect={onSelectContact}
+          onSelectCategory={onSelectContactCategory}
         />
       )}
       {tab === "me" && (
@@ -3085,17 +3262,29 @@ function MobileSessionRow({ session, onClick, dark }: { session: Session; onClic
 function MobileContactsView({
   friends,
   groups,
+  official,
+  service,
+  openim,
+  counts,
+  progress,
   loading,
   dark,
   onHydrate,
   onSelect,
+  onSelectCategory,
 }: {
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
+  official: DirectoryEntry[];
+  service: DirectoryEntry[];
+  openim: DirectoryEntry[];
+  counts: ContactCounts;
+  progress: ContactHydrationProgress | null;
   loading: boolean;
   dark: boolean;
-  onHydrate: () => void;
+  onHydrate: (force?: boolean) => void;
   onSelect: (entry: DirectoryEntry) => void;
+  onSelectCategory: (category: ContactCategoryKey) => void;
 }) {
   const [query, setQuery] = useState("");
   useEffect(() => {
@@ -3103,7 +3292,6 @@ function MobileContactsView({
   }, [onHydrate]);
   const q = query.trim().toLowerCase();
   const filteredFriends = friends.filter((entry) => !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q));
-  const filteredGroups = groups.filter((entry) => !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q));
   const friendSections = groupDirectoryEntries(filteredFriends);
   const indexLetters = ["⌕", ...friendSections.map((section) => section.title)];
 
@@ -3119,18 +3307,18 @@ function MobileContactsView({
             <input value={query} onChange={(e) => setQuery(e.target.value)} className={`bg-transparent outline-none flex-1 text-[16px] ${dark ? "text-[#e8e8e8] placeholder-[#777]" : "text-[#111] placeholder-[#b7b7b7]"}`} placeholder="Search" />
           </div>
         </div>
-        <ContactCountBar friends={friends.length} groups={groups.length} dark={dark} mobile />
-        {loading && <div className={`px-[22px] py-[6px] text-[12px] ${dark ? "text-[#777]" : "text-[#999]"}`}>正在补全联系人资料...</div>}
+        <ContactCountBar counts={counts} dark={dark} mobile />
+        <ContactHydrationStatus progress={progress} loading={loading} dark={dark} mobile />
       </div>
       <div className={dark ? "bg-[#111111]" : "bg-white"}>
         <MobileContactStaticRow dark={dark} color="#ffad33" label="New Friends" icon="person+" />
         <MobileContactStaticRow dark={dark} color="#ffad33" label="Chats Only Friends" icon="person" />
-        <MobileContactStaticRow dark={dark} color="#07c160" label="Group Chats" icon="group" />
+        <MobileContactStaticRow dark={dark} color="#07c160" label="Group Chats" icon="group" count={groups.length} onClick={() => onSelectCategory("groups")} />
         <MobileContactStaticRow dark={dark} color="#1e9bf0" label="Tags" icon="tag" />
-        <MobileContactStaticRow dark={dark} color="#1688f0" label="Official Accounts" icon="leaf" />
-        <MobileContactStaticRow dark={dark} color="#21a8f4" label="Service Accounts" icon="diamond" />
+        <MobileContactStaticRow dark={dark} color="#1688f0" label="Official Accounts" icon="leaf" count={official.length} onClick={() => onSelectCategory("official")} />
+        <MobileContactStaticRow dark={dark} color="#21a8f4" label="Service Accounts" icon="diamond" count={service.length} onClick={() => onSelectCategory("service")} />
+        <MobileContactStaticRow dark={dark} color="#2d9bf0" label="WeCom Contacts" icon="wecom" count={openim.length} onClick={() => onSelectCategory("openim")} />
       </div>
-      {filteredGroups.length > 0 && <MobileContactSection dark={dark} title="群聊" entries={filteredGroups} onSelect={onSelect} />}
       {friendSections.map((section) => (
         <MobileContactSection key={section.title} dark={dark} title={section.title} entries={section.entries} onSelect={onSelect} />
       ))}
@@ -3145,33 +3333,112 @@ function MobileContactsView({
   );
 }
 
-function MobileContactStaticRow({ color, label, icon, dark }: { color: string; label: string; icon: string; dark: boolean }) {
+function MobileContactCategoryPage({
+  category,
+  entries,
+  dark,
+  onBack,
+  onSelect,
+}: {
+  category: ContactCategoryKey;
+  entries: DirectoryEntry[];
+  dark: boolean;
+  onBack: () => void;
+  onSelect: (entry: DirectoryEntry) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const visible = sortDirectoryEntries(entries.filter((entry) =>
+    !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q)
+  ));
+  const sections = category === "groups" ? [{ title: "", entries: visible }] : groupDirectoryEntries(visible);
   return (
-    <div className="h-[52px] pl-[18px] pr-[10px] flex items-center gap-[12px]">
+    <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+      <MobileTopBar dark={dark} title={categoryTitle(category)} leftLabel="‹" onLeft={onBack} />
+      <div className="h-[44px] px-[12px] flex items-center shrink-0">
+        <div className={`w-full h-[36px] rounded-[7px] flex items-center gap-[7px] px-[12px] ${dark ? "bg-[#242424] text-[#777]" : "bg-white text-[#b7b7b7]"}`}>
+          <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
+          </svg>
+          <input value={query} onChange={(e) => setQuery(e.target.value)} className={`bg-transparent outline-none flex-1 text-[16px] ${dark ? "text-[#e8e8e8] placeholder-[#777]" : "text-[#111] placeholder-[#b7b7b7]"}`} placeholder="Search" />
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        {sections.map((section, index) => (
+          <MobileContactSection
+            key={section.title || `category_${index}`}
+            dark={dark}
+            title={section.title}
+            entries={section.entries}
+            onSelect={onSelect}
+          />
+        ))}
+        <div className={`text-center text-[17px] py-[28px] ${dark ? "text-[#777]" : "text-[#999]"}`}>
+          {categoryCountLabel(category, entries.length)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MobileContactStaticRow({
+  color,
+  label,
+  icon,
+  dark,
+  count,
+  onClick,
+}: {
+  color: string;
+  label: string;
+  icon: string;
+  dark: boolean;
+  count?: number;
+  onClick?: () => void;
+}) {
+  const content = (
+    <>
       <div className="w-[34px] h-[34px] rounded-[5px] flex items-center justify-center text-white" style={{ backgroundColor: color }}>
         <svg className="w-[20px] h-[20px]" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
           {icon === "tag" && <path strokeLinecap="round" strokeLinejoin="round" d="m4 12 8-8h7v7l-8 8-7-7Zm12-5h.01" />}
           {icon === "leaf" && <path strokeLinecap="round" strokeLinejoin="round" d="M5 5c8 0 13 5 14 14-8-1-14-6-14-14Zm0 0c4 5 8 9 14 14" />}
           {icon === "diamond" && <path strokeLinecap="round" strokeLinejoin="round" d="m12 4 7 8-7 8-7-8 7-8Zm-7 8h14" />}
           {icon === "group" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 11a4 4 0 1 0-8 0 4 4 0 0 0 8 0ZM4.5 21c.8-4.2 3.3-6.3 7.5-6.3s6.7 2.1 7.5 6.3" />}
-          {icon !== "tag" && icon !== "leaf" && icon !== "diamond" && icon !== "group" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0ZM5 21c.8-4 3.1-6 7-6s6.2 2 7 6M18 6v4M20 8h-4" />}
+          {icon === "wecom" && <path strokeLinecap="round" strokeLinejoin="round" d="M6 7.5a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v5a4 4 0 0 1-4 4h-1.2L8 20v-3.5H6a4 4 0 0 1-4-4v-5Zm8.5 1.5h.01M9.5 9h.01" />}
+          {icon !== "tag" && icon !== "leaf" && icon !== "diamond" && icon !== "group" && icon !== "wecom" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0ZM5 21c.8-4 3.1-6 7-6s6.2 2 7 6M18 6v4M20 8h-4" />}
         </svg>
       </div>
-      <div className={`flex-1 h-full border-b flex items-center text-[16px] ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>{label}</div>
-    </div>
+      <div className={`flex-1 min-w-0 h-full border-b flex items-center gap-[8px] text-[16px] ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
+        <span className="truncate">{label}</span>
+        {typeof count === "number" && <span className={dark ? "text-[#777]" : "text-[#999]"}>{count}</span>}
+      </div>
+      {onClick && <div className={`text-[22px] pr-[2px] ${dark ? "text-[#555]" : "text-[#b8b8b8]"}`}>›</div>}
+    </>
+  );
+  return (
+    onClick ? (
+      <button type="button" onClick={onClick} className={`w-full h-[52px] pl-[18px] pr-[10px] flex items-center gap-[12px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
+        {content}
+      </button>
+    ) : (
+      <div className="h-[52px] pl-[18px] pr-[10px] flex items-center gap-[12px]">
+        {content}
+      </div>
+    )
   );
 }
 
 function MobileContactSection({ title, entries, onSelect, dark }: { title: string; entries: DirectoryEntry[]; onSelect: (entry: DirectoryEntry) => void; dark: boolean }) {
   return (
     <div>
-      <div className={`h-[30px] px-[18px] flex items-center text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{title}</div>
+      {title && <div className={`h-[30px] px-[18px] flex items-center text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{title}</div>}
       <div className={dark ? "bg-[#111111]" : "bg-white"}>
         {entries.map((entry) => (
           <button key={`${entry.source}_${entry.wxid}`} type="button" onClick={() => onSelect(entry)} className={`w-full h-[54px] pl-[18px] pr-[10px] flex items-center gap-[11px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
             <MobileAvatar name={entry.name || entry.wxid} avatar={entry.avatar} group={entry.is_group} size={36} />
-            <div className={`flex-1 min-w-0 h-full border-b flex items-center ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
+            <div className={`flex-1 min-w-0 h-full border-b flex items-center gap-[8px] ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
               <div className="text-[16px] truncate">{entry.name || entry.wxid}</div>
+              {entry.badge && <span className="shrink-0 text-[11px] leading-[18px] px-[5px] rounded-[4px] bg-[#2d9bf0]/20 text-[#2d9bf0]">{entry.badge}</span>}
             </div>
           </button>
         ))}
@@ -3831,17 +4098,31 @@ function EntryAvatar({ entry }: { entry: DirectoryEntry }) {
 function ContactsPanel({
   friends,
   groups,
+  official,
+  service,
+  openim,
+  counts,
+  progress,
+  selectedCategory,
   loading,
   dark,
   onHydrate,
   onSelect,
+  onSelectCategory,
 }: {
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
+  official: DirectoryEntry[];
+  service: DirectoryEntry[];
+  openim: DirectoryEntry[];
+  counts: ContactCounts;
+  progress: ContactHydrationProgress | null;
+  selectedCategory: ContactCategoryKey | null;
   loading: boolean;
   dark: boolean;
-  onHydrate: () => void;
+  onHydrate: (force?: boolean) => void;
   onSelect: (entry: DirectoryEntry) => void;
+  onSelectCategory: (category: ContactCategoryKey) => void;
 }) {
   const [query, setQuery] = useState("");
   useEffect(() => {
@@ -3852,7 +4133,6 @@ function ContactsPanel({
   const filterEntry = (entry: DirectoryEntry) =>
     !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q);
   const visibleFriends = friends.filter(filterEntry);
-  const visibleGroups = groups.filter(filterEntry);
   const friendSections = groupDirectoryEntries(visibleFriends);
 
   return (
@@ -3873,23 +4153,22 @@ function ContactsPanel({
           type="button"
           className={`w-[38px] h-[38px] rounded-[4px] flex items-center justify-center ${dark ? "bg-[#262626] text-[#999] active:bg-[#303030]" : "bg-[#dcdcdc] text-[#555] active:bg-[#d0d0d0]"}`}
           title="刷新详情"
-          onClick={onHydrate}
+          onClick={() => onHydrate(true)}
         >
           <svg className="w-[23px] h-[23px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
             <path d="M16 11a4 4 0 1 0-8 0 4 4 0 0 0 8 0ZM4.5 21c.8-4.2 3.3-6.3 7.5-6.3s6.7 2.1 7.5 6.3M18 5v4M20 7h-4" />
           </svg>
         </button>
       </div>
-      <ContactCountBar friends={friends.length} groups={groups.length} dark={dark} />
+      <ContactCountBar counts={counts} dark={dark} />
 
-      {loading && (
-        <div className={`px-[18px] pb-[8px] text-[12px] shrink-0 ${dark ? "text-[#777]" : "text-[#888]"}`}>
-          正在通过 GetContact 批量补全联系人资料...
-        </div>
-      )}
+      <ContactHydrationStatus progress={progress} loading={loading} dark={dark} />
 
       <div className="flex-1 overflow-y-auto">
-        <ContactSection dark={dark} title="群聊" entries={visibleGroups} onSelect={onSelect} />
+        <ContactCategoryRow dark={dark} color="#07c160" label="群聊" count={groups.length} active={selectedCategory === "groups"} onClick={() => onSelectCategory("groups")} />
+        <ContactCategoryRow dark={dark} color="#1688f0" label="公众号" count={official.length} active={selectedCategory === "official"} onClick={() => onSelectCategory("official")} />
+        <ContactCategoryRow dark={dark} color="#21a8f4" label="服务号" count={service.length} active={selectedCategory === "service"} onClick={() => onSelectCategory("service")} />
+        <ContactCategoryRow dark={dark} color="#2d9bf0" label="企业联系人" count={openim.length} active={selectedCategory === "openim"} onClick={() => onSelectCategory("openim")} badge="企微" />
         {friendSections.map((section) => (
           <ContactSection key={section.title} dark={dark} title={section.title} entries={section.entries} onSelect={onSelect} />
         ))}
@@ -3898,26 +4177,100 @@ function ContactsPanel({
   );
 }
 
-function ContactCountBar({
-  friends,
-  groups,
+function ContactCountBar({ counts, dark, mobile }: { counts: ContactCounts; dark: boolean; mobile?: boolean }) {
+  const items = [
+    ["好友", counts.friends],
+    ["群", counts.groups],
+    ["公众号", counts.official],
+    ["服务号", counts.service],
+    ["企微", counts.openim],
+  ] as const;
+  return (
+    <div className={`${mobile ? "px-[18px] pb-[8px]" : "px-[18px] pb-[10px]"} shrink-0`}>
+      <div className={`min-h-[28px] rounded-[4px] flex items-center gap-x-[12px] gap-y-[4px] flex-wrap px-[10px] py-[5px] text-[13px] ${
+        dark ? "bg-[#202020] text-[#9a9a9a]" : "bg-[#dddddd] text-[#666]"
+      }`}>
+        {items.map(([label, count]) => (
+          <span key={label} className="whitespace-nowrap">
+            {label} <strong className={dark ? "text-[#e8e8e8]" : "text-[#111]"}>{count}</strong>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ContactHydrationStatus({
+  progress,
+  loading,
   dark,
   mobile,
 }: {
-  friends: number;
-  groups: number;
+  progress: ContactHydrationProgress | null;
+  loading: boolean;
   dark: boolean;
   mobile?: boolean;
 }) {
+  const active = Boolean(progress?.active);
+  if (!active && !loading) return null;
+  const total = Number(progress?.total || 0);
+  const processed = Number(progress?.processed || 0);
+  const batch = Number(progress?.batch || 0);
+  const totalBatches = Number(progress?.total_batches || 0);
+  const updated = Number(progress?.updated || 0);
+  const failed = Number(progress?.failed || 0);
+  const ratio = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+  const text = active && total
+    ? `GetContact 第 ${batch}/${totalBatches} 批，已处理 ${processed}/${total}，已更新 ${updated}，失败 ${failed}`
+    : "正在通过 GetContact 批量补全联系人资料...";
   return (
-    <div className={`${mobile ? "px-[18px] pb-[8px]" : "px-[18px] pb-[10px]"} shrink-0`}>
-      <div className={`h-[28px] rounded-[4px] flex items-center gap-[14px] px-[10px] text-[13px] ${
-        dark ? "bg-[#202020] text-[#9a9a9a]" : "bg-[#dddddd] text-[#666]"
-      }`}>
-        <span>好友 <strong className={dark ? "text-[#e8e8e8]" : "text-[#111]"}>{friends}</strong></span>
-        <span>群 <strong className={dark ? "text-[#e8e8e8]" : "text-[#111]"}>{groups}</strong></span>
-      </div>
+    <div className={`${mobile ? "px-[18px]" : "px-[18px]"} pb-[8px] shrink-0`}>
+      <div className={`text-[12px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{text}</div>
+      {total > 0 && (
+        <div className={`mt-[5px] h-[4px] rounded-full overflow-hidden ${dark ? "bg-[#2a2a2a]" : "bg-[#d5d5d5]"}`}>
+          <div className="h-full bg-[#07c160] transition-all" style={{ width: `${ratio}%` }} />
+        </div>
+      )}
     </div>
+  );
+}
+
+function ContactCategoryRow({
+  dark,
+  color,
+  label,
+  count,
+  active,
+  badge,
+  onClick,
+}: {
+  dark: boolean;
+  color: string;
+  label: string;
+  count: number;
+  active: boolean;
+  badge?: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`w-full h-[58px] px-[14px] flex items-center gap-[12px] text-left ${
+        active
+          ? (dark ? "bg-[#2a2a2a]" : "bg-[#d2d2d2]")
+          : (dark ? "hover:bg-[#242424] active:bg-[#2a2a2a]" : "hover:bg-[#dedede] active:bg-[#d3d3d3]")
+      }`}
+    >
+      <div className="w-[42px] h-[42px] rounded-[4px] flex items-center justify-center text-white text-[14px] font-medium shrink-0" style={{ backgroundColor: color }}>
+        {badge || label.slice(0, 1)}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className={`text-[16px] truncate ${dark ? "text-[#e8e8e8]" : "text-[#111]"}`}>{label}</div>
+        <div className={`text-[12px] mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{count}</div>
+      </div>
+      <div className={`text-[20px] ${dark ? "text-[#555]" : "text-[#999]"}`}>›</div>
+    </button>
   );
 }
 
@@ -3945,7 +4298,10 @@ function ContactSection({
         >
           <EntryAvatar entry={entry} />
           <div className="min-w-0 flex-1">
-            <div className={`text-[16px] truncate ${dark ? "text-[#e8e8e8]" : "text-[#111]"}`}>{entry.name || entry.wxid}</div>
+            <div className="flex items-center gap-[8px] min-w-0">
+              <div className={`text-[16px] truncate ${dark ? "text-[#e8e8e8]" : "text-[#111]"}`}>{entry.name || entry.wxid}</div>
+              {entry.badge && <span className="shrink-0 text-[11px] leading-[18px] px-[5px] rounded-[4px] bg-[#2d9bf0]/20 text-[#2d9bf0]">{entry.badge}</span>}
+            </div>
             {entry.wxid && entry.wxid !== entry.name && (
               <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{entry.wxid}</div>
             )}
@@ -4243,6 +4599,63 @@ function BroadcastSelectButton({ label, onClick, dark }: { label: string; onClic
     >
       {label}
     </button>
+  );
+}
+
+function DirectoryCategoryPane({
+  title,
+  countLabel,
+  entries,
+  dark,
+  onSelect,
+}: {
+  title: string;
+  countLabel: string;
+  entries: DirectoryEntry[];
+  dark: boolean;
+  onSelect: (entry: DirectoryEntry) => void;
+}) {
+  const sections = groupDirectoryEntries(entries);
+  return (
+    <div className={`h-full overflow-y-auto ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+      <div className={`h-[74px] px-[30px] flex items-center border-b ${dark ? "border-[#2a2a2a]" : "border-[#d8d8d8]"}`}>
+        <div>
+          <div className="text-[24px] font-medium">{title}</div>
+          <div className={`text-[13px] mt-[3px] ${dark ? "text-[#777]" : "text-[#888]"}`}>{countLabel}</div>
+        </div>
+      </div>
+      <div className="max-w-[900px] px-[36px] py-[28px]">
+        {sections.length === 0 && (
+          <div className={`text-[14px] ${dark ? "text-[#777]" : "text-[#999]"}`}>暂无数据</div>
+        )}
+        {sections.map((section) => (
+          <div key={section.title} className="mb-[18px]">
+            <div className={`text-[14px] mb-[10px] ${dark ? "text-[#777]" : "text-[#888]"}`}>{section.title}</div>
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-[8px]">
+              {section.entries.map((entry) => (
+                <button
+                  key={`${entry.source}_${entry.wxid}`}
+                  type="button"
+                  onClick={() => onSelect(entry)}
+                  className={`h-[60px] rounded-[4px] px-[10px] flex items-center gap-[10px] text-left ${
+                    dark ? "hover:bg-[#242424] active:bg-[#2a2a2a]" : "hover:bg-[#dedede] active:bg-[#d3d3d3]"
+                  }`}
+                >
+                  <EntryAvatar entry={entry} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-[7px] min-w-0">
+                      <div className="truncate text-[15px]">{entry.name || entry.wxid}</div>
+                      {entry.badge && <span className="shrink-0 text-[11px] leading-[18px] px-[5px] rounded-[4px] bg-[#2d9bf0]/20 text-[#2d9bf0]">{entry.badge}</span>}
+                    </div>
+                    <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{entry.wxid}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
