@@ -316,10 +316,28 @@ async def batch_get_contact_brief_info(wxid_list: str) -> dict:
 
 
 async def get_contact(wxids: list[str]) -> dict:
-    """Get full contact profiles for one or more wxids."""
+    """Get full contact profiles for one or more wxids.
+
+    Hook /GetContact is only safe up to 100 wxids per request.
+    """
     names = [str(w).strip() for w in (wxids or []) if str(w).strip()]
     if not names:
         return {"contacts": []}
+    if len(names) > 100:
+        combined: list[dict] = []
+        last_extra: dict = {}
+        for i in range(0, len(names), 100):
+            chunk = names[i:i + 100]
+            data = await get_contact(chunk)
+            if isinstance(data, dict):
+                contacts = data.get("contacts")
+                if isinstance(contacts, list):
+                    combined.extend([c for c in contacts if isinstance(c, dict)])
+                elif contacts:
+                    combined.append(contacts)
+                last_extra = {k: v for k, v in data.items() if k != "contacts"}
+            await asyncio.sleep(0.02)
+        return {**last_extra, "contacts": combined}
     if IS_HOOK:
         r = await _post("/GetContact", json={"wxids": names})
     else:
