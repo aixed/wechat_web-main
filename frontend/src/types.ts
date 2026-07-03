@@ -16,6 +16,7 @@ export interface Session {
   lastTime?: string;
   lastTimestamp?: number;   // Unix epoch seconds – used for sorting & TZ-correct display
   unread?: number;
+  atMe?: boolean;
   muted?: boolean;
   pinned?: boolean;
   order?: number;
