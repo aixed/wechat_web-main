@@ -2,7 +2,7 @@
 
 Reads from ../config.yaml and exposes settings for three modes:
   - local_hook       本地Hook (DLL注入本地微信)
-  - remote_hook      远程Hook (服务器上的Hook微信)
+  - remote_hook      远程客户端Hook (客户端DLL主动连接本后端WSS)
   - remote_protocol  远程协议 (服务器上的微信协议)
 """
 
@@ -107,7 +107,22 @@ MGR_BASE_URL = f"http://{HOOK_HOST}:{MGR_PORT}"
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = int(_cfg.get("server_port", 5000))
 
-# Callback  (use public IP so remote servers can reach us)
+# DLL agent WebSocket. The DLL connects outward to this backend, usually through
+# TLS termination as wss://<public-ip>:<client_wss_port><agent_ws_path>.
+AGENT_WS_ENABLED = _to_bool(_cfg.get("agent_ws_enabled", False), False)
+AGENT_WS_PATH = str(_cfg.get("agent_ws_path", "/agent") or "/agent")
+if not AGENT_WS_PATH.startswith("/"):
+    AGENT_WS_PATH = "/" + AGENT_WS_PATH
+CLIENT_WSS_PORT = int(_cfg.get("client_wss_port", 443))
+CLIENT_WSS_SCHEME = str(_cfg.get("client_wss_scheme", "wss") or "wss").lower()
+CLIENT_WSS_HOST = str(_cfg.get("client_wss_host", _cfg.get("ip", "127.0.0.1")) or "127.0.0.1")
+AGENT_WS_REQUEST_TIMEOUT = float(_cfg.get("agent_ws_request_timeout", 30.0))
+
+_client_wss_default_port = 443 if CLIENT_WSS_SCHEME == "wss" else 80
+_client_wss_port_part = "" if CLIENT_WSS_PORT == _client_wss_default_port else f":{CLIENT_WSS_PORT}"
+CLIENT_WSS_URL = f"{CLIENT_WSS_SCHEME}://{CLIENT_WSS_HOST}{_client_wss_port_part}{AGENT_WS_PATH}"
+
+# Callback (use public IP/domain so remote client DLLs can reach us outbound)
 CALLBACK_PORT = int(_cfg.get("callback_port", SERVER_PORT))
 CALLBACK_PATH = str(_cfg.get("callback_path", "/api/callback"))
 CALLBACK_URL = f"http://{PUBLIC_IP}:{CALLBACK_PORT}{CALLBACK_PATH}"
@@ -125,6 +140,8 @@ MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL = int(_cfg.get("max_restarts_after_button_l
 print(f"[CONFIG] wechat_mode={WECHAT_MODE}  mode={LOGIN_MODE}  host={HOOK_HOST}  "
       f"api_port={HOOK_PORT}  mgr_port={MGR_PORT}  "
       f"server_port={SERVER_PORT}  callback={CALLBACK_URL}  "
+      f"agent_ws={'on' if AGENT_WS_ENABLED else 'off'}  "
+      f"client_wss={CLIENT_WSS_URL}  "
       f"recv_type={RECV_TYPE}  "
       f"ip={PUBLIC_IP}  RDV={RDV}  "
       f"restart_on_button_fail={RESTART_ON_BUTTON_LOGIN_FAIL}  "

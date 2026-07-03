@@ -21,6 +21,7 @@ import io
 
 import config
 import wechat_api
+from agent_ws import agent_manager
 from ws_manager import manager
 from message_store import MessageStore
 from pb_parser import parse_raw_pb
@@ -376,9 +377,8 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
 
 # ─── Startup / Shutdown ────────────────────────────────────────────
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize on startup, cleanup on shutdown."""
+async def _run_backend_initialization():
+    """Initialize cached state from the Hook/Protocol API."""
     _log("=" * 60)
     _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}]")
     _log("=" * 60)
@@ -553,10 +553,41 @@ async def lifespan(app: FastAPI):
     _log("=" * 60)
     _log(f"Backend ready at http://{config.SERVER_HOST}:{config.SERVER_PORT}")
     _log(f"Login mode: {config.LOGIN_MODE}  |  API: {config.HOOK_BASE_URL}")
+    if config.AGENT_WS_ENABLED:
+        _log(f"Agent WS: {config.CLIENT_WSS_URL}  path={config.AGENT_WS_PATH}")
     _log(f"Callback URL: {config.CALLBACK_URL}")
     _log("=" * 60)
 
+async def _run_initialization_after_agent():
+    _log(f"[INIT] Waiting for DLL agent on {config.AGENT_WS_PATH} ...")
+    while not agent_manager.is_connected():
+        await asyncio.sleep(1)
+    _log("[INIT] DLL agent connected; starting Hook initialization")
+    await _run_backend_initialization()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize on startup, cleanup on shutdown."""
+    init_task = None
+    if config.AGENT_WS_ENABLED:
+        _log("=" * 60)
+        _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}]")
+        _log(f"Agent WS enabled: {config.CLIENT_WSS_URL}  path={config.AGENT_WS_PATH}")
+        _log("Hook initialization will run after the DLL agent connects.")
+        _log("=" * 60)
+        init_task = asyncio.create_task(_run_initialization_after_agent())
+    else:
+        await _run_backend_initialization()
+
     yield
+
+    if init_task:
+        init_task.cancel()
+        try:
+            await init_task
+        except asyncio.CancelledError:
+            pass
 
     # Shutdown
     _log("[SHUTDOWN] Disabling message callback...")
@@ -564,6 +595,7 @@ async def lifespan(app: FastAPI):
         await wechat_api.configure_msg_receive(False, "", config.RECV_TYPE)
     except Exception:
         pass
+    await agent_manager.close()
     await wechat_api.client.aclose()
     _log("[SHUTDOWN] Done.")
 
@@ -806,6 +838,22 @@ async def wechat_callback(request: Request):
 
 
 # ─── WebSocket (frontend connection) ───────────────────────────────
+
+@app.websocket(config.AGENT_WS_PATH)
+async def agent_websocket_endpoint(websocket: WebSocket):
+    await agent_manager.handle(websocket)
+
+
+@app.get("/api/agent/status")
+async def agent_status():
+    return {
+        **agent_manager.status(),
+        "enabled": config.AGENT_WS_ENABLED,
+        "path": config.AGENT_WS_PATH,
+        "client_wss_url": config.CLIENT_WSS_URL,
+        "client_wss_port": config.CLIENT_WSS_PORT,
+    }
+
 
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):

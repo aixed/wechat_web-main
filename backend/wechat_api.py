@@ -2,7 +2,7 @@
 
 Supports three modes via config.yaml:
   - local_hook       本地Hook DLL endpoints like /SendTextMsg
-  - remote_hook      远程Hook (same API as local, different host)
+  - remote_hook      远程客户端Hook (client DLL connects to this backend via /agent)
   - remote_protocol  远程协议 endpoints like /newsendmsg/
 """
 
@@ -14,7 +14,15 @@ import os
 import hashlib
 import zlib
 import json as _json
-from config import HOOK_BASE_URL, IS_HOOK, IS_PROTOCOL, LOGIN_MODE
+from config import (
+    AGENT_WS_ENABLED,
+    AGENT_WS_REQUEST_TIMEOUT,
+    HOOK_BASE_URL,
+    IS_HOOK,
+    IS_PROTOCOL,
+    LOGIN_MODE,
+)
+from agent_ws import agent_manager
 
 from config import IS_LOCAL_HOOK
 
@@ -29,7 +37,7 @@ _req_id = 0
 #  - Local Hook: Lock (serialize everything — DLL is NOT thread-safe)
 #  - Remote:     Semaphore (allow up to N concurrent requests — server handles concurrency)
 _REMOTE_CONCURRENCY = 10
-if IS_LOCAL_HOOK:
+if IS_LOCAL_HOOK or (AGENT_WS_ENABLED and IS_HOOK):
     _hook_lock: asyncio.Lock | asyncio.Semaphore = asyncio.Lock()
 else:
     _hook_lock = asyncio.Semaphore(_REMOTE_CONCURRENCY)
@@ -162,7 +170,8 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
     """Logged POST wrapper — serialized through _hook_lock to protect the Hook."""
     global _req_id, _consecutive_failures, _last_failure_time
 
-    full_url = f"{HOOK_BASE_URL}{endpoint}"
+    use_agent_ws = AGENT_WS_ENABLED and IS_HOOK
+    full_url = f"agent-ws://{endpoint.lstrip('/')}" if use_agent_ws else f"{HOOK_BASE_URL}{endpoint}"
 
     if not bypass_circuit_breaker and _circuit_open():
         backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
@@ -181,10 +190,25 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
         rid = _req_id
         log_json = _scrub_payload_for_log(json or {})
         body_str = str(log_json)[:200]
-        _log(f"[API #{rid}] → POST {endpoint}  body={body_str}")
+        transport = "AGENT" if use_agent_ws else "POST"
+        _log(f"[API #{rid}] → {transport} {endpoint}  body={body_str}")
         t0 = time.time()
         try:
-            r = await client.post(endpoint, json=json, timeout=timeout)
+            if use_agent_ws:
+                route = endpoint.strip("/")
+                agent_response = await agent_manager.request(
+                    route,
+                    json or {},
+                    timeout=timeout or AGENT_WS_REQUEST_TIMEOUT,
+                )
+                r = httpx.Response(
+                    status_code=agent_response.status,
+                    content=agent_response.body,
+                    headers={"content-type": agent_response.content_type},
+                    request=httpx.Request("POST", f"http://agent.local/{route}"),
+                )
+            else:
+                r = await client.post(endpoint, json=json, timeout=timeout)
             ms = int((time.time() - t0) * 1000)
             body_preview = r.text[:150] if r.text else "(empty)"
             _log(f"[API #{rid}] ← {r.status_code} in {ms}ms  len={len(r.text)}  body={body_preview}")
