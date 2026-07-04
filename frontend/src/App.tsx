@@ -1858,7 +1858,7 @@ export default function App() {
   useEffect(() => {
     if (!authenticated || selectedAccountId) return;
     loadAccounts();
-    const timer = window.setInterval(loadAccounts, 3000);
+    const timer = window.setInterval(loadAccounts, 1000);
     return () => window.clearInterval(timer);
   }, [authenticated, selectedAccountId, loadAccounts]);
 

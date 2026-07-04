@@ -159,6 +159,10 @@ def _scrub_payload_for_log(obj):
     return obj
 
 
+def _console_payload(obj, limit: int = 1200) -> str:
+    return _truncate(_pretty_json(obj), limit).replace("\n", " ")
+
+
 def _circuit_open() -> bool:
     """Check if circuit breaker is open (should skip request)."""
     if _consecutive_failures == 0:
@@ -184,14 +188,16 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
     global _req_id, _consecutive_failures, _last_failure_time
 
     use_agent_ws = AGENT_WS_ENABLED and IS_HOOK
-    full_url = f"agent-ws://{endpoint.lstrip('/')}" if use_agent_ws else f"{HOOK_BASE_URL}{endpoint}"
+    agent_id = _CURRENT_AGENT_ID.get() or ""
+    full_url = f"agent-ws://{agent_id or 'active'}/{endpoint.lstrip('/')}" if use_agent_ws else f"{HOOK_BASE_URL}{endpoint}"
 
     if not bypass_circuit_breaker and _circuit_open():
         backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
         log_json = _scrub_payload_for_log(json or {})
-        _log(f"[API] ⏸ Circuit breaker OPEN — skipping {endpoint} (failures={_consecutive_failures}, backoff={backoff}s)")
+        _log(f"[API] ⏸ Circuit breaker OPEN — skipping {full_url} (failures={_consecutive_failures}, backoff={backoff}s)")
         await _append_main_log(
             f"[{_ts()}]POST {full_url}\n"
+            f"          agent_id={agent_id or '-'} endpoint={endpoint}\n"
             f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
             f"{_indent_multiline(f'ERROR Circuit breaker open (failures={_consecutive_failures}, backoff={backoff}s)', '          >> ')}\n"
             f"          error=circuit_open\n"
@@ -202,9 +208,8 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
         _req_id += 1
         rid = _req_id
         log_json = _scrub_payload_for_log(json or {})
-        body_str = str(log_json)[:200]
         transport = "AGENT" if use_agent_ws else "POST"
-        _log(f"[API #{rid}] → {transport} {endpoint}  body={body_str}")
+        _log(f"[API #{rid}] → {transport} {full_url} agent={agent_id or '-'} body={_console_payload(log_json)}")
         t0 = time.time()
         try:
             if use_agent_ws:
@@ -224,10 +229,11 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
             else:
                 r = await client.post(endpoint, json=json, timeout=timeout)
             ms = int((time.time() - t0) * 1000)
-            body_preview = r.text[:150] if r.text else "(empty)"
-            _log(f"[API #{rid}] ← {r.status_code} in {ms}ms  len={len(r.text)}  body={body_preview}")
+            body_preview = _truncate(r.text if r.text else "(empty)", 1200).replace("\n", " ")
+            _log(f"[API #{rid}] ← {transport} {full_url} status={r.status_code} time={ms}ms len={len(r.text)} body={body_preview}")
             await _append_main_log(
                 f"[{_ts()}]POST {full_url}\n"
+                f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
                 f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
                 f"{_indent_multiline(_truncate(r.text), '          >> ')}\n"
                 f"          time_used={ms}ms\n"
@@ -239,13 +245,14 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
             return r
         except Exception as e:
             ms = int((time.time() - t0) * 1000)
-            _log(f"[API #{rid}] ✗ ERROR in {ms}ms: {type(e).__name__}: {e}")
+            _log(f"[API #{rid}] ✗ {transport} {full_url} agent={agent_id or '-'} ERROR time={ms}ms {type(e).__name__}: {e}")
             _consecutive_failures += 1
             _last_failure_time = time.time()
             backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
             _log(f"[API] ⚠ Consecutive failures: {_consecutive_failures} — next backoff: {backoff}s")
             await _append_main_log(
                 f"[{_ts()}]POST {full_url}\n"
+                f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
                 f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
                 f"{_indent_multiline(_truncate(f'{type(e).__name__}: {e}', 2000), '          >> ')}\n"
                 f"          error={type(e).__name__} time_used={ms}ms\n"
