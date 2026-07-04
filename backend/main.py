@@ -218,7 +218,8 @@ _active_agent_id = ""
 _account_runtimes: dict[str, dict] = {}
 _self_wxid_to_agent_id: dict[str, str] = {}
 _ACCOUNT_LOCK = asyncio.Lock()
-_ACCOUNT_CARD_REFRESH_INTERVAL_SEC = 1.0
+_ACCOUNT_CARD_REFRESH_FAST_INTERVAL_SEC = 1.0
+_ACCOUNT_CARD_REFRESH_LOGGED_IN_INTERVAL_SEC = 10.0
 _account_card_refresh_at: dict[str, float] = {}
 _account_card_refreshing: set[str] = set()
 _initializing_agents: set[str] = set()
@@ -597,7 +598,13 @@ def _schedule_account_card_refresh() -> None:
         if not agent_id or agent_id in _account_card_refreshing or agent_id in _initializing_agents:
             continue
         last = _account_card_refresh_at.get(agent_id, 0.0)
-        if now - last < _ACCOUNT_CARD_REFRESH_INTERVAL_SEC:
+        status = str(account.get("login_status") or "").strip()
+        interval = (
+            _ACCOUNT_CARD_REFRESH_LOGGED_IN_INTERVAL_SEC
+            if status == "3"
+            else _ACCOUNT_CARD_REFRESH_FAST_INTERVAL_SEC
+        )
+        if now - last < interval:
             continue
         _account_card_refreshing.add(agent_id)
         _account_card_refresh_at[agent_id] = now
