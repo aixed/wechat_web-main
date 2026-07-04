@@ -398,6 +398,7 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
     wxid = parsed["wxid"]
     nickname = parsed["nickname"]
     agent = agent_manager.get_agent(agent_id) or {}
+    previous_status = str(agent.get("login_status") or "").strip()
     current_avatar = str(agent.get("avatar") or "").strip()
     avatar = current_avatar
     current_phone = str(agent.get("phone") or "").strip()
@@ -445,9 +446,17 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
         nickname = ""
 
     initialized = None if status == "3" else False
+    if status == "3" and previous_status != "3":
+        runtime = _runtime_for(agent_id)
+        runtime_state = runtime["app_state"]
+        runtime_state["session_list_loaded"] = False
+        runtime_state["sessions"] = None
+        runtime_state["last_messages"] = {}
+        _log(f"[LOGIN_STATUS] agent={agent_id} entered login status 3; next chat entry will query native Session table")
     if status != "3":
         runtime = _runtime_for(agent_id)
         runtime["app_state"]["initialized"] = False
+        runtime["app_state"]["session_list_loaded"] = False
 
     await agent_manager.update_account(
         agent_id,
@@ -1191,8 +1200,6 @@ async def activate_account(req: ActivateAccountRequest):
             }
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
-        owner_wxid = _contact_owner_wxid()
-        _load_session_cache_into_state(owner_wxid)
     return {"ok": True, "active_id": agent_id, "account": agent_manager.get_agent(agent_id)}
 
 
@@ -2871,6 +2878,7 @@ async def refresh_sessions(request: Request):
     if not app_state.get("session_list_loaded"):
         try:
             with wechat_api.use_agent(agent_id or _active_agent_id or agent_manager.active_id()):
+                _log("[REFRESH] querying native Session table: db=MicroMsg.db sql=select * from Session order by nOrder desc")
                 db_sessions = await _query_session_list_from_db()
             session_rows = db_sessions.get("data", []) if isinstance(db_sessions, dict) else []
             if session_rows:
@@ -2882,7 +2890,6 @@ async def refresh_sessions(request: Request):
                 app_state["session_list_loaded"] = True
         except Exception as e:
             _log(f"[REFRESH] Query Session table failed; using local cache: {type(e).__name__}: {e}")
-            app_state["session_list_loaded"] = True
 
     raw_sessions, last_messages = _load_session_cache_into_state(owner_wxid)
     session_list = raw_sessions.get("data", []) if isinstance(raw_sessions, dict) else []
