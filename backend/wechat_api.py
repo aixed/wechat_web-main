@@ -39,6 +39,68 @@ _CURRENT_AGENT_ID: contextvars.ContextVar[str] = contextvars.ContextVar("wechat_
 _query_db_locks: dict[str, asyncio.Lock] = {}
 
 
+class _AgentHookGate:
+    """Per-agent reader/writer gate for fragile Hook routes.
+
+    Normal Hook APIs enter as shared readers. QueryDB enters as an exclusive
+    writer, so once a Session-table query is requested no new Hook calls can
+    start for that same WeChat process until QueryDB returns.
+    """
+
+    def __init__(self) -> None:
+        self._cond = asyncio.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    async def acquire_shared(self) -> None:
+        async with self._cond:
+            while self._writer or self._writers_waiting > 0:
+                await self._cond.wait()
+            self._readers += 1
+
+    async def release_shared(self) -> None:
+        async with self._cond:
+            self._readers = max(0, self._readers - 1)
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    async def acquire_exclusive(self) -> None:
+        async with self._cond:
+            self._writers_waiting += 1
+            try:
+                while self._writer or self._readers > 0:
+                    await self._cond.wait()
+                self._writer = True
+            finally:
+                self._writers_waiting = max(0, self._writers_waiting - 1)
+
+    async def release_exclusive(self) -> None:
+        async with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+
+_agent_hook_gates: dict[str, _AgentHookGate] = {}
+
+
+def _agent_gate_key(agent_id: str) -> str:
+    return str(agent_id or "__default__")
+
+
+def _agent_hook_gate(agent_id: str) -> _AgentHookGate:
+    key = _agent_gate_key(agent_id)
+    gate = _agent_hook_gates.get(key)
+    if gate is None:
+        gate = _AgentHookGate()
+        _agent_hook_gates[key] = gate
+    return gate
+
+
+def _is_query_db_endpoint(endpoint: str) -> bool:
+    return str(endpoint or "").strip().strip("/").split("?", 1)[0].lower() == "querydb"
+
+
 @contextmanager
 def use_agent(agent_id: str | None):
     token = _CURRENT_AGENT_ID.set(str(agent_id or ""))
@@ -190,6 +252,8 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
     use_agent_ws = AGENT_WS_ENABLED and IS_HOOK
     agent_id = _CURRENT_AGENT_ID.get() or ""
     full_url = f"agent-ws://{agent_id or 'active'}/{endpoint.lstrip('/')}" if use_agent_ws else f"{HOOK_BASE_URL}{endpoint}"
+    hook_gate = _agent_hook_gate(agent_id) if IS_HOOK else None
+    query_db_call = _is_query_db_endpoint(endpoint)
 
     if not bypass_circuit_breaker and _circuit_open():
         backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
@@ -204,60 +268,76 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
         )
         raise ConnectionError(f"Circuit breaker open after {_consecutive_failures} failures")
 
-    async with _hook_lock:
-        _req_id += 1
-        rid = _req_id
-        log_json = _scrub_payload_for_log(json or {})
-        transport = "AGENT" if use_agent_ws else "POST"
-        _log(f"[API #{rid}] → {transport} {full_url} agent={agent_id or '-'} body={_console_payload(log_json)}")
-        t0 = time.time()
-        try:
-            if use_agent_ws:
-                route = endpoint.strip("/")
-                agent_response = await agent_manager.request(
-                    route,
-                    json or {},
-                    timeout=timeout or AGENT_WS_REQUEST_TIMEOUT,
-                    agent_id=_CURRENT_AGENT_ID.get() or None,
+    if hook_gate:
+        if query_db_call:
+            _log(f"[API-GATE] QueryDB waiting for exclusive hook access agent={agent_id or '-'}")
+            await hook_gate.acquire_exclusive()
+            _log(f"[API-GATE] QueryDB acquired exclusive hook access agent={agent_id or '-'}")
+        else:
+            await hook_gate.acquire_shared()
+
+    try:
+        async with _hook_lock:
+            _req_id += 1
+            rid = _req_id
+            log_json = _scrub_payload_for_log(json or {})
+            transport = "AGENT" if use_agent_ws else "POST"
+            _log(f"[API #{rid}] → {transport} {full_url} agent={agent_id or '-'} body={_console_payload(log_json)}")
+            t0 = time.time()
+            try:
+                if use_agent_ws:
+                    route = endpoint.strip("/")
+                    agent_response = await agent_manager.request(
+                        route,
+                        json or {},
+                        timeout=timeout or AGENT_WS_REQUEST_TIMEOUT,
+                        agent_id=_CURRENT_AGENT_ID.get() or None,
+                    )
+                    r = httpx.Response(
+                        status_code=agent_response.status,
+                        content=agent_response.body,
+                        headers={"content-type": agent_response.content_type},
+                        request=httpx.Request("POST", f"http://agent.local/{route}"),
+                    )
+                else:
+                    r = await client.post(endpoint, json=json, timeout=timeout)
+                ms = int((time.time() - t0) * 1000)
+                body_preview = _truncate(r.text if r.text else "(empty)", 1200).replace("\n", " ")
+                _log(f"[API #{rid}] ← {transport} {full_url} status={r.status_code} time={ms}ms len={len(r.text)} body={body_preview}")
+                await _append_main_log(
+                    f"[{_ts()}]POST {full_url}\n"
+                    f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
+                    f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
+                    f"{_indent_multiline(_truncate(r.text), '          >> ')}\n"
+                    f"          time_used={ms}ms\n"
                 )
-                r = httpx.Response(
-                    status_code=agent_response.status,
-                    content=agent_response.body,
-                    headers={"content-type": agent_response.content_type},
-                    request=httpx.Request("POST", f"http://agent.local/{route}"),
+                # Success — reset circuit breaker
+                if _consecutive_failures > 0:
+                    _log(f"[API] ✓ Circuit breaker RESET (was at {_consecutive_failures} failures)")
+                _consecutive_failures = 0
+                return r
+            except Exception as e:
+                ms = int((time.time() - t0) * 1000)
+                _log(f"[API #{rid}] ✗ {transport} {full_url} agent={agent_id or '-'} ERROR time={ms}ms {type(e).__name__}: {e}")
+                _consecutive_failures += 1
+                _last_failure_time = time.time()
+                backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
+                _log(f"[API] ⚠ Consecutive failures: {_consecutive_failures} — next backoff: {backoff}s")
+                await _append_main_log(
+                    f"[{_ts()}]POST {full_url}\n"
+                    f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
+                    f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
+                    f"{_indent_multiline(_truncate(f'{type(e).__name__}: {e}', 2000), '          >> ')}\n"
+                    f"          error={type(e).__name__} time_used={ms}ms\n"
                 )
+                raise
+    finally:
+        if hook_gate:
+            if query_db_call:
+                await hook_gate.release_exclusive()
+                _log(f"[API-GATE] QueryDB released exclusive hook access agent={agent_id or '-'}")
             else:
-                r = await client.post(endpoint, json=json, timeout=timeout)
-            ms = int((time.time() - t0) * 1000)
-            body_preview = _truncate(r.text if r.text else "(empty)", 1200).replace("\n", " ")
-            _log(f"[API #{rid}] ← {transport} {full_url} status={r.status_code} time={ms}ms len={len(r.text)} body={body_preview}")
-            await _append_main_log(
-                f"[{_ts()}]POST {full_url}\n"
-                f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
-                f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
-                f"{_indent_multiline(_truncate(r.text), '          >> ')}\n"
-                f"          time_used={ms}ms\n"
-            )
-            # Success — reset circuit breaker
-            if _consecutive_failures > 0:
-                _log(f"[API] ✓ Circuit breaker RESET (was at {_consecutive_failures} failures)")
-            _consecutive_failures = 0
-            return r
-        except Exception as e:
-            ms = int((time.time() - t0) * 1000)
-            _log(f"[API #{rid}] ✗ {transport} {full_url} agent={agent_id or '-'} ERROR time={ms}ms {type(e).__name__}: {e}")
-            _consecutive_failures += 1
-            _last_failure_time = time.time()
-            backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
-            _log(f"[API] ⚠ Consecutive failures: {_consecutive_failures} — next backoff: {backoff}s")
-            await _append_main_log(
-                f"[{_ts()}]POST {full_url}\n"
-                f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
-                f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
-                f"{_indent_multiline(_truncate(f'{type(e).__name__}: {e}', 2000), '          >> ')}\n"
-                f"          error={type(e).__name__} time_used={ms}ms\n"
-            )
-            raise
+                await hook_gate.release_shared()
 
 
 # ═══════════════════════════════════════════════════════════════════
