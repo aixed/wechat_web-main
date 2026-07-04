@@ -223,6 +223,7 @@ _account_card_refresh_at: dict[str, float] = {}
 _account_card_refreshing: set[str] = set()
 _initializing_agents: set[str] = set()
 _agent_login_status_seen: dict[str, str] = {}
+_agent_self_profile_refreshed: set[str] = set()
 _CONTACT_INIT_LOCKS: dict[str, asyncio.Lock] = {}
 _CONTACT_HYDRATING_OWNERS: set[str] = set()
 _CONTACT_HYDRATION_PROGRESS: dict[str, dict] = {}
@@ -384,8 +385,8 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
     """Poll /IsLoginStatus and update account-card metadata.
 
     Status 3 is the only state that may continue into expensive initialization.
-    Status 5 means WeChat is at the "enter WeChat" screen; then GetSelfLoginInfo
-    is safe and needed for showing avatar/name/wxid on the account card.
+    GetSelfLoginInfo is only called after status 3. Earlier login states can
+    leave WeChat half-ready and should not receive profile/detail calls.
     """
     agent_id = str(agent_id or "").strip()
     if config.AGENT_WS_ENABLED and (not agent_id or not agent_manager.is_connected(agent_id)):
@@ -414,15 +415,12 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
     current_wxid = str(agent.get("wxid") or agent.get("account_id") or wxid or "")
     current_nickname = str(agent.get("nickname") or agent.get("name") or "").strip()
 
-    needs_self_profile = status == "5" or (
-        status == "3" and (
-            not wxid
-            or not nickname
-            or not current_avatar
-            or not current_phone
-            or not current_region
-            or not current_signature
-            or not current_account
+    entered_logged_in = status == "3" and previous_status != "3"
+    needs_self_profile = status == "3" and (
+        entered_logged_in
+        or (
+            agent_id not in _agent_self_profile_refreshed
+            and (not wxid or not nickname or not current_avatar or not current_account)
         )
     )
     if needs_self_profile:
@@ -437,6 +435,7 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
             signature = identity["signature"] or current_signature
             wechat_account = identity["account"] or current_account
             profile = identity.get("profile") or {}
+            _agent_self_profile_refreshed.add(agent_id)
         except Exception as e:
             _log(f"[LOGIN_STATUS] GetSelfLoginInfo failed agent={agent_id}: {type(e).__name__}: {e}")
 
@@ -454,6 +453,7 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
         runtime_state["last_messages"] = {}
         _log(f"[LOGIN_STATUS] agent={agent_id} entered login status 3; next chat entry will query native Session table")
     if status != "3":
+        _agent_self_profile_refreshed.discard(agent_id)
         runtime = _runtime_for(agent_id)
         runtime["app_state"]["initialized"] = False
         runtime["app_state"]["session_list_loaded"] = False
