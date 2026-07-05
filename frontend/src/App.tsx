@@ -4446,14 +4446,14 @@ function ContactHydrationStatus({
   const ratio = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
   const phase = String(progress?.phase || "");
   const text = phase === "InitContact"
-    ? "??????????..."
+    ? "\u6b63\u5728\u521d\u59cb\u5316\u8054\u7cfb\u4eba\u5217\u8868..."
     : phase === "BatchGetContactBriefInfo"
       ? (active && total
-          ? `????????? ${batch}/${totalBatches} ??${processed}/${total} ???? ${updated}??? ${failed}`
-          : "?????????...")
+          ? `\u6b63\u5728\u540c\u6b65\u8054\u7cfb\u4eba\u8d44\u6599 ${batch}/${totalBatches} \u6279\uff0c${processed}/${total} \u6761\uff0c\u6210\u529f ${updated}\uff0c\u5931\u8d25 ${failed}`
+          : "\u6b63\u5728\u540c\u6b65\u8054\u7cfb\u4eba\u8d44\u6599...")
       : (active && total
-          ? `??????? ${batch}/${totalBatches} ??${processed}/${total} ???? ${updated}??? ${failed}`
-          : "???????...");
+          ? `\u6b63\u5728\u66f4\u65b0\u901a\u8baf\u5f55 ${batch}/${totalBatches} \u6279\uff0c${processed}/${total} \u6761\uff0c\u6210\u529f ${updated}\uff0c\u5931\u8d25 ${failed}`
+          : "\u6b63\u5728\u66f4\u65b0\u901a\u8baf\u5f55...");
   return (
     <div className={`${mobile ? "px-[18px]" : "px-[18px]"} pb-[8px] shrink-0`}>
       <div className={`text-[12px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{text}</div>
