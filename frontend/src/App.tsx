@@ -9,6 +9,7 @@ import {
   broadcastText,
   clearActiveAgentId,
   clearAccessKey,
+  getActiveAgentId,
   getAccessKey,
   getAccounts,
   getContacts,
@@ -37,10 +38,65 @@ type ViewMode = "chats" | "contacts" | "broadcast";
 type MobileTab = "chats" | "contacts" | "me";
 type PortalTheme = "dark" | "light";
 type ContactCategoryKey = "groups" | "official" | "service" | "openim";
+type AppRoute = "root" | "chat" | "contact" | "broadcast" | "me";
 const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
 const PINNED_ORDER_THRESHOLD = 1_000_000_000_000;
 const MOBILE_SWIPE_DIRECTION_EPSILON = 0.25;
+
+function routeFromPath(pathname: string): AppRoute {
+  const normalized = pathname.replace(/\/+$/, "") || "/";
+  switch (normalized) {
+    case "/chat":
+      return "chat";
+    case "/contact":
+      return "contact";
+    case "/broadcast":
+      return "broadcast";
+    case "/me":
+      return "me";
+    default:
+      return "root";
+  }
+}
+
+function normalizeRouteForDevice(route: AppRoute, isMobile: boolean): AppRoute {
+  if (route === "root") return route;
+  if (isMobile && route === "broadcast") return "chat";
+  if (!isMobile && route === "me") return "chat";
+  return route;
+}
+
+function desktopModeFromRoute(route: AppRoute): ViewMode {
+  if (route === "contact") return "contacts";
+  if (route === "broadcast") return "broadcast";
+  return "chats";
+}
+
+function mobileTabFromRoute(route: AppRoute): MobileTab {
+  if (route === "contact") return "contacts";
+  if (route === "me") return "me";
+  return "chats";
+}
+
+function pathForRoute(route: AppRoute): string {
+  switch (route) {
+    case "chat":
+      return "/chat";
+    case "contact":
+      return "/contact";
+    case "broadcast":
+      return "/broadcast";
+    case "me":
+      return "/me";
+    default:
+      return "/";
+  }
+}
+
+function historyStateEquals(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+}
 
 function clampSidePanelWidth(value: number): number {
   return Math.min(460, Math.max(236, Math.round(value)));
@@ -550,7 +606,7 @@ function mergeRawContactsWithProfiles(raw: any, members: Record<string, ContactP
       ...entry,
       ...profile,
       wxid,
-      nickname: pickFirstString(member.name, profile.NickName, profile.nickname, entry.nickname),
+      nickname: pickFirstString(member.name, profile.markname, profile.Remark, profile.remark, profile.nickname, profile.NickName, entry.nickname),
       strNickName: pickFirstString(member.name, profile.strNickName, entry.strNickName),
       smallhead: pickFirstString(member.avatar, profile.SmallHeadImgUrl, profile.smallhead, entry.smallhead),
       bighead: pickFirstString(profile.BigHeadImgUrl, profile.bighead, member.avatar, entry.bighead),
@@ -571,11 +627,11 @@ function profileDisplayName(profile: ContactProfile | undefined, fallback: strin
   const raw = profile?.profile || {};
   return (
     profile?.name ||
+    raw.markname ||
     raw.Remark ||
     raw.remark ||
-    raw.markname ||
-    raw.NickName ||
     raw.nickname ||
+    raw.NickName ||
     fallback
   );
 }
@@ -951,7 +1007,7 @@ export default function App() {
   const [portalTheme, setPortalThemeState] = useState<PortalTheme>(() =>
     window.localStorage.getItem(PORTAL_THEME_STORAGE) === "light" ? "light" : "dark"
   );
-  const [selectedAccountId, setSelectedAccountId] = useState("");
+  const [selectedAccountId, setSelectedAccountId] = useState(() => getActiveAgentId());
   const [accounts, setAccounts] = useState<WeChatAccount[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -1001,6 +1057,19 @@ export default function App() {
   contactProfilesRef.current = contactProfiles;
   const selectedAccountIdRef = useRef(selectedAccountId);
   selectedAccountIdRef.current = selectedAccountId;
+  const routeRef = useRef<AppRoute>(normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile));
+
+  const setRoute = useCallback((route: AppRoute, options: { replace?: boolean; state?: Record<string, unknown> } = {}) => {
+    const normalizedRoute = normalizeRouteForDevice(route, isMobile);
+    routeRef.current = normalizedRoute;
+    const nextPath = pathForRoute(normalizedRoute);
+    const nextState = { ...(options.state || {}), route: normalizedRoute };
+    const samePath = window.location.pathname === nextPath;
+    const sameState = historyStateEquals(window.history.state, nextState);
+    if (samePath && sameState) return;
+    const method = options.replace ? "replaceState" : "pushState";
+    window.history[method](nextState, "", nextPath);
+  }, [isMobile]);
 
   const resetChatState = useCallback(() => {
     setSelfWxid("");
@@ -1113,12 +1182,15 @@ export default function App() {
     }
     setActiveAgentId(agentId);
     setSelectedAccountId(agentId);
-  }, [loadAccounts, resetChatState]);
+    const initialRoute = normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile);
+    setRoute(initialRoute === "root" ? "chat" : initialRoute, { replace: true });
+  }, [isMobile, loadAccounts, resetChatState, setRoute]);
 
   const handleLeaveAccount = useCallback(() => {
     clearActiveAgentId();
     resetChatState();
     setSelectedAccountId("");
+    window.history.replaceState({ route: "root" }, "", "/");
     loadAccounts();
   }, [loadAccounts, resetChatState]);
 
@@ -1129,6 +1201,7 @@ export default function App() {
     setSelectedAccountId("");
     setAccounts([]);
     resetChatState();
+    window.history.replaceState({ route: "root" }, "", "/");
   }, [resetChatState]);
 
   const setPortalTheme = useCallback((theme: PortalTheme) => {
@@ -1168,7 +1241,7 @@ export default function App() {
 
     for (const [wxid, entry] of Object.entries(updates)) {
       const raw = entry?.profile || {};
-      const name = entry?.name || raw.Remark || raw.remark || raw.NickName || raw.nickname || raw.strNickName || "";
+      const name = entry?.name || raw.markname || raw.Remark || raw.remark || raw.nickname || raw.NickName || raw.strNickName || "";
       const avatar = profileAvatar(entry, "");
       if (name && name !== wxid) nextNames[wxid] = name;
       if (avatar) nextAvatars[wxid] = avatar;
@@ -1310,7 +1383,7 @@ export default function App() {
     }
   }, [ensureContactProfiles, selfWxid]);
 
-  const switchMode = useCallback((mode: ViewMode) => {
+  const switchMode = useCallback((mode: ViewMode, options: { skipRoute?: boolean } = {}) => {
     setViewMode(mode);
     setActiveChat(null);
     if (mode !== "contacts") setDesktopContactCategory(null);
@@ -1318,9 +1391,12 @@ export default function App() {
       setDesktopContactCategory(null);
       hydrateDirectoryContacts();
     }
-  }, [hydrateDirectoryContacts]);
+    if (!options.skipRoute) {
+      setRoute(mode === "contacts" ? "contact" : mode === "broadcast" ? "broadcast" : "chat");
+    }
+  }, [hydrateDirectoryContacts, setRoute]);
 
-  const switchMobileTab = useCallback((tab: MobileTab) => {
+  const switchMobileTab = useCallback((tab: MobileTab, options: { skipRoute?: boolean } = {}) => {
     setMobileTab(tab);
     setActiveChat(null);
     setDirectoryProfileWxid(null);
@@ -1329,7 +1405,10 @@ export default function App() {
     if (tab === "contacts") {
       hydrateDirectoryContacts();
     }
-  }, [hydrateDirectoryContacts]);
+    if (!options.skipRoute) {
+      setRoute(tab === "contacts" ? "contact" : tab === "me" ? "me" : "chat");
+    }
+  }, [hydrateDirectoryContacts, setRoute]);
 
   const openDirectoryProfile = useCallback(async (entry: DirectoryEntry) => {
     if (!entry?.wxid) return;
@@ -1339,7 +1418,7 @@ export default function App() {
     setDirectoryProfileWxid(entry.wxid);
     setDirectoryProfileLoading(true);
     try {
-      await ensureContactProfiles([entry.wxid]);
+      await ensureContactProfiles([entry.wxid], "", { force: true });
     } catch (err) {
       console.error("[DIRECTORY_PROFILE]", err);
     } finally {
@@ -1568,7 +1647,7 @@ export default function App() {
       const cachedProfiles = (contact_profiles && typeof contact_profiles === "object") ? contact_profiles : {};
       for (const [profileWxid, entry] of Object.entries<ContactProfile>(cachedProfiles)) {
         const raw = entry?.profile || {};
-        const name = entry?.name || raw.Remark || raw.remark || raw.NickName || raw.nickname || raw.strNickName || "";
+        const name = entry?.name || raw.markname || raw.Remark || raw.remark || raw.nickname || raw.NickName || raw.strNickName || "";
         const avatar = profileAvatar(entry, "");
         if (name && name !== profileWxid) nameMap[profileWxid] = name;
         if (avatar) avatars[profileWxid] = avatar;
@@ -1686,7 +1765,7 @@ export default function App() {
       const liveContactMap = { ...contactMap };
       const liveAvatarMap = { ...avatarMap };
       for (const [wxid, entry] of Object.entries<any>(contactUpdates)) {
-        const name = entry?.name || entry?.profile?.Remark || entry?.profile?.NickName || "";
+        const name = entry?.name || entry?.profile?.markname || entry?.profile?.Remark || entry?.profile?.remark || entry?.profile?.nickname || entry?.profile?.NickName || "";
         const avatar = profileAvatar(entry, "");
         if (name && name !== wxid) liveContactMap[wxid] = name;
         if (avatar) liveAvatarMap[wxid] = avatar;
@@ -1889,6 +1968,15 @@ export default function App() {
   }, [authenticated, selectedAccountId, hydrateChatSessions]);
 
   useEffect(() => {
+    if (!authenticated || !selectedAccountId) return;
+    const currentRoute = normalizeRouteForDevice(routeRef.current, isMobile);
+    const expectedPath = pathForRoute(currentRoute === "root" ? "chat" : currentRoute);
+    if (window.location.pathname !== expectedPath) {
+      setRoute(currentRoute === "root" ? "chat" : currentRoute, { replace: true });
+    }
+  }, [authenticated, selectedAccountId, isMobile, setRoute]);
+
+  useEffect(() => {
     if (!authenticated || selectedAccountId) return;
     loadAccounts();
     const timer = window.setInterval(loadAccounts, 1000);
@@ -1899,6 +1987,9 @@ export default function App() {
   const handleSelectChat = (wxid: string, seed?: Partial<Session>) => {
     setViewMode("chats");
     setDirectoryProfileWxid(null);
+    setDesktopContactCategory(null);
+    setMobileContactCategory(null);
+    setMobileProfileDetailOpen(false);
     setSessions((prev) => {
       const idx = prev.findIndex((s) => s.wxid === wxid);
       if (idx >= 0 && !seed) return prev;
@@ -1934,8 +2025,7 @@ export default function App() {
       return sortSessionsForDisplay([seeded, ...prev]);
     });
     setActiveChat(wxid);
-    // Push a history entry so mobile back gesture returns to session list
-    window.history.pushState({ chat: wxid }, "");
+    setRoute("chat");
     // Clear unread badge locally + notify backend (which broadcasts to all frontends)
     setSessions((prev) =>
       prev.map((s) => (s.wxid === wxid ? { ...s, unread: 0 } : s))
@@ -2018,26 +2108,67 @@ export default function App() {
   const handleBack = () => {
     setActiveChat(null);
     hasUnsavedInput.current = false;
-    // If we pushed a state for this chat, go back to remove it
-    if (window.history.state?.chat) {
-      window.history.back();
-    }
+    setRoute(
+      isMobile
+        ? (mobileTab === "contacts" ? "contact" : mobileTab === "me" ? "me" : "chat")
+        : (viewMode === "contacts" ? "contact" : viewMode === "broadcast" ? "broadcast" : "chat")
+    );
   };
+
+  useEffect(() => {
+    const route = normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile);
+    routeRef.current = route;
+
+    if (!authenticated || !selectedAccountId) {
+      if (window.location.pathname !== "/") {
+        window.history.replaceState({ route: "root" }, "", "/");
+      }
+      return;
+    }
+
+    if (isMobile) {
+      const targetTab = mobileTabFromRoute(route);
+      if (mobileTab !== targetTab) {
+        switchMobileTab(targetTab, { skipRoute: true });
+        return;
+      }
+      return;
+    }
+
+    const targetMode = desktopModeFromRoute(route);
+    if (viewMode !== targetMode) {
+      switchMode(targetMode, { skipRoute: true });
+      return;
+    }
+    if (route !== "chat" && activeChat) {
+      setActiveChat(null);
+    }
+  }, [authenticated, selectedAccountId, isMobile, mobileTab, viewMode, activeChat, switchMobileTab, switchMode]);
 
   // Listen for browser back button / swipe-back gesture
   useEffect(() => {
-    const onPopState = (_e: PopStateEvent) => {
-      // If we're in a chat and user pressed back, return to session list
-      setActiveChat((current) => {
-        if (current) return null;   // was in chat → go to session list
-        return current;
-      });
+    const onPopState = () => {
+      const route = normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile);
+      routeRef.current = route;
+      if (!authenticated || !selectedAccountId) return;
+
+      setActiveChat(null);
+      setDirectoryProfileWxid(null);
+
+      if (isMobile) {
+        setMobileContactCategory(null);
+        setMobileProfileDetailOpen(false);
+        switchMobileTab(mobileTabFromRoute(route), { skipRoute: true });
+        return;
+      }
+
+      setDesktopContactCategory(null);
+      switchMode(desktopModeFromRoute(route), { skipRoute: true });
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, []);
+  }, [authenticated, selectedAccountId, isMobile, switchMobileTab, switchMode]);
 
-  // ─── Prevent accidental page close only when there's unsent text ───
   const hasUnsavedInput = useRef(false);
   const setHasUnsavedInput = useCallback((val: boolean) => {
     hasUnsavedInput.current = val;
@@ -2130,7 +2261,7 @@ export default function App() {
       const wxid = contactWxid(c);
       if (!wxid || shouldFilterSession(wxid)) return null;
       const profile = contactProfiles[wxid];
-      const fallbackName = c.markname || c.nickname || c.NickName || c.strNickName || contactMap[wxid] || wxid;
+      const fallbackName = c.markname || c.Remark || c.remark || c.nickname || c.NickName || c.strNickName || contactMap[wxid] || wxid;
       const fallbackAvatar =
         avatarMap[wxid] ||
         c.smallhead ||
@@ -2163,7 +2294,7 @@ export default function App() {
   const rawRoomEntries = chatroomListFromRaw(rawContacts)
     .map((c: any) => ({
       wxid: contactWxid(c),
-      name: c.nickname || c.NickName || c.strNickName || "",
+      name: c.markname || c.Remark || c.remark || c.nickname || c.NickName || c.strNickName || "",
       avatar: c.smallhead || c.bighead || c.SmallHeadImgUrl || c.BigHeadImgUrl ||
         c.headimgurl || c.head_img || c.head_big || c.head_small ||
         c.HeadImgUrl || c.HeadUrl || c.smallHeadUrl || c.bigHeadUrl || c.avatar || "",
@@ -4165,6 +4296,9 @@ function SidebarIconButton({
 
 function EntryAvatar({ entry }: { entry: DirectoryEntry }) {
   const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    setFailed(false);
+  }, [entry.wxid, entry.avatar]);
   if (entry.avatar && !failed) {
     return (
       <img
@@ -4254,7 +4388,7 @@ function ContactsPanel({
 
       <ContactHydrationStatus progress={progress} loading={loading} dark={dark} />
 
-      <div className="flex-1 overflow-y-auto">
+      <div className="session-list-scroll flex-1 overflow-y-auto">
         <ContactCategoryRow dark={dark} color="#07c160" label="群聊" count={groups.length} active={selectedCategory === "groups"} onClick={() => onSelectCategory("groups")} />
         <ContactCategoryRow dark={dark} color="#1688f0" label="公众号" count={official.length} active={selectedCategory === "official"} onClick={() => onSelectCategory("official")} />
         <ContactCategoryRow dark={dark} color="#21a8f4" label="服务号" count={service.length} active={selectedCategory === "service"} onClick={() => onSelectCategory("service")} />
@@ -4312,10 +4446,14 @@ function ContactHydrationStatus({
   const ratio = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
   const phase = String(progress?.phase || "");
   const text = phase === "InitContact"
-    ? "正在调用 InitContact 初始化通讯录..."
-    : (active && total
-        ? `GetContact 第 ${batch}/${totalBatches} 批，已处理 ${processed}/${total}，已更新 ${updated}，失败 ${failed}`
-        : "正在通过 GetContact 批量补全联系人资料...");
+    ? "??????????..."
+    : phase === "BatchGetContactBriefInfo"
+      ? (active && total
+          ? `????????? ${batch}/${totalBatches} ??${processed}/${total} ???? ${updated}??? ${failed}`
+          : "?????????...")
+      : (active && total
+          ? `??????? ${batch}/${totalBatches} ??${processed}/${total} ???? ${updated}??? ${failed}`
+          : "???????...");
   return (
     <div className={`${mobile ? "px-[18px]" : "px-[18px]"} pb-[8px] shrink-0`}>
       <div className={`text-[12px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{text}</div>
@@ -4659,7 +4797,7 @@ function BroadcastPanel({
         </div>
       </div>
 
-      <div className={`flex-1 overflow-y-auto border-t ${dark ? "border-[#2a2a2a]" : "border-[#d8d8d8]"}`}>
+      <div className={`session-list-scroll flex-1 overflow-y-auto border-t ${dark ? "border-[#2a2a2a]" : "border-[#d8d8d8]"}`}>
         {visible.map((entry) => (
           <label
             key={`${entry.source}_${entry.wxid}`}

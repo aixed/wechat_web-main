@@ -45,19 +45,16 @@ html, body, #root {
 }
 
 .session-list-scroll {
-  scrollbar-width: none;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  scrollbar-gutter: stable;
 }
 
 .session-list-scroll:hover {
-  scrollbar-width: thin;
   scrollbar-color: #555 transparent;
 }
 
 .session-list-scroll::-webkit-scrollbar {
-  width: 0;
-}
-
-.session-list-scroll:hover::-webkit-scrollbar {
   width: 8px;
 }
 
