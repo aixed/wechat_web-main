@@ -874,6 +874,85 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
     return out
 
 
+def _messages_equivalent(left: dict | None, right: dict | None) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    left_id = str(left.get("id", "") or "").strip()
+    right_id = str(right.get("id", "") or "").strip()
+    if left_id and right_id and left_id == right_id:
+        return True
+    return (
+        str(left.get("msgtype", "") or "") == str(right.get("msgtype", "") or "")
+        and str(left.get("msg", "") or "") == str(right.get("msg", "") or "")
+        and int(left.get("timestamp") or left.get("time_unix") or 0) == int(right.get("timestamp") or right.get("time_unix") or 0)
+        and str(left.get("sendorrecv", "") or "") == str(right.get("sendorrecv", "") or "")
+    )
+
+
+def _sync_session_preview_from_message(wxid: str, msg: dict, *, owner_wxid: str = "") -> None:
+    wxid = str(wxid or "").strip()
+    if not wxid or not isinstance(msg, dict):
+        return
+    owner = _contact_owner_wxid(owner_wxid)
+    msg_timestamp = int(msg.get("timestamp") or msg.get("time_unix") or 0)
+    current_last = (app_state.get("last_messages") or {}).get(wxid) or {}
+    current_time = int(current_last.get("time") or 0)
+    if msg_timestamp and current_time and msg_timestamp < current_time:
+        return
+
+    preview = _format_preview(str(msg.get("msgtype", "") or "1"), str(msg.get("msg", "") or ""))
+    if "@chatroom" in wxid:
+        if int(msg.get("isSender") or 0) == 1 or str(msg.get("sendorrecv", "") or "") == "1":
+            preview = f"\u6211: {preview}"
+        else:
+            sender_wxid = str(msg.get("fromid", "") or "").strip()
+            if sender_wxid:
+                sender_name = (
+                    message_store.get_contact(sender_wxid).get("name", "")
+                    or _CONTACT_BRIEF_CACHE.get(_contact_cache_key(sender_wxid, owner), {}).get("name", "")
+                    or sender_wxid
+                )
+                preview = f"{sender_name}: {preview}"
+
+    last_message = {
+        "content": str(msg.get("msg", "") or ""),
+        "type": str(msg.get("msgtype", "") or "1"),
+        "is_sender": 1 if str(msg.get("sendorrecv", "") or "") == "1" or int(msg.get("isSender") or 0) == 1 else 0,
+        "time": msg_timestamp,
+    }
+    app_state["last_messages"][wxid] = last_message
+    sqlite_cache.upsert_last_messages({wxid: last_message}, owner_wxid=owner)
+    sqlite_cache.upsert_session_preview(
+        wxid,
+        nickname=message_store.get_contact(wxid).get("name", ""),
+        content=preview,
+        msg_type=str(msg.get("msgtype", "") or "1"),
+        timestamp=msg_timestamp,
+        unread_delta=0,
+        owner_wxid=owner,
+    )
+    _load_session_cache_into_state(owner)
+
+
+async def _refresh_latest_message_from_hook(wxid: str, *, owner_wxid: str = "") -> None:
+    wxid = str(wxid or "").strip()
+    if not wxid or getattr(wechat_api, "IS_PROTOCOL", False):
+        return
+    owner = _contact_owner_wxid(owner_wxid)
+    history = await wechat_api.get_chat_history(wxid, 1)
+    rows = history.get("data", []) if isinstance(history, dict) else []
+    normalized = _normalize_history_rows(wxid, rows)
+    if not normalized:
+        return
+    newest = normalized[-1]
+    cached_latest_rows = sqlite_cache.get_messages(wxid, 1, owner_wxid=owner)
+    cached_latest = cached_latest_rows[-1] if cached_latest_rows else None
+    if not _messages_equivalent(cached_latest, newest):
+        sqlite_cache.upsert_messages(wxid, [newest], owner_wxid=owner)
+    message_store.add_message(wxid, newest, replace=True)
+    _sync_session_preview_from_message(wxid, newest, owner_wxid=owner)
+
+
 # ─── Startup / Shutdown ────────────────────────────────────────────
 
 async def _run_backend_initialization(agent_id: str | None = None) -> bool:
@@ -3080,16 +3159,30 @@ async def get_messages(wxid: str, limit: int = 50, db: str = "MSG0.db"):
         else:
             message_store.add_history_no_flag(wxid, cached)
             source = "sqlite_partial"
+        try:
+            await _refresh_latest_message_from_hook(wxid, owner_wxid=owner_wxid)
+        except Exception as e:
+            _log(f"[SQLITE_CACHE] latest-message refresh failed for {wxid}: {type(e).__name__}: {e}")
         return {"data": message_store.get_messages(wxid, limit), "source": source}
 
     if initialized:
         existing = message_store.get_messages(wxid, limit)
+        try:
+            await _refresh_latest_message_from_hook(wxid, owner_wxid=owner_wxid)
+            existing = message_store.get_messages(wxid, limit)
+        except Exception as e:
+            _log(f"[SQLITE_CACHE] latest-message refresh failed for {wxid}: {type(e).__name__}: {e}")
         if existing:
             return {"data": existing, "source": "memory"}
         return {"data": [], "source": "sqlite"}
 
     if message_store.is_db_loaded(wxid):
         existing = message_store.get_messages(wxid, limit)
+        try:
+            await _refresh_latest_message_from_hook(wxid, owner_wxid=owner_wxid)
+            existing = message_store.get_messages(wxid, limit)
+        except Exception as e:
+            _log(f"[SQLITE_CACHE] latest-message refresh failed for {wxid}: {type(e).__name__}: {e}")
         if existing:
             return {"data": existing, "source": "memory"}
 
@@ -3100,6 +3193,7 @@ async def get_messages(wxid: str, limit: int = 50, db: str = "MSG0.db"):
     try:
         if normalized:
             sqlite_cache.upsert_messages(wxid, normalized, mark_initialized=True, owner_wxid=owner_wxid)
+            _sync_session_preview_from_message(wxid, normalized[-1], owner_wxid=owner_wxid)
         else:
             sqlite_cache.mark_initialized(wxid, owner_wxid=owner_wxid)
     except Exception as e:
