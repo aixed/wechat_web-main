@@ -287,11 +287,15 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
             try:
                 if use_agent_ws:
                     route = endpoint.strip("/")
+                    if query_db_call:
+                        _log("[API] QueryDB via /agent with clean body (no body.agent_id injection)")
                     agent_response = await agent_manager.request(
                         route,
                         json or {},
                         timeout=timeout or AGENT_WS_REQUEST_TIMEOUT,
                         agent_id=_CURRENT_AGENT_ID.get() or None,
+                        inject_agent_id=not query_db_call,
+                        include_method=not query_db_call,
                     )
                     r = httpx.Response(
                         status_code=agent_response.status,

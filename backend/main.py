@@ -225,8 +225,10 @@ _account_card_refreshing: set[str] = set()
 _initializing_agents: set[str] = set()
 _agent_login_status_seen: dict[str, str] = {}
 _agent_self_profile_refreshed: set[str] = set()
+_agent_polling_paused_until: dict[str, float] = {}
 _CONTACT_INIT_LOCKS: dict[str, asyncio.Lock] = {}
 _CONTACT_HYDRATING_OWNERS: set[str] = set()
+_SESSION_CONTACT_HYDRATING_OWNERS: set[str] = set()
 _CONTACT_HYDRATION_PROGRESS: dict[str, dict] = {}
 
 
@@ -597,6 +599,8 @@ def _schedule_account_card_refresh() -> None:
         agent_id = str(account.get("id") or "")
         if not agent_id or agent_id in _account_card_refreshing or agent_id in _initializing_agents:
             continue
+        if now < _agent_polling_paused_until.get(agent_id, 0.0):
+            continue
         last = _account_card_refresh_at.get(agent_id, 0.0)
         status = str(account.get("login_status") or "").strip()
         interval = (
@@ -623,6 +627,7 @@ _CONTACT_BRIEF_LOCK = asyncio.Lock()
 _CONTACT_PROFILE_CACHE: dict[str, dict] = {}  # owner::wxid -> {"profile": dict, "ts": float}
 _CONTACT_PROFILE_CACHE_TTL_SEC = 24 * 60 * 60
 _CONTACT_PROFILE_LOCK = asyncio.Lock()
+_GETCONTACT_SEMAPHORE = asyncio.Semaphore(2)
 
 # ─── Contact label cache ───────────────────────────────────────────
 # Maps WeChat label ids from GetContact.LabelTag to readable names.
@@ -1559,10 +1564,29 @@ def _normalize_wxids(wxids: list[str]) -> list[str]:
     return out
 
 
+def _real_contact_wxid(wxid: str) -> str:
+    value = str(wxid or "").strip()
+    if not value or value == "default" or value.startswith("agent:"):
+        return ""
+    return value
+
+
+def _prioritize_wxids(wxids: list[str], *priority: str) -> list[str]:
+    ordered = [_real_contact_wxid(wxid) for wxid in priority]
+    ordered.extend(wxids or [])
+    return _normalize_wxids(ordered)
+
+
 async def _query_session_list_from_db() -> dict:
     """Read the native WeChat Session table ordered by nOrder."""
-    sql = "select * from Session order by nOrder desc"
-    data = await wechat_api.query_db("MicroMsg.db", sql, timeout=8.0)
+    # Keep the /agent QueryDB payload narrow. The remote WS path has crashed
+    # when returning Session.* because bytesXml can contain invalid/binary text.
+    sql = (
+        "select strUsrName, strNickName, strContent, nMsgType, nTime, "
+        "nOrder, nUnReadCount, othersAtMe, nIsSend as isSender "
+        "from Session order by nOrder desc"
+    )
+    data = await wechat_api.query_db("MicroMsg.db", sql, timeout=20.0)
     rows = data.get("data") if isinstance(data, dict) else []
     if isinstance(rows, dict):
         rows = rows.get("data") or rows.get("rows") or []
@@ -1846,6 +1870,37 @@ def _contacts_from_getcontact_response(data) -> list[dict]:
             continue
         break
     return []
+
+
+def _getcontact_response_ok(data) -> bool:
+    if isinstance(data, list):
+        return True
+    if not isinstance(data, dict):
+        return False
+    if data.get("error"):
+        return False
+    for key in ("code", "ret", "Ret"):
+        if key not in data:
+            continue
+        try:
+            value = int(data.get(key) or 0)
+        except Exception:
+            continue
+        if key == "code" and value != 0:
+            return False
+        if key.lower() == "ret" and value <= 0:
+            return False
+    status = data.get("status")
+    if status is not None:
+        try:
+            if int(status) not in (0, 200):
+                return False
+        except Exception:
+            pass
+    text = str(data.get("retmsg") or data.get("msg") or data.get("message") or "").lower()
+    if text and any(token in text for token in ("fail", "failed", "error", "异常", "失败")):
+        return False
+    return True
 
 
 def _all_raw_contact_entries(contacts: dict | list) -> list[dict]:
@@ -2159,10 +2214,6 @@ def _contact_needs_detail_hydration(entry: dict) -> bool:
     profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
     if entry.get("avatar") or _contact_profile_avatar(profile):
         return False
-    if profile.get("_getcontact_hydrated") is True:
-        return False
-    if str(profile.get("_getcontact_hydrated") or "").lower() in {"1", "true", "yes"}:
-        return False
     return True
 
 
@@ -2173,6 +2224,15 @@ def _contact_detail_missing_ids(owner_wxid: str = "", candidates: list[str] | No
         if wxid and _contact_needs_detail_hydration(entry):
             missing.append(wxid)
     return missing
+
+
+def _contact_cache_missing_display(wxid: str, entry: dict | None) -> bool:
+    if not wxid or not isinstance(entry, dict):
+        return True
+    profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
+    avatar = str(entry.get("avatar") or _contact_profile_avatar(profile) or "").strip()
+    name = str(entry.get("name") or _contact_profile_name(profile) or "").strip()
+    return not avatar or not name or name == wxid
 
 
 def _cache_raw_contacts(contacts: dict, *, owner_wxid: str = "") -> tuple[int, int]:
@@ -2341,7 +2401,15 @@ async def _fetch_and_cache_contact_details(
         batch_index = i // 100 + 1
         batch_update_count = 0
         try:
-            data = await wechat_api.get_contact(batch)
+            async with _GETCONTACT_SEMAPHORE:
+                data = await wechat_api.get_contact(batch)
+            if not _getcontact_response_ok(data):
+                failed += len(batch)
+                _log(
+                    f"[CONTACTS] GetContact detail batch returned non-success "
+                    f"({len(batch)}): {str(data)[:300]}"
+                )
+                continue
             contacts = _contacts_from_getcontact_response(data)
             useful_contacts: list[dict] = []
             found: set[str] = set()
@@ -2403,7 +2471,10 @@ async def _fetch_and_cache_contact_details(
             updated_total += batch_update_count
             if broadcast_updates and updates:
                 await _broadcast_contact_profile_updates(updates, account_id=account_id)
-            _log(f"[CONTACTS] GetContact hydrated batch {batch_index}/{total_batches}: requested={len(batch)} updates={len(updates)}")
+            _log(
+                f"[CONTACTS] GetContact hydrated batch {batch_index}/{total_batches}: "
+                f"owner={owner_wxid} requested={len(batch)} updates={len(updates)}"
+            )
         except Exception as e:
             failed += len(batch)
             _log(f"[CONTACTS] GetContact detail batch failed ({len(batch)}): {type(e).__name__}: {e}")
@@ -2445,7 +2516,7 @@ async def _fetch_and_cache_contact_details(
 
 
 def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], account_id: str = "") -> None:
-    ids = _normalize_wxids(wxids)
+    ids = _prioritize_wxids(wxids, owner_wxid, _get_self_wxid())
     if not ids or owner_wxid in _CONTACT_HYDRATING_OWNERS:
         return
 
@@ -2490,6 +2561,35 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
     _track_background_send(task, "contacts_getcontact")
 
 
+def _schedule_session_contact_hydration(owner_wxid: str, wxids: list[str], account_id: str = "") -> None:
+    ids = _prioritize_wxids(wxids, owner_wxid, _get_self_wxid())
+    cached = sqlite_cache.get_contacts(ids, owner_wxid=owner_wxid) if ids else {}
+    missing_ids = [wxid for wxid in ids if _contact_cache_missing_display(wxid, cached.get(wxid))]
+    ids = missing_ids
+    if not ids or owner_wxid in _SESSION_CONTACT_HYDRATING_OWNERS:
+        return
+
+    async def _hydrate_session_contacts() -> None:
+        _SESSION_CONTACT_HYDRATING_OWNERS.add(owner_wxid)
+        try:
+            with wechat_api.use_agent(account_id):
+                updates = await _fetch_and_cache_contact_details(
+                    ids,
+                    broadcast_updates=True,
+                    owner_wxid=owner_wxid,
+                    account_id=account_id,
+                )
+            _log(f"[SESSIONS] GetContact hydrated recent sessions: owner={owner_wxid} ids={len(ids)} updates={len(updates)}")
+        except Exception as e:
+            _log(f"[SESSIONS] recent session GetContact hydration failed: {type(e).__name__}: {e}")
+        finally:
+            _SESSION_CONTACT_HYDRATING_OWNERS.discard(owner_wxid)
+
+    _log(f"[SESSIONS] scheduling recent-session GetContact hydration: owner={owner_wxid} ids={len(ids)}, batch=100")
+    task = asyncio.create_task(_hydrate_session_contacts())
+    _track_background_send(task, "sessions_getcontact")
+
+
 async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_empty: bool = False, force_details: bool = False) -> dict:
     """Load the directory from local SQLite, initializing it once via InitContact.
 
@@ -2520,10 +2620,32 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
         cached_before = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
         try:
             _log("[CONTACTS] first directory open: calling InitContact")
+            _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
+                "active": True,
+                "phase": "InitContact",
+                "batch": 0,
+                "total_batches": 0,
+                "processed": 0,
+                "total": 0,
+                "updated": 0,
+                "failed": 0,
+            }
+            await _broadcast_contact_hydration_progress(owner_wxid, account_id)
             contacts = await wechat_api.init_contact()
         except Exception as e:
             snapshot = _contacts_snapshot_from_db(owner_wxid)
             app_state["contacts"] = snapshot
+            _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
+                "active": False,
+                "phase": "InitContact",
+                "batch": 0,
+                "total_batches": 0,
+                "processed": 0,
+                "total": 0,
+                "updated": 0,
+                "failed": 1,
+            }
+            await _broadcast_contact_hydration_progress(owner_wxid, account_id)
             if snapshot.get("friend") or snapshot.get("chatroom"):
                 _log(f"[CONTACTS] InitContact failed; served local cache: {type(e).__name__}: {e}")
                 return _with_contact_hydration_progress(snapshot, owner_wxid)
@@ -2533,6 +2655,17 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
         if not raw_entries:
             snapshot = _contacts_snapshot_from_db(owner_wxid)
             app_state["contacts"] = snapshot
+            _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
+                "active": False,
+                "phase": "InitContact",
+                "batch": 0,
+                "total_batches": 0,
+                "processed": 0,
+                "total": 0,
+                "updated": 0,
+                "failed": 0,
+            }
+            await _broadcast_contact_hydration_progress(owner_wxid, account_id)
             _log(
                 f"[CONTACTS] InitContact returned no parseable contacts; "
                 f"served local cache={len(cached_before)}"
@@ -2675,7 +2808,8 @@ async def _ensure_contact_profiles(
                         return {}
                     profile = _openim_profile_from_payload(payload, wxid, gid=gid)
                     try:
-                        contact_data = await wechat_api.get_contact([wxid])
+                        async with _GETCONTACT_SEMAPHORE:
+                            contact_data = await wechat_api.get_contact([wxid])
                         contacts = _contacts_from_getcontact_response(contact_data)
                         if contacts and isinstance(contacts[0], dict):
                             merged = dict(contacts[0])
@@ -2882,28 +3016,50 @@ async def refresh_sessions(request: Request):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
     owner_wxid = _contact_owner_wxid()
-    if not app_state.get("session_list_loaded"):
-        try:
-            with wechat_api.use_agent(agent_id or _active_agent_id or agent_manager.active_id()):
-                _log("[REFRESH] querying native Session table: db=MicroMsg.db sql=select * from Session order by nOrder desc")
-                db_sessions = await _query_session_list_from_db()
-            session_rows = db_sessions.get("data", []) if isinstance(db_sessions, dict) else []
-            if session_rows:
-                sqlite_cache.upsert_sessions(session_rows, owner_wxid=owner_wxid)
-                app_state["session_list_loaded"] = True
-                _log(f"[REFRESH] native Session table cached: {len(session_rows)} rows")
-            else:
-                _log("[REFRESH] native Session table returned empty; falling back to local cache")
-                app_state["session_list_loaded"] = True
-        except Exception as e:
-            _log(f"[REFRESH] Query Session table failed; using local cache: {type(e).__name__}: {e}")
+    target_agent_id = agent_id or _active_agent_id or agent_manager.active_id()
+    if target_agent_id:
+        _agent_polling_paused_until[target_agent_id] = time.time() + 20.0
+    try:
+        with wechat_api.use_agent(target_agent_id):
+            _log(
+                "[REFRESH] querying native Session table via /agent: "
+                "db=MicroMsg.db sql=select strUsrName, strNickName, strContent, "
+                "nMsgType, nTime, nOrder, nUnReadCount, othersAtMe, nIsSend as isSender "
+                "from Session order by nOrder desc"
+            )
+            db_sessions = await _query_session_list_from_db()
+        session_rows = db_sessions.get("data", []) if isinstance(db_sessions, dict) else []
+        if session_rows:
+            sqlite_cache.upsert_sessions(session_rows, owner_wxid=owner_wxid)
+            session_wxids = [
+                str(_row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
+                for row in session_rows
+                if isinstance(row, dict)
+            ]
+            _schedule_session_contact_hydration(owner_wxid, session_wxids, target_agent_id or "")
+            app_state["session_list_loaded"] = True
+            _log(f"[REFRESH] native Session table cached: {len(session_rows)} rows")
+        else:
+            _log("[REFRESH] native Session table returned empty; falling back to local cache")
+    except Exception as e:
+        _log(f"[REFRESH] Query Session table failed; using local cache: {type(e).__name__}: {e}")
+    finally:
+        if target_agent_id:
+            _agent_polling_paused_until[target_agent_id] = time.time() + 1.0
 
     raw_sessions, last_messages = _load_session_cache_into_state(owner_wxid)
     session_list = raw_sessions.get("data", []) if isinstance(raw_sessions, dict) else []
+    profile_wxids = [
+        str(_row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
+        for row in session_list
+        if isinstance(row, dict)
+    ]
+    profile_wxids = _prioritize_wxids(profile_wxids, owner_wxid, _get_self_wxid())
+    contact_profiles = sqlite_cache.get_contacts(profile_wxids, owner_wxid=owner_wxid) if profile_wxids else {}
 
     total_ms = int((time.time() - t0) * 1000)
     _log(f"[REFRESH] ✓ {len(session_list)} sessions from local cache; no per-session MSG query — {total_ms}ms")
-    return {"sessions": raw_sessions, "last_messages": last_messages}
+    return {"sessions": raw_sessions, "last_messages": last_messages, "contact_profiles": contact_profiles}
 
 
 # ─── REST API: Messages (History via QueryDB) ─────────────────────

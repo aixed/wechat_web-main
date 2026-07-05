@@ -135,7 +135,7 @@ export default function ChatArea({
     } finally {
       setProfileLoading(false);
     }
-  }, [contactProfiles, onRequestContactProfile, session.is_group, session.wxid]);
+  }, [onRequestContactProfile, session.is_group, session.wxid]);
 
   // ─── Auto-scroll to bottom ──────────────────────────────────────
   const scrollToBottom = useCallback((instant?: boolean) => {
@@ -563,10 +563,20 @@ export default function ChatArea({
             <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
           </svg>
         </button>
-        <h2 className={`flex-1 text-center text-[17px] font-medium truncate pr-[36px] ${titleText}`}>
-          {session.nickname || session.wxid}
-        </h2>
-        <button className={`w-[36px] h-[36px] flex items-center justify-center ${titleText}`}>
+        <button
+          type="button"
+          onClick={() => handleAvatarClick(session.wxid)}
+          className={`flex-1 min-w-0 h-[36px] text-center text-[17px] font-medium active:opacity-70 ${titleText}`}
+          title="刷新资料"
+        >
+          <span className="block truncate">{session.nickname || session.wxid}</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => handleAvatarClick(session.wxid)}
+          className={`w-[36px] h-[36px] flex items-center justify-center active:opacity-70 ${titleText}`}
+          aria-label="查看资料"
+        >
           <svg className="w-[20px] h-[20px]" fill="currentColor" viewBox="0 0 24 24">
             <circle cx="5" cy="12" r="1.5" />
             <circle cx="12" cy="12" r="1.5" />
