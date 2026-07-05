@@ -6,6 +6,7 @@ const frontendPort = Number(process.env.FRONTEND_PORT || 3001)
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  appType: 'spa',
   server: {
     host: '0.0.0.0',
     port: frontendPort,

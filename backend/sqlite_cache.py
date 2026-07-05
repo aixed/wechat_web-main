@@ -347,10 +347,11 @@ class SqliteMessageCache:
                 profile = {"wxid": wxid}
             name = str(
                 contact.get("name")
+                or profile.get("markname")
                 or profile.get("Remark")
                 or profile.get("remark")
-                or profile.get("NickName")
                 or profile.get("nickname")
+                or profile.get("NickName")
                 or ""
             )
             avatar = str(
@@ -397,10 +398,7 @@ class SqliteMessageCache:
                         WHEN contacts.profile_json IS NULL OR contacts.profile_json = '' OR contacts.profile_json = '{}' THEN excluded.profile_json
                         WHEN excluded.avatar != '' THEN excluded.profile_json
                         WHEN instr(excluded.profile_json, 'SmallHeadImgUrl') > 0 OR instr(excluded.profile_json, 'smallhead') > 0 THEN excluded.profile_json
-                        WHEN instr(excluded.profile_json, '_getcontact_hydrated') > 0
-                            AND contacts.avatar != ''
-                            THEN contacts.profile_json
-                        WHEN instr(excluded.profile_json, '_getcontact_hydrated') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, 'BigHeadImgUrl') > 0 OR instr(excluded.profile_json, 'bighead') > 0 THEN excluded.profile_json
                         ELSE contacts.profile_json
                     END,
                     updated_at=excluded.updated_at
@@ -807,8 +805,10 @@ class SqliteMessageCache:
                 profile["wxid"] = wxid
             nickname = str(
                 member.get("name")
+                or member.get("markname")
                 or member.get("nickname")
                 or member.get("displayname")
+                or profile.get("markname")
                 or profile.get("nickname")
                 or profile.get("NickName")
                 or wxid

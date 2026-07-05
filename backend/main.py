@@ -623,11 +623,25 @@ _CONTACT_BRIEF_LOCK = asyncio.Lock()
 
 
 # ─── Full contact profile cache ────────────────────────────────────
-# Populated lazily via /GetContact for strangers / new chats.
+# Populated lazily via /GetContact for explicit profile opens and detail refreshes.
 _CONTACT_PROFILE_CACHE: dict[str, dict] = {}  # owner::wxid -> {"profile": dict, "ts": float}
 _CONTACT_PROFILE_CACHE_TTL_SEC = 24 * 60 * 60
 _CONTACT_PROFILE_LOCK = asyncio.Lock()
-_GETCONTACT_SEMAPHORE = asyncio.Semaphore(2)
+def _hook_api_parallelism(limit_override: int | None = None) -> int:
+    try:
+        override = int(limit_override or 0)
+    except Exception:
+        override = 0
+    if override > 0:
+        limit = override
+    else:
+        try:
+            limit = int(getattr(config, "HOOK_API_CONCURRENCY", 10) or 10)
+        except Exception:
+            limit = 10
+    return max(1, min(limit, 100))
+
+
 
 # ─── Contact label cache ───────────────────────────────────────────
 # Maps WeChat label ids from GetContact.LabelTag to readable names.
@@ -1789,11 +1803,11 @@ def _contact_profile_wxid(profile: dict) -> str:
 
 def _contact_profile_name(profile: dict) -> str:
     return str(
-        profile.get("Remark")
+        profile.get("markname")
+        or profile.get("Remark")
         or profile.get("remark")
-        or profile.get("markname")
-        or profile.get("NickName")
         or profile.get("nickname")
+        or profile.get("NickName")
         or profile.get("nick")
         or profile.get("strNickName")
         or _contact_profile_wxid(profile)
@@ -1803,11 +1817,11 @@ def _contact_profile_name(profile: dict) -> str:
 
 def _contact_profile_explicit_name(profile: dict) -> str:
     return str(
-        profile.get("Remark")
+        profile.get("markname")
+        or profile.get("Remark")
         or profile.get("remark")
-        or profile.get("markname")
-        or profile.get("NickName")
         or profile.get("nickname")
+        or profile.get("NickName")
         or profile.get("nick")
         or profile.get("strNickName")
         or ""
@@ -2029,6 +2043,7 @@ def _contacts_snapshot_from_db(owner_wxid: str = "") -> dict:
         avatar = str(entry.get("avatar") or _contact_profile_avatar(raw) or "")
         raw.update({
             "wxid": wxid,
+            "name": raw.get("name") or name,
             "nickname": raw.get("nickname") or raw.get("NickName") or name,
             "strNickName": raw.get("strNickName") or name,
             "smallhead": raw.get("smallhead") or raw.get("SmallHeadImgUrl") or avatar,
@@ -2281,12 +2296,6 @@ def _profile_has_useful_payload(profile: dict) -> bool:
     return any(key != "wxid" and value not in ("", None, {}, []) for key, value in profile.items())
 
 
-def _mark_getcontact_hydrated(profile: dict) -> dict:
-    payload = dict(profile) if isinstance(profile, dict) else {}
-    payload["_getcontact_hydrated"] = True
-    return payload
-
-
 def _contact_needs_detail_hydration(entry: dict) -> bool:
     if not isinstance(entry, dict):
         return False
@@ -2305,13 +2314,12 @@ def _contact_detail_missing_ids(owner_wxid: str = "", candidates: list[str] | No
     return missing
 
 
-def _contact_cache_missing_display(wxid: str, entry: dict | None) -> bool:
+def _contact_cache_missing_avatar(wxid: str, entry: dict | None) -> bool:
     if not wxid or not isinstance(entry, dict):
         return True
     profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
     avatar = str(entry.get("avatar") or _contact_profile_avatar(profile) or "").strip()
-    name = str(entry.get("name") or _contact_profile_name(profile) or "").strip()
-    return not avatar or not name or name == wxid
+    return not avatar
 
 
 def _cache_raw_contacts(contacts: dict, *, owner_wxid: str = "") -> tuple[int, int]:
@@ -2416,7 +2424,7 @@ async def _cache_contact_profiles(profiles: list[dict], *, owner_wxid: str = "")
             for profile in profiles:
                 if not isinstance(profile, dict):
                     continue
-                profile = _mark_getcontact_hydrated(profile)
+                profile = dict(profile)
                 wxid = _contact_profile_wxid(profile)
                 if not wxid:
                     continue
@@ -2465,7 +2473,7 @@ async def _fetch_and_cache_contact_details(
     if broadcast_progress:
         _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
             "active": True,
-            "phase": "GetContact",
+            "phase": "BatchGetContactBriefInfo",
             "batch": 0,
             "total_batches": total_batches,
             "processed": 0,
@@ -2480,88 +2488,88 @@ async def _fetch_and_cache_contact_details(
         batch_index = i // 100 + 1
         batch_update_count = 0
         try:
-            async with _GETCONTACT_SEMAPHORE:
-                data = await wechat_api.get_contact(batch)
+            wxid_str = ",".join(batch)
+            data = await wechat_api.batch_get_contact_brief_info(wxid_str)
             if not _getcontact_response_ok(data):
                 failed += len(batch)
                 _log(
-                    f"[CONTACTS] GetContact detail batch returned non-success "
+                    f"[CONTACTS] BatchGetContactBriefInfo batch returned non-success "
                     f"({len(batch)}): {str(data)[:300]}"
                 )
                 continue
-            contacts = _contacts_from_getcontact_response(data)
-            useful_contacts: list[dict] = []
+
+            info_list = data.get("info", []) if isinstance(data, dict) else []
             found: set[str] = set()
-            empty_updates: dict[str, dict] = {}
-            for contact in contacts:
-                if not isinstance(contact, dict):
+            updates: dict[str, dict] = {}
+            for info in info_list:
+                if not isinstance(info, dict):
                     continue
-                wxid = _contact_profile_wxid(contact)
+                wxid = _contact_profile_wxid(info)
                 if not wxid:
                     continue
                 found.add(wxid)
-                if _contact_profile_explicit_name(contact) or _contact_profile_avatar(contact):
-                    useful_contacts.append(contact)
-                    continue
-                empty_profile = {
+                profile = dict(info)
+                name = _contact_profile_name(profile)
+                avatar = _contact_profile_avatar(profile)
+                updates[wxid] = {
                     "wxid": wxid,
-                    "gid": wxid if wxid.endswith("@chatroom") else "",
-                    "type": "chatroom" if wxid.endswith("@chatroom") else str(contact.get("type") or ""),
-                    "_getcontact_hydrated": True,
-                }
-                empty_updates[wxid] = {
-                    "wxid": wxid,
-                    "name": "",
-                    "avatar": "",
+                    "name": name or wxid,
+                    "avatar": avatar,
                     "is_group": wxid.endswith("@chatroom"),
-                    "profile": empty_profile,
+                    "profile": profile,
                 }
 
             for wxid in batch:
                 if wxid in found:
                     continue
-                empty_updates[wxid] = {
+                updates[wxid] = {
                     "wxid": wxid,
-                    "name": "",
+                    "name": wxid,
                     "avatar": "",
                     "is_group": wxid.endswith("@chatroom"),
                     "profile": {
                         "wxid": wxid,
                         "gid": wxid if wxid.endswith("@chatroom") else "",
-                        "type": "chatroom" if wxid.endswith("@chatroom") else "",
-                        "_getcontact_hydrated": True,
+                        "type": "chatroom" if wxid.endswith("@chatroom") else "friend",
                     },
                 }
 
-            updates = await _cache_contact_profiles(useful_contacts, owner_wxid=owner_wxid)
-            if empty_updates:
-                sqlite_cache.upsert_contacts(empty_updates, owner_wxid=owner_wxid)
-                updates.update({
-                    wxid: {
-                        "wxid": wxid,
-                        "name": "",
-                        "avatar": "",
-                        "profile": payload.get("profile") or {"wxid": wxid},
-                    }
-                    for wxid, payload in empty_updates.items()
-                })
+            if updates:
+                sqlite_cache.upsert_contacts(updates, owner_wxid=owner_wxid)
+                now = time.time()
+                async with _CONTACT_PROFILE_LOCK:
+                    async with _CONTACT_BRIEF_LOCK:
+                        avatar_urls = app_state.setdefault("avatar_urls", {})
+                        for wxid, payload in updates.items():
+                            profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {"wxid": wxid}
+                            cache_key = _contact_cache_key(wxid, owner_wxid)
+                            _CONTACT_PROFILE_CACHE[cache_key] = {"profile": profile, "ts": now}
+                            _CONTACT_BRIEF_CACHE[cache_key] = {
+                                "name": payload.get("name", "") or wxid,
+                                "avatar": payload.get("avatar", "") or "",
+                                "ts": now,
+                            }
+                            if payload.get("avatar"):
+                                avatar_urls[wxid] = payload["avatar"]
+                            message_store.set_contact(wxid, name=payload.get("name", "") or wxid, avatar=payload.get("avatar", "") or "")
+
             result.update(updates)
             batch_update_count = len(updates)
             updated_total += batch_update_count
             if broadcast_updates and updates:
                 await _broadcast_contact_profile_updates(updates, account_id=account_id)
             _log(
-                f"[CONTACTS] GetContact hydrated batch {batch_index}/{total_batches}: "
+                f"[CONTACTS] BatchGetContactBriefInfo hydrated batch {batch_index}/{total_batches}: "
                 f"owner={owner_wxid} requested={len(batch)} updates={len(updates)}"
             )
         except Exception as e:
             failed += len(batch)
-            _log(f"[CONTACTS] GetContact detail batch failed ({len(batch)}): {type(e).__name__}: {e}")
+            _log(f"[CONTACTS] BatchGetContactBriefInfo batch failed ({len(batch)}): {type(e).__name__}: {e}")
         processed += len(batch)
         if broadcast_progress:
             _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
                 "active": True,
-                "phase": "GetContact",
+                "phase": "BatchGetContactBriefInfo",
                 "batch": batch_index,
                 "total_batches": total_batches,
                 "processed": min(processed, total),
@@ -2582,7 +2590,7 @@ async def _fetch_and_cache_contact_details(
     if broadcast_progress:
         _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
             "active": False,
-            "phase": "GetContact",
+            "phase": "BatchGetContactBriefInfo",
             "batch": total_batches,
             "total_batches": total_batches,
             "processed": total,
@@ -2603,7 +2611,7 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
     total_batches = (total + 99) // 100
     _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
         "active": True,
-        "phase": "GetContact",
+        "phase": "BatchGetContactBriefInfo",
         "batch": 0,
         "total_batches": total_batches,
         "processed": 0,
@@ -2629,21 +2637,21 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
             else:
                 app_state["contacts"] = snapshot
             await _broadcast_contacts_snapshot(snapshot, account_id=account_id, owner_wxid=owner_wxid)
-            _log(f"[CONTACTS] GetContact hydration complete: owner={owner_wxid} ids={len(ids)}")
+            _log(f"[CONTACTS] BatchGetContactBriefInfo hydration complete: owner={owner_wxid} ids={len(ids)}")
         except Exception as e:
-            _log(f"[CONTACTS] GetContact hydration task failed: {type(e).__name__}: {e}")
+            _log(f"[CONTACTS] BatchGetContactBriefInfo hydration task failed: {type(e).__name__}: {e}")
         finally:
             _CONTACT_HYDRATING_OWNERS.discard(owner_wxid)
 
-    _log(f"[CONTACTS] scheduling GetContact hydration: owner={owner_wxid} ids={len(ids)}, batch=100")
+    _log(f"[CONTACTS] scheduling BatchGetContactBriefInfo hydration: owner={owner_wxid} ids={len(ids)}, batch=100")
     task = asyncio.create_task(_hydrate_details())
-    _track_background_send(task, "contacts_getcontact")
+    _track_background_send(task, "contacts_briefinfo")
 
 
 def _schedule_session_contact_hydration(owner_wxid: str, wxids: list[str], account_id: str = "") -> None:
     ids = _prioritize_wxids(wxids, owner_wxid, _get_self_wxid())
     cached = sqlite_cache.get_contacts(ids, owner_wxid=owner_wxid) if ids else {}
-    missing_ids = [wxid for wxid in ids if _contact_cache_missing_display(wxid, cached.get(wxid))]
+    missing_ids = [wxid for wxid in ids if _contact_cache_missing_avatar(wxid, cached.get(wxid))]
     ids = missing_ids
     if not ids or owner_wxid in _SESSION_CONTACT_HYDRATING_OWNERS:
         return
@@ -2658,15 +2666,73 @@ def _schedule_session_contact_hydration(owner_wxid: str, wxids: list[str], accou
                     owner_wxid=owner_wxid,
                     account_id=account_id,
                 )
-            _log(f"[SESSIONS] GetContact hydrated recent sessions: owner={owner_wxid} ids={len(ids)} updates={len(updates)}")
+            _log(f"[SESSIONS] BatchGetContactBriefInfo hydrated recent sessions: owner={owner_wxid} ids={len(ids)} updates={len(updates)}")
         except Exception as e:
-            _log(f"[SESSIONS] recent session GetContact hydration failed: {type(e).__name__}: {e}")
+            _log(f"[SESSIONS] recent session BatchGetContactBriefInfo hydration failed: {type(e).__name__}: {e}")
         finally:
             _SESSION_CONTACT_HYDRATING_OWNERS.discard(owner_wxid)
 
-    _log(f"[SESSIONS] scheduling recent-session GetContact hydration: owner={owner_wxid} ids={len(ids)}, batch=100")
+    _log(f"[SESSIONS] scheduling recent-session BatchGetContactBriefInfo hydration: owner={owner_wxid} ids={len(ids)}, batch=100")
     task = asyncio.create_task(_hydrate_session_contacts())
-    _track_background_send(task, "sessions_getcontact")
+    _track_background_send(task, "sessions_briefinfo")
+
+
+async def _fetch_and_cache_contact_profiles_via_getcontact(
+    wxids: list[str],
+    *,
+    broadcast_updates: bool = False,
+    owner_wxid: str = "",
+    account_id: str = "",
+) -> dict[str, dict]:
+    """Fetch detailed profiles via /GetContact and refresh caches/database."""
+    targets: list[str] = []
+    seen: set[str] = set()
+    for wxid in wxids or []:
+        wxid = str(wxid or "").strip()
+        if not wxid or wxid in seen:
+            continue
+        seen.add(wxid)
+        targets.append(wxid)
+    if not targets:
+        return {}
+
+    owner_wxid = owner_wxid or _contact_owner_wxid()
+    result: dict[str, dict] = {}
+
+    for i in range(0, len(targets), 100):
+        batch = targets[i:i + 100]
+        try:
+            data = await wechat_api.get_contact(batch)
+            if not _getcontact_response_ok(data):
+                _log(
+                    f"[PROFILE] GetContact batch returned non-success "
+                    f"({len(batch)}): {str(data)[:300]}"
+                )
+                continue
+            contacts = _contacts_from_getcontact_response(data)
+            profiles: list[dict] = []
+            for contact in contacts:
+                if not isinstance(contact, dict):
+                    continue
+                wxid = _contact_profile_wxid(contact)
+                if not wxid:
+                    continue
+                profiles.append(dict(contact))
+            if not profiles:
+                continue
+            updates = await _cache_contact_profiles(profiles, owner_wxid=owner_wxid)
+            result.update(updates)
+            if broadcast_updates and updates:
+                await _broadcast_contact_profile_updates(updates, account_id=account_id)
+            _log(
+                f"[PROFILE] GetContact refreshed batch: owner={owner_wxid} "
+                f"requested={len(batch)} updates={len(updates)}"
+            )
+        except Exception as e:
+            _log(f"[PROFILE] GetContact batch failed ({len(batch)}): {type(e).__name__}: {e}")
+        await asyncio.sleep(0.02)
+
+    return result
 
 
 async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_empty: bool = False, force_details: bool = False) -> dict:
@@ -2674,7 +2740,7 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
 
     GetFriendAndChatRoomList is intentionally not used here; on remote Hook it can
     crash WeChat. InitContact provides the wxid/gid list, then this Contacts view
-    hydrates details with /GetContact in 100-id batches.
+    hydrates details with /BatchGetContactBriefInfo in 100-id batches.
     """
     owner_wxid = _contact_owner_wxid()
     account_id = _active_agent_id or agent_manager.active_id() or ""
@@ -2784,11 +2850,11 @@ async def _ensure_contact_profiles(
     fetch_missing: bool = False,
     force_refresh: bool = False,
 ) -> dict[str, dict]:
-    """Return contact profiles/summaries from cache, calling /GetContact for misses.
+    """Return contact profiles/summaries from cache, calling Hook detail APIs for misses.
 
-    require_full=True is used by the profile card and fetches when the full
-    profile cache is absent. require_full=False is used by callbacks and only
-    fetches when we have no usable avatar/name for a new sender.
+    require_full=True is used by explicit profile opens and refreshes, and will
+    fetch detailed data via /GetContact. require_full=False is used by passive
+    hydration paths and only fetches when we have no usable avatar.
     """
     wxids = _normalize_wxids(wxids)
     if not wxids:
@@ -2836,8 +2902,7 @@ async def _ensure_contact_profiles(
                     or ""
                 )
 
-                has_real_name = bool(name and name != wxid)
-                if not require_full and has_real_name and avatar:
+                if not require_full and avatar:
                     result[wxid] = {"wxid": wxid, "name": name or wxid, "avatar": avatar, "profile": {}}
                     if not force_refresh:
                         continue
@@ -2876,7 +2941,7 @@ async def _ensure_contact_profiles(
     regular_missing = [wxid for wxid in missing if not wxid.endswith("@openim")]
 
     if openim_missing:
-        sem = asyncio.Semaphore(8)
+        sem = asyncio.Semaphore(_hook_api_parallelism())
 
         async def fetch_openim_profile(wxid: str) -> dict[str, dict]:
             async with sem:
@@ -2887,8 +2952,7 @@ async def _ensure_contact_profiles(
                         return {}
                     profile = _openim_profile_from_payload(payload, wxid, gid=gid)
                     try:
-                        async with _GETCONTACT_SEMAPHORE:
-                            contact_data = await wechat_api.get_contact([wxid])
+                        contact_data = await wechat_api.get_contact([wxid])
                         contacts = _contacts_from_getcontact_response(contact_data)
                         if contacts and isinstance(contacts[0], dict):
                             merged = dict(contacts[0])
@@ -2907,12 +2971,20 @@ async def _ensure_contact_profiles(
                 await _broadcast_contact_profile_updates(updates, account_id=account_id)
 
     if regular_missing:
-        updates = await _fetch_and_cache_contact_details(
-            regular_missing,
-            broadcast_updates=broadcast_updates,
-            owner_wxid=owner_wxid,
-            account_id=account_id,
-        )
+        if require_full:
+            updates = await _fetch_and_cache_contact_profiles_via_getcontact(
+                regular_missing,
+                broadcast_updates=broadcast_updates,
+                owner_wxid=owner_wxid,
+                account_id=account_id,
+            )
+        else:
+            updates = await _fetch_and_cache_contact_details(
+                regular_missing,
+                broadcast_updates=broadcast_updates,
+                owner_wxid=owner_wxid,
+                account_id=account_id,
+            )
         result.update(updates)
 
     if any(
@@ -3346,18 +3418,7 @@ def _send_result_ok(result: dict) -> bool:
 
 
 def _send_api_parallelism(limit_override: int | None = None) -> int:
-    try:
-        override = int(limit_override or 0)
-    except Exception:
-        override = 0
-    if override > 0:
-        limit = override
-    else:
-        try:
-            limit = int(getattr(config, "HOOK_API_CONCURRENCY", 10) or 10)
-        except Exception:
-            limit = 10
-    return max(1, min(limit, 100))
+    return _hook_api_parallelism(limit_override)
 
 
 def _track_background_send(task: asyncio.Task, label: str) -> None:
@@ -5024,7 +5085,7 @@ async def _fallback_group_member_details(gid: str) -> dict[str, dict]:
                 if not wxid or wxid not in result:
                     continue
                 avatar = info.get("smallhead", "") or info.get("bighead", "")
-                name = info.get("nickname", "") or info.get("nick", "") or info.get("markname", "")
+                name = info.get("markname", "") or info.get("nickname", "") or info.get("nick", "")
                 if avatar:
                     result[wxid]["avatar"] = avatar
                 if name and result[wxid]["name"] == wxid:
