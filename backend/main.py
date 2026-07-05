@@ -2443,6 +2443,50 @@ async def _cache_contact_profiles(profiles: list[dict], *, owner_wxid: str = "")
     return updates
 
 
+async def _fetch_and_cache_openim_profiles(
+    wxids: list[str],
+    *,
+    gid: str = "",
+    broadcast_updates: bool = False,
+    owner_wxid: str = "",
+    account_id: str = "",
+) -> dict[str, dict]:
+    targets: list[str] = []
+    seen: set[str] = set()
+    for wxid in wxids or []:
+        wxid = str(wxid or "").strip()
+        if not wxid or wxid in seen or not wxid.endswith("@openim"):
+            continue
+        seen.add(wxid)
+        targets.append(wxid)
+    if not targets:
+        return {}
+
+    owner_wxid = owner_wxid or _contact_owner_wxid()
+    result: dict[str, dict] = {}
+    sem = asyncio.Semaphore(_hook_api_parallelism())
+
+    async def fetch_one(wxid: str) -> dict[str, dict]:
+        async with sem:
+            try:
+                data = await wechat_api.get_openim_contact(wxid, gid=gid)
+                payload = _find_openim_payload(data)
+                if not payload:
+                    return {}
+                profile = _openim_profile_from_payload(payload, wxid, gid=gid)
+                return await _cache_contact_profiles([profile], owner_wxid=owner_wxid)
+            except Exception as e:
+                _log(f"[PROFILE] GetOpenIMContact failed ({wxid}): {type(e).__name__}: {e}")
+                return {}
+
+    for updates in await asyncio.gather(*(fetch_one(wxid) for wxid in targets)):
+        result.update(updates)
+        if broadcast_updates and updates:
+            await _broadcast_contact_profile_updates(updates, account_id=account_id)
+
+    return result
+
+
 async def _fetch_and_cache_contact_details(
     wxids: list[str],
     *,
@@ -2450,6 +2494,7 @@ async def _fetch_and_cache_contact_details(
     broadcast_progress: bool = False,
     owner_wxid: str = "",
     account_id: str = "",
+    gid: str = "",
 ) -> dict[str, dict]:
     targets: list[str] = []
     seen: set[str] = set()
@@ -2464,6 +2509,21 @@ async def _fetch_and_cache_contact_details(
 
     result: dict[str, dict] = {}
     owner_wxid = owner_wxid or _contact_owner_wxid()
+    openim_targets = [wxid for wxid in targets if wxid.endswith("@openim")]
+    regular_targets = [wxid for wxid in targets if not wxid.endswith("@openim")]
+    if openim_targets:
+        openim_updates = await _fetch_and_cache_openim_profiles(
+            openim_targets,
+            gid=gid,
+            broadcast_updates=broadcast_updates,
+            owner_wxid=owner_wxid,
+            account_id=account_id,
+        )
+        result.update(openim_updates)
+    targets = regular_targets
+    if not targets:
+        return result
+
     total = len(targets)
     total_batches = (total + 99) // 100
     processed = 0
@@ -2674,16 +2734,24 @@ def _schedule_session_contact_hydration(owner_wxid: str, wxids: list[str], accou
                         f"owner={owner_wxid} ids={len(self_missing)} updates={len(self_updates)}"
                     )
                 if brief_ids:
+                    openim_brief_ids = [wxid for wxid in brief_ids if wxid.endswith("@openim")]
+                    regular_brief_ids = [wxid for wxid in brief_ids if not wxid.endswith("@openim")]
                     updates = await _fetch_and_cache_contact_details(
                         brief_ids,
                         broadcast_updates=True,
                         owner_wxid=owner_wxid,
                         account_id=account_id,
                     )
-                    _log(
-                        f"[SESSIONS] BatchGetContactBriefInfo hydrated recent sessions: "
-                        f"owner={owner_wxid} ids={len(brief_ids)} updates={len(updates)}"
-                    )
+                    if regular_brief_ids:
+                        _log(
+                            f"[SESSIONS] BatchGetContactBriefInfo hydrated recent sessions: "
+                            f"owner={owner_wxid} ids={len(regular_brief_ids)} updates={len(updates)}"
+                        )
+                    if openim_brief_ids:
+                        _log(
+                            f"[SESSIONS] GetOpenIMContact hydrated recent sessions: "
+                            f"owner={owner_wxid} ids={len(openim_brief_ids)} updates={len(updates)}"
+                        )
         except Exception as e:
             _log(f"[SESSIONS] recent session contact hydration failed: {type(e).__name__}: {e}")
         finally:
@@ -2961,34 +3029,14 @@ async def _ensure_contact_profiles(
     regular_missing = [wxid for wxid in missing if not wxid.endswith("@openim")]
 
     if openim_missing:
-        sem = asyncio.Semaphore(_hook_api_parallelism())
-
-        async def fetch_openim_profile(wxid: str) -> dict[str, dict]:
-            async with sem:
-                try:
-                    data = await wechat_api.get_openim_contact(wxid, gid=gid)
-                    payload = _find_openim_payload(data)
-                    if not payload:
-                        return {}
-                    profile = _openim_profile_from_payload(payload, wxid, gid=gid)
-                    try:
-                        contact_data = await wechat_api.get_contact([wxid])
-                        contacts = _contacts_from_getcontact_response(contact_data)
-                        if contacts and isinstance(contacts[0], dict):
-                            merged = dict(contacts[0])
-                            merged.update({k: v for k, v in profile.items() if v not in ("", None, {})})
-                            profile = merged
-                    except Exception as e:
-                        _log(f"[PROFILE] OpenIM GetContact merge skipped ({wxid}): {type(e).__name__}: {e}")
-                    return await _cache_contact_profiles([profile], owner_wxid=owner_wxid)
-                except Exception as e:
-                    _log(f"[PROFILE] GetOpenIMContact failed ({wxid}): {type(e).__name__}: {e}")
-                    return {}
-
-        for updates in await asyncio.gather(*(fetch_openim_profile(wxid) for wxid in openim_missing)):
-            result.update(updates)
-            if broadcast_updates and updates:
-                await _broadcast_contact_profile_updates(updates, account_id=account_id)
+        updates = await _fetch_and_cache_openim_profiles(
+            openim_missing,
+            gid=gid,
+            broadcast_updates=broadcast_updates,
+            owner_wxid=owner_wxid,
+            account_id=account_id,
+        )
+        result.update(updates)
 
     if regular_missing:
         if require_full:
@@ -3081,9 +3129,24 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
 
     # 2) Ask Hook only for the missing ones (max 100 per call)
     if missing:
+        openim_missing = [wxid for wxid in missing if wxid.endswith("@openim")]
+        regular_missing = [wxid for wxid in missing if not wxid.endswith("@openim")]
+
+        if openim_missing:
+            openim_updates = await _fetch_and_cache_openim_profiles(
+                openim_missing,
+                broadcast_updates=False,
+                owner_wxid=owner_wxid,
+            )
+            for wxid, entry in openim_updates.items():
+                members[wxid] = {
+                    "name": str(entry.get("name") or wxid),
+                    "avatar": str(entry.get("avatar") or ""),
+                }
+
         batch_size = 100
-        for i in range(0, len(missing), batch_size):
-            batch = missing[i:i + batch_size]
+        for i in range(0, len(regular_missing), batch_size):
+            batch = regular_missing[i:i + batch_size]
             wxid_str = ",".join(batch)
             try:
                 data = await wechat_api.batch_get_contact_brief_info(wxid_str)
