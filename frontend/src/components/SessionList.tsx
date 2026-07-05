@@ -8,6 +8,8 @@ interface SessionListProps {
   activeWxid?: string | null;
   onSelectChat: (wxid: string) => void;
   onSessionAction: (action: SessionMenuAction, session: Session) => void;
+  onRefreshSessions: () => void;
+  loading?: boolean;
   theme?: "dark" | "light";
 }
 
@@ -63,7 +65,15 @@ function MuteIcon() {
   );
 }
 
-export default function SessionList({ sessions, activeWxid, onSelectChat, onSessionAction, theme = "dark" }: SessionListProps) {
+export default function SessionList({
+  sessions,
+  activeWxid,
+  onSelectChat,
+  onSessionAction,
+  onRefreshSessions,
+  loading = false,
+  theme = "dark",
+}: SessionListProps) {
   const [menu, setMenu] = useState<{ x: number; y: number; session: Session } | null>(null);
   const dark = theme !== "light";
 
@@ -97,8 +107,8 @@ export default function SessionList({ sessions, activeWxid, onSelectChat, onSess
   return (
     <div className={`h-full w-full flex flex-col no-select ${dark ? "bg-[#191919]" : "bg-[#e9e8e8]"}`}>
       {/* Search bar */}
-      <div className="px-[8px] pt-[8px] pb-[6px] shrink-0">
-        <div className={`rounded-[6px] flex items-center pr-[8px] h-[34px] sessionlist-searchbar ${dark ? "bg-[#262626]" : "bg-[#dcdcdc]"}`}>
+      <div className="px-[8px] pt-[8px] pb-[6px] shrink-0 flex items-center gap-[6px]">
+        <div className={`min-w-0 flex-1 rounded-[6px] flex items-center pr-[8px] h-[34px] sessionlist-searchbar ${dark ? "bg-[#262626]" : "bg-[#dcdcdc]"}`}>
           <span aria-hidden style={{ width: 5 }} className="shrink-0" />
           <svg className={`w-[14px] h-[14px] shrink-0 ${dark ? "text-[#5c5c5c]" : "text-[#777]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -109,12 +119,27 @@ export default function SessionList({ sessions, activeWxid, onSelectChat, onSess
             className={`bg-transparent border-none outline-none text-[14px] ml-[6px] w-full min-w-0 ${dark ? "text-[#999] placeholder-[#5c5c5c]" : "text-[#333] placeholder-[#888]"}`}
           />
         </div>
+        <button
+          type="button"
+          onClick={onRefreshSessions}
+          disabled={loading}
+          title="刷新最近会话"
+          className={`h-[34px] px-[9px] rounded-[6px] text-[13px] shrink-0 transition-colors ${
+            dark
+              ? "bg-[#262626] text-[#d8d8d8] hover:bg-[#303030] disabled:text-[#666]"
+              : "bg-[#dcdcdc] text-[#333] hover:bg-[#d2d2d2] disabled:text-[#999]"
+          }`}
+        >
+          {loading ? "刷新中" : "刷新"}
+        </button>
       </div>
 
       {/* Session list */}
       <div className="flex-1 overflow-y-auto">
         {sessions.length === 0 && (
-          <div className={`text-center text-[14px] mt-20 ${dark ? "text-[#5c5c5c]" : "text-[#999]"}`}>暂无会话</div>
+          <div className={`text-center text-[14px] mt-20 ${dark ? "text-[#5c5c5c]" : "text-[#999]"}`}>
+            {loading ? "正在获取最近会话..." : "暂无会话，点击刷新获取最近会话"}
+          </div>
         )}
         {sessions.map((session) => {
           const isActive = session.wxid === activeWxid;

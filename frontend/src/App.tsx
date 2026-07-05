@@ -966,7 +966,6 @@ export default function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("chats");
   const [sessionsHydrating, setSessionsHydrating] = useState(false);
   const [sessionsHydrated, setSessionsHydrated] = useState(false);
-  const [sessionsRequested, setSessionsRequested] = useState(false);
   const [contactsHydrating, setContactsHydrating] = useState(false);
   const [contactsHydrated, setContactsHydrated] = useState(false);
   const [contactHydrationProgress, setContactHydrationProgress] = useState<ContactHydrationProgress | null>(null);
@@ -1015,7 +1014,6 @@ export default function App() {
     setViewMode("chats");
     setSessionsHydrating(false);
     setSessionsHydrated(false);
-    setSessionsRequested(false);
     setMobileTab("chats");
     setMobileProfileDetailOpen(false);
     setDirectoryProfileWxid(null);
@@ -1082,9 +1080,39 @@ export default function App() {
       await loadAccounts();
       return;
     }
+    const accountWxid = account.wxid || "";
+    if (accountWxid) {
+      const rawProfile = account.profile || {};
+      const displayName =
+        account.nickname ||
+        profileDisplayName({ wxid: accountWxid, name: "", profile: rawProfile }, accountWxid);
+      const avatar =
+        account.avatar ||
+        profileAvatar({ wxid: accountWxid, name: displayName, avatar: "", profile: rawProfile }, "");
+      setSelfWxid(accountWxid);
+      setContactProfiles((prev) => ({
+        ...prev,
+        [accountWxid]: {
+          wxid: accountWxid,
+          name: displayName,
+          avatar,
+          profile: {
+            ...rawProfile,
+            wxid: accountWxid,
+            NickName: displayName,
+            nickname: displayName,
+            SmallHeadImgUrl: avatar,
+            BigHeadImgUrl: avatar,
+          },
+        },
+      }));
+      setContactMap((prev) => ({ ...prev, [accountWxid]: displayName }));
+      if (avatar) {
+        setAvatarMap((prev) => ({ ...prev, [accountWxid]: avatar }));
+      }
+    }
     setActiveAgentId(agentId);
     setSelectedAccountId(agentId);
-    setSessionsRequested(true);
   }, [loadAccounts, resetChatState]);
 
   const handleLeaveAccount = useCallback(() => {
@@ -1214,6 +1242,16 @@ export default function App() {
     const requestAccountId = selectedAccountIdRef.current;
     let keepHydrating = false;
     setContactsHydrating(true);
+    setContactHydrationProgress({
+      active: true,
+      phase: "InitContact",
+      batch: 0,
+      total_batches: 0,
+      processed: 0,
+      total: 0,
+      updated: 0,
+      failed: 0,
+    });
     try {
       const refreshed = force ? await refreshContacts() : await getContacts();
       if (selectedAccountIdRef.current !== requestAccountId) return;
@@ -1276,9 +1314,6 @@ export default function App() {
     setViewMode(mode);
     setActiveChat(null);
     if (mode !== "contacts") setDesktopContactCategory(null);
-    if (mode === "chats") {
-      setSessionsRequested(true);
-    }
     if (mode === "contacts") {
       setDesktopContactCategory(null);
       hydrateDirectoryContacts();
@@ -1291,9 +1326,6 @@ export default function App() {
     setDirectoryProfileWxid(null);
     setMobileContactCategory(null);
     setMobileProfileDetailOpen(false);
-    if (tab === "chats") {
-      setSessionsRequested(true);
-    }
     if (tab === "contacts") {
       hydrateDirectoryContacts();
     }
@@ -1426,8 +1458,8 @@ export default function App() {
     }
   }, [ensureContactProfiles, queueBriefLookup]);
 
-  const hydrateChatSessions = useCallback(async () => {
-    if (sessionsHydrating || sessionsHydrated) return;
+  const hydrateChatSessions = useCallback(async (force = false) => {
+    if (sessionsHydrating || (!force && sessionsHydrated)) return;
     const requestAccountId = selectedAccountIdRef.current;
     setSessionsHydrating(true);
     try {
@@ -1435,10 +1467,26 @@ export default function App() {
       if (selectedAccountIdRef.current !== requestAccountId) return;
       const rawSessions = data?.sessions || data;
       const lastMessages = data?.last_messages || {};
-      const parsed = parseSessions(rawSessions, contactMapRef.current, lastMessages);
+      const cachedProfiles = (data?.contact_profiles && typeof data.contact_profiles === "object")
+        ? data.contact_profiles
+        : {};
+      if (Object.keys(cachedProfiles).length > 0) {
+        applyContactProfileUpdates(cachedProfiles);
+      }
+
+      const sessionNames = { ...contactMapRef.current };
+      const sessionAvatars = { ...avatarMapRef.current };
+      for (const [profileWxid, entry] of Object.entries<ContactProfile>(cachedProfiles)) {
+        const name = profileDisplayName(entry, "");
+        const avatar = profileAvatar(entry, "");
+        if (name && name !== profileWxid) sessionNames[profileWxid] = name;
+        if (avatar) sessionAvatars[profileWxid] = avatar;
+      }
+
+      const parsed = parseSessions(rawSessions, sessionNames, lastMessages);
       const enriched: Session[] = parsed.map((s) => ({
         ...s,
-        avatar: avatarMapRef.current[s.wxid] || s.avatar || "",
+        avatar: sessionAvatars[s.wxid] || s.avatar || "",
       }));
 
       setSessions((prev) => {
@@ -1464,7 +1512,11 @@ export default function App() {
         setSessionsHydrating(false);
       }
     }
-  }, [sessionsHydrated, sessionsHydrating]);
+  }, [applyContactProfileUpdates, sessionsHydrated, sessionsHydrating]);
+
+  const handleRefreshSessions = useCallback(() => {
+    hydrateChatSessions(true);
+  }, [hydrateChatSessions]);
 
   // ─── Fetch group member names (fast) on entering a group ──────────
   const fetchGroupMemberNames = useCallback((gid: string) => {
@@ -1570,23 +1622,6 @@ export default function App() {
       }
       enriched = sortSessionsForDisplay(Array.from(enrichedMap.values()));
       setSessions(enriched);
-
-      const needsBrief = enriched
-        .filter((s) => !s.is_group && (
-          !avatars[s.wxid] ||
-          (!nameMap[s.wxid] && (!s.nickname || s.nickname === s.wxid))
-        ))
-        .map((s) => s.wxid);
-      const openimNeedsProfile = needsBrief.filter((targetWxid) => targetWxid.endsWith("@openim"));
-      const regularNeedsBrief = needsBrief.filter((targetWxid) => !targetWxid.endsWith("@openim"));
-      queueBriefLookup(regularNeedsBrief, wxid);
-      if (openimNeedsProfile.length > 0) {
-        ensureContactProfiles(openimNeedsProfile).catch((err) => console.error("[OPENIM_PROFILE]", err));
-      }
-      const groupNeedsProfile = enriched
-        .filter((s) => s.is_group && !avatars[s.wxid])
-        .map((s) => s.wxid);
-      ensureGroupProfiles(groupNeedsProfile);
 
       if (messages_cache && typeof messages_cache === "object") {
         setChatMessages((prev) => {
@@ -1849,11 +1884,9 @@ export default function App() {
   const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId));
 
   useEffect(() => {
-    if (!authenticated || !selectedAccountId || !sessionsRequested) return;
-    const wantsChats = isMobile ? mobileTab === "chats" : viewMode === "chats";
-    if (!wantsChats || activeChat) return;
-    hydrateChatSessions();
-  }, [activeChat, authenticated, hydrateChatSessions, isMobile, mobileTab, selectedAccountId, sessionsRequested, viewMode]);
+    if (!authenticated || !selectedAccountId) return;
+    hydrateChatSessions(false);
+  }, [authenticated, selectedAccountId, hydrateChatSessions]);
 
   useEffect(() => {
     if (!authenticated || selectedAccountId) return;
@@ -2371,6 +2404,8 @@ export default function App() {
           onSelectContact={openDirectoryProfile}
           onSelectContactCategory={setMobileContactCategory}
           onHydrateContacts={hydrateDirectoryContacts}
+          onRefreshSessions={handleRefreshSessions}
+          sessionsLoading={sessionsHydrating}
           onOpenSelfDetail={openMobileSelfProfileDetail}
         />
       </MobileSwipeFrame>
@@ -2405,6 +2440,8 @@ export default function App() {
             activeWxid={activeChat}
             onSelectChat={handleSelectChat}
             onSessionAction={handleSessionMenuAction}
+            onRefreshSessions={handleRefreshSessions}
+            loading={sessionsHydrating}
             theme={portalTheme}
           />
         )}
@@ -3170,6 +3207,8 @@ function MobileMainShell({
   onSelectContact,
   onSelectContactCategory,
   onHydrateContacts,
+  onRefreshSessions,
+  sessionsLoading,
   onOpenSelfDetail,
 }: {
   tab: MobileTab;
@@ -3192,11 +3231,21 @@ function MobileMainShell({
   onSelectContact: (entry: DirectoryEntry) => void;
   onSelectContactCategory: (category: ContactCategoryKey) => void;
   onHydrateContacts: (force?: boolean) => void;
+  onRefreshSessions: () => void;
+  sessionsLoading: boolean;
   onOpenSelfDetail: () => void;
 }) {
   return (
     <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
-      {tab === "chats" && <MobileChatsView sessions={sessions} onSelectChat={onSelectChat} dark={dark} />}
+      {tab === "chats" && (
+        <MobileChatsView
+          sessions={sessions}
+          onSelectChat={onSelectChat}
+          onRefreshSessions={onRefreshSessions}
+          loading={sessionsLoading}
+          dark={dark}
+        />
+      )}
       {tab === "contacts" && (
         <MobileContactsView
           friends={friends}
@@ -3228,33 +3277,47 @@ function MobileMainShell({
   );
 }
 
-function MobileSearchBar({ placeholder = "Search", dark = false }: { placeholder?: string; dark?: boolean }) {
-  return (
-    <div className="h-[44px] px-[12px] flex items-center">
-      <div className={`w-full h-[36px] rounded-[7px] flex items-center justify-center gap-[7px] ${dark ? "bg-[#242424] text-[#777]" : "bg-white text-[#b7b7b7]"}`}>
-        <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
-        </svg>
-        <span className="text-[16px]">{placeholder}</span>
-      </div>
-    </div>
-  );
-}
-
 function MobileChatsView({
   sessions,
   onSelectChat,
+  onRefreshSessions,
+  loading,
   dark,
 }: {
   sessions: Session[];
   onSelectChat: (wxid: string) => void;
+  onRefreshSessions: () => void;
+  loading: boolean;
   dark: boolean;
 }) {
   return (
     <div className="flex-1 min-h-0 overflow-y-auto pt-[calc(env(safe-area-inset-top)+8px)] pb-[10px]">
-      <MobileSearchBar dark={dark} />
+      <div className="h-[44px] px-[12px] flex items-center gap-[8px]">
+        <div className={`min-w-0 flex-1 h-[36px] rounded-[7px] flex items-center justify-center gap-[7px] ${dark ? "bg-[#242424] text-[#777]" : "bg-white text-[#b7b7b7]"}`}>
+          <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
+          </svg>
+          <span className="text-[16px]">Search</span>
+        </div>
+        <button
+          type="button"
+          onClick={onRefreshSessions}
+          disabled={loading}
+          className={`h-[36px] px-[12px] rounded-[7px] text-[14px] shrink-0 ${
+            dark
+              ? "bg-[#242424] text-[#d8d8d8] disabled:text-[#666]"
+              : "bg-white text-[#333] disabled:text-[#aaa]"
+          }`}
+        >
+          {loading ? "刷新中" : "刷新"}
+        </button>
+      </div>
       <div className={dark ? "bg-[#111111]" : "bg-white"}>
-        {sessions.length === 0 && <div className={`text-center text-[14px] py-[48px] ${dark ? "text-[#666]" : "text-[#999]"}`}>暂无会话</div>}
+        {sessions.length === 0 && (
+          <div className={`text-center text-[14px] py-[48px] ${dark ? "text-[#666]" : "text-[#999]"}`}>
+            {loading ? "正在获取最近会话..." : "暂无会话，点击刷新获取最近会话"}
+          </div>
+        )}
         {sessions.map((session) => (
           <MobileSessionRow key={session.wxid} session={session} onClick={() => onSelectChat(session.wxid)} dark={dark} />
         ))}
@@ -4247,9 +4310,12 @@ function ContactHydrationStatus({
   const updated = Number(progress?.updated || 0);
   const failed = Number(progress?.failed || 0);
   const ratio = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
-  const text = active && total
-    ? `GetContact 第 ${batch}/${totalBatches} 批，已处理 ${processed}/${total}，已更新 ${updated}，失败 ${failed}`
-    : "正在通过 GetContact 批量补全联系人资料...";
+  const phase = String(progress?.phase || "");
+  const text = phase === "InitContact"
+    ? "正在调用 InitContact 初始化通讯录..."
+    : (active && total
+        ? `GetContact 第 ${batch}/${totalBatches} 批，已处理 ${processed}/${total}，已更新 ${updated}，失败 ${failed}`
+        : "正在通过 GetContact 批量补全联系人资料...");
   return (
     <div className={`${mobile ? "px-[18px]" : "px-[18px]"} pb-[8px] shrink-0`}>
       <div className={`text-[12px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{text}</div>

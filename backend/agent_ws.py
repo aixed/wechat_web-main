@@ -261,6 +261,8 @@ class AgentWebSocketManager:
         method: str = "POST",
         timeout: float = 30.0,
         agent_id: str | None = None,
+        inject_agent_id: bool = True,
+        include_method: bool = True,
     ) -> AgentCallResponse:
         request_id = f"req-{uuid.uuid4().hex}"
         route_name = route.strip("/")
@@ -285,16 +287,18 @@ class AgentWebSocketManager:
         request_body = body if body is not None else {}
         if isinstance(request_body, dict):
             request_body = dict(request_body)
-            request_body.setdefault("agent_id", target_id)
+            if inject_agent_id:
+                request_body.setdefault("agent_id", target_id)
 
         message = {
             "type": "request",
             "id": request_id,
             "route": route_name,
-            "method": method,
             "agent_id": target_id,
             "body": request_body,
         }
+        if include_method:
+            message["method"] = method
 
         try:
             async with conn.send_lock:
