@@ -135,7 +135,7 @@ export default function SessionList({
       </div>
 
       {/* Session list */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="session-list-scroll flex-1 overflow-y-auto overflow-x-hidden">
         {sessions.length === 0 && (
           <div className={`text-center text-[14px] mt-20 ${dark ? "text-[#5c5c5c]" : "text-[#999]"}`}>
             {loading ? "正在获取最近会话..." : "暂无会话，点击刷新获取最近会话"}
