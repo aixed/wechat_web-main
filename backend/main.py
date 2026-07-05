@@ -2649,30 +2649,50 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
 
 
 def _schedule_session_contact_hydration(owner_wxid: str, wxids: list[str], account_id: str = "") -> None:
-    ids = _prioritize_wxids(wxids, owner_wxid, _get_self_wxid())
+    self_wxid = str(_get_self_wxid() or "").strip()
+    ids = _prioritize_wxids(wxids, owner_wxid, self_wxid)
     cached = sqlite_cache.get_contacts(ids, owner_wxid=owner_wxid) if ids else {}
     missing_ids = [wxid for wxid in ids if _contact_cache_missing_avatar(wxid, cached.get(wxid))]
-    ids = missing_ids
-    if not ids or owner_wxid in _SESSION_CONTACT_HYDRATING_OWNERS:
+    self_missing = [wxid for wxid in missing_ids if wxid == self_wxid]
+    brief_ids = [wxid for wxid in missing_ids if wxid != self_wxid]
+    if not self_missing and (not brief_ids or owner_wxid in _SESSION_CONTACT_HYDRATING_OWNERS):
         return
 
     async def _hydrate_session_contacts() -> None:
         _SESSION_CONTACT_HYDRATING_OWNERS.add(owner_wxid)
         try:
             with wechat_api.use_agent(account_id):
-                updates = await _fetch_and_cache_contact_details(
-                    ids,
-                    broadcast_updates=True,
-                    owner_wxid=owner_wxid,
-                    account_id=account_id,
-                )
-            _log(f"[SESSIONS] BatchGetContactBriefInfo hydrated recent sessions: owner={owner_wxid} ids={len(ids)} updates={len(updates)}")
+                if self_missing:
+                    self_updates = await _fetch_and_cache_contact_profiles_via_getcontact(
+                        self_missing,
+                        broadcast_updates=True,
+                        owner_wxid=owner_wxid,
+                        account_id=account_id,
+                    )
+                    _log(
+                        f"[SESSIONS] GetContact hydrated self recent-session profile: "
+                        f"owner={owner_wxid} ids={len(self_missing)} updates={len(self_updates)}"
+                    )
+                if brief_ids:
+                    updates = await _fetch_and_cache_contact_details(
+                        brief_ids,
+                        broadcast_updates=True,
+                        owner_wxid=owner_wxid,
+                        account_id=account_id,
+                    )
+                    _log(
+                        f"[SESSIONS] BatchGetContactBriefInfo hydrated recent sessions: "
+                        f"owner={owner_wxid} ids={len(brief_ids)} updates={len(updates)}"
+                    )
         except Exception as e:
-            _log(f"[SESSIONS] recent session BatchGetContactBriefInfo hydration failed: {type(e).__name__}: {e}")
+            _log(f"[SESSIONS] recent session contact hydration failed: {type(e).__name__}: {e}")
         finally:
             _SESSION_CONTACT_HYDRATING_OWNERS.discard(owner_wxid)
 
-    _log(f"[SESSIONS] scheduling recent-session BatchGetContactBriefInfo hydration: owner={owner_wxid} ids={len(ids)}, batch=100")
+    if self_missing:
+        _log(f"[SESSIONS] scheduling self GetContact hydration before brief batch: owner={owner_wxid} ids={len(self_missing)}")
+    if brief_ids:
+        _log(f"[SESSIONS] scheduling recent-session BatchGetContactBriefInfo hydration: owner={owner_wxid} ids={len(brief_ids)}, batch=100")
     task = asyncio.create_task(_hydrate_session_contacts())
     _track_background_send(task, "sessions_briefinfo")
 
