@@ -8,6 +8,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
+from starlette.staticfiles import StaticFiles
 from datetime import datetime
 
 import json
@@ -3855,6 +3856,7 @@ async def send_at(req: SendAtRequest):
 
 _UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "_uploads")
 os.makedirs(_UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=_UPLOAD_DIR), name="uploads")
 
 
 @app.post("/api/broadcast/text")
@@ -5535,10 +5537,10 @@ def _run_callback_server():
     async def _health():
         return {"status": "callback_server_ok", "port": config.CALLBACK_PORT}
 
-    _log(f"[CALLBACK_SERVER] Starting on 0.0.0.0:{config.CALLBACK_PORT} ...")
+    _log(f"[CALLBACK_SERVER] Starting on {config.CALLBACK_HOST}:{config.CALLBACK_PORT} ...")
     uvicorn.run(
         cb_app,
-        host="0.0.0.0",
+        host=config.CALLBACK_HOST,
         port=config.CALLBACK_PORT,
         log_level="warning",
     )
@@ -5553,7 +5555,7 @@ if __name__ == "__main__":
     # so the remote Hook can reach us on the forwarded port.
     if config.CALLBACK_PORT != config.SERVER_PORT:
         _log(f"[STARTUP] Callback port ({config.CALLBACK_PORT}) != server port ({config.SERVER_PORT})")
-        _log(f"[STARTUP] Starting separate callback listener on 0.0.0.0:{config.CALLBACK_PORT}")
+        _log(f"[STARTUP] Starting separate callback listener on {config.CALLBACK_HOST}:{config.CALLBACK_PORT}")
         cb_thread = threading.Thread(target=_run_callback_server, daemon=True)
         cb_thread.start()
 

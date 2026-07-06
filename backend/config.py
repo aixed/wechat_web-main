@@ -103,8 +103,10 @@ RDV = str(_cfg.get("RDV", ""))
 HOOK_BASE_URL = f"http://{HOOK_HOST}:{HOOK_PORT}"
 MGR_BASE_URL = f"http://{HOOK_HOST}:{MGR_PORT}"
 
-# Backend server — bind to 0.0.0.0 so remote Hook callbacks can reach us
-SERVER_HOST = "0.0.0.0"
+# Backend server. Keep this on 127.0.0.1 when the frontend runs on the same
+# machine and proxies /api + /agent; set to 0.0.0.0 only when exposing backend
+# ports directly is intentional.
+SERVER_HOST = str(_cfg.get("server_host", "127.0.0.1") or "127.0.0.1")
 SERVER_PORT = int(_cfg.get("server_port", 5000))
 WEB_ACCESS_KEY = str(_cfg.get("web_access_key", os.environ.get("WECHAT_WEB_ACCESS_KEY", ""))).strip()
 
@@ -132,10 +134,13 @@ CLIENT_WSS_URL = f"{CLIENT_WSS_SCHEME}://{CLIENT_WSS_HOST}{_client_wss_port_part
 
 # Callback (use public IP/domain so remote client DLLs can reach us outbound)
 CALLBACK_PORT = int(_cfg.get("callback_port", SERVER_PORT))
+CALLBACK_HOST = str(_cfg.get("callback_host", SERVER_HOST) or SERVER_HOST)
 CALLBACK_PATH = str(_cfg.get("callback_path", "/api/callback") or "/api/callback")
 if not CALLBACK_PATH.startswith("/"):
     CALLBACK_PATH = "/" + CALLBACK_PATH
-CALLBACK_URL = f"http://{PUBLIC_IP}:{CALLBACK_PORT}{CALLBACK_PATH}"
+CALLBACK_PUBLIC_PORT = int(_cfg.get("callback_public_port", CALLBACK_PORT))
+_callback_public_port_part = "" if CALLBACK_PUBLIC_PORT == 80 else f":{CALLBACK_PUBLIC_PORT}"
+CALLBACK_URL = f"http://{PUBLIC_IP}{_callback_public_port_part}{CALLBACK_PATH}"
 RECV_TYPE = int(_cfg.get("recvtype", _cfg.get("recv_type", 2)))
 if RECV_TYPE not in (1, 2):
     print(f"[CONFIG] ⚠ invalid recv_type={RECV_TYPE!r}, using 2", flush=True)
@@ -149,7 +154,7 @@ MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL = int(_cfg.get("max_restarts_after_button_l
 
 print(f"[CONFIG] wechat_mode={WECHAT_MODE}  mode={LOGIN_MODE}  host={HOOK_HOST}  "
       f"api_port={HOOK_PORT}  mgr_port={MGR_PORT}  "
-      f"server_port={SERVER_PORT}  callback={CALLBACK_URL}  "
+      f"server={SERVER_HOST}:{SERVER_PORT}  callback={CALLBACK_URL}  callback_bind={CALLBACK_HOST}:{CALLBACK_PORT}  "
       f"hook_api_concurrency={HOOK_API_CONCURRENCY}  "
       f"agent_ws={'on' if AGENT_WS_ENABLED else 'off'}  "
       f"client_wss={CLIENT_WSS_URL}  "
