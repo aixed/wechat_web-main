@@ -399,6 +399,12 @@ class SqliteMessageCache:
                         WHEN excluded.avatar != '' THEN excluded.profile_json
                         WHEN instr(excluded.profile_json, 'SmallHeadImgUrl') > 0 OR instr(excluded.profile_json, 'smallhead') > 0 THEN excluded.profile_json
                         WHEN instr(excluded.profile_json, 'BigHeadImgUrl') > 0 OR instr(excluded.profile_json, 'bighead') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, 'VerifyFlag') > 0 OR instr(excluded.profile_json, 'verifyflag') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, 'BitVal') > 0 OR instr(excluded.profile_json, 'bitval') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, 'ServiceType') > 0 OR instr(excluded.profile_json, 'service_type') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, 'ServiceFlag') > 0 OR instr(excluded.profile_json, 'serviceFlag') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, 'AccountType') > 0 OR instr(excluded.profile_json, 'account_type') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, 'OpenIM') > 0 OR instr(excluded.profile_json, 'openim_detail') > 0 THEN excluded.profile_json
                         ELSE contacts.profile_json
                     END,
                     updated_at=excluded.updated_at

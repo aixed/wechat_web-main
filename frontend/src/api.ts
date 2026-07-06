@@ -2,12 +2,20 @@ const BASE = "";  // Same origin via Vite proxy
 export const ACCESS_KEY_STORAGE = "wechat_web_access_key";
 export const ACTIVE_AGENT_STORAGE = "wechat_web_active_agent_id";
 
+let activeAgentIdOverride = "";
+
 export const getAccessKey = () => window.localStorage.getItem(ACCESS_KEY_STORAGE) || "";
 export const setAccessKey = (key: string) => window.localStorage.setItem(ACCESS_KEY_STORAGE, key);
 export const clearAccessKey = () => window.localStorage.removeItem(ACCESS_KEY_STORAGE);
-export const getActiveAgentId = () => window.localStorage.getItem(ACTIVE_AGENT_STORAGE) || "";
-export const setActiveAgentId = (agentId: string) => window.localStorage.setItem(ACTIVE_AGENT_STORAGE, agentId);
-export const clearActiveAgentId = () => window.localStorage.removeItem(ACTIVE_AGENT_STORAGE);
+export const getActiveAgentId = () => activeAgentIdOverride || window.localStorage.getItem(ACTIVE_AGENT_STORAGE) || "";
+export const setActiveAgentId = (agentId: string) => {
+  activeAgentIdOverride = agentId;
+  window.localStorage.setItem(ACTIVE_AGENT_STORAGE, agentId);
+};
+export const clearActiveAgentId = () => {
+  activeAgentIdOverride = "";
+  window.localStorage.removeItem(ACTIVE_AGENT_STORAGE);
+};
 
 export const authQuery = () => {
   const params = new URLSearchParams();
