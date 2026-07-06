@@ -31,9 +31,9 @@ remote_protocol_api_port: 30001
 remote_protocol_mgr_port: 29999
 
 # --- 后端服务 ---
-# 后端监听地址。前后端在同一台机器时建议只监听 127.0.0.1，
-# 公网只暴露前端端口，由 Vite/Nginx 代理 /api 与 /agent。
-server_host: "127.0.0.1"
+# 后端监听地址。DLL 使用 RemoteWS 直连 server_port 时需要监听 0.0.0.0；
+# 若只通过前端端口或 Nginx 代理 /api 与 /agent，可改为 127.0.0.1。
+server_host: "0.0.0.0"
 server_port: 5000
 # Web 前端访问密钥；浏览器需先输入该 key 才能访问聊天页和 API。
 # 不要把真实密钥提交到 Git，可在 config.yaml 或 WECHAT_WEB_ACCESS_KEY 中配置。
@@ -48,15 +48,15 @@ frontend_host: "0.0.0.0"
 frontend_port: 3001
 
 # --- 远程客户端 DLL 主动连接到本后端的 WS/WSS 长连接 ---
-# 无证书测试：client_wss_scheme="ws"，client_wss_port=80，
-#   DLL 使用 RemoteWS="ws://1.14.149.2/agent"，由前端端口代理到本机后端。
+# 无证书测试：client_wss_scheme="ws"，client_wss_port=5000，
+#   DLL 使用 RemoteWS="ws://1.14.149.2:5000/agent"，直连 server_port。
 # 正式部署：client_wss_scheme="wss"，client_wss_port=443，
 #   DLL 使用 RemoteWS="wss://1.14.149.2/agent"，需 Nginx/Caddy 等提供 TLS 证书并转发到 server_port。
 agent_ws_enabled: true
 agent_ws_path: "/agent"
 client_wss_scheme: "ws"
 client_wss_host: "127.0.0.1"
-client_wss_port: 80
+client_wss_port: 5000
 agent_ws_request_timeout: 30
 
 # --- 回调 ---

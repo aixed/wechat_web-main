@@ -79,7 +79,7 @@ python login_remote_hook.py
 python main.py
 ```
 
-后端默认监听 `127.0.0.1:5000`，前后端同机部署时公网只需要开放前端端口（如 `80`），由前端开发服务器代理 `/api`、`/agent` 和回调路径到本机后端。
+远程 Hook DLL 若使用 `RemoteWS="ws://公网IP:5000/agent"` 直连后端，`server_host` 需要配置为 `0.0.0.0`，并确保云服务器安全组放行 `5000`。如果只通过前端端口或 Nginx 代理 `/api`、`/agent`，后端可以只监听 `127.0.0.1:5000`。
 
 ### 3. 启动前端
 
@@ -117,7 +117,7 @@ npm run lint
 示例：
 
 ```text
-"C:\Program Files (x86)\Tencent\WeChat391016\WeChat\WeChat.exe" CallBackURL=http://localhost/receiveChatBotMsg/msg&RecvType=1&ConnectType=http&RemoteWS="ws://1.14.149.2/agent"&StartPort=30001&RDV=<客户端自己的RDV>
+"C:\Program Files (x86)\Tencent\WeChat391016\WeChat\WeChat.exe" CallBackURL=http://localhost/receiveChatBotMsg/msg&RecvType=1&ConnectType=http&RemoteWS="ws://1.14.149.2:5000/agent"&StartPort=30001&RDV=<客户端自己的RDV>
 ```
 
 `RemoteWS` 支持两种形式：
@@ -132,14 +132,14 @@ npm run lint
 - `wechat_mode`：微信使用方式，`1`=本地 Hook，`2`=远程客户端 Hook（客户端 DLL 主动连本后端 WS/WSS），`3`=远程服务器协议。旧配置 `login` 仍兼容，可选 `local_hook`、`remote_hook`、`remote_protocol`。
 - `*_host` / `*_api_port` / `*_mgr_port`：不同模式下的服务地址和端口。
 - `ip`：公网 IP 或域名，用于生成远程客户端 DLL 可访问的回调地址。
-- `server_host` / `server_port`：后端主服务监听地址和端口；前后端同机部署时建议 `server_host: "127.0.0.1"`。
+- `server_host` / `server_port`：后端主服务监听地址和端口；DLL 直连 `ws://公网IP:5000/agent` 时用 `server_host: "0.0.0.0"`，只走前端或 Nginx 代理时可用 `127.0.0.1`。
 - `web_access_key`：Web 前端和 `/api/*` 接口访问密钥；不要提交真实值，可在本地 `config.yaml` 或环境变量 `WECHAT_WEB_ACCESS_KEY` 中配置。
 - `hook_api_concurrency`：Hook/API 并发数；本地 Hook 默认 `1`，远程 Hook/远程协议默认 `10`，用于避免慢查询阻塞 `GetContact`、头像、发送消息等交互接口。
 - `frontend_host` / `frontend_port`：前端开发服务器监听地址和端口；Windows/Linux 启动脚本不覆盖这些值，由 Vite 直接读取 `config.yaml`。
 - `agent_ws_enabled`：是否启用远程客户端 DLL 主动连接本后端的 `/agent` WebSocket 通道；启用后 Hook API 调用会通过这条长连接发给 DLL。
 - `agent_ws_path`：DLL 连接路径，默认 `/agent`。
-- `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；无证书同机部署可用 `client_wss_scheme: "ws"`、`client_wss_port: 80`，DLL 配置 `RemoteWS="ws://1.14.149.2/agent"`；正式 TLS 部署用 `client_wss_scheme: "wss"`、`client_wss_port: 443`，DLL 配置 `RemoteWS="wss://1.14.149.2/agent"`。
-- 使用前端端口代理 `/agent` 时，后端 `server_port` 不需要暴露公网；若使用 Nginx/Caddy，也需要保留 WebSocket Upgrade 头。
+- `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；无证书直连后端可用 `client_wss_scheme: "ws"`、`client_wss_port: 5000`，DLL 配置 `RemoteWS="ws://1.14.149.2:5000/agent"`；正式 TLS 部署用 `client_wss_scheme: "wss"`、`client_wss_port: 443`，DLL 配置 `RemoteWS="wss://1.14.149.2/agent"`。
+- 使用前端端口代理 `/agent` 时，后端 `server_port` 不需要暴露公网；直连 `server_port` 时，需要云服务器安全组放行该端口。若使用 Nginx/Caddy，也需要保留 WebSocket Upgrade 头。
 - `callback_host` / `callback_port`：回调服务本机监听地址；`callback_public_port` / `callback_path`：远程客户端 Hook 实际访问的公网端口和路径。
 - `recvtype`：Hook 消息接收类型，默认 `1`；`1` 为 Hook 直接返回 `msglist`，`2` 为 protobuf/raw `pb_msg`。旧配置 `recv_type` 仍兼容。
 - `WECHAT_FILES_BASE`：可选环境变量，用于指定本机微信文件目录；不设置时会按默认微信文件目录推导。
