@@ -1113,15 +1113,16 @@ function dedupeMessagesForDisplay(msgs: ChatMessage[]): ChatMessage[] {
 
 function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessage | null {
   if (!msg || typeof msg !== "object") return null;
-  if (msg.msgtype && msg.fromid && msg.id) {
+  if (msg.msgtype && msg.id) {
+    const normalizedIsSender = Number(msg.isSender ?? (String(msg.sendorrecv || sendorrecv) === "1" ? 1 : 0));
     return {
       ...msg,
       id: String(msg.id),
       msgtype: String(msg.msgtype || "1"),
       sendorrecv: String(msg.sendorrecv || sendorrecv || "2"),
-      isSender: Number(msg.isSender ?? (String(msg.sendorrecv || sendorrecv) === "1" ? 1 : 0)),
+      isSender: normalizedIsSender,
       msg: String(msg.msg || ""),
-      fromid: String(msg.fromid || ""),
+      fromid: String(msg.fromid || (normalizedIsSender === 1 ? myWxid : "")),
       toid: String(msg.toid || ""),
       fromgid: String(msg.fromgid || ""),
       fromtype: String(msg.fromtype || ""),
