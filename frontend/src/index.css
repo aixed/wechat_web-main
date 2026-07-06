@@ -77,6 +77,33 @@ html, body, #root {
   background: #6a6a6a;
 }
 
+.pane-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #444 transparent;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+}
+
+.pane-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.pane-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.pane-scroll::-webkit-scrollbar-thumb {
+  background: #3f3f3f;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.pane-scroll::-webkit-scrollbar-thumb:hover {
+  background: #5a5a5a;
+  background-clip: content-box;
+}
+
 /* Disable text selection on UI elements */
 .no-select {
   user-select: none;
