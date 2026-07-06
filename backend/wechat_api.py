@@ -860,6 +860,18 @@ async def query_db(dbname: str, sql: str, timeout: float | None = None) -> dict:
         return {"data": []}
 
 
+async def get_msg_struct(msg_id: str) -> dict:
+    """Fetch the full structured XML for a message by MsgSvrID.
+
+    Type=49 app messages can have truncated or prefixed CompressContent in MSG DB.
+    /GetMsgStruct returns the complete XML, including refermsg for quote messages.
+    """
+    if IS_HOOK and msg_id:
+        r = await _post("/GetMsgStruct", json={"msg_id": str(msg_id)}, timeout=20.0 if IS_LOCAL_HOOK else 30.0)
+        return safe_json(r)
+    return {}
+
+
 def _decompress_content(hex_str: str) -> str:
     """Try to extract readable content from CompressContent hex data.
     WeChat 4.x can store type 49 message XML in CompressContent as either:
@@ -1054,6 +1066,15 @@ async def _query_db_parallel(dbs: list[str], sql: str) -> list:
 
 _ALL_DBS = ["MSG0.db", "MSG1.db", "MSG2.db", "MSG3.db"]
 
+# WeChat MSG.Type reference used by history rendering.
+# 1=text, 3=image, 34=voice, 37=friend confirm, 40=POSSIBLEFRIEND_MSG,
+# 42=contact card, 43=video, 47=animated sticker, 48=location,
+# 49=app/share/file/quote message (SubType/appmsg.type distinguishes details;
+#    appmsg.type=57 is a quote/refer message and should use /GetMsgStruct
+#    when CompressContent is present),
+# 50=VOIPMSG, 51=init message, 52=VOIPNOTIFY, 53=VOIPINVITE,
+# 62=short video, 9999=SYSNOTICE, 10000=system, 10002=revoke.
+
 
 def _sql_literal(value: str) -> str:
     return str(value or "").replace("'", "''")
@@ -1116,8 +1137,29 @@ async def get_chat_history(wxid: str, limit: int = 50, before_time: int = 0, dbs
         bytes_extra_hex = _row_hex_value(row, "BytesExtra", "BytesExtraHex")
         compress_hex = _row_hex_value(row, "CompressContent", "CompressHex")
 
-        # For type 49 (app messages: quotes, links, files), StrContent may be empty
-        # in WeChat 4.x — actual XML is in CompressContent
+        # For type 49 app messages, prefer /GetMsgStruct whenever MSG has
+        # CompressContent. QueryDB may return truncated/prefixed XML, while
+        # GetMsgStruct returns the complete XML including <refermsg>.
+        if msg_type == "49" and compress_hex:
+            msg_id = str(row.get("MsgSvrID", "") or "").strip()
+            if msg_id:
+                try:
+                    struct = await get_msg_struct(msg_id)
+                    content = ""
+                    if isinstance(struct, dict):
+                        content = str(struct.get("content") or "")
+                        data_obj = struct.get("data")
+                        if not content and isinstance(data_obj, dict):
+                            content = str(data_obj.get("content") or "")
+                    if content.strip():
+                        row["StrContent"] = content
+                        str_content = content
+                        _log(f"[GET_MSG_STRUCT] Recovered type 49 content msg_id={msg_id} len={len(content)}")
+                except Exception as e:
+                    _log(f"[GET_MSG_STRUCT] failed msg_id={msg_id}: {type(e).__name__}: {e}")
+
+        # Fallback for type 49 when GetMsgStruct is unavailable: try local
+        # decoding/extraction from CompressContent.
         if msg_type == "49" and not str_content.strip():
             if compress_hex:
                 decompressed = _decompress_content(compress_hex)

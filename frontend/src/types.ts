@@ -54,6 +54,12 @@ export interface WeChatAccount {
 
 // ─── Messages ────────────────────────────────────────────────────
 
+// WeChat MSG.Type reference:
+// 1 text, 3 image, 34 voice, 37 friend confirm, 40 POSSIBLEFRIEND_MSG,
+// 42 contact card, 43 video, 47 animated sticker, 48 location,
+// 49 app/share/file message (appmsg.type=57 means quote/refer message),
+// 50 VOIPMSG, 51 init, 52 VOIPNOTIFY, 53 VOIPINVITE, 62 short video,
+// 9999 SYSNOTICE, 10000 system, 10002 revoke.
 export interface ChatMessage {
   id: string;           // msgsvrid or clientmsgid
   msgtype: string;
