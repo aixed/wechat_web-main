@@ -578,7 +578,13 @@ function contactListFromRaw(raw: any): any[] {
     ...(Array.isArray(raw.data) ? raw.data : []),
     ...(Array.isArray(raw) ? raw : []),
   ];
-  return uniqueContacts(list).filter((entry) => !isChatroomContact(entry));
+  return uniqueContacts(list).filter((entry) => {
+    if (isChatroomContact(entry)) return false;
+    const wxid = contactWxid(entry);
+    if (!wxid) return false;
+    if (wxid.endsWith("@openim")) return false;
+    return true;
+  });
 }
 
 function chatroomListFromRaw(raw: any): any[] {
@@ -594,7 +600,7 @@ function chatroomListFromRaw(raw: any): any[] {
 }
 
 function mergeRawContactsWithProfiles(raw: any, members: Record<string, ContactProfile>): any {
-  if (!raw || !members || Object.keys(members).length === 0) return raw;
+  if (!members || Object.keys(members).length === 0) return raw;
 
   const mergeEntry = (entry: any) => {
     if (!entry || typeof entry !== "object") return entry;
@@ -614,11 +620,34 @@ function mergeRawContactsWithProfiles(raw: any, members: Record<string, ContactP
     };
   };
 
-  if (Array.isArray(raw)) return raw.map(mergeEntry);
-  if (typeof raw !== "object") return raw;
+  const openimEntries = Object.entries(members)
+    .filter(([wxid, member]) => wxid.endsWith("@openim") || Boolean(member?.profile?.OpenIM || member?.profile?.openim_detail))
+    .map(([wxid, member]) => {
+      const profile = member?.profile || {};
+      return {
+        ...profile,
+        wxid,
+        nickname: pickFirstString(member?.name, profile.markname, profile.Remark, profile.remark, profile.nickname, profile.NickName, profile.strNickName, wxid),
+        strNickName: pickFirstString(member?.name, profile.strNickName, profile.nickname, profile.NickName, wxid),
+        smallhead: pickFirstString(member?.avatar, profile.SmallHeadImgUrl, profile.smallhead),
+        bighead: pickFirstString(profile.BigHeadImgUrl, profile.bighead, member?.avatar),
+        avatar: pickFirstString(member?.avatar, profile.avatar),
+      };
+    });
+
+  if (Array.isArray(raw)) {
+    return uniqueContacts([...raw.map(mergeEntry), ...openimEntries]);
+  }
+  if (!raw || typeof raw !== "object") {
+    return openimEntries.length ? openimEntries : raw;
+  }
   const next = { ...raw };
   for (const key of ["friend", "friends", "chatroom", "chatrooms", "chat_room", "chat_rooms", "group", "groups", "group_chat", "group_chats", "data"]) {
     if (Array.isArray(next[key])) next[key] = next[key].map(mergeEntry);
+  }
+  if (openimEntries.length) {
+    const baseFriends = Array.isArray(next.friend) ? next.friend : Array.isArray(next.friends) ? next.friends : [];
+    next.friend = uniqueContacts([...baseFriends, ...openimEntries]);
   }
   return next;
 }
@@ -743,11 +772,28 @@ function groupDirectoryEntries(entries: DirectoryEntry[]): Array<{ title: string
   return result;
 }
 
+function numericContactField(raw: any, ...keys: string[]): number | null {
+  for (const key of keys) {
+    const value = raw?.[key];
+    if (value === undefined || value === null || value === "") continue;
+    const num = Number(value);
+    if (Number.isFinite(num)) return num;
+  }
+  return null;
+}
+
 function rawContactCategory(raw: any, wxid: string): ContactCategoryKey | "personal" {
   const id = String(wxid || "").trim();
   if (id.endsWith("@chatroom")) return "groups";
-  if (id.endsWith("@openim")) return "openim";
+  if (id.endsWith("@openim") || Boolean(raw?.OpenIM || raw?.OpenIMDetail || raw?.openim_detail)) return "openim";
   if (id.startsWith("gh_")) {
+    const bitVal = numericContactField(raw, "BitVal", "bitval", "status", "Status");
+    if (bitVal === 513 || bitVal === 515) return "service";
+
+    const verifyFlag = numericContactField(raw, "VerifyFlag", "verifyflag");
+    if (verifyFlag === 24) return "service";
+    if (verifyFlag === 8) return "official";
+
     const marker = String(
       raw?.ServiceType ??
       raw?.service_type ??
@@ -757,11 +803,13 @@ function rawContactCategory(raw: any, wxid: string): ContactCategoryKey | "perso
       raw?.account_type ??
       raw?.TypeName ??
       raw?.typeName ??
+      raw?.SourceText ??
       raw?.type ??
       raw?.Type ??
       "",
     ).toLowerCase();
-    if (marker.includes("service") || marker.includes("服务")) return "service";
+    if (marker.includes("service") || marker.includes("\u670d\u52a1")) return "service";
+    if (marker.includes("official") || marker.includes("public") || marker.includes("\u516c\u4f17\u53f7")) return "official";
     return "official";
   }
   return "personal";
@@ -1734,9 +1782,12 @@ export default function App() {
       const profiles = (wsMsg.data as any)?.contact_profiles || {};
       const progress = (wsMsg.data as any)?.hydration_progress;
       if (contacts) {
-        setRawContacts(contacts);
-        const names = buildContactMap(contacts);
-        const avatars = buildAvatarMap(contacts, undefined);
+        const mergedContacts = profiles && typeof profiles === "object"
+          ? mergeRawContactsWithProfiles(contacts, profiles)
+          : contacts;
+        setRawContacts(mergedContacts);
+        const names = buildContactMap(mergedContacts);
+        const avatars = buildAvatarMap(mergedContacts, undefined);
         if (Object.keys(names).length > 0) setContactMap((prev) => ({ ...prev, ...names }));
         if (Object.keys(avatars).length > 0) setAvatarMap((prev) => ({ ...prev, ...avatars }));
       }
@@ -2320,7 +2371,27 @@ export default function App() {
   const friendEntries = allNonGroupEntries.filter((entry) => entry.category === "personal");
   const officialEntries = allNonGroupEntries.filter((entry) => entry.category === "official");
   const serviceEntries = allNonGroupEntries.filter((entry) => entry.category === "service");
-  const openimEntries = allNonGroupEntries.filter((entry) => entry.category === "openim");
+  const openimEntryMap = new Map<string, DirectoryEntry>(allNonGroupEntries
+    .filter((entry) => entry.category === "openim")
+    .map((entry) => [entry.wxid, entry]));
+  for (const [wxid, profile] of Object.entries(contactProfiles)) {
+    const raw = profile?.profile || {};
+    if (!(wxid.endsWith("@openim") || raw.OpenIM || raw.OpenIMDetail || raw.openim_detail)) continue;
+    if (shouldFilterSession(wxid) || wxid.includes("@chatroom")) continue;
+    if (openimEntryMap.has(wxid)) continue;
+    const fallbackName = contactMap[wxid] || profile.name || raw.NickName || raw.nickname || wxid;
+    const fallbackAvatar = avatarMap[wxid] || profile.avatar || raw.SmallHeadImgUrl || raw.BigHeadImgUrl || raw.avatar || "";
+    openimEntryMap.set(wxid, {
+      wxid,
+      name: profileDisplayName(profile, fallbackName),
+      avatar: profileAvatar(profile, fallbackAvatar),
+      is_group: false,
+      source: "friend",
+      category: "openim",
+      badge: "\u4f01\u5fae",
+    });
+  }
+  const openimEntries = sortDirectoryEntries(Array.from(openimEntryMap.values()));
   const contactCategoryEntries: Record<ContactCategoryKey, DirectoryEntry[]> = {
     groups: groupEntries,
     official: officialEntries,

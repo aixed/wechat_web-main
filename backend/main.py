@@ -1849,6 +1849,66 @@ def _contact_profile_avatar(profile: dict) -> str:
     )
 
 
+def _contact_profile_int(profile: dict, *keys: str) -> int | None:
+    for key in keys:
+        if key not in profile:
+            continue
+        value = profile.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return int(value)
+        except Exception:
+            try:
+                return int(float(value))
+            except Exception:
+                continue
+    return None
+
+
+def _contact_profile_account_category(profile: dict, wxid: str = "") -> str:
+    wxid = str(wxid or _contact_profile_wxid(profile) or "").strip()
+    if not wxid.startswith("gh_"):
+        return ""
+
+    bit_val = _contact_profile_int(profile, "BitVal", "bitval", "status", "Status")
+    if bit_val in (513, 515):
+        return "service"
+
+    verify_flag = _contact_profile_int(profile, "VerifyFlag", "verifyflag")
+    if verify_flag == 24:
+        return "service"
+    if verify_flag == 8:
+        return "official"
+
+    marker = str(
+        profile.get("ServiceType")
+        or profile.get("service_type")
+        or profile.get("ServiceFlag")
+        or profile.get("serviceFlag")
+        or profile.get("AccountType")
+        or profile.get("account_type")
+        or profile.get("TypeName")
+        or profile.get("typeName")
+        or profile.get("SourceText")
+        or ""
+    ).lower()
+    if marker:
+        if "service" in marker or "\u670d\u52a1" in marker:
+            return "service"
+        if "official" in marker or "public" in marker or "\u516c\u4f17\u53f7" in marker:
+            return "official"
+
+    return ""
+
+
+def _contact_profile_needs_account_type(profile: dict, wxid: str = "") -> bool:
+    wxid = str(wxid or _contact_profile_wxid(profile) or "").strip()
+    if not wxid.startswith("gh_"):
+        return False
+    return not _contact_profile_account_category(profile, wxid)
+
+
 def _contact_payload(raw: dict | list) -> dict | list:
     """Unwrap common Hook response envelopes while keeping contact-shaped dicts intact."""
     if not isinstance(raw, dict):
@@ -2301,25 +2361,40 @@ def _contact_needs_detail_hydration(entry: dict) -> bool:
         return False
     profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
     if entry.get("avatar") or _contact_profile_avatar(profile):
-        return False
+        return _contact_profile_needs_account_type(profile, str(entry.get("wxid") or ""))
     return True
 
 
+def _contact_cache_needs_hydration(wxid: str, entry: dict | None) -> bool:
+    if not wxid or not isinstance(entry, dict):
+        return True
+    profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
+    avatar = str(entry.get("avatar") or _contact_profile_avatar(profile) or "").strip()
+    if not avatar:
+        return True
+    return _contact_profile_needs_account_type(profile, wxid)
+
+
 def _contact_detail_missing_ids(owner_wxid: str = "", candidates: list[str] | None = None) -> list[str]:
-    cached = sqlite_cache.get_contacts(candidates, owner_wxid=owner_wxid or _contact_owner_wxid())
+    owner = owner_wxid or _contact_owner_wxid()
+    candidate_list = [str(wxid or "").strip() for wxid in (candidates or []) if str(wxid or "").strip()] if candidates is not None else None
+    cached = sqlite_cache.get_contacts(candidate_list, owner_wxid=owner)
     missing: list[str] = []
-    for wxid, entry in cached.items():
-        if wxid and _contact_needs_detail_hydration(entry):
+    if candidate_list is None:
+        for wxid, entry in cached.items():
+            if wxid and _contact_needs_detail_hydration(entry):
+                missing.append(wxid)
+        return missing
+
+    for wxid in candidate_list:
+        entry = cached.get(wxid)
+        if _contact_cache_needs_hydration(wxid, entry):
             missing.append(wxid)
     return missing
 
 
 def _contact_cache_missing_avatar(wxid: str, entry: dict | None) -> bool:
-    if not wxid or not isinstance(entry, dict):
-        return True
-    profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
-    avatar = str(entry.get("avatar") or _contact_profile_avatar(profile) or "").strip()
-    return not avatar
+    return _contact_cache_needs_hydration(wxid, entry)
 
 
 def _cache_raw_contacts(contacts: dict, *, owner_wxid: str = "") -> tuple[int, int]:
@@ -2923,8 +2998,24 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
                 continue
             seen.add(wxid)
             ids.append(wxid)
-        if ids:
-            _schedule_contact_detail_hydration(owner_wxid, ids, account_id)
+        missing_ids = _contact_detail_missing_ids(owner_wxid, ids)
+        if missing_ids:
+            _log(
+                f"[CONTACTS] scheduling avatar hydration after InitContact: "
+                f"missing={len(missing_ids)} total={len(ids)}"
+            )
+            _schedule_contact_detail_hydration(owner_wxid, missing_ids, account_id)
+        else:
+            _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
+                "active": False,
+                "phase": "BatchGetContactBriefInfo",
+                "batch": 0,
+                "total_batches": 0,
+                "processed": 0,
+                "total": 0,
+                "updated": 0,
+                "failed": 0,
+            }
 
         return _with_contact_hydration_progress(snapshot, owner_wxid)
 
