@@ -862,8 +862,10 @@ async def query_db(dbname: str, sql: str, timeout: float | None = None) -> dict:
 
 def _decompress_content(hex_str: str) -> str:
     """Try to extract readable content from CompressContent hex data.
-    WeChat 4.x stores type 49 message XML in CompressContent as LZ4-compressed data.
-    Format: first 4 bytes = uncompressed size (little-endian), rest = LZ4 block data."""
+    WeChat 4.x can store type 49 message XML in CompressContent as either:
+      - LZ4 data with a 4-byte uncompressed-size header
+      - raw XML with a small binary prefix before the XML declaration
+    """
     if not hex_str:
         return ""
     try:
@@ -913,7 +915,24 @@ def _decompress_content(hex_str: str) -> str:
             except Exception:
                 continue
 
-        # 3. Last resort: check if raw bytes are directly readable UTF-8 XML
+        # 3. Some records are not LZ4-compressed: they contain a short binary
+        # prefix and readable XML starts a few bytes later (often at byte 3).
+        for marker in (b"<?xml", b"<msg", b"<appmsg"):
+            start = raw.find(marker)
+            if start < 0:
+                continue
+            text = raw[start:].decode("utf-8", errors="ignore")
+            msg_start = text.find("<msg")
+            if msg_start > 0:
+                text = text[msg_start:]
+            end = text.find("</msg>")
+            if end >= 0:
+                text = text[:end + 6]
+            if "<msg" in text or "<appmsg" in text:
+                _log(f"[DECOMPRESS] Raw prefixed XML found at byte={start}, len={len(text)}")
+                return text
+
+        # 4. Last resort: check if raw bytes are directly readable UTF-8 XML
         try:
             text = raw.decode('utf-8', errors='strict')
             if '<msg>' in text and '</msg>' in text:
