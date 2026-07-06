@@ -5,6 +5,7 @@ import ChatArea from "./components/ChatArea";
 import {
   activateAccount,
   batchGetContactBrief,
+  broadcastFileUpload,
   broadcastImageUpload,
   broadcastText,
   clearActiveAgentId,
@@ -20,6 +21,7 @@ import {
   loginWithKey,
   markAsRead,
   markSessionUnread,
+  multiAccountBroadcastFileUploadStream,
   multiAccountBroadcastImageUploadStream,
   multiAccountBroadcastText,
   muteSession,
@@ -35,7 +37,7 @@ import type { ContactProfile, Session, ChatMessage, WSMessage, WeChatAccount } f
 import { replaceWechatEmojis } from "./utils/wechatEmoji";
 
 type ViewMode = "chats" | "contacts" | "broadcast";
-type MobileTab = "chats" | "contacts" | "me";
+type MobileTab = "chats" | "contacts" | "me" | "broadcast";
 type PortalTheme = "dark" | "light";
 type ContactCategoryKey = "groups" | "official" | "service" | "openim";
 type AppRoute = "root" | "chat" | "contact" | "broadcast" | "me";
@@ -121,7 +123,6 @@ function pathForRoute(route: AppRoute, accountWxid = ""): string {
 
 function normalizeRouteForDevice(route: AppRoute, isMobile: boolean): AppRoute {
   if (route === "root") return route;
-  if (isMobile && route === "broadcast") return "chat";
   if (!isMobile && route === "me") return "chat";
   return route;
 }
@@ -134,6 +135,7 @@ function desktopModeFromRoute(route: AppRoute): ViewMode {
 
 function mobileTabFromRoute(route: AppRoute): MobileTab {
   if (route === "contact") return "contacts";
+  if (route === "broadcast") return "broadcast";
   if (route === "me") return "me";
   return "chats";
 }
@@ -1603,7 +1605,7 @@ export default function App() {
       hydrateDirectoryContacts();
     }
     if (!options.skipRoute) {
-      setRoute(tab === "contacts" ? "contact" : tab === "me" ? "me" : "chat");
+      setRoute(tab === "contacts" ? "contact" : tab === "me" ? "me" : tab === "broadcast" ? "broadcast" : "chat");
     }
   }, [hydrateDirectoryContacts, setRoute]);
 
@@ -3298,6 +3300,7 @@ function MobileMultiAccountBroadcastPage({
   const [targetTypes, setTargetTypes] = useState<Set<string>>(new Set(["friends"]));
   const [message, setMessage] = useState("");
   const [image, setImage] = useState<File | null>(null);
+  const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState("");
   const [sending, setSending] = useState(false);
   const [resultText, setResultText] = useState("");
@@ -3414,6 +3417,22 @@ function MobileMultiAccountBroadcastPage({
       if (res?.account_counts) updateProgressFromPayload(res);
       else updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "正常群发图片" : "底层群发图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const sendFileBroadcast = async () => {
+    if (!file || agentIds.length === 0 || selectedTargetTypes.length === 0 || sending) return;
+    setSending(true);
+    setResultText("");
+    setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
+    try {
+      await prepareProgress();
+      const res = await multiAccountBroadcastFileUploadStream(agentIds, selectedTargetTypes, file, concurrencyLimit, updateProgressFromPayload);
+      if (res?.account_counts) updateProgressFromPayload(res);
+      else updateProgressFromResult(res);
+      setResultText(`正常群发文件完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -3565,6 +3584,28 @@ function MobileMultiAccountBroadcastPage({
           </div>
         </div>
 
+        <div className={`mt-[12px] rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
+          <div className="text-[15px] font-medium mb-[10px]">文件消息</div>
+          <label className={`min-h-[42px] rounded-[10px] px-[10px] flex items-center justify-center border text-center break-all ${dark ? "border-[#333] bg-[#242424]" : "border-[#e0e0e0] bg-[#f7f7f7]"}`}>
+            <input
+              type="file"
+              className="hidden"
+              onChange={(e) => setFile(e.target.files?.[0] || null)}
+            />
+            {file?.name || "选择文件"}
+          </label>
+          <div className="mt-[10px]">
+            <button
+              type="button"
+              disabled={sending || !file || agentIds.length === 0 || selectedTargetTypes.length === 0}
+              onClick={sendFileBroadcast}
+              className={`w-full h-[42px] rounded-[10px] border ${dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#242424] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"}`}
+            >
+              {sending ? "发送中" : "正常群发文件"}
+            </button>
+          </div>
+        </div>
+
         <div className={`mt-[12px] text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
           已选账号 {agentIds.length} 个，目标类型 {selectedTargetTypes.length} 个。{resultText}
         </div>
@@ -3689,6 +3730,11 @@ function MobileMainShell({
           dark={dark}
           onOpenSelfDetail={onOpenSelfDetail}
         />
+      )}
+      {tab === "broadcast" && (
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <BroadcastPanel friends={friends} groups={groups} dark={dark} />
+        </div>
       )}
       <MobileTabBar active={tab} onChange={onSwitchTab} dark={dark} />
     </div>
@@ -4116,6 +4162,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
   const [targetTypes, setTargetTypes] = useState<Set<string>>(new Set(["friends"]));
   const [message, setMessage] = useState("");
   const [image, setImage] = useState<File | null>(null);
+  const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState("");
   const [selectedAgents, setSelectedAgents] = useState<Set<string>>(new Set());
   const [sending, setSending] = useState(false);
@@ -4229,6 +4276,22 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
       if (res?.account_counts) updateProgressFromPayload(res);
       else updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "正常群发图片" : "底层群发图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const sendFileBroadcast = async () => {
+    if (!file || selectedTargetTypes.length === 0 || agentIds.length === 0 || sending) return;
+    setSending(true);
+    setResultText("");
+    setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
+    try {
+      await prepareProgress();
+      const res = await multiAccountBroadcastFileUploadStream(agentIds, selectedTargetTypes, file, concurrencyLimit, updateProgressFromPayload);
+      if (res?.account_counts) updateProgressFromPayload(res);
+      else updateProgressFromResult(res);
+      setResultText(`正常群发文件完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -4401,6 +4464,32 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
                 }`}
               >
                 正常群发图片
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[13px] text-[#888] mb-[8px]">文件消息</div>
+            <input
+              type="file"
+              onChange={(e) => setFile(e.target.files?.[0] || null)}
+              className={`block text-[13px] ${dark ? "text-[#aaa]" : "text-[#555]"}`}
+            />
+            {file && (
+              <div className={`mt-[8px] text-[13px] break-all ${dark ? "text-[#aaa]" : "text-[#555]"}`}>
+                {file.name}
+              </div>
+            )}
+            <div className="mt-[10px] flex flex-wrap gap-[8px]">
+              <button
+                type="button"
+                disabled={sending || !file || selectedTargetTypes.length === 0 || agentIds.length === 0}
+                onClick={sendFileBroadcast}
+                className={`h-[36px] px-[18px] rounded-[4px] border active:opacity-85 ${
+                  dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#1d1d1d] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"
+                }`}
+              >
+                {sending ? "发送中" : "正常群发文件"}
               </button>
             </div>
           </div>
@@ -4883,6 +4972,7 @@ function BroadcastPanel({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [message, setMessage] = useState("");
   const [broadcastImages, setBroadcastImages] = useState<BroadcastImageItem[]>([]);
+  const [broadcastFile, setBroadcastFile] = useState<File | null>(null);
   const [sending, setSending] = useState(false);
   const [sent, setSent] = useState(0);
   const [failed, setFailed] = useState(0);
@@ -4899,6 +4989,7 @@ function BroadcastPanel({
   );
   const payloadParts = buildBroadcastParts(message, broadcastImages);
   const hasPayload = payloadParts.length > 0;
+  const selectedWxids = Array.from(selected).filter((wxid) => targetMap.has(wxid));
 
   useEffect(() => {
     return () => {
@@ -4924,18 +5015,7 @@ function BroadcastPanel({
     });
   };
 
-  const handlePaste = (e: React.ClipboardEvent) => {
-    const clipboardFiles = Array.from(e.clipboardData?.files || []);
-    const fileFromFiles = clipboardFiles.find((file) => file.type.startsWith("image/"));
-    const items = Array.from(e.clipboardData?.items || []);
-    const fileFromItems = items
-      .find((item) => item.kind === "file" && item.type.startsWith("image/"))
-      ?.getAsFile();
-    const image = fileFromFiles || fileFromItems;
-    if (!image) return;
-
-    e.preventDefault();
-    e.stopPropagation();
+  const addBroadcastImage = (image: File) => {
     const ordinal = imageOrdinalRef.current++;
     const token = `【图片${ordinal}】`;
     const preview = URL.createObjectURL(image);
@@ -4965,6 +5045,26 @@ function BroadcastPanel({
     });
   };
 
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const clipboardFiles = Array.from(e.clipboardData?.files || []);
+    const fileFromFiles = clipboardFiles.find((file) => file.type.startsWith("image/"));
+    const items = Array.from(e.clipboardData?.items || []);
+    const fileFromItems = items
+      .find((item) => item.kind === "file" && item.type.startsWith("image/"))
+      ?.getAsFile();
+    const image = fileFromFiles || fileFromItems;
+    if (!image) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    addBroadcastImage(image);
+  };
+
+  const handleImageInput = (files: FileList | null) => {
+    const image = Array.from(files || []).find((file) => file.type.startsWith("image/"));
+    if (image) addBroadcastImage(image);
+  };
+
   const removeBroadcastImage = (image: BroadcastImageItem) => {
     URL.revokeObjectURL(image.preview);
     previewUrlsRef.current = previewUrlsRef.current.filter((url) => url !== image.preview);
@@ -4974,7 +5074,7 @@ function BroadcastPanel({
 
   const sendBroadcast = async (mode = "nosrc") => {
     const parts = buildBroadcastParts(message, broadcastImages);
-    const wxids = Array.from(selected).filter((wxid) => targetMap.has(wxid));
+    const wxids = selectedWxids;
     if (parts.length === 0 || wxids.length === 0 || sending) return;
     setSending(true);
     setSent(0);
@@ -5028,6 +5128,48 @@ function BroadcastPanel({
     }
   };
 
+  const sendFileBroadcast = async () => {
+    const wxids = selectedWxids;
+    if (!broadcastFile || wxids.length === 0 || sending) return;
+    setSending(true);
+    setSent(0);
+    setFailed(0);
+    const status = new Map(wxids.map((wxid) => [wxid, true]));
+    const updateProgress = () => {
+      let ok = 0;
+      let bad = 0;
+      for (const value of status.values()) {
+        if (value) ok += 1;
+        else bad += 1;
+      }
+      setSent(ok);
+      setFailed(bad);
+    };
+    try {
+      const res = await broadcastFileUpload(wxids, broadcastFile, concurrencyLimit);
+      const rows = Array.isArray(res?.results) ? res.results : [];
+      if (rows.length === 0 && res?.error) {
+        for (const wxid of wxids) status.set(wxid, false);
+      } else {
+        const seen = new Set<string>();
+        for (const row of rows) {
+          const wxid = String(row?.wxid || "");
+          if (!wxid) continue;
+          seen.add(wxid);
+          if (!row?.ok) status.set(wxid, false);
+        }
+        for (const wxid of wxids) {
+          if (!seen.has(wxid)) status.set(wxid, false);
+        }
+      }
+    } catch {
+      for (const wxid of wxids) status.set(wxid, false);
+    } finally {
+      updateProgress();
+      setSending(false);
+    }
+  };
+
   return (
     <div className={`h-full flex flex-col ${dark ? "bg-[#191919] text-[#e8e8e8]" : "bg-[#e9e8e8] text-[#111]"}`} onPaste={handlePaste}>
       <div className="h-[92px] px-[18px] flex items-center">
@@ -5069,6 +5211,7 @@ function BroadcastPanel({
       </div>
 
       <div className="px-[18px] py-[12px] shrink-0">
+        <div className={`text-[13px] mb-[6px] ${dark ? "text-[#888]" : "text-[#777]"}`}>文本消息</div>
         <textarea
           ref={messageInputRef}
           value={message}
@@ -5076,6 +5219,21 @@ function BroadcastPanel({
           className={`w-full h-[94px] resize-none rounded-[4px] border outline-none px-[10px] py-[8px] text-[15px] ${dark ? "bg-[#1d1d1d] border-[#303030] text-[#eee] placeholder-[#666]" : "bg-white border-[#d8d8d8] text-[#111]"}`}
           placeholder="输入要群发的消息"
         />
+        <div className={`mt-[10px] text-[13px] mb-[6px] ${dark ? "text-[#888]" : "text-[#777]"}`}>图片消息</div>
+        <label className={`min-h-[36px] rounded-[4px] border px-[10px] flex items-center justify-center text-[13px] cursor-pointer active:opacity-80 ${
+          dark ? "bg-[#1d1d1d] border-[#303030] text-[#ddd]" : "bg-white border-[#d8d8d8] text-[#333]"
+        }`}>
+          <input
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              handleImageInput(e.target.files);
+              e.currentTarget.value = "";
+            }}
+          />
+          选择图片
+        </label>
         {broadcastImages.length > 0 && (
           <div className="mt-[8px] flex flex-wrap gap-[8px]">
             {broadcastImages.map((image) => (
@@ -5099,28 +5257,49 @@ function BroadcastPanel({
             ))}
           </div>
         )}
-        <div className={`mt-[8px] flex items-center justify-between gap-[10px] text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
-          <span>已选 {selected.size} 个对象{sending ? `，已发送 ${sent}，失败 ${failed}` : ""}</span>
-          <div className="flex items-center gap-[8px]">
+        <div className={`mt-[10px] text-[13px] mb-[6px] ${dark ? "text-[#888]" : "text-[#777]"}`}>文件消息</div>
+        <label className={`min-h-[36px] rounded-[4px] border px-[10px] flex items-center justify-center text-center text-[13px] break-all cursor-pointer active:opacity-80 ${
+          dark ? "bg-[#1d1d1d] border-[#303030] text-[#ddd]" : "bg-white border-[#d8d8d8] text-[#333]"
+        }`}>
+          <input
+            type="file"
+            className="hidden"
+            onChange={(e) => setBroadcastFile(e.target.files?.[0] || null)}
+          />
+          {broadcastFile?.name || "选择文件"}
+        </label>
+        <div className={`mt-[10px] flex flex-col gap-[8px] text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
+          <span>已选 {selectedWxids.length} 个对象{sending ? `，已发送 ${sent}，失败 ${failed}` : ""}</span>
+          <div className="grid grid-cols-1 min-[360px]:grid-cols-2 gap-[8px]">
             <button
               type="button"
-              disabled={sending || selected.size === 0 || !hasPayload}
+              disabled={sending || selectedWxids.length === 0 || !hasPayload}
               onClick={() => sendBroadcast("nosrc")}
-              className="h-[34px] min-w-[92px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#b9d9c7] active:opacity-80"
+              className="h-[34px] min-w-0 rounded-[4px] bg-[#07c160] text-white disabled:bg-[#b9d9c7] active:opacity-80"
             >
-              {sending ? "发送中" : "发送"}
+              {sending ? "发送中" : "底层发送文本/图片"}
             </button>
             <button
               type="button"
-              disabled={sending || selected.size === 0 || !hasPayload}
+              disabled={sending || selectedWxids.length === 0 || !hasPayload}
               onClick={() => sendBroadcast("normal")}
-              className={`h-[34px] min-w-[92px] rounded-[4px] border disabled:opacity-50 active:opacity-80 ${
+              className={`h-[34px] min-w-0 rounded-[4px] border disabled:opacity-50 active:opacity-80 ${
                 dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9]" : "border-[#07c160] bg-white text-[#07a854]"
               }`}
             >
-              普通发送
+              普通发送文本/图片
             </button>
           </div>
+          <button
+            type="button"
+            disabled={sending || selectedWxids.length === 0 || !broadcastFile}
+            onClick={sendFileBroadcast}
+            className={`h-[34px] w-full rounded-[4px] border disabled:opacity-50 active:opacity-80 ${
+              dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9]" : "border-[#07c160] bg-white text-[#07a854]"
+            }`}
+          >
+            {sending ? "发送中" : "群发文件"}
+          </button>
         </div>
       </div>
 

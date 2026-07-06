@@ -3598,7 +3598,7 @@ def _send_result_ok(result: dict) -> bool:
 def _extract_msg_svr_id(result: dict) -> str:
     if not isinstance(result, dict):
         return ""
-    for key in ("MsgSvrID", "msgsvrid", "msgSvrID", "msgSvrId", "msg_id", "msgid"):
+    for key in ("MsgSvrID", "msgsvrid", "msgSvrID", "msgSvrId", "msg_id", "msgid", "field3"):
         value = result.get(key)
         if value not in (None, ""):
             return str(value)
@@ -3875,63 +3875,98 @@ async def _broadcast_image_to_targets(
     return await asyncio.gather(*(_send_one(wxid) for wxid in target_wxids)) if target_wxids else []
 
 
-async def _prepare_forward_image_msgsvrid(agent_id: str, upload_name: str, file_hex: str) -> tuple[str, dict, dict]:
-    with wechat_api.use_agent(agent_id):
-        try:
-            cdn = await wechat_api.cdn_upload_image(upload_name, "filehelper", file_data=file_hex)
-        except Exception as e:
-            cdn = {"error": f"{type(e).__name__}: {e}"}
-        if cdn.get("error"):
-            return "", cdn, {"error": cdn["error"]}
-        try:
-            seed_result = await wechat_api.send_image_no_src("filehelper", cdn)
-        except Exception as e:
-            seed_result = {"error": f"{type(e).__name__}: {e}"}
-    if not _send_result_ok(seed_result):
-        return "", cdn, {"error": "SendImgMsg_NoSrc to filehelper failed", "result": seed_result}
-    msg_svr_id = _extract_msg_svr_id(seed_result)
-    if not msg_svr_id:
-        return "", cdn, {"error": "SendImgMsg_NoSrc did not return MsgSvrID", "result": seed_result}
-    return msg_svr_id, cdn, seed_result
-
-
-async def _forward_image_msg_to_target(
+async def _send_image_file_no_src_to_target(
     wxid: str,
-    msg_svr_id: str,
+    picpath: str,
+    file_hex: str,
     image_extra: dict,
     agent_id: str = "",
 ) -> dict:
     try:
         with wechat_api.use_agent(agent_id):
-            result = await wechat_api.forward_all_msg(msg_svr_id, wxid)
+            result = await wechat_api.send_image_file_no_src(wxid, picpath, file_hex)
         ok = _send_result_ok(result)
+        msg_svr_id = _extract_msg_svr_id(result)
         if ok:
-            await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", {**image_extra, "forward_msgsvrid": msg_svr_id})
-        row = {"wxid": wxid, "ok": ok, "result": result, "msgsvrid": msg_svr_id}
+            extra = {**image_extra}
+            if msg_svr_id:
+                extra["msgsvrid"] = msg_svr_id
+            await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", extra)
+        row = {"wxid": wxid, "ok": ok, "result": result}
+        if msg_svr_id:
+            row["msgsvrid"] = msg_svr_id
         if agent_id:
             row["agent_id"] = agent_id
         return row
     except Exception as e:
-        row = {"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}", "msgsvrid": msg_svr_id}
+        row = {"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
         if agent_id:
             row["agent_id"] = agent_id
         return row
 
 
-async def _forward_image_msg_to_targets(
+async def _send_image_file_no_src_to_targets(
     target_wxids: list[str],
-    msg_svr_id: str,
+    picpath: str,
+    file_hex: str,
     image_extra: dict,
     agent_id: str = "",
     concurrency_limit: int = 0,
 ) -> list[dict]:
     sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
-    async def _forward_one(wxid: str) -> dict:
+    async def _send_one(wxid: str) -> dict:
         async with sem:
-            return await _forward_image_msg_to_target(wxid, msg_svr_id, image_extra, agent_id)
+            return await _send_image_file_no_src_to_target(wxid, picpath, file_hex, image_extra, agent_id)
 
-    return await asyncio.gather(*(_forward_one(wxid) for wxid in target_wxids)) if target_wxids else []
+    return await asyncio.gather(*(_send_one(wxid) for wxid in target_wxids)) if target_wxids else []
+
+
+async def _send_file_no_src_to_target(
+    wxid: str,
+    filepath: str,
+    file_hex: str,
+    file_extra: dict,
+    agent_id: str = "",
+) -> dict:
+    try:
+        with wechat_api.use_agent(agent_id):
+            result = await wechat_api.send_file_no_src(wxid, filepath, file_hex)
+        ok = _send_result_ok(result)
+        msg_svr_id = _extract_msg_svr_id(result)
+        if ok:
+            extra = {**file_extra}
+            if msg_svr_id:
+                extra["msgsvrid"] = msg_svr_id
+            await _broadcast_local_sent_for_agent(agent_id, wxid, "49", str(file_extra.get("file_name") or ""), extra)
+        row = {"wxid": wxid, "ok": ok, "result": result}
+        if msg_svr_id:
+            row["msgsvrid"] = msg_svr_id
+        if agent_id:
+            row["agent_id"] = agent_id
+        return row
+    except Exception as e:
+        row = {"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
+        if agent_id:
+            row["agent_id"] = agent_id
+        return row
+
+
+async def _send_file_no_src_to_targets(
+    target_wxids: list[str],
+    filepath: str,
+    file_hex: str,
+    file_extra: dict,
+    agent_id: str = "",
+    concurrency_limit: int = 0,
+) -> list[dict]:
+    sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
+
+    async def _send_one(wxid: str) -> dict:
+        async with sem:
+            return await _send_file_no_src_to_target(wxid, filepath, file_hex, file_extra, agent_id)
+
+    return await asyncio.gather(*(_send_one(wxid) for wxid in target_wxids)) if target_wxids else []
 
 
 @app.post("/api/broadcast/image-upload")
@@ -3960,21 +3995,10 @@ async def broadcast_image_upload(
     agent_id = _active_agent_id or agent_manager.active_id() or ""
     if str(mode or "").lower() in {"normal", "src", "regular"}:
         db_image_id = sqlite_cache.put_media_blob(data, file.content_type or "image/*", file.filename or filename)
-        msg_svr_id, cdn, seed_result = await _prepare_forward_image_msgsvrid(agent_id, filepath, data.hex())
-        if not msg_svr_id:
-            error = seed_result.get("error") or "failed to prepare forward image"
-            return {
-                "total": len(target_wxids),
-                "sent": 0,
-                "failed": len(target_wxids),
-                "results": [{"wxid": wxid, "ok": False, "error": error} for wxid in target_wxids],
-                "mode": "normal",
-                "seed_result": seed_result,
-                "cdn": {k: cdn.get(k) for k in _BROADCAST_IMG_CDN_KEYS},
-            }
-        results = await _forward_image_msg_to_targets(
+        results = await _send_image_file_no_src_to_targets(
             target_wxids,
-            msg_svr_id,
+            filepath,
+            data.hex(),
             {"db_image_id": db_image_id, "img_path": filepath},
             agent_id,
             concurrency_limit,
@@ -3987,9 +4011,7 @@ async def broadcast_image_upload(
             "failed": failed,
             "results": results,
             "mode": "normal",
-            "msgsvrid": msg_svr_id,
-            "seed_result": seed_result,
-            "cdn": {k: cdn.get(k) for k in _BROADCAST_IMG_CDN_KEYS},
+            "strategy": "direct_nosrc",
         }
 
     send_path = filepath
@@ -4041,6 +4063,49 @@ async def broadcast_image_upload(
         "failed": failed,
         "results": results,
         "cdn": {k: cdn.get(k) for k in _BROADCAST_IMG_CDN_KEYS},
+    }
+
+
+@app.post("/api/broadcast/file-upload")
+async def broadcast_file_upload(
+    wxids: str = Form(...),
+    concurrency_limit: int = Form(0),
+    file: UploadFile = File(...),
+):
+    try:
+        target_wxids = [w for w in json.loads(wxids) if w]
+    except Exception:
+        target_wxids = [w.strip() for w in wxids.split(",") if w.strip()]
+    if not target_wxids:
+        return {"total": 0, "sent": 0, "failed": 0, "results": [], "error": "no targets"}
+
+    safe_name = (file.filename or "file").replace("\\", "_").replace("/", "_")
+    upload_dir = os.path.join(_UPLOAD_DIR, f"broadcast_file_{int(time.time() * 1000)}")
+    os.makedirs(upload_dir, exist_ok=True)
+    filepath = os.path.join(upload_dir, safe_name)
+    data = await file.read()
+    with open(filepath, "wb") as f:
+        f.write(data)
+    _log(f"[BROADCAST] Saved file: {filepath} ({len(data)} bytes)")
+
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    results = await _send_file_no_src_to_targets(
+        target_wxids,
+        filepath,
+        data.hex(),
+        {"file_path": filepath, "file_name": safe_name, "file_size": len(data)},
+        agent_id,
+        concurrency_limit,
+    )
+    sent = sum(1 for row in results if row.get("ok"))
+    failed = len(results) - sent
+    return {
+        "total": len(target_wxids),
+        "sent": sent,
+        "failed": failed,
+        "results": results,
+        "mode": "normal",
+        "strategy": "direct_nosrc",
     }
 
 
@@ -4443,18 +4508,14 @@ async def multi_account_broadcast_image_upload(
             _activate_runtime(agent_id)
             db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
         if normal_mode:
-            msg_svr_id, cdn, seed_result = await _prepare_forward_image_msgsvrid(agent_id, upload_name, file_hex)
-            if not msg_svr_id:
-                error = seed_result.get("error") or "failed to prepare forward image"
-                send_results = [{"agent_id": agent_id, "wxid": wxid, "ok": False, "error": error, "seed_result": seed_result} for wxid in agent_targets]
-            else:
-                send_results = await _forward_image_msg_to_targets(
-                    agent_targets,
-                    msg_svr_id,
-                    {"db_image_id": db_image_id},
-                    agent_id,
-                    concurrency_limit,
-                )
+            send_results = await _send_image_file_no_src_to_targets(
+                agent_targets,
+                upload_name,
+                file_hex,
+                {"db_image_id": db_image_id},
+                agent_id,
+                concurrency_limit,
+            )
             sent += sum(1 for row in send_results if row.get("ok"))
             failed += sum(1 for row in send_results if not row.get("ok"))
             results.extend(send_results)
@@ -4639,21 +4700,13 @@ async def multi_account_broadcast_image_upload_stream(
                 _activate_runtime(agent_id)
                 db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
             if normal_mode:
-                msg_svr_id, cdn, seed_result = await _prepare_forward_image_msgsvrid(agent_id, upload_name, file_hex)
-                if not msg_svr_id:
-                    error = seed_result.get("error") or "failed to prepare forward image"
-                    for wxid in agent_targets:
-                        row = {"agent_id": agent_id, "wxid": wxid, "ok": False, "error": error, "seed_result": seed_result}
-                        record_result(row)
-                        yield line(snapshot("progress", row=row))
-                    continue
                 sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
-                async def _forward_normal(wxid: str) -> dict:
+                async def _send_normal(wxid: str) -> dict:
                     async with sem:
-                        return await _forward_image_msg_to_target(wxid, msg_svr_id, {"db_image_id": db_image_id}, agent_id)
+                        return await _send_image_file_no_src_to_target(wxid, upload_name, file_hex, {"db_image_id": db_image_id}, agent_id)
 
-                tasks = [asyncio.create_task(_forward_normal(wxid)) for wxid in agent_targets]
+                tasks = [asyncio.create_task(_send_normal(wxid)) for wxid in agent_targets]
                 for task in asyncio.as_completed(tasks):
                     row = await task
                     record_result(row)
@@ -4694,6 +4747,142 @@ async def multi_account_broadcast_image_upload_stream(
                     yield line(snapshot("progress", row=row))
 
         yield line(snapshot("done", results=results))
+
+    return StreamingResponse(_events(), media_type="application/x-ndjson")
+
+
+@app.post("/api/accounts/broadcast/file-upload-stream")
+async def multi_account_broadcast_file_upload_stream(
+    wxids: str = Form("[]"),
+    agent_ids: str = Form("[]"),
+    target_types: str = Form("[]"),
+    concurrency_limit: int = Form(0),
+    file: UploadFile = File(...),
+):
+    try:
+        target_wxids = [w for w in json.loads(wxids) if w]
+    except Exception:
+        target_wxids = [w.strip() for w in wxids.split(",") if w.strip()]
+    try:
+        requested_agents = [a for a in json.loads(agent_ids or "[]") if a]
+    except Exception:
+        requested_agents = [a.strip() for a in str(agent_ids or "").split(",") if a.strip()]
+    try:
+        parsed_target_types = _normalize_broadcast_target_types(json.loads(target_types or "[]"))
+    except Exception:
+        parsed_target_types = _normalize_broadcast_target_types([x.strip() for x in str(target_types or "").split(",") if x.strip()])
+
+    selected_agents, work_items, account_targets, account_counts, skipped_results = await _prepare_multi_account_targets(
+        requested_agents,
+        target_wxids,
+        parsed_target_types,
+    )
+    total_targets = len(work_items)
+
+    if not target_wxids and not parsed_target_types:
+        async def _empty_events():
+            yield json.dumps({
+                "type": "done",
+                "accounts": len(selected_agents),
+                "targets": 0,
+                "account_targets": account_targets,
+                "account_counts": account_counts,
+                "total": 0,
+                "sent": 0,
+                "failed": 0,
+                "results": [],
+                "error": "no targets",
+            }, ensure_ascii=False) + "\n"
+
+        return StreamingResponse(_empty_events(), media_type="application/x-ndjson")
+
+    work_by_agent: dict[str, list[str]] = {}
+    for agent_id, wxid in work_items:
+        work_by_agent.setdefault(agent_id, []).append(wxid)
+
+    data = await file.read()
+    original_name = (file.filename or "file").replace("\\", "/").split("/")[-1] or "file"
+    safe_name = original_name.replace("\\", "_").replace("/", "_")
+    upload_dir = os.path.join(_UPLOAD_DIR, f"multi_broadcast_file_{int(time.time() * 1000)}")
+    os.makedirs(upload_dir, exist_ok=True)
+    filepath = os.path.join(upload_dir, safe_name)
+    with open(filepath, "wb") as f:
+        f.write(data)
+    file_hex = data.hex()
+    _log(f"[MULTI_BROADCAST] Saved file: {filepath} ({len(data)} bytes)")
+
+    async def _events():
+        progress_counts: dict[str, dict] = {agent_id: dict(counts) for agent_id, counts in account_counts.items()}
+        for agent_id in selected_agents:
+            item = progress_counts.setdefault(agent_id, {**_empty_contact_counts(), "targets": account_targets.get(agent_id, 0)})
+            item.setdefault("targets", account_targets.get(agent_id, 0))
+            item["sent"] = 0
+            item["failed"] = 0
+
+        sent = 0
+        failed = 0
+        results: list[dict] = []
+
+        def line(payload: dict) -> str:
+            return json.dumps(payload, ensure_ascii=False) + "\n"
+
+        def snapshot(event_type: str, row: dict | None = None, **extra) -> dict:
+            payload = {
+                "type": event_type,
+                "accounts": len(selected_agents),
+                "targets": total_targets,
+                "account_targets": account_targets,
+                "account_counts": progress_counts,
+                "total": total_targets,
+                "sent": sent,
+                "failed": failed,
+            }
+            if row is not None:
+                payload["row"] = row
+            payload.update(extra)
+            return payload
+
+        def record_result(row: dict) -> None:
+            nonlocal sent, failed
+            results.append(row)
+            ok = bool(row.get("ok"))
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+            row_agent_id = str(row.get("agent_id") or "")
+            if row_agent_id:
+                current = progress_counts.setdefault(row_agent_id, {**_empty_contact_counts(), "targets": account_targets.get(row_agent_id, 0)})
+                current["sent" if ok else "failed"] = int(current.get("sent" if ok else "failed") or 0) + 1
+
+        yield line(snapshot("plan", file_name=safe_name, file_size=len(data)))
+
+        for row in skipped_results:
+            record_result(row)
+            yield line(snapshot("progress", row=row))
+
+        file_extra = {"file_path": filepath, "file_name": safe_name, "file_size": len(data)}
+        for agent_id in selected_agents:
+            agent_targets = work_by_agent.get(agent_id, [])
+            if not agent_targets:
+                continue
+            async with _ACCOUNT_LOCK:
+                await agent_manager.set_active(agent_id)
+                _activate_runtime(agent_id)
+
+            sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
+
+            async def _send_normal(wxid: str) -> dict:
+                async with sem:
+                    return await _send_file_no_src_to_target(wxid, filepath, file_hex, file_extra, agent_id)
+
+            tasks = [asyncio.create_task(_send_normal(wxid)) for wxid in agent_targets]
+            for task in asyncio.as_completed(tasks):
+                row = await task
+                record_result(row)
+                yield line(snapshot("progress", row=row))
+
+        yield line(snapshot("done", results=results, file_name=safe_name, file_size=len(data)))
 
     return StreamingResponse(_events(), media_type="application/x-ndjson")
 
