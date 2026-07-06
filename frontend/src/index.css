@@ -16,6 +16,8 @@ html, body, #root {
   background: #191919;
   color: #e0e0e0;
   overflow: hidden;
+  overscroll-behavior: none;
+  overscroll-behavior-x: none;
 }
 
 @layer utilities {
@@ -84,7 +86,9 @@ html, body, #root {
 .mobile-swipe-stage {
   position: relative;
   touch-action: pan-y;
-  overscroll-behavior-x: contain;
+  overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  isolation: isolate;
 }
 
 .mobile-swipe-backdrop {
@@ -100,4 +104,6 @@ html, body, #root {
   position: relative;
   z-index: 1;
   will-change: transform;
+  overscroll-behavior: none;
+  overscroll-behavior-x: none;
 }

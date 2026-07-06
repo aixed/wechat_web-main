@@ -44,6 +44,8 @@ const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
 const PINNED_ORDER_THRESHOLD = 1_000_000_000_000;
 const MOBILE_SWIPE_DIRECTION_EPSILON = 0.25;
+const MOBILE_BROWSER_SWIPE_EDGE_PX = 44;
+const MOBILE_SWIPE_MAX_DRAG_PX = 120;
 
 function decodeRouteSegment(segment: string): string {
   try {
@@ -189,6 +191,7 @@ function MobileSwipeFrame({
 }) {
   const [dragX, setDragX] = useState(0);
   const [settling, setSettling] = useState(false);
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const touchRef = useRef<{
     x: number;
     y: number;
@@ -197,13 +200,83 @@ function MobileSwipeFrame({
     blocked: boolean;
   } | null>(null);
 
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+
+    const guard = {
+      active: false,
+      x: 0,
+      y: 0,
+      horizontal: null as boolean | null,
+    };
+    const resetGuard = () => {
+      guard.active = false;
+      guard.horizontal = null;
+    };
+    const preventNativeGesture = (event: globalThis.TouchEvent) => {
+      if (event.cancelable) event.preventDefault();
+    };
+    const isEdgeSwipe = (x: number) => (
+      (Boolean(onBack) && x <= MOBILE_BROWSER_SWIPE_EDGE_PX) ||
+      (Boolean(onForward) && x >= Math.max(0, (window.innerWidth || 0) - MOBILE_BROWSER_SWIPE_EDGE_PX))
+    );
+
+    const handleNativeTouchStart = (event: globalThis.TouchEvent) => {
+      const touch = event.touches[0];
+      resetGuard();
+      if (!touch || event.touches.length !== 1) return;
+      if (isNoSwipeTarget(event.target)) return;
+      if (!isEdgeSwipe(touch.clientX)) return;
+      guard.active = true;
+      guard.x = touch.clientX;
+      guard.y = touch.clientY;
+      preventNativeGesture(event);
+    };
+
+    const handleNativeTouchMove = (event: globalThis.TouchEvent) => {
+      if (!guard.active) return;
+      const touch = event.touches[0];
+      if (!touch) {
+        resetGuard();
+        return;
+      }
+      const dx = touch.clientX - guard.x;
+      const dy = touch.clientY - guard.y;
+      if (guard.horizontal === null && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+        guard.horizontal = Math.abs(dx) > Math.abs(dy);
+      }
+      if (guard.horizontal === false) {
+        resetGuard();
+        return;
+      }
+      preventNativeGesture(event);
+    };
+
+    stage.addEventListener("touchstart", handleNativeTouchStart, { capture: true, passive: false });
+    stage.addEventListener("touchmove", handleNativeTouchMove, { capture: true, passive: false });
+    stage.addEventListener("touchend", resetGuard, { capture: true });
+    stage.addEventListener("touchcancel", resetGuard, { capture: true });
+    return () => {
+      stage.removeEventListener("touchstart", handleNativeTouchStart, { capture: true });
+      stage.removeEventListener("touchmove", handleNativeTouchMove, { capture: true });
+      stage.removeEventListener("touchend", resetGuard, { capture: true });
+      stage.removeEventListener("touchcancel", resetGuard, { capture: true });
+    };
+  }, [onBack, onForward]);
+
   const clampDrag = (dx: number) => {
     const width = Math.max(1, window.innerWidth || 1);
-    const max = width * 0.84;
+    const max = Math.min(width * 0.34, MOBILE_SWIPE_MAX_DRAG_PX);
     const allowed = dx > 0 ? Boolean(onBack) : Boolean(onForward);
     const amount = Math.min(Math.abs(dx), max);
-    const eased = allowed ? amount : Math.min(amount * 0.18, 24);
+    const eased = allowed ? amount : Math.min(amount * 0.18, 18);
     return Math.sign(dx) * eased;
+  };
+
+  const triggerDistance = () => {
+    const width = Math.max(1, window.innerWidth || 1);
+    return Math.min(112, Math.max(72, width * 0.22));
   };
 
   const finishGesture = (action?: () => void, targetX = 0) => {
@@ -258,12 +331,14 @@ function MobileSwipeFrame({
       return;
     }
     const width = Math.max(1, window.innerWidth || 1);
-    if (dx > width / 2 && onBack) {
-      finishGesture(onBack, width);
+    const threshold = triggerDistance();
+    const targetX = Math.min(width * 0.28, MOBILE_SWIPE_MAX_DRAG_PX);
+    if (dx > threshold && onBack) {
+      finishGesture(onBack, targetX);
       return;
     }
-    if (dx < -width / 2 && onForward) {
-      finishGesture(onForward, -width);
+    if (dx < -threshold && onForward) {
+      finishGesture(onForward, -targetX);
       return;
     }
     finishGesture();
@@ -271,6 +346,7 @@ function MobileSwipeFrame({
 
   return (
     <div
+      ref={stageRef}
       className="mobile-swipe-stage relative h-dvh w-screen overflow-hidden"
       style={{ backgroundColor: dark ? "#111111" : "#ededed" }}
       onTouchStart={handleTouchStart}
