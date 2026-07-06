@@ -20,7 +20,7 @@ import {
   loginWithKey,
   markAsRead,
   markSessionUnread,
-  multiAccountBroadcastImageUpload,
+  multiAccountBroadcastImageUploadStream,
   multiAccountBroadcastText,
   muteSession,
   refreshContacts,
@@ -3368,6 +3368,15 @@ function MobileMultiAccountBroadcastPage({
     });
   };
 
+  const updateProgressFromPayload = (payload: any) => {
+    setProgress({
+      total: Number(payload?.total || payload?.targets || 0),
+      sent: Number(payload?.sent || 0),
+      failed: Number(payload?.failed || 0),
+      accountCounts: payload?.account_counts || {},
+    });
+  };
+
   const prepareProgress = async () => {
     const plan = await getMultiAccountBroadcastTargets(agentIds, selectedTargetTypes);
     setProgress({
@@ -3401,8 +3410,9 @@ function MobileMultiAccountBroadcastPage({
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image, mode, concurrencyLimit);
-      updateProgressFromResult(res);
+      const res = await multiAccountBroadcastImageUploadStream(agentIds, selectedTargetTypes, image, mode, concurrencyLimit, updateProgressFromPayload);
+      if (res?.account_counts) updateProgressFromPayload(res);
+      else updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "普通图片" : "图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
@@ -4173,6 +4183,15 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
     });
   };
 
+  const updateProgressFromPayload = (payload: any) => {
+    setProgress({
+      total: Number(payload?.total || payload?.targets || 0),
+      sent: Number(payload?.sent || 0),
+      failed: Number(payload?.failed || 0),
+      accountCounts: payload?.account_counts || {},
+    });
+  };
+
   const prepareProgress = async () => {
     const plan = await getMultiAccountBroadcastTargets(agentIds, selectedTargetTypes);
     setProgress({
@@ -4206,8 +4225,9 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastImageUpload(agentIds, selectedTargetTypes, image, mode, concurrencyLimit);
-      updateProgressFromResult(res);
+      const res = await multiAccountBroadcastImageUploadStream(agentIds, selectedTargetTypes, image, mode, concurrencyLimit, updateProgressFromPayload);
+      if (res?.account_counts) updateProgressFromPayload(res);
+      else updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "普通图片" : "图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);

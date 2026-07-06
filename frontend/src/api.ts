@@ -208,6 +208,58 @@ export const multiAccountBroadcastImageUpload = async (agentIds: string[], targe
   return res.json();
 };
 
+export type MultiAccountBroadcastImageProgressEvent = {
+  type?: "plan" | "progress" | "done";
+  [key: string]: any;
+};
+
+export const multiAccountBroadcastImageUploadStream = async (
+  agentIds: string[],
+  targetTypes: string[],
+  file: File,
+  mode = "nosrc",
+  concurrencyLimit = 10,
+  onProgress?: (event: MultiAccountBroadcastImageProgressEvent) => void,
+) => {
+  const form = new FormData();
+  form.append("agent_ids", JSON.stringify(agentIds));
+  form.append("target_types", JSON.stringify(targetTypes));
+  form.append("mode", mode);
+  form.append("concurrency_limit", String(concurrencyLimit));
+  form.append("file", file);
+  const res = await fetchWithTimeout("/api/accounts/broadcast/image-upload-stream", { method: "POST", body: form, headers: authHeaders() }, 600_000);
+  if (!res.body) {
+    const payload = await res.json();
+    onProgress?.({ type: "done", ...payload });
+    return payload;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalPayload: MultiAccountBroadcastImageProgressEvent | null = null;
+
+  const handleLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const payload = JSON.parse(trimmed) as MultiAccountBroadcastImageProgressEvent;
+    onProgress?.(payload);
+    if (payload.type === "done") finalPayload = payload;
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) handleLine(line);
+  }
+  buffer += decoder.decode();
+  handleLine(buffer);
+  return finalPayload || {};
+};
+
 export const revokeMsg = (msgSvrid: number, toWxid: string) =>
   fetchJSON("/api/revoke", {
     method: "POST",
