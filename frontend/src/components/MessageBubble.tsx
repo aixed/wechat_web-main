@@ -436,18 +436,20 @@ export default function MessageBubble({
           if (appType === "57") {
             const parsed = parseRefermsg(message.msg);
             return (
-              <div>
+              <div className="min-w-[220px] max-w-[420px]">
+                <div className="whitespace-pre-wrap break-words text-[17px] leading-[1.4]">
+                  {replaceWechatEmojis(parsed.title?.replace(/\r\n/g, "\n") || "")}
+                </div>
                 {parsed.refer && (
-                  <div className={`rounded-[4px] px-2 py-1 mb-1.5 text-[12px] border-l-2 ${
+                  <div className={`mt-2 rounded-[3px] px-2.5 py-2 text-[13px] leading-[1.35] ${
                     isSelf
-                      ? "bg-[#7ed65e] border-[#5cb85c] text-[#3d6b26]"
-                      : "bg-[#3a3a3a] border-[#555] text-[#999]"
+                      ? "bg-[#dff6d4] text-[#668060]"
+                      : dark ? "bg-[#3a3a3a] text-[#aaa]" : "bg-[#f0f0f0] text-[#777]"
                   }`}>
                     <span className="font-medium">{parsed.refer.displayname}: </span>
                     <span>{replaceWechatEmojis(parsed.refer.content?.substring(0, 60) || "")}</span>
                   </div>
                 )}
-                <span className="whitespace-pre-wrap break-words text-[17px] leading-[1.4]">{replaceWechatEmojis(parsed.title?.replace(/\r\n/g, "\n") || "")}</span>
               </div>
             );
           }

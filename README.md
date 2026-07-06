@@ -144,6 +144,31 @@ npm run lint
 - `recvtype`：Hook 消息接收类型，默认 `1`；`1` 为 Hook 直接返回 `msglist`，`2` 为 protobuf/raw `pb_msg`。旧配置 `recv_type` 仍兼容。
 - `WECHAT_FILES_BASE`：可选环境变量，用于指定本机微信文件目录；不设置时会按默认微信文件目录推导。
 
+### 消息类型参考
+
+历史消息来自 `MSG*.db` 的 `MSG.Type` 字段。当前已知类型：
+
+| Type | 说明 |
+| --- | --- |
+| `1` | 文本消息 |
+| `3` | 图片消息 |
+| `34` | 语音消息 |
+| `37` | 好友确认消息 |
+| `40` | `POSSIBLEFRIEND_MSG` |
+| `42` | 共享名片 |
+| `43` | 视频消息 |
+| `47` | 动画表情 |
+| `48` | 位置消息 |
+| `49` | 分享链接/文件/应用消息；`appmsg.type=57` 或 `SubType=57` 为引用消息。带 `CompressContent` 时优先调用 `/GetMsgStruct` 获取完整 XML。 |
+| `50` | `VOIPMSG` |
+| `51` | 微信初始化消息 |
+| `52` | `VOIPNOTIFY` |
+| `53` | `VOIPINVITE` |
+| `62` | 小视频 |
+| `9999` | `SYSNOTICE` |
+| `10000` | 系统消息 |
+| `10002` | 撤回消息 |
+
 ## 开源前注意事项
 
 - `frontend/node_modules/`、后端缓存、上传文件、日志和本地配置均已通过 `.gitignore` 排除。
