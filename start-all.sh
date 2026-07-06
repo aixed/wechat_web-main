@@ -53,21 +53,44 @@ hash_file() {
 }
 
 ensure_python_stack() {
-  if ! command -v python3 >/dev/null 2>&1; then
+  PYTHON_BASE="${PYTHON_BIN:-}"
+  if [ -z "$PYTHON_BASE" ]; then
+    if command -v python3.13 >/dev/null 2>&1; then
+      PYTHON_BASE="python3.13"
+    elif command -v python3 >/dev/null 2>&1; then
+      PYTHON_BASE="python3"
+    fi
+  fi
+  if [ -z "$PYTHON_BASE" ]; then
     ensure_apt_packages python3
+    PYTHON_BASE="python3"
+  fi
+  export PYTHON_BASE
+
+  py_version=$("$PYTHON_BASE" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+  if [ "$py_version" != "3.13" ]; then
+    log "[WARN] Python 3.13 was not found. Set PYTHON_BIN to a Python 3.13 executable to run the backend on Python 3.13."
   fi
 
-  if ! python3 -m venv --help >/dev/null 2>&1; then
-    py_venv_pkg=$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}-venv")')
+  if ! "$PYTHON_BASE" -m venv --help >/dev/null 2>&1; then
+    py_venv_pkg=$("$PYTHON_BASE" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}-venv")')
     ensure_apt_packages "$py_venv_pkg" || ensure_apt_packages python3-venv
   fi
 
-  py_dev_pkg=$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}-dev")')
+  py_dev_pkg=$("$PYTHON_BASE" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}-dev")')
   ensure_apt_packages build-essential "$py_dev_pkg" || ensure_apt_packages build-essential python3-dev
+
+  if [ -x "$ROOT_DIR/backend/.venv/bin/python" ]; then
+    venv_version=$("$ROOT_DIR/backend/.venv/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    if [ "$venv_version" != "$py_version" ]; then
+      log "[SETUP] recreating backend virtualenv for Python $py_version"
+      rm -rf "$ROOT_DIR/backend/.venv"
+    fi
+  fi
 
   if [ ! -x "$ROOT_DIR/backend/.venv/bin/python" ]; then
     log "[SETUP] creating backend virtualenv"
-    python3 -m venv "$ROOT_DIR/backend/.venv"
+    "$PYTHON_BASE" -m venv "$ROOT_DIR/backend/.venv"
   fi
 
   PYTHON_CMD="$ROOT_DIR/backend/.venv/bin/python"

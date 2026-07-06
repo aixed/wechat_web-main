@@ -70,6 +70,8 @@ cp config.example.yaml config.yaml
 
 ### 2. 启动后端
 
+后端推荐使用 Python 3.13；`start-all.bat` / `start-all.sh` 会优先使用 Python 3.13。若系统里有多个 Python，可通过 `PYTHON_BIN` 指定 3.13 解释器。
+
 ```bash
 cd backend
 pip install -r requirements.txt
@@ -95,6 +97,9 @@ npm run dev
 # 前端构建
 cd frontend
 npm run build
+
+# 指定 Python 3.13 启动（Linux/macOS 示例）
+PYTHON_BIN=/usr/bin/python3.13 ./start-all.sh
 
 # 前端代码检查
 cd frontend
