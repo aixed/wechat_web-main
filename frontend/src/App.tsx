@@ -1161,6 +1161,13 @@ export default function App() {
   const routeAccountWxidRef = useRef(routeAccountWxid);
   routeAccountWxidRef.current = routeAccountWxid;
   const routeRef = useRef<AppRoute>(normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile));
+  const selectedAccount =
+    accounts.find((account) => account.id === selectedAccountId) ||
+    (routeAccountWxid ? accounts.find((account) => accountMatchesRoute(account, routeAccountWxid)) : undefined);
+  const selectedAccountWxid = String(selectedAccount?.wxid || "").trim();
+  const routeSelfWxid = /^wxid_/i.test(routeAccountWxid) || routeAccountWxid.includes("@") ? routeAccountWxid : "";
+  const effectiveSelfWxid = selfWxid || selectedAccountWxid || routeSelfWxid;
+  const selfDisplayId = effectiveSelfWxid || accountRouteKey(selectedAccount) || routeAccountWxid;
 
   const setRouteAccount = useCallback((accountWxid: string) => {
     const next = String(accountWxid || "").trim();
@@ -1476,30 +1483,38 @@ export default function App() {
   }, [contactsHydrated, contactsHydrating]);
 
   const openSelfProfileCard = useCallback(async () => {
-    if (!selfWxid) return;
     setSelfCardOpen(true);
+    const wxid = effectiveSelfWxid;
+    if (!wxid) {
+      setSelfProfileLoading(false);
+      return;
+    }
     setSelfProfileLoading(true);
     try {
-      await ensureContactProfiles([selfWxid], "", { force: true });
+      await ensureContactProfiles([wxid], "", { force: true });
     } catch (err) {
       console.error("[SELF_PROFILE]", err);
     } finally {
       setSelfProfileLoading(false);
     }
-  }, [ensureContactProfiles, selfWxid]);
+  }, [effectiveSelfWxid, ensureContactProfiles]);
 
   const openMobileSelfProfileDetail = useCallback(async () => {
-    if (!selfWxid) return;
     setMobileProfileDetailOpen(true);
+    const wxid = effectiveSelfWxid;
+    if (!wxid) {
+      setSelfProfileLoading(false);
+      return;
+    }
     setSelfProfileLoading(true);
     try {
-      await ensureContactProfiles([selfWxid], "", { force: true });
+      await ensureContactProfiles([wxid], "", { force: true });
     } catch (err) {
       console.error("[SELF_PROFILE]", err);
     } finally {
       setSelfProfileLoading(false);
     }
-  }, [ensureContactProfiles, selfWxid]);
+  }, [effectiveSelfWxid, ensureContactProfiles]);
 
   const switchMode = useCallback((mode: ViewMode, options: { skipRoute?: boolean } = {}) => {
     setViewMode(mode);
@@ -1621,7 +1636,7 @@ export default function App() {
   /** Queue avatar resolution for a list of wxids (deduped, debounced). */
   const queueBriefLookup = useCallback((wxids: string[], mySelfWxid?: string) => {
     if (!wxids || wxids.length === 0) return;
-    const selfId = mySelfWxid || selfWxid;
+    const selfId = mySelfWxid || effectiveSelfWxid;
     const currentAvatars = avatarMapRef.current;
     const currentContacts = contactMapRef.current;
     for (const wxid of wxids) {
@@ -1638,7 +1653,7 @@ export default function App() {
       pendingBriefWxids.current.add(wxid);
     }
     scheduleBriefFlush();
-  }, [selfWxid, scheduleBriefFlush]);
+  }, [effectiveSelfWxid, scheduleBriefFlush]);
 
   const hydrateGroupSenders = useCallback((groupId: string, wxids: string[], mySelfWxid?: string) => {
     const unique = Array.from(new Set((wxids || []).filter(Boolean)));
@@ -1757,7 +1772,7 @@ export default function App() {
         session_cache,
       } = wsMsg.data as any;
       const wxid = self_info?.data?.wxid || self_info?.wxid || "";
-      setSelfWxid(wxid);
+      if (wxid) setSelfWxid(wxid);
       setRawContacts(contacts);
 
       const nameMap = buildContactMap(contacts);
@@ -2520,10 +2535,37 @@ export default function App() {
     directoryEntryMap.set(entry.wxid, entry);
   }
   const directoryProfileEntry = directoryProfileWxid ? directoryEntryMap.get(directoryProfileWxid) || null : null;
-  const selfProfile = selfWxid ? contactProfiles[selfWxid] : undefined;
-  const selfInfoName = contactMap[selfWxid] || (selfProfile ? profileDisplayName(selfProfile, "") : "") || "我";
+  const selectedAccountProfile = selectedAccount?.profile || {};
+  const selectedAccountName = selectedAccount
+    ? (
+        (selectedAccount.nickname && selectedAccount.nickname !== selectedAccount.id ? selectedAccount.nickname : "") ||
+        profileDisplayName({ wxid: selfDisplayId, name: "", profile: selectedAccountProfile }, selfDisplayId || "我")
+      )
+    : "";
+  const selectedAccountAvatar =
+    selectedAccount?.avatar ||
+    profileAvatar({ wxid: selfDisplayId, name: selectedAccountName, avatar: "", profile: selectedAccountProfile }, "");
+  const accountFallbackProfile: ContactProfile | undefined = selfDisplayId ? {
+    wxid: selfDisplayId,
+    name: selectedAccountName || selfDisplayId,
+    avatar: selectedAccountAvatar,
+    profile: {
+      ...selectedAccountProfile,
+      wxid: selfDisplayId,
+      NickName: selectedAccountName || selfDisplayId,
+      nickname: selectedAccountName || selfDisplayId,
+      SmallHeadImgUrl: selectedAccountAvatar || selectedAccountProfile.SmallHeadImgUrl,
+      BigHeadImgUrl: selectedAccountAvatar || selectedAccountProfile.BigHeadImgUrl,
+    },
+  } : undefined;
+  const selfProfile = (effectiveSelfWxid ? contactProfiles[effectiveSelfWxid] : undefined) || accountFallbackProfile;
+  const selfInfoName =
+    (effectiveSelfWxid ? contactMap[effectiveSelfWxid] : "") ||
+    (selfProfile ? profileDisplayName(selfProfile, "") : "") ||
+    selectedAccountName ||
+    "我";
   const selfAvatar =
-    profileAvatar(selfProfile, avatarMap[selfWxid] || "") ||
+    profileAvatar(selfProfile, (effectiveSelfWxid ? avatarMap[effectiveSelfWxid] : "") || selectedAccountAvatar || "") ||
     (selfProfile?.profile?.BigHeadImgUrl || selfProfile?.profile?.SmallHeadImgUrl || "");
   const darkTheme = portalTheme === "dark";
   const activeSession = sessions.find((s) => s.wxid === activeChat) || (activeChat ? {
@@ -2605,7 +2647,7 @@ export default function App() {
               mobile
               session={activeSession}
               messages={activeMsgs}
-              selfWxid={selfWxid}
+              selfWxid={effectiveSelfWxid}
               onBack={handleBack}
               onNewMessages={handleNewMessages}
               avatarMap={avatarMap}
@@ -2706,7 +2748,7 @@ export default function App() {
           counts={contactCounts}
           contactProgress={contactHydrationProgress}
           selfName={selfInfoName}
-          selfWxid={selfWxid}
+          selfWxid={effectiveSelfWxid}
           selfAvatar={selfAvatar}
           selfProfile={selfProfile}
           contactsLoading={contactsHydrating}
@@ -2823,7 +2865,7 @@ export default function App() {
           <ChatArea
             session={activeSession}
             messages={activeMsgs}
-            selfWxid={selfWxid}
+            selfWxid={effectiveSelfWxid}
             onBack={handleBack}
             onNewMessages={handleNewMessages}
             avatarMap={avatarMap}
