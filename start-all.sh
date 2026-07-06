@@ -124,71 +124,6 @@ ensure_node_stack() {
   fi
 }
 
-is_port_free() {
-  "$PYTHON_CMD" - "$1" <<'PY'
-import socket
-import sys
-
-port = int(sys.argv[1])
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try:
-    sock.bind(("0.0.0.0", port))
-except OSError:
-    sys.exit(1)
-finally:
-    sock.close()
-PY
-}
-
-choose_frontend_port() {
-  configured_port="${FRONTEND_PORT:-}"
-  if [ -z "$configured_port" ] && [ -f "$ROOT_DIR/config.yaml" ]; then
-    configured_port=$("$PYTHON_CMD" - "$ROOT_DIR/config.yaml" <<'PY'
-import sys
-from pathlib import Path
-
-import yaml
-
-config_path = Path(sys.argv[1])
-data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-value = data.get("frontend_port")
-if value in (None, ""):
-    raise SystemExit(0)
-try:
-    port = int(value)
-except (TypeError, ValueError):
-    raise SystemExit("frontend_port must be an integer")
-if not 1 <= port <= 65535:
-    raise SystemExit("frontend_port must be between 1 and 65535")
-print(port)
-PY
-)
-  fi
-
-  if [ -n "$configured_port" ]; then
-    if is_port_free "$configured_port"; then
-      FRONTEND_PORT="$configured_port"
-      export FRONTEND_PORT
-      return
-    fi
-    log "[ERROR] Frontend port $configured_port is already in use."
-    exit 1
-  fi
-
-  port="3001"
-  while [ "$port" -le 3999 ]; do
-    if is_port_free "$port"; then
-      FRONTEND_PORT="$port"
-      export FRONTEND_PORT
-      return
-    fi
-    port=$((port + 1))
-  done
-  log "[ERROR] No free frontend port found in 3000-3999."
-  exit 1
-}
-
 descendants() {
   parent="$1"
   ps -eo pid=,ppid= 2>/dev/null | while read -r pid ppid; do
@@ -218,7 +153,6 @@ fi
 
 ensure_python_stack
 ensure_node_stack
-choose_frontend_port
 
 log "Starting backend..."
 (
@@ -230,19 +164,17 @@ printf '%s\n' "$BACKEND_PID" > "$RUN_DIR/backend.pid"
 
 sleep 2
 
-log "Starting frontend on port $FRONTEND_PORT..."
+log "Starting frontend..."
 (
   cd "$ROOT_DIR/frontend"
-  FRONTEND_PORT="$FRONTEND_PORT" npm run dev
+  npm run dev
 ) &
 FRONTEND_PID=$!
 printf '%s\n' "$FRONTEND_PID" > "$RUN_DIR/frontend.pid"
-printf '%s\n' "$FRONTEND_PORT" > "$RUN_DIR/frontend.port"
 
 echo
 echo "Backend and frontend are starting."
-echo "Frontend: http://127.0.0.1:$FRONTEND_PORT"
-echo "Backend:  http://127.0.0.1:5000"
+echo "Frontend and backend host/port are configured by config.yaml."
 echo "Press Ctrl+C to stop both."
 
 wait

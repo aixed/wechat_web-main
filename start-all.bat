@@ -68,26 +68,17 @@ if errorlevel 1 (
   exit /b 1
 )
 
-for /f %%P in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=3000; while ($p -le 3999 -and (Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue)) { $p++ }; if ($p -gt 3999) { exit 1 }; $p"') do set "FRONTEND_PORT=%%P"
-if not defined FRONTEND_PORT (
-  echo [ERROR] No free frontend port found in 3000-3999.
-  pause
-  exit /b 1
-)
-
 echo Starting backend...
 set "START_PYTHON_CMD=%PYTHON_CMD%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$cmd='title WeChat Web Backend && cd /d \"' + $env:START_ROOT + 'backend\" && ' + $env:START_PYTHON_CMD + ' main.py'; $p=Start-Process -FilePath cmd.exe -ArgumentList @('/k', $cmd) -PassThru; Set-Content -Path ($env:START_ROOT + '.run\backend.pid') -Value $p.Id -Encoding ASCII"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 2"
 
-echo Starting frontend on port %FRONTEND_PORT%...
-set "START_FRONTEND_PORT=%FRONTEND_PORT%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$cmd='title WeChat Web Frontend && cd /d \"' + $env:START_ROOT + 'frontend\" && set FRONTEND_PORT=' + $env:START_FRONTEND_PORT + '&& if not exist node_modules (npm install && npm run dev) else (npm run dev)'; $p=Start-Process -FilePath cmd.exe -ArgumentList @('/k', $cmd) -PassThru; Set-Content -Path ($env:START_ROOT + '.run\frontend.pid') -Value $p.Id -Encoding ASCII; Set-Content -Path ($env:START_ROOT + '.run\frontend.port') -Value $env:START_FRONTEND_PORT -Encoding ASCII"
+echo Starting frontend...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$cmd='title WeChat Web Frontend && cd /d \"' + $env:START_ROOT + 'frontend\" && if not exist node_modules (npm install && npm run dev) else (npm run dev)'; $p=Start-Process -FilePath cmd.exe -ArgumentList @('/k', $cmd) -PassThru; Set-Content -Path ($env:START_ROOT + '.run\frontend.pid') -Value $p.Id -Encoding ASCII"
 
 echo.
 echo Backend and frontend startup commands were launched.
-echo Frontend: http://127.0.0.1:%FRONTEND_PORT%
-echo Backend:  http://127.0.0.1:5000
+echo Frontend and backend host/port are configured by config.yaml.
 
 endlocal
