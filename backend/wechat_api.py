@@ -1036,7 +1036,25 @@ async def _query_db_parallel(dbs: list[str], sql: str) -> list:
 _ALL_DBS = ["MSG0.db", "MSG1.db", "MSG2.db", "MSG3.db"]
 
 
-async def get_chat_history(wxid: str, limit: int = 50, before_time: int = 0) -> dict:
+def _sql_literal(value: str) -> str:
+    return str(value or "").replace("'", "''")
+
+
+def _row_hex_value(row: dict, raw_key: str, hex_key: str) -> str:
+    value = row.get(hex_key, "")
+    if value:
+        return str(value)
+    value = row.get(raw_key, "")
+    if not value:
+        return ""
+    if str(row.get(f"{raw_key}__encoding", "")).lower() == "hex":
+        return str(value)
+    if isinstance(value, bytes):
+        return value.hex()
+    return str(value)
+
+
+async def get_chat_history(wxid: str, limit: int = 50, before_time: int = 0, dbs: list[str] | None = None) -> dict:
     """Get chat history for a specific contact/group, searching across all DB files.
     Returns messages sorted newest-first (DESC by CreateTime), limited to `limit`.
     If before_time > 0, only returns messages with CreateTime < before_time (for pagination).
@@ -1049,13 +1067,14 @@ async def get_chat_history(wxid: str, limit: int = 50, before_time: int = 0) -> 
     # Always include BytesExtra (for group sender extraction + image paths)
     # and CompressContent (for type 49 fallback)
     time_filter = f"AND CreateTime < {before_time}" if before_time > 0 else ""
+    safe_wxid = _sql_literal(wxid)
     sql = (
         f"SELECT TalkerId, CreateTime, StrTalker, StrContent, MsgSvrID, Type, IsSender, "
-        f"hex(BytesExtra) as BytesExtraHex, hex(CompressContent) as CompressHex "
-        f"FROM MSG WHERE StrTalker = '{wxid}' {time_filter} "
+        f"BytesExtra, CompressContent "
+        f"FROM MSG WHERE StrTalker = '{safe_wxid}' {time_filter} "
         f"ORDER BY localId DESC LIMIT {limit}"
     )
-    all_rows = await _query_db_parallel(_ALL_DBS, sql)
+    all_rows = await _query_db_parallel(dbs or _ALL_DBS, sql)
 
     # Sort all rows by CreateTime DESC
     def get_create_time(row):
@@ -1075,11 +1094,12 @@ async def get_chat_history(wxid: str, limit: int = 50, before_time: int = 0) -> 
 
         msg_type = str(row.get("Type", ""))
         str_content = row.get("StrContent", "") or ""
+        bytes_extra_hex = _row_hex_value(row, "BytesExtra", "BytesExtraHex")
+        compress_hex = _row_hex_value(row, "CompressContent", "CompressHex")
 
         # For type 49 (app messages: quotes, links, files), StrContent may be empty
         # in WeChat 4.x — actual XML is in CompressContent
         if msg_type == "49" and not str_content.strip():
-            compress_hex = row.get("CompressHex", "")
             if compress_hex:
                 decompressed = _decompress_content(compress_hex)
                 if decompressed:
@@ -1087,21 +1107,26 @@ async def get_chat_history(wxid: str, limit: int = 50, before_time: int = 0) -> 
                     _log(f"[DECOMPRESS] Recovered type 49 content: {decompressed[:100]}")
 
         # For group chats, extract sender wxid from BytesExtra
-        hex_data = row.get("BytesExtraHex", "")
-        if is_group and hex_data:
+        if is_group and bytes_extra_hex:
             is_sender_val = str(row.get("IsSender", "0"))
             if is_sender_val != "1":
-                sender = _extract_sender_from_bytes_extra(hex_data)
+                sender = _extract_sender_from_bytes_extra(bytes_extra_hex)
                 if sender:
                     row["SenderWxid"] = sender
                 else:
                     _log(f"[SENDER] Failed to extract sender for type={msg_type} msgid={row.get('MsgSvrID', '?')}")
 
         # Keep BytesExtraHex for type 3 (image) messages — frontend needs it to find the file
-        if msg_type != "3":
+        if msg_type == "3" and bytes_extra_hex:
+            row["BytesExtraHex"] = bytes_extra_hex
+        else:
             row.pop("BytesExtraHex", None)
 
-        # Remove CompressHex from response to save bandwidth
+        # Remove raw/heavy DB fields from response to save bandwidth.
+        row.pop("BytesExtra", None)
+        row.pop("BytesExtra__encoding", None)
+        row.pop("CompressContent", None)
+        row.pop("CompressContent__encoding", None)
         row.pop("CompressHex", None)
 
     return {"data": result_rows}

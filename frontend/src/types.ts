@@ -100,7 +100,6 @@ export interface WSInitMessage {
     avatar_urls: Record<string, string>;
     contact_profiles?: Record<string, ContactProfile>;
     hydration_progress?: ContactHydrationProgress;
-    messages_cache?: Record<string, ChatMessage[]>;
     session_cache?: Record<string, {
       wxid: string;
       lastMsg: string;

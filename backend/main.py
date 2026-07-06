@@ -889,21 +889,6 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
     return out
 
 
-def _messages_equivalent(left: dict | None, right: dict | None) -> bool:
-    if not isinstance(left, dict) or not isinstance(right, dict):
-        return False
-    left_id = str(left.get("id", "") or "").strip()
-    right_id = str(right.get("id", "") or "").strip()
-    if left_id and right_id and left_id == right_id:
-        return True
-    return (
-        str(left.get("msgtype", "") or "") == str(right.get("msgtype", "") or "")
-        and str(left.get("msg", "") or "") == str(right.get("msg", "") or "")
-        and int(left.get("timestamp") or left.get("time_unix") or 0) == int(right.get("timestamp") or right.get("time_unix") or 0)
-        and str(left.get("sendorrecv", "") or "") == str(right.get("sendorrecv", "") or "")
-    )
-
-
 def _sync_session_preview_from_message(wxid: str, msg: dict, *, owner_wxid: str = "") -> None:
     wxid = str(wxid or "").strip()
     if not wxid or not isinstance(msg, dict):
@@ -947,25 +932,6 @@ def _sync_session_preview_from_message(wxid: str, msg: dict, *, owner_wxid: str 
         owner_wxid=owner,
     )
     _load_session_cache_into_state(owner)
-
-
-async def _refresh_latest_message_from_hook(wxid: str, *, owner_wxid: str = "") -> None:
-    wxid = str(wxid or "").strip()
-    if not wxid or getattr(wechat_api, "IS_PROTOCOL", False):
-        return
-    owner = _contact_owner_wxid(owner_wxid)
-    history = await wechat_api.get_chat_history(wxid, 1)
-    rows = history.get("data", []) if isinstance(history, dict) else []
-    normalized = _normalize_history_rows(wxid, rows)
-    if not normalized:
-        return
-    newest = normalized[-1]
-    cached_latest_rows = sqlite_cache.get_messages(wxid, 1, owner_wxid=owner)
-    cached_latest = cached_latest_rows[-1] if cached_latest_rows else None
-    if not _messages_equivalent(cached_latest, newest):
-        sqlite_cache.upsert_messages(wxid, [newest], owner_wxid=owner)
-    message_store.add_message(wxid, newest, replace=True)
-    _sync_session_preview_from_message(wxid, newest, owner_wxid=owner)
 
 
 # ─── Startup / Shutdown ────────────────────────────────────────────
@@ -1577,7 +1543,6 @@ async def websocket_endpoint(websocket: WebSocket):
             "last_messages": app_state["last_messages"],
             "avatar_urls": app_state.get("avatar_urls", {}),
             "contact_profiles": sqlite_cache.get_contacts(owner_wxid=_contact_owner_wxid()),
-            "messages_cache": message_store.get_all_messages(),
             "session_cache": message_store.get_sessions(),
         }
     }, ensure_ascii=False))
@@ -3444,76 +3409,61 @@ async def refresh_sessions(request: Request):
 # ─── REST API: Messages (History via QueryDB) ─────────────────────
 
 @app.get("/api/messages/{wxid}")
-async def get_messages(wxid: str, limit: int = 50, db: str = "MSG0.db"):
+async def get_messages(wxid: str, limit: int = 20, db: str = "MSG0.db"):
     """Get chat history for a contact/group.
-    Prefer local SQLite cache. Callback messages are persisted immediately, so
-    reopening a chat can show cached content without touching Hook QueryDB.
+    Opening a chat should show the freshest recent rows from the native MSG DB.
+    The frontend requests 20 rows for the initial view; older rows are fetched
+    only when the user scrolls to the top.
     """
+    limit = max(1, min(int(limit or 20), 100))
     owner_wxid = _contact_owner_wxid()
-    initialized = sqlite_cache.has_initialized(wxid, owner_wxid=owner_wxid)
-    cached = sqlite_cache.get_messages(wxid, limit, owner_wxid=owner_wxid)
-    if cached:
-        if initialized:
-            message_store.add_history(wxid, cached)
-            source = "sqlite"
-        else:
-            message_store.add_history_no_flag(wxid, cached)
-            source = "sqlite_partial"
-        try:
-            await _refresh_latest_message_from_hook(wxid, owner_wxid=owner_wxid)
-        except Exception as e:
-            _log(f"[SQLITE_CACHE] latest-message refresh failed for {wxid}: {type(e).__name__}: {e}")
-        return {"data": message_store.get_messages(wxid, limit), "source": source}
-
-    if initialized:
-        existing = message_store.get_messages(wxid, limit)
-        try:
-            await _refresh_latest_message_from_hook(wxid, owner_wxid=owner_wxid)
-            existing = message_store.get_messages(wxid, limit)
-        except Exception as e:
-            _log(f"[SQLITE_CACHE] latest-message refresh failed for {wxid}: {type(e).__name__}: {e}")
-        if existing:
-            return {"data": existing, "source": "memory"}
-        return {"data": [], "source": "sqlite"}
-
-    if message_store.is_db_loaded(wxid):
-        existing = message_store.get_messages(wxid, limit)
-        try:
-            await _refresh_latest_message_from_hook(wxid, owner_wxid=owner_wxid)
-            existing = message_store.get_messages(wxid, limit)
-        except Exception as e:
-            _log(f"[SQLITE_CACHE] latest-message refresh failed for {wxid}: {type(e).__name__}: {e}")
-        if existing:
-            return {"data": existing, "source": "memory"}
-
-    history = await wechat_api.get_chat_history(wxid, max(limit, 100))
-    rows = history.get("data", []) if isinstance(history, dict) else []
-    normalized = _normalize_history_rows(wxid, rows)
-    message_store.add_history(wxid, normalized)
+    normalized: list[dict] = []
     try:
-        if normalized:
+        history = await wechat_api.get_chat_history(wxid, limit, dbs=[db])
+        rows = history.get("data", []) if isinstance(history, dict) else []
+        normalized = _normalize_history_rows(wxid, rows)
+    except Exception as e:
+        _log(f"[HISTORY] QueryDB latest failed for {wxid}: {type(e).__name__}: {e}")
+
+    if normalized:
+        message_store.add_history(wxid, normalized)
+        try:
             sqlite_cache.upsert_messages(wxid, normalized, mark_initialized=True, owner_wxid=owner_wxid)
             _sync_session_preview_from_message(wxid, normalized[-1], owner_wxid=owner_wxid)
-        else:
-            sqlite_cache.mark_initialized(wxid, owner_wxid=owner_wxid)
+        except Exception as e:
+            _log(f"[SQLITE_CACHE] history write failed for {wxid}: {type(e).__name__}: {e}")
+        return {"data": normalized[-limit:], "source": "hook_db"}
+
+    cached = sqlite_cache.get_messages(wxid, limit, owner_wxid=owner_wxid)
+    if cached:
+        message_store.add_history_no_flag(wxid, cached)
+        return {"data": cached, "source": "sqlite_fallback"}
+
+    existing = message_store.get_messages(wxid, limit)
+    if existing:
+        return {"data": existing, "source": "memory_fallback"}
+
+    try:
+        sqlite_cache.mark_initialized(wxid, owner_wxid=owner_wxid)
     except Exception as e:
-        _log(f"[SQLITE_CACHE] history write failed for {wxid}: {type(e).__name__}: {e}")
-    return {"data": message_store.get_messages(wxid, limit), "source": "hook_db"}
+        _log(f"[SQLITE_CACHE] history init mark failed for {wxid}: {type(e).__name__}: {e}")
+    return {"data": [], "source": "hook_db"}
 
 
 @app.get("/api/messages/{wxid}/older")
-async def get_older_messages(wxid: str, before: int = 0, limit: int = 50):
+async def get_older_messages(wxid: str, before: int = 0, limit: int = 100, db: str = "MSG0.db"):
     """Load older messages before a given timestamp (for infinite scroll).
     Returns messages with CreateTime < before, sorted chronologically."""
     if before <= 0:
         return {"data": []}
+    limit = max(1, min(int(limit or 100), 100))
     owner_wxid = _contact_owner_wxid()
     cached = sqlite_cache.get_messages(wxid, limit, before=before, owner_wxid=owner_wxid)
     if cached:
         message_store.add_history_no_flag(wxid, cached)
         return {"data": cached, "source": "sqlite"}
 
-    history = await wechat_api.get_chat_history(wxid, limit, before_time=before)
+    history = await wechat_api.get_chat_history(wxid, limit, before_time=before, dbs=[db])
     rows = history.get("data", []) if isinstance(history, dict) else []
     normalized = _normalize_history_rows(wxid, rows)
     # Add to store so they persist in memory

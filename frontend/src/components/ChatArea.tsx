@@ -8,7 +8,7 @@ interface ChatAreaProps {
   messages: ChatMessage[];
   selfWxid: string;
   onBack: () => void;
-  onNewMessages: (wxid: string, msgs: ChatMessage[]) => void;
+  onNewMessages: (wxid: string, msgs: ChatMessage[], options?: { replace?: boolean }) => void;
   avatarMap: Record<string, string>;
   contactMap: Record<string, string>;
   contactProfiles: Record<string, ContactProfile>;
@@ -26,6 +26,8 @@ interface ChatAreaProps {
 
 const TEXTAREA_BASE_HEIGHT = 86;
 const TEXTAREA_MAX_HEIGHT = 124;
+const INITIAL_HISTORY_LIMIT = 20;
+const OLDER_HISTORY_LIMIT = 100;
 
 interface PendingImage {
   id: string;
@@ -250,15 +252,15 @@ export default function ChatArea({
     const isFirstLoad = !loadedRef.current.has(session.wxid);
     loadedRef.current.add(session.wxid);
 
-    // Always ask the backend for history; the backend serves initialized chats
-    // from its local SQLite cache and only warms missing chats from Hook DB.
+    // Opening a chat always refreshes the latest DB rows. Older rows are loaded
+    // only when the user scrolls to the top.
     if (isFirstLoad) setLoadingHistory(true);
 
-    getMessages(session.wxid, 100)
+    getMessages(session.wxid, INITIAL_HISTORY_LIMIT)
       .then((data: any) => {
-        if (data && Array.isArray(data.data) && data.data.length > 0) {
+        if (data && Array.isArray(data.data)) {
           // Debug: log first 3 rows for group chats
-          if (isGroup) {
+          if (isGroup && data.data.length > 0) {
             console.log("[DB_DEBUG] first 3 rows:", JSON.stringify(data.data.slice(0, 3)).substring(0, 1000));
           }
           const historyMsgs: ChatMessage[] = data.data.map((row: any) => {
@@ -320,9 +322,7 @@ export default function ChatArea({
           });
 
           // Backend returns messages in ascending chronological order (oldest first)
-          if (historyMsgs.length > 0) {
-            onNewMessages(session.wxid, historyMsgs);
-          }
+          onNewMessages(session.wxid, historyMsgs, { replace: true });
         }
       })
       .catch((err: Error) => console.error("[HISTORY]", err))
@@ -349,7 +349,7 @@ export default function ChatArea({
     const container = messagesContainerRef.current;
 
     try {
-      const data = await getOlderMessages(session.wxid, oldestTs, 50);
+      const data = await getOlderMessages(session.wxid, oldestTs, OLDER_HISTORY_LIMIT);
       if (data && Array.isArray(data.data) && data.data.length > 0) {
         const olderMsgs: ChatMessage[] = data.data.map((row: any) => ({
           ...row,
@@ -371,7 +371,7 @@ export default function ChatArea({
         suppressAutoScrollRef.current = true;
         onNewMessages(session.wxid, olderMsgs);
 
-        if (data.data.length < 50) {
+        if (data.data.length < OLDER_HISTORY_LIMIT) {
           setHasMoreOlder(false);
         }
       } else {
@@ -385,13 +385,12 @@ export default function ChatArea({
     }
   }, [messages, hasMoreOlder, session.wxid, isGroup, onNewMessages]);
 
-  // Detect scroll to top → load older messages
+  // Detect scroll to top → automatically load older messages
   useEffect(() => {
     const container = messagesContainerRef.current;
     if (!container) return;
 
     const handleScroll = () => {
-      // When scrolled near top (within 50px), trigger loading older messages
       if (container.scrollTop < 50 && !loadingOlderRef.current && hasMoreOlder) {
         loadOlderMessagesHandler();
       }
@@ -604,12 +603,9 @@ export default function ChatArea({
                 {loadingOlder ? (
                   <span className={`text-[12px] ${mutedText}`}>加载更多消息...</span>
                 ) : hasMoreOlder ? (
-                  <button
-                    onClick={loadOlderMessagesHandler}
-                    className={`text-[12px] ${mutedText} hover:text-[#888] active:text-[#888]`}
-                  >
-                    ↑ 查看更早的消息
-                  </button>
+                  <span className={`text-[12px] ${mutedText}`}>
+                    ↑ 上滑查看更早的消息
+                  </span>
                 ) : (
                   <span className={`text-[12px] ${dark ? "text-[#3a3a3a]" : "text-[#bbb]"}`}>— 没有更多消息了 —</span>
                 )}

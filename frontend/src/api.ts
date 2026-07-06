@@ -96,10 +96,10 @@ export const refreshSessions = (agentId = "") => fetchJSON(withAgentQuery("/api/
 
 // ─── Messages ────────────────────────────────────────────────────
 
-export const getMessages = (wxid: string, limit = 50) =>
+export const getMessages = (wxid: string, limit = 20) =>
   fetchJSON(`/api/messages/${wxid}?limit=${limit}`);
 
-export const getOlderMessages = (wxid: string, beforeTime: number, limit = 50) =>
+export const getOlderMessages = (wxid: string, beforeTime: number, limit = 100) =>
   fetchJSON(`/api/messages/${wxid}/older?before=${beforeTime}&limit=${limit}`);
 
 export const searchMessages = (wxid: string, keyword: string, limit = 50) =>

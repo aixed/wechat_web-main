@@ -1111,19 +1111,6 @@ function dedupeMessagesForDisplay(msgs: ChatMessage[]): ChatMessage[] {
   return removeDuplicateSynthetics(removeCallbackEchoes(visible));
 }
 
-function mergeMessagesById(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
-  const merged = [...existing];
-  const seen = new Set(existing.map((m) => String(m.id)));
-  for (const msg of incoming) {
-    if (isHookStatusEchoMessage(msg)) continue;
-    const id = String(msg.id || "");
-    if (id && seen.has(id)) continue;
-    if (id) seen.add(id);
-    merged.push(msg);
-  }
-  return sortByTimestamp(dedupeMessagesForDisplay(merged));
-}
-
 function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessage | null {
   if (!msg || typeof msg !== "object") return null;
   if (msg.msgtype && msg.fromid && msg.id) {
@@ -1844,7 +1831,6 @@ export default function App() {
         avatar_urls,
         contact_profiles,
         hydration_progress,
-        messages_cache,
         session_cache,
       } = wsMsg.data as any;
       const wxid = self_info?.data?.wxid || self_info?.wxid || "";
@@ -1910,21 +1896,6 @@ export default function App() {
       }
       enriched = sortSessionsForDisplay(Array.from(enrichedMap.values()));
       setSessions(enriched);
-
-      if (messages_cache && typeof messages_cache === "object") {
-        setChatMessages((prev) => {
-          const next = { ...prev };
-          for (const [chatId, rows] of Object.entries<any>(messages_cache)) {
-            if (!Array.isArray(rows)) continue;
-            const normalized = rows
-              .map((row) => toChatMessage(row, String(row?.sendorrecv || "2"), wxid))
-              .filter(Boolean) as ChatMessage[];
-            const existing = next[chatId] || [];
-            next[chatId] = mergeMessagesById(existing, normalized);
-          }
-          return next;
-        });
-      }
 
       console.log("[INIT]", wxid,
         "sessions:", enriched.length,
@@ -2437,9 +2408,12 @@ export default function App() {
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
   }, []);
 
-  const handleNewMessages = (wxid: string, msgs: ChatMessage[]) => {
+  const handleNewMessages = (wxid: string, msgs: ChatMessage[], options?: { replace?: boolean }) => {
     const displayMsgs = msgs.filter((msg) => !isHookStatusEchoMessage(msg));
     setChatMessages((prev) => {
+      if (options?.replace) {
+        return { ...prev, [wxid]: sortByTimestamp(dedupeMessagesForDisplay(displayMsgs)) };
+      }
       const existing = prev[wxid] || [];
       // DB history is authoritative — replace any existing messages with the same ID
       // (callback versions may have wrong sender/timestamp)
