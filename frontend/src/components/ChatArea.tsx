@@ -265,17 +265,18 @@ export default function ChatArea({
           }
           const historyMsgs: ChatMessage[] = data.data.map((row: any) => {
             // New backend format: message is already normalized
-            if (row && typeof row === "object" && row.msgtype && row.fromid && row.id) {
+            if (row && typeof row === "object" && row.msgtype && row.id) {
+              const normalizedIsSender = Number(row.isSender ?? (String(row.sendorrecv) === "1" ? 1 : 0));
               return {
                 ...row,
                 id: String(row.id),
                 msgtype: String(row.msgtype || "1"),
                 sendorrecv: String(row.sendorrecv || "2"),
-                isSender: Number(row.isSender ?? (String(row.sendorrecv) === "1" ? 1 : 0)),
+                isSender: normalizedIsSender,
                 msg: String(row.msg || ""),
                 time: String(row.time || ""),
                 timestamp: Number(row.timestamp || row.time_unix || 0),
-                fromid: String(row.fromid || ""),
+                fromid: String(row.fromid || (normalizedIsSender === 1 ? selfWxid : "")),
                 toid: String(row.toid || ""),
                 fromgid: String(row.fromgid || ""),
                 fromtype: String(row.fromtype || (isGroup ? "2" : "1")),
@@ -351,20 +352,23 @@ export default function ChatArea({
     try {
       const data = await getOlderMessages(session.wxid, oldestTs, OLDER_HISTORY_LIMIT);
       if (data && Array.isArray(data.data) && data.data.length > 0) {
-        const olderMsgs: ChatMessage[] = data.data.map((row: any) => ({
-          ...row,
-          id: String(row.id),
-          msgtype: String(row.msgtype || "1"),
-          sendorrecv: String(row.sendorrecv || "2"),
-          isSender: Number(row.isSender ?? (String(row.sendorrecv) === "1" ? 1 : 0)),
-          msg: String(row.msg || ""),
-          time: String(row.time || ""),
-          timestamp: Number(row.timestamp || row.time_unix || 0),
-          fromid: String(row.fromid || ""),
-          toid: String(row.toid || ""),
-          fromgid: String(row.fromgid || ""),
-          fromtype: String(row.fromtype || (isGroup ? "2" : "1")),
-        }));
+        const olderMsgs: ChatMessage[] = data.data.map((row: any) => {
+          const normalizedIsSender = Number(row.isSender ?? (String(row.sendorrecv) === "1" ? 1 : 0));
+          return {
+            ...row,
+            id: String(row.id),
+            msgtype: String(row.msgtype || "1"),
+            sendorrecv: String(row.sendorrecv || "2"),
+            isSender: normalizedIsSender,
+            msg: String(row.msg || ""),
+            time: String(row.time || ""),
+            timestamp: Number(row.timestamp || row.time_unix || 0),
+            fromid: String(row.fromid || (normalizedIsSender === 1 ? selfWxid : "")),
+            toid: String(row.toid || ""),
+            fromgid: String(row.fromgid || ""),
+            fromtype: String(row.fromtype || (isGroup ? "2" : "1")),
+          };
+        });
 
         // Save current scroll height and set suppress flag BEFORE triggering re-render
         prevScrollHeightRef.current = container?.scrollHeight || 0;
