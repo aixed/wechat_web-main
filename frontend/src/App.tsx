@@ -2887,7 +2887,7 @@ export default function App() {
         </div>
       </div>
 
-      <div className={`flex-1 min-w-0 h-full ${darkTheme ? "bg-[#111111]" : "bg-[#ededed]"}`}>
+      <div className={`flex-1 min-w-0 min-h-0 h-full overflow-hidden ${darkTheme ? "bg-[#111111]" : "bg-[#ededed]"}`}>
         {viewMode === "contacts" && desktopContactCategory ? (
           <DirectoryCategoryPane
             title={categoryTitle(desktopContactCategory)}
@@ -3085,7 +3085,7 @@ function AccountPortal({
             </button>
           </div>
         </div>
-        <div className="flex-1 overflow-y-auto p-[18px]">
+        <div className="pane-scroll flex-1 min-h-0 overflow-y-auto p-[18px]">
           {loading && accounts.length === 0 && <div className="text-[#777] text-[14px]">正在读取微信连接...</div>}
           {accounts.length === 0 && !loading && (
             <div className="text-[#777] text-[14px] leading-[24px]">
@@ -3130,7 +3130,7 @@ function AccountPortal({
           </div>
         </div>
       </div>
-      <div className="flex-1 min-w-0 h-full">
+      <div className="flex-1 min-w-0 min-h-0 h-full overflow-hidden">
         <MultiAccountBroadcastPanel accounts={accounts} theme={theme} />
       </div>
     </div>
@@ -3429,7 +3429,7 @@ function MobileMultiAccountBroadcastPage({
         onLeft={onBack}
         onRight={allAccountsSelected ? clearAgents : selectAllAgents}
       />
-      <div className="flex-1 overflow-y-auto px-[14px] py-[14px] pb-[calc(20px+env(safe-area-inset-bottom))]">
+      <div className="pane-scroll flex-1 min-h-0 overflow-y-auto px-[14px] py-[14px] pb-[calc(36px+env(safe-area-inset-bottom))]">
         <div className={`rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
           <div className="flex items-center justify-between mb-[10px]">
             <div className="text-[15px] font-medium">发送账号</div>
@@ -4235,7 +4235,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
   };
 
   return (
-    <div className={`h-full overflow-y-auto p-[28px] ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#f4f4f4] text-[#111]"}`}>
+    <div className={`pane-scroll h-full min-h-0 overflow-y-auto p-[28px] pb-[72px] ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#f4f4f4] text-[#111]"}`}>
       <div className="max-w-[760px]">
         <div className="text-[22px] font-medium">多号群发</div>
         <div className="mt-[18px] grid grid-cols-1 gap-[14px]">
