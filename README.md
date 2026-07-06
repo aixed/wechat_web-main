@@ -66,7 +66,7 @@ wechat_web/
 cp config.example.yaml config.yaml
 ```
 
-然后根据你的 Hook/协议服务地址、端口、回调公网 IP 和 RDV 标识修改 `config.yaml`。
+然后根据你的 Hook/协议服务地址、端口和回调公网 IP 修改 `config.yaml`。
 
 ### 2. 启动后端
 
@@ -103,7 +103,7 @@ npm run lint
 
 ## 配置说明
 
-`config.yaml` 不会被提交到仓库。公开部署或提交代码前，请确认没有把真实 IP、RDV、Token、账号信息、日志、缓存文件或聊天媒体数据提交到 Git。
+`config.yaml` 不会被提交到仓库。公开部署或提交代码前，请确认没有把真实 IP、Token、账号信息、日志、缓存文件或聊天媒体数据提交到 Git。
 
 ### 远程 Hook DLL 启动参数
 
@@ -112,7 +112,7 @@ npm run lint
 示例：
 
 ```text
-"C:\Program Files (x86)\Tencent\WeChat391016\WeChat\WeChat.exe" CallBackURL=http://localhost:8000/receiveChatBotMsg&RecvType=1&ConnectType=http&RemoteWS="ws://1.14.149.2:5000/agent"&StartPort=30001&RDV=127f78ac
+"C:\Program Files (x86)\Tencent\WeChat391016\WeChat\WeChat.exe" CallBackURL=http://localhost:8000/receiveChatBotMsg&RecvType=1&ConnectType=http&RemoteWS="ws://1.14.149.2:5000/agent"&StartPort=30001&RDV=<客户端自己的RDV>
 ```
 
 `RemoteWS` 支持两种形式：
@@ -127,7 +127,6 @@ npm run lint
 - `wechat_mode`：微信使用方式，`1`=本地 Hook，`2`=远程客户端 Hook（客户端 DLL 主动连本后端 WS/WSS），`3`=远程服务器协议。旧配置 `login` 仍兼容，可选 `local_hook`、`remote_hook`、`remote_protocol`。
 - `*_host` / `*_api_port` / `*_mgr_port`：不同模式下的服务地址和端口。
 - `ip`：本后端的公网 IP 或域名，供远程客户端 DLL 主动连接和回调访问。
-- `RDV`：远程服务所需的连接或鉴权标识。
 - `server_port`：后端主服务端口。
 - `web_access_key`：Web 前端和 `/api/*` 接口访问密钥；不要提交真实值，可在本地 `config.yaml` 或环境变量 `WECHAT_WEB_ACCESS_KEY` 中配置。
 - `hook_api_concurrency`：Hook/API 并发数；本地 Hook 默认 `1`，远程 Hook/远程协议默认 `10`，用于避免慢查询阻塞 `GetContact`、头像、发送消息等交互接口。
@@ -138,7 +137,7 @@ npm run lint
 - 使用 `wss` 时，公网 `client_wss_port` 需要由反向代理或外层 TLS 服务转发到后端 `server_port`，并保留 WebSocket Upgrade 头；使用 `ws://IP:5000` 测试时可直连后端服务端口。
 - `callback_port` / `callback_path`：远程客户端 Hook 回调本后端的地址配置。
 - `recvtype`：Hook 消息接收类型，默认 `1`；`1` 为 Hook 直接返回 `msglist`，`2` 为 protobuf/raw `pb_msg`。旧配置 `recv_type` 仍兼容。
-- `WECHAT_FILES_BASE`：可选环境变量，用于指定本机微信文件目录；不设置时会按 `APPDATA/WxDirDataPath/<RDV>/WeChat Files` 推导。
+- `WECHAT_FILES_BASE`：可选环境变量，用于指定本机微信文件目录；不设置时会按默认微信文件目录推导。
 
 ## 开源前注意事项
 
