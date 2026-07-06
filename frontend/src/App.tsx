@@ -39,24 +39,81 @@ type MobileTab = "chats" | "contacts" | "me";
 type PortalTheme = "dark" | "light";
 type ContactCategoryKey = "groups" | "official" | "service" | "openim";
 type AppRoute = "root" | "chat" | "contact" | "broadcast" | "me";
+type ParsedAppRoute = { accountWxid: string; route: AppRoute };
 const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
 const PINNED_ORDER_THRESHOLD = 1_000_000_000_000;
 const MOBILE_SWIPE_DIRECTION_EPSILON = 0.25;
 
-function routeFromPath(pathname: string): AppRoute {
-  const normalized = pathname.replace(/\/+$/, "") || "/";
-  switch (normalized) {
-    case "/chat":
+function decodeRouteSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+function routeFromSegment(segment: string | undefined): AppRoute | null {
+  switch (segment) {
+    case "chat":
       return "chat";
-    case "/contact":
+    case "contact":
       return "contact";
-    case "/broadcast":
+    case "broadcast":
       return "broadcast";
-    case "/me":
+    case "me":
       return "me";
     default:
-      return "root";
+      return null;
+  }
+}
+
+function parseRouteFromPath(pathname: string): ParsedAppRoute {
+  const segments = pathname.split("/").filter(Boolean).map(decodeRouteSegment);
+  if (segments.length === 0) return { accountWxid: "", route: "root" };
+  if (routeFromSegment(segments[0])) return { accountWxid: "", route: "root" };
+  return {
+    accountWxid: segments[0],
+    route: routeFromSegment(segments[1]) || "chat",
+  };
+}
+
+function routeFromPath(pathname: string): AppRoute {
+  return parseRouteFromPath(pathname).route;
+}
+
+function accountWxidFromPath(pathname: string): string {
+  return parseRouteFromPath(pathname).accountWxid;
+}
+
+function accountRouteKey(account: Pick<WeChatAccount, "id" | "account_id" | "wxid"> | null | undefined): string {
+  return String(account?.wxid || account?.account_id || account?.id || "").trim();
+}
+
+function accountMatchesRoute(account: WeChatAccount, routeAccountWxid: string): boolean {
+  const target = String(routeAccountWxid || "").trim();
+  if (!target) return false;
+  return [account.wxid, account.account_id, account.id].some((value) => String(value || "").trim() === target);
+}
+
+function routeAccountPathPart(accountWxid: string): string {
+  return encodeURIComponent(accountWxid).replace(/%40/g, "@");
+}
+
+function pathForRoute(route: AppRoute, accountWxid = ""): string {
+  if (!accountWxid) return "/";
+  const base = `/${routeAccountPathPart(accountWxid)}`;
+  switch (route) {
+    case "contact":
+      return `${base}/contact`;
+    case "broadcast":
+      return `${base}/broadcast`;
+    case "me":
+      return `${base}/me`;
+    case "chat":
+      return `${base}/chat`;
+    default:
+      return base;
   }
 }
 
@@ -77,21 +134,6 @@ function mobileTabFromRoute(route: AppRoute): MobileTab {
   if (route === "contact") return "contacts";
   if (route === "me") return "me";
   return "chats";
-}
-
-function pathForRoute(route: AppRoute): string {
-  switch (route) {
-    case "chat":
-      return "/chat";
-    case "contact":
-      return "/contact";
-    case "broadcast":
-      return "/broadcast";
-    case "me":
-      return "/me";
-    default:
-      return "/";
-  }
 }
 
 function historyStateEquals(a: unknown, b: unknown): boolean {
@@ -301,7 +343,16 @@ type BroadcastProgressState = {
   total: number;
   sent: number;
   failed: number;
-  accountCounts: Record<string, { friends?: number; groups?: number; targets?: number; sent?: number; failed?: number }>;
+  accountCounts: Record<string, {
+    friends?: number;
+    groups?: number;
+    official?: number;
+    service?: number;
+    openim?: number;
+    targets?: number;
+    sent?: number;
+    failed?: number;
+  }>;
 };
 
 function buildBroadcastParts(message: string, images: BroadcastImageItem[]): BroadcastPayloadPart[] {
@@ -1051,11 +1102,13 @@ function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessag
 // ─── App Component ───────────────────────────────────────────────
 export default function App() {
   const isMobile = useIsMobileViewport();
+  const initialRouteAccountWxid = accountWxidFromPath(window.location.pathname);
   const [authenticated, setAuthenticated] = useState(() => Boolean(getAccessKey()));
   const [portalTheme, setPortalThemeState] = useState<PortalTheme>(() =>
     window.localStorage.getItem(PORTAL_THEME_STORAGE) === "light" ? "light" : "dark"
   );
-  const [selectedAccountId, setSelectedAccountId] = useState(() => getActiveAgentId());
+  const [selectedAccountId, setSelectedAccountId] = useState(() => initialRouteAccountWxid ? "" : getActiveAgentId());
+  const [routeAccountWxid, setRouteAccountWxid] = useState(() => initialRouteAccountWxid);
   const [accounts, setAccounts] = useState<WeChatAccount[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -1105,13 +1158,22 @@ export default function App() {
   contactProfilesRef.current = contactProfiles;
   const selectedAccountIdRef = useRef(selectedAccountId);
   selectedAccountIdRef.current = selectedAccountId;
+  const routeAccountWxidRef = useRef(routeAccountWxid);
+  routeAccountWxidRef.current = routeAccountWxid;
   const routeRef = useRef<AppRoute>(normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile));
+
+  const setRouteAccount = useCallback((accountWxid: string) => {
+    const next = String(accountWxid || "").trim();
+    routeAccountWxidRef.current = next;
+    setRouteAccountWxid(next);
+  }, []);
 
   const setRoute = useCallback((route: AppRoute, options: { replace?: boolean; state?: Record<string, unknown> } = {}) => {
     const normalizedRoute = normalizeRouteForDevice(route, isMobile);
     routeRef.current = normalizedRoute;
-    const nextPath = pathForRoute(normalizedRoute);
-    const nextState = { ...(options.state || {}), route: normalizedRoute };
+    const accountWxid = routeAccountWxidRef.current;
+    const nextPath = pathForRoute(normalizedRoute, accountWxid);
+    const nextState = { ...(options.state || {}), route: normalizedRoute, account_wxid: accountWxid };
     const samePath = window.location.pathname === nextPath;
     const sameState = historyStateEquals(window.history.state, nextState);
     if (samePath && sameState) return;
@@ -1188,9 +1250,13 @@ export default function App() {
     }
   }, [loadAccounts]);
 
-  const handleSelectAccount = useCallback(async (account: WeChatAccount) => {
+  const handleSelectAccount = useCallback(async (
+    account: WeChatAccount,
+    options: { route?: AppRoute; replace?: boolean } = {},
+  ) => {
     const agentId = account.id;
     if (!agentId) return;
+    const accountPathKey = accountRouteKey(account);
     resetChatState();
     const data = await activateAccount(agentId);
     if (!data?.ok) {
@@ -1230,27 +1296,31 @@ export default function App() {
     }
     setActiveAgentId(agentId);
     setSelectedAccountId(agentId);
-    const initialRoute = normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile);
-    setRoute(initialRoute === "root" ? "chat" : initialRoute, { replace: true });
-  }, [isMobile, loadAccounts, resetChatState, setRoute]);
+    setRouteAccount(accountPathKey);
+    const currentRoute = normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile);
+    const nextRoute = options.route || (currentRoute === "root" ? "chat" : currentRoute);
+    setRoute(nextRoute, { replace: options.replace ?? true });
+  }, [isMobile, loadAccounts, resetChatState, setRoute, setRouteAccount]);
 
   const handleLeaveAccount = useCallback(() => {
     clearActiveAgentId();
     resetChatState();
     setSelectedAccountId("");
+    setRouteAccount("");
     window.history.replaceState({ route: "root" }, "", "/");
     loadAccounts();
-  }, [loadAccounts, resetChatState]);
+  }, [loadAccounts, resetChatState, setRouteAccount]);
 
   const handleLogout = useCallback(() => {
     clearActiveAgentId();
     clearAccessKey();
     setAuthenticated(false);
     setSelectedAccountId("");
+    setRouteAccount("");
     setAccounts([]);
     resetChatState();
     window.history.replaceState({ route: "root" }, "", "/");
-  }, [resetChatState]);
+  }, [resetChatState, setRouteAccount]);
 
   const setPortalTheme = useCallback((theme: PortalTheme) => {
     setPortalThemeState(theme);
@@ -2011,7 +2081,22 @@ export default function App() {
     }
   }, [selfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, hydrateGroupSenders, ensureContactProfiles, ensureGroupProfiles, applyContactProfileUpdates, selectedAccountId]);
 
-  const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId));
+  const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId), selectedAccountId);
+
+  useEffect(() => {
+    if (!authenticated || !routeAccountWxid) return;
+    const matched = accounts.find((account) => accountMatchesRoute(account, routeAccountWxid));
+    if (!matched) return;
+    if (selectedAccountId === matched.id) {
+      setActiveAgentId(matched.id);
+      return;
+    }
+    const targetRoute = normalizeRouteForDevice(routeRef.current, isMobile);
+    handleSelectAccount(matched, {
+      route: targetRoute === "root" ? "chat" : targetRoute,
+      replace: true,
+    });
+  }, [authenticated, accounts, routeAccountWxid, selectedAccountId, isMobile, handleSelectAccount]);
 
   useEffect(() => {
     if (!authenticated || !selectedAccountId) return;
@@ -2021,7 +2106,8 @@ export default function App() {
   useEffect(() => {
     if (!authenticated || !selectedAccountId) return;
     const currentRoute = normalizeRouteForDevice(routeRef.current, isMobile);
-    const expectedPath = pathForRoute(currentRoute === "root" ? "chat" : currentRoute);
+    const accountWxid = routeAccountWxidRef.current;
+    const expectedPath = pathForRoute(currentRoute === "root" ? "chat" : currentRoute, accountWxid);
     if (window.location.pathname !== expectedPath) {
       setRoute(currentRoute === "root" ? "chat" : currentRoute, { replace: true });
     }
@@ -2033,6 +2119,21 @@ export default function App() {
     const timer = window.setInterval(loadAccounts, 1000);
     return () => window.clearInterval(timer);
   }, [authenticated, selectedAccountId, loadAccounts]);
+
+  useEffect(() => {
+    if (!authenticated || !selectedAccountId || accounts.length > 0 || accountsLoading) return;
+    loadAccounts();
+  }, [authenticated, selectedAccountId, accounts.length, accountsLoading, loadAccounts]);
+
+  useEffect(() => {
+    if (!authenticated || !selectedAccountId || routeAccountWxid) return;
+    const account = accounts.find((row) => row.id === selectedAccountId);
+    const accountWxid = accountRouteKey(account);
+    if (!accountWxid) return;
+    setRouteAccount(accountWxid);
+    const currentRoute = normalizeRouteForDevice(routeRef.current, isMobile);
+    setRoute(currentRoute === "root" ? "chat" : currentRoute, { replace: true });
+  }, [authenticated, selectedAccountId, routeAccountWxid, accounts, isMobile, setRoute, setRouteAccount]);
 
   // ─── Navigation (browser history integration for mobile back gesture) ──
   const handleSelectChat = (wxid: string, seed?: Partial<Session>) => {
@@ -2167,15 +2268,17 @@ export default function App() {
   };
 
   useEffect(() => {
-    const route = normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile);
+    const parsedRoute = parseRouteFromPath(window.location.pathname);
+    setRouteAccount(parsedRoute.accountWxid);
+    const route = normalizeRouteForDevice(parsedRoute.route, isMobile);
     routeRef.current = route;
-
-    if (!authenticated || !selectedAccountId) {
-      if (window.location.pathname !== "/") {
-        window.history.replaceState({ route: "root" }, "", "/");
-      }
+    if (!parsedRoute.accountWxid && window.location.pathname !== "/") {
+      routeRef.current = "root";
+      window.history.replaceState({ route: "root", account_wxid: "" }, "", "/");
       return;
     }
+
+    if (!authenticated || !selectedAccountId) return;
 
     if (isMobile) {
       const targetTab = mobileTabFromRoute(route);
@@ -2194,13 +2297,20 @@ export default function App() {
     if (route !== "chat" && activeChat) {
       setActiveChat(null);
     }
-  }, [authenticated, selectedAccountId, isMobile, mobileTab, viewMode, activeChat, switchMobileTab, switchMode]);
+  }, [authenticated, selectedAccountId, isMobile, mobileTab, viewMode, activeChat, switchMobileTab, switchMode, setRouteAccount]);
 
   // Listen for browser back button / swipe-back gesture
   useEffect(() => {
     const onPopState = () => {
-      const route = normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile);
+      const parsedRoute = parseRouteFromPath(window.location.pathname);
+      setRouteAccount(parsedRoute.accountWxid);
+      const route = normalizeRouteForDevice(parsedRoute.route, isMobile);
       routeRef.current = route;
+      if (!parsedRoute.accountWxid && window.location.pathname !== "/") {
+        routeRef.current = "root";
+        window.history.replaceState({ route: "root", account_wxid: "" }, "", "/");
+        return;
+      }
       if (!authenticated || !selectedAccountId) return;
 
       setActiveChat(null);
@@ -2218,7 +2328,7 @@ export default function App() {
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, [authenticated, selectedAccountId, isMobile, switchMobileTab, switchMode]);
+  }, [authenticated, selectedAccountId, isMobile, switchMobileTab, switchMode, setRouteAccount]);
 
   const hasUnsavedInput = useRef(false);
   const setHasUnsavedInput = useCallback((val: boolean) => {
@@ -3267,6 +3377,9 @@ function MobileMultiAccountBroadcastPage({
           <div className="grid grid-cols-2 gap-[10px]">
             <TargetTypeButton active={targetTypes.has("friends")} dark={dark} title="所有个人" subtitle="按账号展开" onClick={() => toggleTargetType("friends")} />
             <TargetTypeButton active={targetTypes.has("groups")} dark={dark} title="所有群" subtitle="按账号展开" onClick={() => toggleTargetType("groups")} />
+            <TargetTypeButton active={targetTypes.has("official")} dark={dark} title="所有公众号" subtitle="按账号展开" onClick={() => toggleTargetType("official")} />
+            <TargetTypeButton active={targetTypes.has("service")} dark={dark} title="所有服务号" subtitle="按账号展开" onClick={() => toggleTargetType("service")} />
+            <TargetTypeButton active={targetTypes.has("openim")} dark={dark} title="所有企微" subtitle="按账号展开" onClick={() => toggleTargetType("openim")} />
           </div>
         </div>
 
@@ -4058,7 +4171,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
 
           <div>
             <div className="text-[13px] text-[#888] mb-[8px]">目标类型</div>
-            <div className="grid grid-cols-2 gap-[10px] max-w-[420px]">
+            <div className="grid grid-cols-2 gap-[10px] max-w-[560px]">
               <TargetTypeButton
                 active={targetTypes.has("friends")}
                 dark={dark}
@@ -4072,6 +4185,27 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
                 title="所有群"
                 subtitle="每个账号的群聊"
                 onClick={() => toggleTargetType("groups")}
+              />
+              <TargetTypeButton
+                active={targetTypes.has("official")}
+                dark={dark}
+                title="所有公众号"
+                subtitle="每个账号的公众号"
+                onClick={() => toggleTargetType("official")}
+              />
+              <TargetTypeButton
+                active={targetTypes.has("service")}
+                dark={dark}
+                title="所有服务号"
+                subtitle="每个账号的服务号"
+                onClick={() => toggleTargetType("service")}
+              />
+              <TargetTypeButton
+                active={targetTypes.has("openim")}
+                dark={dark}
+                title="所有企微"
+                subtitle="每个账号的企微"
+                onClick={() => toggleTargetType("openim")}
               />
             </div>
           </div>
@@ -4248,14 +4382,23 @@ function BroadcastProgressView({
           const target = Number(item.targets || 0);
           const accountDone = Number(item.sent || 0) + Number(item.failed || 0);
           const accountRatio = target ? Math.min(100, Math.round((accountDone / target) * 100)) : 0;
+          const countParts = [
+            ["好友", item.friends],
+            ["群", item.groups],
+            ["公众号", item.official],
+            ["服务号", item.service],
+            ["企微", item.openim],
+          ]
+            .filter(([, count]) => typeof count === "number")
+            .map(([label, count]) => `${label}${Number(count || 0)}`);
           return (
             <div key={agentId}>
               <div className="flex items-center justify-between text-[12px]">
                 <span className={`truncate pr-[10px] ${dark ? "text-[#aaa]" : "text-[#555]"}`}>{accountName(agentId)}</span>
-                <span className={dark ? "text-[#777]" : "text-[#888]"}>
+                <span className={`shrink-0 max-w-[72%] text-right truncate ${dark ? "text-[#777]" : "text-[#888]"}`}>
                   {accountDone}/{target}
-                  {typeof item.friends === "number" || typeof item.groups === "number"
-                    ? ` · 好友${item.friends || 0}/群${item.groups || 0}`
+                  {countParts.length > 0
+                    ? ` · ${countParts.join("/")}`
                     : ""}
                 </span>
               </div>

@@ -1788,6 +1788,7 @@ def _contact_init_lock(owner_wxid: str) -> asyncio.Lock:
 def _contact_profile_wxid(profile: dict) -> str:
     return str(
         profile.get("wxid")
+        or profile.get("id")
         or profile.get("UserName")
         or profile.get("userName")
         or profile.get("strUsrName")
@@ -1891,6 +1892,8 @@ def _contact_profile_account_category(profile: dict, wxid: str = "") -> str:
         or profile.get("TypeName")
         or profile.get("typeName")
         or profile.get("SourceText")
+        or profile.get("type")
+        or profile.get("Type")
         or ""
     ).lower()
     if marker:
@@ -1907,6 +1910,25 @@ def _contact_profile_needs_account_type(profile: dict, wxid: str = "") -> bool:
     if not wxid.startswith("gh_"):
         return False
     return not _contact_profile_account_category(profile, wxid)
+
+
+def _contact_directory_category(profile: dict, wxid: str = "") -> str:
+    """Match the Contacts page buckets: personal, groups, official, service, openim."""
+    if not isinstance(profile, dict):
+        profile = {}
+    wxid = str(wxid or _contact_profile_wxid(profile) or "").strip()
+    if not wxid:
+        return ""
+    if wxid.endswith("@chatroom"):
+        return "groups"
+    if (
+        wxid.endswith("@openim")
+        or bool(profile.get("OpenIM") or profile.get("OpenIMDetail") or profile.get("openim_detail"))
+    ):
+        return "openim"
+    if wxid.startswith("gh_"):
+        return _contact_profile_account_category(profile, wxid) or "official"
+    return "personal"
 
 
 def _contact_payload(raw: dict | list) -> dict | list:
@@ -2389,6 +2411,22 @@ def _contact_detail_missing_ids(owner_wxid: str = "", candidates: list[str] | No
     for wxid in candidate_list:
         entry = cached.get(wxid)
         if _contact_cache_needs_hydration(wxid, entry):
+            missing.append(wxid)
+    return missing
+
+
+def _contact_account_category_missing_ids(owner_wxid: str = "", candidates: list[str] | None = None) -> list[str]:
+    owner = owner_wxid or _contact_owner_wxid()
+    candidate_list = [str(wxid or "").strip() for wxid in (candidates or []) if str(wxid or "").strip()] if candidates is not None else None
+    cached = sqlite_cache.get_contacts(candidate_list, owner_wxid=owner)
+    missing: list[str] = []
+    wxids = candidate_list if candidate_list is not None else list(cached.keys())
+    for wxid in wxids:
+        if not wxid.startswith("gh_"):
+            continue
+        entry = cached.get(wxid) or {}
+        profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
+        if not _contact_profile_account_category(profile, wxid):
             missing.append(wxid)
     return missing
 
@@ -2898,7 +2936,13 @@ async def _fetch_and_cache_contact_profiles_via_getcontact(
     return result
 
 
-async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_empty: bool = False, force_details: bool = False) -> dict:
+async def _refresh_contacts_incremental(
+    *,
+    list_type: str | int = "0",
+    init_if_empty: bool = False,
+    force_details: bool = False,
+    hydrate_details: bool = True,
+) -> dict:
     """Load the directory from local SQLite, initializing it once via InitContact.
 
     GetFriendAndChatRoomList is intentionally not used here; on remote Hook it can
@@ -2910,8 +2954,12 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
     if app_state.get("contacts_loaded"):
         snapshot = _contacts_snapshot_from_db(owner_wxid)
         app_state["contacts"] = snapshot
-        ids = list(sqlite_cache.get_contacts(owner_wxid=owner_wxid).keys()) if force_details else _contact_detail_missing_ids(owner_wxid)
-        if ids:
+        ids = (
+            list(sqlite_cache.get_contacts(owner_wxid=owner_wxid).keys())
+            if force_details
+            else _contact_detail_missing_ids(owner_wxid)
+        )
+        if hydrate_details and ids:
             _schedule_contact_detail_hydration(owner_wxid, ids, account_id)
         return _with_contact_hydration_progress(snapshot, owner_wxid)
 
@@ -2920,8 +2968,12 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
         if app_state.get("contacts_loaded"):
             snapshot = _contacts_snapshot_from_db(owner_wxid)
             app_state["contacts"] = snapshot
-            ids = list(sqlite_cache.get_contacts(owner_wxid=owner_wxid).keys()) if force_details else _contact_detail_missing_ids(owner_wxid)
-            if ids:
+            ids = (
+                list(sqlite_cache.get_contacts(owner_wxid=owner_wxid).keys())
+                if force_details
+                else _contact_detail_missing_ids(owner_wxid)
+            )
+            if hydrate_details and ids:
                 _schedule_contact_detail_hydration(owner_wxid, ids, account_id)
             return _with_contact_hydration_progress(snapshot, owner_wxid)
 
@@ -2998,8 +3050,8 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
                 continue
             seen.add(wxid)
             ids.append(wxid)
-        missing_ids = _contact_detail_missing_ids(owner_wxid, ids)
-        if missing_ids:
+        missing_ids = _contact_detail_missing_ids(owner_wxid, ids) if hydrate_details else []
+        if hydrate_details and missing_ids:
             _log(
                 f"[CONTACTS] scheduling avatar hydration after InitContact: "
                 f"missing={len(missing_ids)} total={len(ids)}"
@@ -3008,14 +3060,15 @@ async def _refresh_contacts_incremental(*, list_type: str | int = "0", init_if_e
         else:
             _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
                 "active": False,
-                "phase": "BatchGetContactBriefInfo",
+                "phase": "BatchGetContactBriefInfo" if hydrate_details else "InitContact",
                 "batch": 0,
                 "total_batches": 0,
-                "processed": 0,
-                "total": 0,
+                "processed": len(ids) if not hydrate_details else 0,
+                "total": len(ids) if not hydrate_details else 0,
                 "updated": 0,
                 "failed": 0,
             }
+            await _broadcast_contact_hydration_progress(owner_wxid, account_id)
 
         return _with_contact_hydration_progress(snapshot, owner_wxid)
 
@@ -3961,12 +4014,39 @@ def _normalize_broadcast_target_types(raw_types) -> set[str]:
         "contact": "friends",
         "好友": "friends",
         "个人": "friends",
+        "所有个人": "friends",
+        "所有好友": "friends",
         "group": "groups",
         "groups": "groups",
         "chatroom": "groups",
         "chatrooms": "groups",
         "群": "groups",
         "群聊": "groups",
+        "所有群": "groups",
+        "所有群聊": "groups",
+        "official": "official",
+        "officials": "official",
+        "official_account": "official",
+        "official_accounts": "official",
+        "public": "official",
+        "public_account": "official",
+        "public_accounts": "official",
+        "公众号": "official",
+        "所有公众号": "official",
+        "service": "service",
+        "services": "service",
+        "service_account": "service",
+        "service_accounts": "service",
+        "服务号": "service",
+        "所有服务号": "service",
+        "openim": "openim",
+        "wecom": "openim",
+        "wework": "openim",
+        "enterprise": "openim",
+        "企微": "openim",
+        "企业微信": "openim",
+        "所有企微": "openim",
+        "所有企业微信": "openim",
     }
     out: set[str] = set()
     for value in raw_types or []:
@@ -3981,37 +4061,40 @@ def _raw_contact_list(raw_contacts: dict | list, key: str) -> list:
     raw_contacts = _contact_payload(raw_contacts)
     if not raw_contacts:
         return []
+    target_category = {
+        "friend": "personal",
+        "friends": "personal",
+        "personal": "personal",
+        "chatroom": "groups",
+        "chatrooms": "groups",
+        "group": "groups",
+        "groups": "groups",
+        "official": "official",
+        "service": "service",
+        "openim": "openim",
+    }.get(str(key or "").strip().lower(), str(key or "").strip().lower())
     if isinstance(raw_contacts, list):
-        return [
-            entry for entry in raw_contacts
-            if isinstance(entry, dict)
-            and (key == "chatroom") == _contact_wxid(entry).endswith("@chatroom")
-        ]
-    if not isinstance(raw_contacts, dict):
-        return []
-    if key == "friend":
+        value = [entry for entry in raw_contacts if isinstance(entry, dict)]
+    elif isinstance(raw_contacts, dict):
         value = [
             *_extract_contact_list(raw_contacts, "friend", "friends", "contact", "contacts"),
-            *_extract_contact_list(raw_contacts, "data"),
-            *_extract_batch_contact_entries(raw_contacts),
-        ]
-        value = [entry for entry in value if not _contact_wxid(entry).endswith("@chatroom")]
-    else:
-        value = [
             *_extract_contact_list(
                 raw_contacts,
                 "chatroom", "chatrooms", "chat_room", "chat_rooms",
                 "group", "groups", "group_chat", "group_chats",
             ),
-            *_extract_contact_list(raw_contacts, "friend", "friends", "contact", "contacts", "data"),
+            *_extract_contact_list(raw_contacts, "data"),
             *_extract_batch_contact_entries(raw_contacts),
         ]
-        value = [entry for entry in value if _contact_wxid(entry).endswith("@chatroom")]
+    else:
+        return []
     seen: set[str] = set()
     out: list[dict] = []
     for entry in value:
         wxid = _contact_wxid(entry)
         if not wxid or wxid in seen:
+            continue
+        if _contact_directory_category(entry, wxid) != target_category:
             continue
         seen.add(wxid)
         out.append(entry)
@@ -4023,6 +4106,7 @@ def _contact_wxid(entry) -> str:
         return ""
     return str(
         entry.get("wxid")
+        or entry.get("id")
         or entry.get("UserName")
         or entry.get("userName")
         or entry.get("strUsrName")
@@ -4030,6 +4114,7 @@ def _contact_wxid(entry) -> str:
         or entry.get("gid")
         or entry.get("chatroomid")
         or entry.get("chatroom_id")
+        or entry.get("describe")
         or entry.get("account")
         or ""
     ).strip()
@@ -4049,30 +4134,53 @@ def _dedupe_targets(wxids: list[str]) -> list[str]:
 
 def _contact_counts(raw_contacts: dict | list) -> dict[str, int]:
     return {
-        "friends": len([
-            entry for entry in _raw_contact_list(raw_contacts, "friend")
-            if _contact_wxid(entry) and not _contact_wxid(entry).endswith("@chatroom")
-        ]),
-        "groups": len([
-            entry for entry in _raw_contact_list(raw_contacts, "chatroom")
-            if _contact_wxid(entry) and _contact_wxid(entry).endswith("@chatroom")
-        ]),
+        "friends": len(_raw_contact_list(raw_contacts, "friends")),
+        "groups": len(_raw_contact_list(raw_contacts, "groups")),
+        "official": len(_raw_contact_list(raw_contacts, "official")),
+        "service": len(_raw_contact_list(raw_contacts, "service")),
+        "openim": len(_raw_contact_list(raw_contacts, "openim")),
     }
+
+
+def _empty_contact_counts() -> dict[str, int]:
+    return {"friends": 0, "groups": 0, "official": 0, "service": 0, "openim": 0}
 
 
 def _resolve_targets_from_contacts(contacts: dict | list, target_types: set[str]) -> list[str]:
     targets: list[str] = []
-    if "friends" in target_types:
-        for entry in _raw_contact_list(contacts, "friend"):
+    for target_type in ("friends", "groups", "official", "service", "openim"):
+        if target_type not in target_types:
+            continue
+        for entry in _raw_contact_list(contacts, target_type):
             wxid = _contact_wxid(entry)
-            if wxid and not wxid.endswith("@chatroom"):
-                targets.append(wxid)
-    if "groups" in target_types:
-        for entry in _raw_contact_list(contacts, "chatroom"):
-            wxid = _contact_wxid(entry)
-            if wxid and wxid.endswith("@chatroom"):
+            if wxid:
                 targets.append(wxid)
     return _dedupe_targets(targets)
+
+
+async def _ensure_broadcast_contact_categories(contacts: dict | list, owner_wxid: str, account_id: str) -> dict:
+    gh_wxids: list[str] = []
+    seen: set[str] = set()
+    for entry in _all_raw_contact_entries(contacts):
+        wxid = _contact_profile_wxid(entry)
+        if not wxid or not wxid.startswith("gh_") or wxid in seen:
+            continue
+        seen.add(wxid)
+        gh_wxids.append(wxid)
+    missing = _contact_account_category_missing_ids(owner_wxid, gh_wxids)
+    if missing:
+        _log(f"[BROADCAST] hydrating official/service category fields: owner={owner_wxid} ids={len(missing)}")
+        with wechat_api.use_agent(account_id):
+            await _fetch_and_cache_contact_details(
+                missing,
+                broadcast_updates=False,
+                broadcast_progress=False,
+                owner_wxid=owner_wxid,
+                account_id=account_id,
+            )
+        contacts = _contacts_snapshot_from_db(owner_wxid)
+        app_state["contacts"] = contacts
+    return contacts
 
 
 async def _ensure_account_contacts(agent_id: str):
@@ -4086,18 +4194,28 @@ async def _ensure_account_contacts(agent_id: str):
             if not app_state.get("initialized"):
                 await _run_backend_initialization(agent_id)
         owner_wxid = _contact_owner_wxid()
-        cached_contacts = _contacts_snapshot_from_db(owner_wxid)
-        if cached_contacts.get("friend") or cached_contacts.get("chatroom"):
+        if app_state.get("contacts_loaded"):
+            cached_contacts = _contacts_snapshot_from_db(owner_wxid)
             app_state["contacts"] = cached_contacts
-            app_state["contacts_loaded"] = True
+            cached_contacts = await _ensure_broadcast_contact_categories(cached_contacts, owner_wxid, agent_id)
             counts = _contact_counts(cached_contacts)
-            _log(f"[BROADCAST] local contacts for {owner_wxid}: friends={counts['friends']} groups={counts['groups']}")
+            _log(
+                f"[BROADCAST] local contacts for {owner_wxid}: "
+                f"friends={counts['friends']} groups={counts['groups']} "
+                f"official={counts['official']} service={counts['service']} openim={counts['openim']}"
+            )
             return cached_contacts
         with wechat_api.use_agent(agent_id):
-            contacts = await _refresh_contacts_incremental(list_type="0", init_if_empty=True)
+            await _refresh_contacts_incremental(list_type="0", init_if_empty=True, hydrate_details=False)
+        contacts = _contacts_snapshot_from_db(owner_wxid)
         app_state["contacts"] = contacts
+        contacts = await _ensure_broadcast_contact_categories(contacts, owner_wxid, agent_id)
         counts = _contact_counts(contacts)
-        _log(f"[BROADCAST] initialized contacts for {owner_wxid}: friends={counts['friends']} groups={counts['groups']}")
+        _log(
+            f"[BROADCAST] initialized contacts for {owner_wxid}: "
+            f"friends={counts['friends']} groups={counts['groups']} "
+            f"official={counts['official']} service={counts['service']} openim={counts['openim']}"
+        )
         return contacts
 
 
@@ -4131,7 +4249,7 @@ async def _prepare_multi_account_targets(
                 if str(login_status.get("status") or "") != "3":
                     raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
                 target_wxids = _dedupe_targets(direct_targets)
-                account_counts[agent_id] = {"friends": 0, "groups": 0, "targets": len(target_wxids)}
+                account_counts[agent_id] = {**_empty_contact_counts(), "targets": len(target_wxids)}
             else:
                 contacts = await _ensure_account_contacts(agent_id)
                 counts = _contact_counts(contacts)
@@ -4139,7 +4257,7 @@ async def _prepare_multi_account_targets(
                 account_counts[agent_id] = {**counts, "targets": len(target_wxids)}
         except Exception as e:
             target_wxids = []
-            account_counts.setdefault(agent_id, {"friends": 0, "groups": 0, "targets": 0})
+            account_counts.setdefault(agent_id, {**_empty_contact_counts(), "targets": 0})
             skipped_results.append({"agent_id": agent_id, "wxid": "", "ok": False, "error": f"{type(e).__name__}: {e}"})
         account_targets[agent_id] = len(target_wxids)
         total += len(target_wxids)

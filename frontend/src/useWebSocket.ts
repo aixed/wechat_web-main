@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback, useState } from "react";
 import type { WSMessage } from "./types";
 import { getAccessKey, getActiveAgentId } from "./api";
 
-export function useWebSocket(onMessage: (msg: WSMessage) => void, enabled = true) {
+export function useWebSocket(onMessage: (msg: WSMessage) => void, enabled = true, agentId = "") {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const onMessageRef = useRef(onMessage);
@@ -40,8 +40,8 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void, enabled = true
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const params = new URLSearchParams();
     params.set("key", getAccessKey());
-    const agentId = getActiveAgentId();
-    if (agentId) params.set("agent_id", agentId);
+    const activeAgentId = agentId || getActiveAgentId();
+    if (activeAgentId) params.set("agent_id", activeAgentId);
     const wsUrl = `${protocol}//${window.location.host}/api/ws?${params.toString()}`;
     console.log("[WS] Connecting to", wsUrl);
 
@@ -139,7 +139,7 @@ export function useWebSocket(onMessage: (msg: WSMessage) => void, enabled = true
     };
 
     wsRef.current = ws;
-  }, [clearTimers, enabled]);
+  }, [agentId, clearTimers, enabled]);
 
   const forceReconnect = useCallback(() => {
     console.log("[WS] Force reconnect");
