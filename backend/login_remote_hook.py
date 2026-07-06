@@ -24,14 +24,13 @@ import requests
 sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     HOOK_HOST, HOOK_PORT, MGR_PORT,
-    PUBLIC_IP, RDV, CALLBACK_PORT, CALLBACK_PATH,
+    RDV, CALLBACK_URL,
     RECV_TYPE,
     RESTART_ON_BUTTON_LOGIN_FAIL, MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL,
 )
 
 MGR_URL = f"http://{HOOK_HOST}:{MGR_PORT}"
 API_URL = f"http://{HOOK_HOST}:{HOOK_PORT}"
-CALLBACK_URL = f"http://{PUBLIC_IP}:{CALLBACK_PORT}{CALLBACK_PATH}"
 
 TIMEOUT = 15  # seconds per request
 STARTUP_WAIT = 90  # 最多等90秒让API端口就绪

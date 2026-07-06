@@ -31,6 +31,9 @@ remote_protocol_api_port: 30001
 remote_protocol_mgr_port: 29999
 
 # --- 后端服务 ---
+# 后端监听地址。前后端在同一台机器时建议只监听 127.0.0.1，
+# 公网只暴露前端端口，由 Vite/Nginx 代理 /api 与 /agent。
+server_host: "127.0.0.1"
 server_port: 5000
 # Web 前端访问密钥；浏览器需先输入该 key 才能访问聊天页和 API。
 # 不要把真实密钥提交到 Git，可在 config.yaml 或 WECHAT_WEB_ACCESS_KEY 中配置。
@@ -44,20 +47,23 @@ hook_api_concurrency: 10
 frontend_port: 3001
 
 # --- 远程客户端 DLL 主动连接到本后端的 WS/WSS 长连接 ---
-# 无证书测试：client_wss_scheme="ws"，client_wss_port=5000，
-#   DLL 使用 RemoteWS="ws://1.14.149.2:5000/agent"，可直连 server_port。
+# 无证书测试：client_wss_scheme="ws"，client_wss_port=80，
+#   DLL 使用 RemoteWS="ws://1.14.149.2/agent"，由前端端口代理到本机后端。
 # 正式部署：client_wss_scheme="wss"，client_wss_port=443，
 #   DLL 使用 RemoteWS="wss://1.14.149.2/agent"，需 Nginx/Caddy 等提供 TLS 证书并转发到 server_port。
 agent_ws_enabled: true
 agent_ws_path: "/agent"
-client_wss_scheme: "wss"
+client_wss_scheme: "ws"
 client_wss_host: "127.0.0.1"
-client_wss_port: 443
+client_wss_port: 80
 agent_ws_request_timeout: 30
 
 # --- 回调 ---
-# callback_port: 远程客户端 Hook 回调本后端的端口，需要能被客户端出站访问
-callback_port: 8000
+# callback_host/callback_port 是后端本机监听地址；
+# callback_public_port 是外部客户端访问前端代理的端口。
+callback_host: "127.0.0.1"
+callback_port: 5000
+callback_public_port: 80
 callback_path: "/receiveChatBotMsg/msg"
 # 消息接收类型：
 #   1 = Hook 直接返回 msglist
