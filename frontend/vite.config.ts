@@ -11,7 +11,7 @@ export default defineConfig({
     host: '0.0.0.0',
     port: frontendPort,
     strictPort: true,
-    allowedHosts: ['chat.solvernow.com', '1.14.149.2'],
+    allowedHosts: ['chat.solvernow.com', 'jp.aixed.com', '1.14.149.2'],
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:5000',
