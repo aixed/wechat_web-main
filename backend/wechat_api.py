@@ -612,6 +612,18 @@ async def send_image_no_src(wxidorgid: str, cdn_fields: dict) -> dict:
     return safe_json(r)
 
 
+async def forward_all_msg(msgsvrid: str, wxid: str) -> dict:
+    """Forward one existing message by MsgSvrID to a target wxid/chatroom."""
+    if not IS_HOOK:
+        return {"error": "ForwardAllMsg is only supported in hook mode"}
+    r = await _post(
+        "/ForwardAllMsg",
+        json={"msgsvrid": str(msgsvrid), "wxid": wxid},
+        timeout=90.0 if IS_LOCAL_HOOK else 180.0,
+    )
+    return safe_json(r)
+
+
 async def send_file(wxid: str, filepath: str, file_data: str | None = None) -> dict:
     """Send file."""
     if IS_HOOK:
