@@ -3397,7 +3397,7 @@ function MobileMultiAccountBroadcastPage({
       await prepareProgress();
       const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode, concurrencyLimit);
       updateProgressFromResult(res);
-      setResultText(`${mode === "normal" ? "普通文本" : "文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+      setResultText(`${mode === "normal" ? "正常群发文本" : "底层群发文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -3413,7 +3413,7 @@ function MobileMultiAccountBroadcastPage({
       const res = await multiAccountBroadcastImageUploadStream(agentIds, selectedTargetTypes, image, mode, concurrencyLimit, updateProgressFromPayload);
       if (res?.account_counts) updateProgressFromPayload(res);
       else updateProgressFromResult(res);
-      setResultText(`${mode === "normal" ? "普通图片" : "图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+      setResultText(`${mode === "normal" ? "正常群发图片" : "底层群发图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -3520,7 +3520,7 @@ function MobileMultiAccountBroadcastPage({
               onClick={() => sendText("nosrc")}
               className={`h-[42px] rounded-[10px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
             >
-              {sending ? "发送中" : "群发文本"}
+              {sending ? "发送中" : "底层群发文本"}
             </button>
             <button
               type="button"
@@ -3528,7 +3528,7 @@ function MobileMultiAccountBroadcastPage({
               onClick={() => sendText("normal")}
               className={`h-[42px] rounded-[10px] border ${dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#242424] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"}`}
             >
-              普通文本
+              正常群发文本
             </button>
           </div>
         </div>
@@ -3552,7 +3552,7 @@ function MobileMultiAccountBroadcastPage({
               onClick={() => sendImage("nosrc")}
               className={`h-[42px] rounded-[10px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
             >
-              {sending ? "发送中" : "群发图片"}
+              {sending ? "发送中" : "底层群发图片"}
             </button>
             <button
               type="button"
@@ -3560,7 +3560,7 @@ function MobileMultiAccountBroadcastPage({
               onClick={() => sendImage("normal")}
               className={`h-[42px] rounded-[10px] border ${dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#242424] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"}`}
             >
-              普通图片
+              正常群发图片
             </button>
           </div>
         </div>
@@ -4212,7 +4212,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
       await prepareProgress();
       const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode, concurrencyLimit);
       updateProgressFromResult(res);
-      setResultText(`${mode === "normal" ? "普通文本" : "文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+      setResultText(`${mode === "normal" ? "正常群发文本" : "底层群发文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -4228,7 +4228,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
       const res = await multiAccountBroadcastImageUploadStream(agentIds, selectedTargetTypes, image, mode, concurrencyLimit, updateProgressFromPayload);
       if (res?.account_counts) updateProgressFromPayload(res);
       else updateProgressFromResult(res);
-      setResultText(`${mode === "normal" ? "普通图片" : "图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+      setResultText(`${mode === "normal" ? "正常群发图片" : "底层群发图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -4359,7 +4359,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
                 onClick={() => sendText("nosrc")}
                 className={`h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white active:opacity-85 ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
               >
-                {sending ? "发送中" : "群发文本"}
+                {sending ? "发送中" : "底层群发文本"}
               </button>
               <button
                 type="button"
@@ -4369,7 +4369,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
                   dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#1d1d1d] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"
                 }`}
               >
-                普通文本
+                正常群发文本
               </button>
             </div>
           </div>
@@ -4390,7 +4390,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
                 onClick={() => sendImage("nosrc")}
                 className={`h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white active:opacity-85 ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}
               >
-                {sending ? "发送中" : "群发图片"}
+                {sending ? "发送中" : "底层群发图片"}
               </button>
               <button
                 type="button"
@@ -4400,7 +4400,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
                   dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#1d1d1d] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"
                 }`}
               >
-                普通图片
+                正常群发图片
               </button>
             </div>
           </div>
