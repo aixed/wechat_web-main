@@ -527,6 +527,15 @@ async def send_image(wxid: str, picpath: str, diyfilename: str = "", file_data: 
     return safe_json(r)
 
 
+async def send_image_file_no_src(wxid: str, picpath: str, file_data: str | None = None) -> dict:
+    """Send an image through SendImgMsg_NoSrc with picpath/fileData."""
+    if not IS_HOOK:
+        return {"error": "SendImgMsg_NoSrc is only supported in hook mode"}
+    body = _attach_file_data({"wxid": wxid, "picpath": picpath}, "picpath", file_data)
+    r = await _post("/SendImgMsg_NoSrc", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
+    return safe_json(r)
+
+
 def _first_nested_dict(data: dict, *path: str) -> dict:
     cur = data
     for key in path:
@@ -634,6 +643,15 @@ async def send_file(wxid: str, filepath: str, file_data: str | None = None) -> d
             "userName": wxid,
             "filepath": filepath,
         })
+    return safe_json(r)
+
+
+async def send_file_no_src(wxid: str, filepath: str, file_data: str | None = None) -> dict:
+    """Send a file through the lower-level no-source endpoint."""
+    if not IS_HOOK:
+        return {"error": "SendFileMsg_NoSrc is only supported in hook mode"}
+    body = _attach_file_data({"wxid": wxid, "filepath": filepath}, "filepath", file_data)
+    r = await _post("/SendFileMsg_NoSrc", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
     return safe_json(r)
 
 
