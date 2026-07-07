@@ -986,6 +986,7 @@ function formatMsgTypePreview(msgType: string, content: string): string {
       if (content?.includes("<type>33</type>") || content?.includes("<type>36</type>")) return "[小程序]";
       return "[链接/文件]";
     }
+    case "50": return "[语音聊天]";
     case "10000": case "10002": return "[系统消息]";
     case "9994": return "";
     default: return content?.substring(0, 30) || "[消息]";
