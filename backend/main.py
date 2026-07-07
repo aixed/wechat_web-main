@@ -19,6 +19,7 @@ import time
 import httpx
 import base64
 import io
+import shutil
 from typing import Any
 
 import config
@@ -693,6 +694,8 @@ def _format_preview(msg_type: str, content: str) -> str:
         return "[位置]"
     if t == "49":
         return "[链接/文件]"
+    if t == "50":
+        return "[语音聊天]"
     if t in ("10000", "10002"):
         return "[系统消息]"
     return (content or "")[:30] or "[消息]"
@@ -5123,6 +5126,54 @@ def _image_file_response(path: str, msg_id: str = ""):
     return FileResponse(path)
 
 
+def _safe_media_filename_part(value: str, fallback: str = "media", limit: int = 80) -> str:
+    safe = "".join(c if c.isalnum() or c in ("_", "-", ".") else "_" for c in str(value or ""))
+    safe = safe.strip("._")
+    return (safe[:limit] or fallback)
+
+
+def _nonempty_file(path: str) -> bool:
+    try:
+        return bool(path and os.path.isfile(path) and os.path.getsize(path) > 0)
+    except Exception:
+        return False
+
+
+def _extract_download_save_path(result: Any) -> str:
+    """Find savePath/file path returned by the Hook /download API."""
+    stack: list[Any] = [result]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                lowered = str(key).lower()
+                if lowered in {"savepath", "save_path", "filepath", "file_path", "path"}:
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(current)
+    return ""
+
+
+def _cache_downloaded_image_file(source_path: str, cache_path: str) -> str:
+    """Copy a locally accessible Hook download into the backend image cache."""
+    if not _nonempty_file(source_path):
+        return ""
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        source_abs = os.path.abspath(source_path)
+        cache_abs = os.path.abspath(cache_path)
+        if os.path.normcase(source_abs) != os.path.normcase(cache_abs):
+            shutil.copyfile(source_path, cache_path)
+        if _nonempty_file(cache_path):
+            return cache_path
+    except Exception as e:
+        _log(f"[IMG_DL] cache copy failed: {type(e).__name__}: {e}")
+    return source_path
+
+
 # Concurrency control for /DownPic:
 # - Local:  Lock (serialize to protect Hook DLL)
 # - Remote: Semaphore (allow a few concurrent CDN downloads)
@@ -5262,11 +5313,17 @@ async def download_image(request: Request):
 
         if has_cdn_params:
             xml_hash = hashlib.md5((msg_xml or msg_id or "").encode("utf-8", errors="replace")).hexdigest()
-            cache_path = os.path.join(_IMG_CACHE_DIR, f"{xml_hash}.jpg")
+            file_id_hash = hashlib.md5(cdn_params["file_id"].encode("utf-8", errors="replace")).hexdigest()[:12]
+            msg_part = _safe_media_filename_part(str(msg_id or ""), "nomsg", 64)
+            download_filename = f"wximg_{msg_part}_{xml_hash[:12]}_{file_id_hash}.jpg"
+            cache_path = os.path.join(_IMG_CACHE_DIR, "cdn", download_filename)
+            legacy_cache_path = os.path.join(_IMG_CACHE_DIR, f"{xml_hash}.jpg")
+            cache_candidates = (cache_path, legacy_cache_path)
 
             # Already downloaded before?
-            if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-                return _image_file_response(cache_path, msg_id)
+            for cached_path in cache_candidates:
+                if _nonempty_file(cached_path):
+                    return _image_file_response(cached_path, msg_id)
 
             # Also check callback cache by msgsvrid
             if msg_id:
@@ -5293,8 +5350,9 @@ async def download_image(request: Request):
                 except (asyncio.TimeoutError, Exception):
                     pass
                 # Re-check cache after wait
-                if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-                    return _image_file_response(cache_path, msg_id)
+                for cached_path in cache_candidates:
+                    if _nonempty_file(cached_path):
+                        return _image_file_response(cached_path, msg_id)
 
             # ── Start new download (serialized: one CDN download at a time) ──
             loop = asyncio.get_event_loop()
@@ -5319,14 +5377,26 @@ async def download_image(request: Request):
                         cdn_result = await wechat_api.cdn_download_pic(
                             decode_key=cdn_params["decode_key"],
                             file_id=cdn_params["file_id"],
-                            img_filename="down.jpg",
+                            img_filename=download_filename,
                         )
                         _log(f"[IMG_DL] CDN response: {cdn_result}")
+                        save_path = _extract_download_save_path(cdn_result)
+                        ready_path = _cache_downloaded_image_file(save_path, cache_path)
+                        if ready_path:
+                            _log(f"[IMG_DL] ✓ Image ready from /download savePath: {ready_path}")
+                            await _fulfill_cdn_pending(pending_key, ready_path)
+                            if msg_id:
+                                await _fulfill_cdn_pending(f"msgsvrid:{msg_id}", ready_path)
+                            if not inflight_fut.done():
+                                inflight_fut.set_result(ready_path)
                     except Exception as e:
                         _log(f"[IMG_DL] CDN /download error: {e}")
 
-                # Wait for callback to deliver the base64 image (up to 60s)
-                _log(f"[IMG_DL] Waiting for callback (60s)...")
+                # Wait for callback only if /download did not expose a local savePath.
+                if fut.done():
+                    _log(f"[IMG_DL] Image result already fulfilled by /download savePath")
+                else:
+                    _log(f"[IMG_DL] Waiting for callback (60s)...")
                 try:
                     file_path = await asyncio.wait_for(fut, timeout=60.0)
                     _log(f"[IMG_DL] ✓ Image received via callback: {file_path}")
@@ -5354,8 +5424,9 @@ async def download_image(request: Request):
                     cached = os.path.join(cb_dir2, f"{safe_id2}.{ext}")
                     if os.path.exists(cached) and os.path.getsize(cached) > 0:
                         return _image_file_response(cached, msg_id)
-            if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-                return _image_file_response(cache_path, msg_id)
+            for cached_path in cache_candidates:
+                if _nonempty_file(cached_path):
+                    return _image_file_response(cached_path, msg_id)
 
             return {"error": "CDN download timed out — image may still arrive via callback, retry later"}
 

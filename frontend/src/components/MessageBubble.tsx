@@ -51,6 +51,26 @@ function parseLocation(xml: string) {
   }
 }
 
+function parseVoipMessage(xml: string) {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xml || "", "text/xml");
+    const text = doc.getElementsByTagName("msg")[0]?.textContent?.trim() || "";
+    const durationText = doc.getElementsByTagName("duration")[0]?.textContent || "";
+    const duration = Number.parseInt(durationText, 10) || 0;
+    return { text, duration };
+  } catch {
+    return { text: "", duration: 0 };
+  }
+}
+
+function formatVoipDuration(seconds: number): string {
+  if (!seconds || seconds <= 0) return "";
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `Duration: ${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+}
+
 /**
  * Format message time for display above each bubble.
  * Prefers Unix timestamp (seconds) for timezone-correct display.
@@ -487,6 +507,27 @@ export default function MessageBubble({
         } catch {
           return <p className="text-[#888] text-[17px]">[应用消息]</p>;
         }
+      }
+
+      case "50": {
+        const voip = parseVoipMessage(message.msg || "");
+        const label = voip.text || formatVoipDuration(voip.duration) || "语音聊天";
+        return (
+          <div className="flex items-center gap-2 min-w-[120px] max-w-[360px]">
+            <svg
+              className="w-5 h-5 shrink-0"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              viewBox="0 0 24 24"
+            >
+              <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.8 19.8 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.12.91.32 1.8.59 2.65a2 2 0 0 1-.45 2.11L8 9.73a16 16 0 0 0 6.27 6.27l1.25-1.25a2 2 0 0 1 2.11-.45c.85.27 1.74.47 2.65.59A2 2 0 0 1 22 16.92Z" />
+            </svg>
+            <span className="text-[17px] leading-[22px] break-words">{label}</span>
+          </div>
+        );
       }
 
       case "10000":
