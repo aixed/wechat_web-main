@@ -20,6 +20,8 @@ import httpx
 import base64
 import io
 import shutil
+import re
+import html
 from typing import Any
 
 import config
@@ -1226,6 +1228,8 @@ class MultiBroadcastTextRequest(BaseModel):
     target_types: list[str] = []
     mode: str = "nosrc"
     concurrency_limit: int = 0
+    batch_size: int = 100
+    batch_interval: float = 5
 
 
 class MultiBroadcastTargetsRequest(BaseModel):
@@ -3541,6 +3545,8 @@ class BroadcastTextRequest(BaseModel):
     msg: str
     mode: str = "nosrc"
     concurrency_limit: int = 0
+    batch_size: int = 100
+    batch_interval: float = 5
 
 class RevokeRequest(BaseModel):
     msg_svrid: int
@@ -3614,8 +3620,133 @@ def _extract_msg_svr_id(result: dict) -> str:
     return ""
 
 
+def _extract_send_msgsource(result: dict) -> str:
+    if not isinstance(result, dict):
+        return ""
+    for key in ("msgsource", "msgSource", "MsgSource", "msg_source"):
+        value = result.get(key)
+        if value not in (None, ""):
+            return str(value)
+    for key in ("data", "result", "upload", "Data", "Result"):
+        nested = result.get(key)
+        if isinstance(nested, dict):
+            value = _extract_send_msgsource(nested)
+            if value:
+                return value
+    return ""
+
+
+def _broadcast_sender_wxid(agent_id: str = "") -> str:
+    agent = agent_manager.get_agent(agent_id) if agent_id else None
+    wxid = str((agent or {}).get("wxid") or (agent or {}).get("account_id") or "").strip()
+    if wxid and wxid != agent_id and not wxid.startswith("agent:"):
+        return wxid
+    return str(_get_self_wxid() or "").strip()
+
+
+def _build_image_relay_msgsource(msg_svr_id: str, sender_wxid: str, source_msgsource: str) -> str:
+    uuid_match = re.search(r"<uuid>\s*([^<]+?)\s*</uuid>", str(source_msgsource or ""), flags=re.IGNORECASE)
+    uuid = uuid_match.group(1).strip() if uuid_match else ""
+    if not msg_svr_id or not sender_wxid or not uuid:
+        return ""
+    publisher_id = f"msg_{msg_svr_id}|{sender_wxid}|filehelper"
+    return (
+        "<msgsource>\n"
+        "    <tmp_node>\n"
+        f"        <publisher-id>{html.escape(publisher_id, quote=False)}</publisher-id>\n"
+        "    </tmp_node>\n"
+        "    <sec_msg_node>\n"
+        "        <alnode>\n"
+        "            <fr>4</fr>\n"
+        "        </alnode>\n"
+        f"        <uuid>{html.escape(uuid, quote=False)}</uuid>\n"
+        "    </sec_msg_node>\n"
+        "</msgsource>"
+    )
+
+
+async def _bootstrap_broadcast_image_relay(
+    picpath: str,
+    file_hex: str,
+    agent_id: str = "",
+) -> dict:
+    initial_msgsource = "<msgsource><sec_msg_node><alnode><fr>1</fr></alnode></sec_msg_node></msgsource>"
+    try:
+        blob = bytes.fromhex(file_hex) if file_hex else b""
+    except ValueError:
+        blob = b""
+    if not blob:
+        try:
+            with open(picpath, "rb") as source:
+                blob = source.read()
+            file_hex = blob.hex()
+        except Exception as exc:
+            return {"error": f"cannot read bootstrap image: {type(exc).__name__}: {exc}"}
+
+    try:
+        with wechat_api.use_agent(agent_id):
+            result = await wechat_api.send_image_file_no_src(
+                "filehelper", picpath, file_hex, msgsource=initial_msgsource,
+            )
+    except Exception as exc:
+        return {"error": f"filehelper bootstrap failed: {type(exc).__name__}: {exc}"}
+    if not _send_result_ok(result):
+        return {"error": str(result.get("error") or result.get("retmsg") or "filehelper bootstrap failed"), "bootstrap": result}
+
+    msg_svr_id = _extract_msg_svr_id(result)
+    source_msgsource = _extract_send_msgsource(result)
+    sender_wxid = _broadcast_sender_wxid(agent_id)
+    relay_msgsource = _build_image_relay_msgsource(msg_svr_id, sender_wxid, source_msgsource)
+    fields = wechat_api.cdn_fields_from_image_send(result, picpath, blob)
+    if not fields.get("fileid"):
+        return {"error": "filehelper response did not contain upload.fileid", "bootstrap": result}
+    if not relay_msgsource:
+        missing = []
+        if not msg_svr_id:
+            missing.append("MsgSvrID")
+        if not sender_wxid:
+            missing.append("sender wxid")
+        if not re.search(r"<uuid>\s*[^<]+\s*</uuid>", source_msgsource, flags=re.IGNORECASE):
+            missing.append("msgsource.uuid")
+        return {"error": f"filehelper response cannot build msgsource: missing {', '.join(missing)}", "bootstrap": result}
+    fields.update({
+        "relay_msgsource": relay_msgsource,
+        "bootstrap_msgsvrid": msg_svr_id,
+        "bootstrap_msgsource": source_msgsource,
+        "bootstrap_result": result,
+    })
+    return fields
+
+
 def _send_api_parallelism(limit_override: int | None = None) -> int:
     return _hook_api_parallelism(limit_override)
+
+
+def _broadcast_batch_size(value: int | None) -> int:
+    try:
+        return max(1, min(int(value or 100), 10000))
+    except Exception:
+        return 100
+
+
+def _broadcast_batch_interval(value: float | None) -> float:
+    try:
+        return max(0.0, min(float(5 if value is None else value), 3600.0))
+    except Exception:
+        return 5.0
+
+
+async def _gather_broadcast_batches(items: list, send_one, batch_size: int = 100, batch_interval: float = 5) -> list:
+    """Run one account's targets in batches, pausing only between non-empty batches."""
+    size = _broadcast_batch_size(batch_size)
+    interval = _broadcast_batch_interval(batch_interval)
+    results: list = []
+    for offset in range(0, len(items), size):
+        batch = items[offset:offset + size]
+        results.extend(await asyncio.gather(*(send_one(item) for item in batch)))
+        if offset + size < len(items) and interval > 0:
+            await asyncio.sleep(interval)
+    return results
 
 
 def _track_background_send(task: asyncio.Task, label: str) -> None:
@@ -3848,7 +3979,7 @@ async def broadcast_text(req: BroadcastTextRequest):
             except Exception as e:
                 return {"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    results = await asyncio.gather(*(_send_one(wxid) for wxid in wxids)) if wxids else []
+    results = await _gather_broadcast_batches(wxids, _send_one, req.batch_size, req.batch_interval) if wxids else []
     sent = sum(1 for row in results if row.get("ok"))
     failed = len(results) - sent
     return {"total": len(wxids), "sent": sent, "failed": failed, "results": results}
@@ -3860,22 +3991,29 @@ async def _broadcast_image_to_targets(
     image_extra: dict,
     agent_id: str = "",
     concurrency_limit: int = 0,
+    batch_size: int = 100,
+    batch_interval: float = 5,
 ) -> list[dict]:
     sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
     async def _send_one(wxid: str) -> dict:
         async with sem:
             try:
+                if wxid == "filehelper" and isinstance(cdn.get("bootstrap_result"), dict):
+                    return {
+                        "wxid": wxid, "ok": True, "result": cdn["bootstrap_result"],
+                        "bootstrap": True, "source_msgsvrid": cdn.get("bootstrap_msgsvrid", ""),
+                    }
                 with wechat_api.use_agent(agent_id):
-                    result = await wechat_api.send_image_no_src(wxid, cdn)
+                    result = await wechat_api.send_image_no_src(wxid, cdn, str(cdn.get("relay_msgsource") or ""))
                 ok = _send_result_ok(result)
                 if ok:
                     await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", image_extra)
-                return {"wxid": wxid, "ok": ok, "result": result}
+                return {"wxid": wxid, "ok": ok, "result": result, "source_msgsvrid": cdn.get("bootstrap_msgsvrid", "")}
             except Exception as e:
                 return {"wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    return await asyncio.gather(*(_send_one(wxid) for wxid in target_wxids)) if target_wxids else []
+    return await _gather_broadcast_batches(target_wxids, _send_one, batch_size, batch_interval) if target_wxids else []
 
 
 async def _send_image_file_no_src_to_target(
@@ -3915,6 +4053,8 @@ async def _send_image_file_no_src_to_targets(
     image_extra: dict,
     agent_id: str = "",
     concurrency_limit: int = 0,
+    batch_size: int = 100,
+    batch_interval: float = 5,
 ) -> list[dict]:
     sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
@@ -3922,7 +4062,7 @@ async def _send_image_file_no_src_to_targets(
         async with sem:
             return await _send_image_file_no_src_to_target(wxid, picpath, file_hex, image_extra, agent_id)
 
-    return await asyncio.gather(*(_send_one(wxid) for wxid in target_wxids)) if target_wxids else []
+    return await _gather_broadcast_batches(target_wxids, _send_one, batch_size, batch_interval) if target_wxids else []
 
 
 async def _send_file_no_src_to_target(
@@ -3962,6 +4102,8 @@ async def _send_file_no_src_to_targets(
     file_extra: dict,
     agent_id: str = "",
     concurrency_limit: int = 0,
+    batch_size: int = 100,
+    batch_interval: float = 5,
 ) -> list[dict]:
     sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
@@ -3969,7 +4111,7 @@ async def _send_file_no_src_to_targets(
         async with sem:
             return await _send_file_no_src_to_target(wxid, filepath, file_hex, file_extra, agent_id)
 
-    return await asyncio.gather(*(_send_one(wxid) for wxid in target_wxids)) if target_wxids else []
+    return await _gather_broadcast_batches(target_wxids, _send_one, batch_size, batch_interval) if target_wxids else []
 
 
 @app.post("/api/broadcast/image-upload")
@@ -3977,6 +4119,8 @@ async def broadcast_image_upload(
     wxids: str = Form(...),
     mode: str = Form("nosrc"),
     concurrency_limit: int = Form(0),
+    batch_size: int = Form(100),
+    batch_interval: float = Form(5),
     file: UploadFile = File(...),
 ):
     """Broadcast an uploaded image through NoSrc CDN or normal SendPicMsg(fileData)."""
@@ -4005,6 +4149,8 @@ async def broadcast_image_upload(
             {"db_image_id": db_image_id, "img_path": filepath},
             agent_id,
             concurrency_limit,
+            batch_size,
+            batch_interval,
         )
         sent = sum(1 for row in results if row.get("ok"))
         failed = len(results) - sent
@@ -4045,8 +4191,15 @@ async def broadcast_image_upload(
     except Exception as e:
         _log(f"[BROADCAST] Image compression skipped: {e}")
 
-    with wechat_api.use_agent(agent_id):
-        cdn = await wechat_api.cdn_upload_image(send_path, target_wxids[0])
+    try:
+        with open(send_path, "rb") as relay_file:
+            relay_data = relay_file.read()
+    except Exception as exc:
+        return {
+            "total": len(target_wxids), "sent": 0, "failed": len(target_wxids),
+            "results": [{"wxid": wxid, "ok": False, "error": f"cannot read relay image: {exc}"} for wxid in target_wxids],
+        }
+    cdn = await _bootstrap_broadcast_image_relay(send_path, relay_data.hex(), agent_id)
     if cdn.get("error"):
         return {
             "total": len(target_wxids),
@@ -4056,7 +4209,9 @@ async def broadcast_image_upload(
             "cdn": {k: cdn.get(k) for k in _BROADCAST_IMG_CDN_KEYS},
         }
 
-    results = await _broadcast_image_to_targets(target_wxids, cdn, {"img_path": filepath}, agent_id, concurrency_limit)
+    results = await _broadcast_image_to_targets(
+        target_wxids, cdn, {"img_path": filepath}, agent_id, concurrency_limit, batch_size, batch_interval,
+    )
     sent = sum(1 for row in results if row.get("ok"))
     failed = len(results) - sent
 
@@ -4073,6 +4228,8 @@ async def broadcast_image_upload(
 async def broadcast_file_upload(
     wxids: str = Form(...),
     concurrency_limit: int = Form(0),
+    batch_size: int = Form(100),
+    batch_interval: float = Form(5),
     file: UploadFile = File(...),
 ):
     try:
@@ -4099,6 +4256,8 @@ async def broadcast_file_upload(
         {"file_path": filepath, "file_name": safe_name, "file_size": len(data)},
         agent_id,
         concurrency_limit,
+        batch_size,
+        batch_interval,
     )
     sent = sum(1 for row in results if row.get("ok"))
     failed = len(results) - sent
@@ -4110,6 +4269,179 @@ async def broadcast_file_upload(
         "mode": "normal",
         "strategy": "direct_nosrc",
     }
+
+
+def _mixed_content_order(order: str, has_text: bool, attachment_parts: list[dict]) -> list[dict]:
+    """Build one recipient's sequence. Text is first unless explicitly configured otherwise."""
+    text_part = [{"type": "text"}] if has_text else []
+    if str(order or "").strip().lower() in {"attachment_first", "media_first", "image_first", "file_first"}:
+        return [*attachment_parts, *text_part]
+    return [*text_part, *attachment_parts]
+
+
+async def _store_mixed_uploads(images: list[UploadFile], attachment: UploadFile | None) -> tuple[list[dict], dict | None]:
+    stamp = int(time.time() * 1000)
+    image_parts: list[dict] = []
+    for index, upload in enumerate(images):
+        data = await upload.read()
+        original_name = os.path.basename(upload.filename or f"image_{index + 1}.png") or f"image_{index + 1}.png"
+        ext = os.path.splitext(original_name)[1] or ".png"
+        filepath = os.path.join(_UPLOAD_DIR, f"mixed_{stamp}_{index + 1}{ext}")
+        with open(filepath, "wb") as output:
+            output.write(data)
+        image_parts.append({
+            "type": "image",
+            "path": filepath,
+            "name": original_name,
+            "data": data,
+            "hex": data.hex(),
+            "mime": upload.content_type or "image/*",
+        })
+
+    file_part: dict | None = None
+    if attachment is not None and attachment.filename:
+        data = await attachment.read()
+        safe_name = os.path.basename(attachment.filename).replace("\\", "_").replace("/", "_") or "file"
+        upload_dir = os.path.join(_UPLOAD_DIR, f"mixed_file_{stamp}")
+        os.makedirs(upload_dir, exist_ok=True)
+        filepath = os.path.join(upload_dir, safe_name)
+        with open(filepath, "wb") as output:
+            output.write(data)
+        file_part = {
+            "type": "file",
+            "path": filepath,
+            "name": safe_name,
+            "data": data,
+            "hex": data.hex(),
+            "size": len(data),
+        }
+    return image_parts, file_part
+
+
+async def _prepare_mixed_parts_for_agent(
+    agent_id: str,
+    first_wxid: str,
+    image_parts: list[dict],
+    file_part: dict | None,
+    normal_mode: bool,
+) -> list[dict]:
+    prepared: list[dict] = []
+    for image_part in image_parts:
+        db_image_id = sqlite_cache.put_media_blob(image_part["data"], image_part["mime"], image_part["name"])
+        item = {**image_part, "db_image_id": db_image_id}
+        if not normal_mode:
+            try:
+                cdn = await _bootstrap_broadcast_image_relay(item["path"], item["hex"], agent_id)
+                if cdn.get("error"):
+                    item["prepare_error"] = str(cdn["error"])
+                else:
+                    item["cdn"] = {key: cdn[key] for key in _BROADCAST_IMG_CDN_KEYS if key in cdn}
+                    item["cdn"]["relay_msgsource"] = cdn["relay_msgsource"]
+                    item["bootstrap_msgsvrid"] = cdn["bootstrap_msgsvrid"]
+                    item["bootstrap_result"] = cdn["bootstrap_result"]
+            except Exception as exc:
+                item["prepare_error"] = f"{type(exc).__name__}: {exc}"
+        prepared.append(item)
+    if file_part:
+        prepared.append(file_part)
+    return prepared
+
+
+async def _send_mixed_to_target(
+    agent_id: str,
+    wxid: str,
+    message: str,
+    parts: list[dict],
+    normal_mode: bool,
+) -> dict:
+    part_results: list[dict] = []
+    try:
+        for part in parts:
+            part_type = part["type"]
+            if part_type == "text":
+                with wechat_api.use_agent(agent_id):
+                    result = await (wechat_api.send_text(wxid, message) if normal_mode else wechat_api.send_text_no_src(wxid, message))
+                ok = _send_result_ok(result)
+                if ok:
+                    await _broadcast_local_sent_for_agent(agent_id, wxid, "1", message)
+            elif part_type == "image":
+                if part.get("prepare_error"):
+                    raise RuntimeError(part["prepare_error"])
+                if not normal_mode and wxid == "filehelper" and isinstance(part.get("bootstrap_result"), dict):
+                    result = part["bootstrap_result"]
+                    ok = True
+                elif normal_mode:
+                    row = await _send_image_file_no_src_to_target(
+                        wxid, part["path"], part["hex"], {"db_image_id": part["db_image_id"]}, agent_id,
+                    )
+                    ok, result = bool(row.get("ok")), row.get("result", row.get("error"))
+                else:
+                    with wechat_api.use_agent(agent_id):
+                        result = await wechat_api.send_image_no_src(
+                            wxid, part["cdn"], str(part["cdn"].get("relay_msgsource") or ""),
+                        )
+                    ok = _send_result_ok(result)
+                    if ok:
+                        await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", {"db_image_id": part["db_image_id"]})
+            else:
+                row = await _send_file_no_src_to_target(
+                    wxid,
+                    part["path"],
+                    part["hex"],
+                    {"file_path": part["path"], "file_name": part["name"], "file_size": part["size"]},
+                    agent_id,
+                )
+                ok, result = bool(row.get("ok")), row.get("result", row.get("error"))
+
+            part_results.append({"type": part_type, "ok": ok, "result": result})
+            if not ok:
+                return {"agent_id": agent_id, "wxid": wxid, "ok": False, "parts": part_results}
+        return {"agent_id": agent_id, "wxid": wxid, "ok": True, "parts": part_results}
+    except Exception as exc:
+        return {
+            "agent_id": agent_id,
+            "wxid": wxid,
+            "ok": False,
+            "parts": part_results,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+@app.post("/api/broadcast/mixed-upload")
+async def broadcast_mixed_upload(
+    wxids: str = Form(...),
+    msg: str = Form(""),
+    order: str = Form("text_first"),
+    mode: str = Form("nosrc"),
+    concurrency_limit: int = Form(0),
+    batch_size: int = Form(100),
+    batch_interval: float = Form(5),
+    images: list[UploadFile] = File(default=[]),
+    attachment: UploadFile | None = File(default=None),
+):
+    """Send every recipient's complete mixed payload before moving that worker to another recipient."""
+    try:
+        target_wxids = _dedupe_targets(json.loads(wxids))
+    except Exception:
+        target_wxids = _dedupe_targets(str(wxids or "").split(","))
+    message = str(msg or "").strip()
+    image_parts, file_part = await _store_mixed_uploads(images, attachment)
+    if not target_wxids or (not message and not image_parts and not file_part):
+        return {"total": len(target_wxids), "sent": 0, "failed": 0, "results": [], "error": "no targets or content"}
+
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    normal_mode = str(mode or "").lower() in {"normal", "src", "regular"}
+    attachments = await _prepare_mixed_parts_for_agent(agent_id, target_wxids[0], image_parts, file_part, normal_mode)
+    parts = _mixed_content_order(order, bool(message), attachments)
+    sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
+
+    async def send_one(wxid: str) -> dict:
+        async with sem:
+            return await _send_mixed_to_target(agent_id, wxid, message, parts, normal_mode)
+
+    results = await _gather_broadcast_batches(target_wxids, send_one, batch_size, batch_interval)
+    sent = sum(1 for row in results if row.get("ok"))
+    return {"total": len(results), "sent": sent, "failed": len(results) - sent, "results": results, "order": order, "mode": mode}
 
 
 def _normalize_broadcast_target_types(raw_types) -> set[str]:
@@ -4419,8 +4751,22 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
             except Exception as e:
                 return {"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    results = await asyncio.gather(*(_send_one(agent_id, wxid) for agent_id, wxid in work_items)) if work_items else []
-    results = skipped_results + results
+    work_by_agent: dict[str, list[str]] = {}
+    for agent_id, wxid in work_items:
+        work_by_agent.setdefault(agent_id, []).append(wxid)
+
+    async def _send_agent(agent_id: str, targets: list[str]) -> list[dict]:
+        return await _gather_broadcast_batches(
+            targets,
+            lambda wxid: _send_one(agent_id, wxid),
+            req.batch_size,
+            req.batch_interval,
+        )
+
+    account_results = await asyncio.gather(*(
+        _send_agent(agent_id, targets) for agent_id, targets in work_by_agent.items()
+    )) if work_by_agent else []
+    results = skipped_results + [row for rows in account_results for row in rows]
     sent = sum(1 for row in results if row.get("ok"))
     failed = len(results) - sent
 
@@ -4436,6 +4782,93 @@ async def multi_account_broadcast_text(req: MultiBroadcastTextRequest):
     }
 
 
+@app.post("/api/accounts/broadcast/mixed-upload")
+async def multi_account_broadcast_mixed_upload(
+    wxids: str = Form("[]"),
+    agent_ids: str = Form("[]"),
+    target_types: str = Form("[]"),
+    msg: str = Form(""),
+    order: str = Form("text_first"),
+    mode: str = Form("nosrc"),
+    concurrency_limit: int = Form(0),
+    batch_size: int = Form(100),
+    batch_interval: float = Form(5),
+    images: list[UploadFile] = File(default=[]),
+    attachment: UploadFile | None = File(default=None),
+):
+    try:
+        direct_targets = _dedupe_targets(json.loads(wxids or "[]"))
+    except Exception:
+        direct_targets = _dedupe_targets(str(wxids or "").split(","))
+    try:
+        requested_agents = [value for value in json.loads(agent_ids or "[]") if value]
+    except Exception:
+        requested_agents = [value.strip() for value in str(agent_ids or "").split(",") if value.strip()]
+    try:
+        parsed_target_types = _normalize_broadcast_target_types(json.loads(target_types or "[]"))
+    except Exception:
+        parsed_target_types = _normalize_broadcast_target_types(str(target_types or "").split(","))
+
+    selected_agents, work_items, account_targets, account_counts, skipped_results = await _prepare_multi_account_targets(
+        requested_agents, direct_targets, parsed_target_types,
+    )
+    message = str(msg or "").strip()
+    image_parts, file_part = await _store_mixed_uploads(images, attachment)
+    if not work_items or (not message and not image_parts and not file_part):
+        return {
+            "accounts": len(selected_agents), "targets": len(work_items), "total": len(work_items),
+            "sent": 0, "failed": len(skipped_results), "results": skipped_results,
+            "account_targets": account_targets, "account_counts": account_counts,
+            "error": "no targets or content",
+        }
+
+    normal_mode = str(mode or "").lower() in {"normal", "src", "regular"}
+    work_by_agent: dict[str, list[str]] = {}
+    for agent_id, wxid in work_items:
+        work_by_agent.setdefault(agent_id, []).append(wxid)
+
+    results = list(skipped_results)
+    for agent_id in selected_agents:
+        targets = work_by_agent.get(agent_id, [])
+        if not targets:
+            continue
+        async with _ACCOUNT_LOCK:
+            await agent_manager.set_active(agent_id)
+            _activate_runtime(agent_id)
+        attachments = await _prepare_mixed_parts_for_agent(agent_id, targets[0], image_parts, file_part, normal_mode)
+        parts = _mixed_content_order(order, bool(message), attachments)
+        sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
+
+        async def send_one(wxid: str) -> dict:
+            async with sem:
+                return await _send_mixed_to_target(agent_id, wxid, message, parts, normal_mode)
+
+        results.extend(await _gather_broadcast_batches(targets, send_one, batch_size, batch_interval))
+
+    sent = sum(1 for row in results if row.get("ok"))
+    failed = len(results) - sent
+    completed_counts: dict[str, dict] = {key: dict(value) for key, value in account_counts.items()}
+    for row in results:
+        row_agent = str(row.get("agent_id") or "")
+        if not row_agent:
+            continue
+        counts = completed_counts.setdefault(row_agent, {**_empty_contact_counts(), "targets": account_targets.get(row_agent, 0)})
+        bucket = "sent" if row.get("ok") else "failed"
+        counts[bucket] = int(counts.get(bucket) or 0) + 1
+    return {
+        "accounts": len(selected_agents),
+        "targets": len(work_items),
+        "account_targets": account_targets,
+        "account_counts": completed_counts,
+        "total": len(work_items),
+        "sent": sent,
+        "failed": failed,
+        "results": results,
+        "order": order,
+        "mode": mode,
+    }
+
+
 @app.post("/api/accounts/broadcast/image-upload")
 async def multi_account_broadcast_image_upload(
     wxids: str = Form("[]"),
@@ -4443,6 +4876,8 @@ async def multi_account_broadcast_image_upload(
     target_types: str = Form("[]"),
     mode: str = Form("nosrc"),
     concurrency_limit: int = Form(0),
+    batch_size: int = Form(100),
+    batch_interval: float = Form(5),
     file: UploadFile = File(...),
 ):
     try:
@@ -4518,16 +4953,18 @@ async def multi_account_broadcast_image_upload(
                 {"db_image_id": db_image_id},
                 agent_id,
                 concurrency_limit,
+                batch_size,
+                batch_interval,
             )
             sent += sum(1 for row in send_results if row.get("ok"))
             failed += sum(1 for row in send_results if not row.get("ok"))
             results.extend(send_results)
             continue
+        try:
+            cdn = await _bootstrap_broadcast_image_relay(upload_name, file_hex, agent_id)
+        except Exception as e:
+            cdn = {"error": f"{type(e).__name__}: {e}"}
         with wechat_api.use_agent(agent_id):
-            try:
-                cdn = await wechat_api.cdn_upload_image(upload_name, agent_targets[0], file_data=file_hex)
-            except Exception as e:
-                cdn = {"error": f"{type(e).__name__}: {e}"}
             if cdn.get("error"):
                 failed += len(agent_targets)
                 for wxid in agent_targets:
@@ -4538,16 +4975,27 @@ async def multi_account_broadcast_image_upload(
             async def _send_one(wxid: str) -> dict:
                 async with sem:
                     try:
+                        if wxid == "filehelper" and isinstance(cdn.get("bootstrap_result"), dict):
+                            return {
+                                "agent_id": agent_id, "wxid": wxid, "ok": True,
+                                "result": cdn["bootstrap_result"], "bootstrap": True,
+                                "source_msgsvrid": cdn.get("bootstrap_msgsvrid", ""),
+                            }
                         with wechat_api.use_agent(agent_id):
-                            result = await wechat_api.send_image_no_src(wxid, cdn)
+                            result = await wechat_api.send_image_no_src(
+                                wxid, cdn, str(cdn.get("relay_msgsource") or ""),
+                            )
                         ok = _send_result_ok(result)
                         if ok:
                             await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", {"db_image_id": db_image_id})
-                        return {"agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result}
+                        return {
+                            "agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result,
+                            "source_msgsvrid": cdn.get("bootstrap_msgsvrid", ""),
+                        }
                     except Exception as e:
                         return {"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
-            send_results = await asyncio.gather(*(_send_one(wxid) for wxid in agent_targets))
+            send_results = await _gather_broadcast_batches(agent_targets, _send_one, batch_size, batch_interval)
             sent += sum(1 for row in send_results if row.get("ok"))
             failed += sum(1 for row in send_results if not row.get("ok"))
             results.extend(send_results)
@@ -4571,6 +5019,8 @@ async def multi_account_broadcast_image_upload_stream(
     target_types: str = Form("[]"),
     mode: str = Form("nosrc"),
     concurrency_limit: int = Form(0),
+    batch_size: int = Form(100),
+    batch_interval: float = Form(5),
     file: UploadFile = File(...),
 ):
     try:
@@ -4709,45 +5159,70 @@ async def multi_account_broadcast_image_upload_stream(
                     async with sem:
                         return await _send_image_file_no_src_to_target(wxid, upload_name, file_hex, {"db_image_id": db_image_id}, agent_id)
 
-                tasks = [asyncio.create_task(_send_normal(wxid)) for wxid in agent_targets]
-                for task in asyncio.as_completed(tasks):
-                    row = await task
-                    record_result(row)
-                    yield line(snapshot("progress", row=row))
+                size = _broadcast_batch_size(batch_size)
+                interval = _broadcast_batch_interval(batch_interval)
+                for offset in range(0, len(agent_targets), size):
+                    batch = agent_targets[offset:offset + size]
+                    tasks = [asyncio.create_task(_send_normal(wxid)) for wxid in batch]
+                    for task in asyncio.as_completed(tasks):
+                        row = await task
+                        record_result(row)
+                        yield line(snapshot("progress", row=row))
+                    if offset + size < len(agent_targets) and interval > 0:
+                        await asyncio.sleep(interval)
                 continue
 
+            try:
+                cdn = await _bootstrap_broadcast_image_relay(upload_name, file_hex, agent_id)
+            except Exception as e:
+                cdn = {"error": f"{type(e).__name__}: {e}"}
             with wechat_api.use_agent(agent_id):
-                try:
-                    cdn = await wechat_api.cdn_upload_image(upload_name, agent_targets[0], file_data=file_hex)
-                except Exception as e:
-                    cdn = {"error": f"{type(e).__name__}: {e}"}
                 if cdn.get("error"):
                     for wxid in agent_targets:
                         row = {"agent_id": agent_id, "wxid": wxid, "ok": False, "error": cdn["error"]}
                         record_result(row)
                         yield line(snapshot("progress", row=row))
                     continue
+                relay_msgsource = str(cdn.get("relay_msgsource") or "")
+                bootstrap_result = cdn.get("bootstrap_result")
+                bootstrap_msgsvrid = str(cdn.get("bootstrap_msgsvrid") or "")
                 cdn = {k: cdn[k] for k in _BROADCAST_IMG_CDN_KEYS if k in cdn}
+                cdn["relay_msgsource"] = relay_msgsource
                 cdn["toWxid"] = agent_targets[0]
                 sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
                 async def _send_one(wxid: str) -> dict:
                     async with sem:
                         try:
+                            if wxid == "filehelper" and isinstance(bootstrap_result, dict):
+                                return {
+                                    "agent_id": agent_id, "wxid": wxid, "ok": True,
+                                    "result": bootstrap_result, "bootstrap": True,
+                                    "source_msgsvrid": bootstrap_msgsvrid,
+                                }
                             with wechat_api.use_agent(agent_id):
-                                result = await wechat_api.send_image_no_src(wxid, cdn)
+                                result = await wechat_api.send_image_no_src(wxid, cdn, relay_msgsource)
                             ok = _send_result_ok(result)
                             if ok:
                                 await _broadcast_local_sent_for_agent(agent_id, wxid, "3", "", {"db_image_id": db_image_id})
-                            return {"agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result}
+                            return {
+                                "agent_id": agent_id, "wxid": wxid, "ok": ok, "result": result,
+                                "source_msgsvrid": bootstrap_msgsvrid,
+                            }
                         except Exception as e:
                             return {"agent_id": agent_id, "wxid": wxid, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
-                tasks = [asyncio.create_task(_send_one(wxid)) for wxid in agent_targets]
-                for task in asyncio.as_completed(tasks):
-                    row = await task
-                    record_result(row)
-                    yield line(snapshot("progress", row=row))
+                size = _broadcast_batch_size(batch_size)
+                interval = _broadcast_batch_interval(batch_interval)
+                for offset in range(0, len(agent_targets), size):
+                    batch = agent_targets[offset:offset + size]
+                    tasks = [asyncio.create_task(_send_one(wxid)) for wxid in batch]
+                    for task in asyncio.as_completed(tasks):
+                        row = await task
+                        record_result(row)
+                        yield line(snapshot("progress", row=row))
+                    if offset + size < len(agent_targets) and interval > 0:
+                        await asyncio.sleep(interval)
 
         yield line(snapshot("done", results=results))
 
@@ -4760,6 +5235,8 @@ async def multi_account_broadcast_file_upload_stream(
     agent_ids: str = Form("[]"),
     target_types: str = Form("[]"),
     concurrency_limit: int = Form(0),
+    batch_size: int = Form(100),
+    batch_interval: float = Form(5),
     file: UploadFile = File(...),
 ):
     try:
@@ -4879,11 +5356,17 @@ async def multi_account_broadcast_file_upload_stream(
                 async with sem:
                     return await _send_file_no_src_to_target(wxid, filepath, file_hex, file_extra, agent_id)
 
-            tasks = [asyncio.create_task(_send_normal(wxid)) for wxid in agent_targets]
-            for task in asyncio.as_completed(tasks):
-                row = await task
-                record_result(row)
-                yield line(snapshot("progress", row=row))
+            size = _broadcast_batch_size(batch_size)
+            interval = _broadcast_batch_interval(batch_interval)
+            for offset in range(0, len(agent_targets), size):
+                batch = agent_targets[offset:offset + size]
+                tasks = [asyncio.create_task(_send_normal(wxid)) for wxid in batch]
+                for task in asyncio.as_completed(tasks):
+                    row = await task
+                    record_result(row)
+                    yield line(snapshot("progress", row=row))
+                if offset + size < len(agent_targets) and interval > 0:
+                    await asyncio.sleep(interval)
 
         yield line(snapshot("done", results=results, file_name=safe_name, file_size=len(data)))
 
