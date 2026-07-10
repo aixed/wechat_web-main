@@ -5,9 +5,7 @@ import ChatArea from "./components/ChatArea";
 import {
   activateAccount,
   batchGetContactBrief,
-  broadcastFileUpload,
-  broadcastImageUpload,
-  broadcastText,
+  broadcastMixedUpload,
   clearActiveAgentId,
   clearAccessKey,
   getActiveAgentId,
@@ -23,6 +21,7 @@ import {
   markSessionUnread,
   multiAccountBroadcastFileUploadStream,
   multiAccountBroadcastImageUploadStream,
+  multiAccountBroadcastMixedUpload,
   multiAccountBroadcastText,
   muteSession,
   refreshContacts,
@@ -33,6 +32,7 @@ import {
   unmuteSession,
   unpinChat,
 } from "./api";
+import type { BroadcastContentOrder } from "./api";
 import type { ContactProfile, Session, ChatMessage, WSMessage, WeChatAccount } from "./types";
 import { replaceWechatEmojis } from "./utils/wechatEmoji";
 
@@ -152,6 +152,18 @@ function normalizeConcurrencyLimit(value: number | string): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 10;
   return Math.min(100, Math.max(1, Math.trunc(parsed)));
+}
+
+function normalizeBatchSize(value: number | string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 100;
+  return Math.min(10000, Math.max(1, Math.trunc(parsed)));
+}
+
+function normalizeBatchInterval(value: number | string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 5;
+  return Math.min(3600, Math.max(0, Math.round(parsed * 10) / 10));
 }
 
 function useIsMobileViewport() {
@@ -3307,6 +3319,9 @@ function MobileMultiAccountBroadcastPage({
   const [resultText, setResultText] = useState("");
   const [progress, setProgress] = useState<BroadcastProgressState>({ total: 0, sent: 0, failed: 0, accountCounts: {} });
   const [concurrencyLimit, setConcurrencyLimit] = useState(10);
+  const [batchSize, setBatchSize] = useState(100);
+  const [batchInterval, setBatchInterval] = useState(5);
+  const [contentOrder, setContentOrder] = useState<BroadcastContentOrder>("text_first");
 
   useEffect(() => {
     const validIds = new Set(accounts.map((a) => a.id).filter(Boolean));
@@ -3399,7 +3414,7 @@ function MobileMultiAccountBroadcastPage({
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode, concurrencyLimit);
+      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode, concurrencyLimit, batchSize, batchInterval);
       updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "正常群发文本" : "底层群发文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
@@ -3414,7 +3429,7 @@ function MobileMultiAccountBroadcastPage({
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastImageUploadStream(agentIds, selectedTargetTypes, image, mode, concurrencyLimit, updateProgressFromPayload);
+      const res = await multiAccountBroadcastImageUploadStream(agentIds, selectedTargetTypes, image, mode, concurrencyLimit, updateProgressFromPayload, batchSize, batchInterval);
       if (res?.account_counts) updateProgressFromPayload(res);
       else updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "正常群发图片" : "底层群发图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
@@ -3430,10 +3445,27 @@ function MobileMultiAccountBroadcastPage({
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastFileUploadStream(agentIds, selectedTargetTypes, file, concurrencyLimit, updateProgressFromPayload);
+      const res = await multiAccountBroadcastFileUploadStream(agentIds, selectedTargetTypes, file, concurrencyLimit, updateProgressFromPayload, batchSize, batchInterval);
       if (res?.account_counts) updateProgressFromPayload(res);
       else updateProgressFromResult(res);
       setResultText(`正常群发文件完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const sendMixedBroadcast = async (mode = "nosrc") => {
+    if ((!message.trim() && !image && !file) || agentIds.length === 0 || selectedTargetTypes.length === 0 || sending) return;
+    setSending(true);
+    setResultText("");
+    setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
+    try {
+      await prepareProgress();
+      const res = await multiAccountBroadcastMixedUpload(
+        agentIds, selectedTargetTypes, message.trim(), image ? [image] : [], file, contentOrder, mode, concurrencyLimit, batchSize, batchInterval,
+      );
+      updateProgressFromResult(res);
+      setResultText(`${mode === "normal" ? "正常混合群发" : "底层混合群发"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -3523,6 +3555,15 @@ function MobileMultiAccountBroadcastPage({
           />
         </div>
 
+        <BroadcastBatchControls
+          dark={dark}
+          batchSize={batchSize}
+          batchInterval={batchInterval}
+          onBatchSizeChange={setBatchSize}
+          onBatchIntervalChange={setBatchInterval}
+          className={`mt-[12px] rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}
+        />
+
         <div className={`mt-[12px] rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
           <div className="text-[15px] font-medium mb-[10px]">文本消息</div>
           <textarea
@@ -3603,6 +3644,28 @@ function MobileMultiAccountBroadcastPage({
               className={`w-full h-[42px] rounded-[10px] border ${dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:bg-[#242424] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:border-[#d8d8d8] disabled:text-[#aaa]"}`}
             >
               {sending ? "发送中" : "正常群发文件"}
+            </button>
+          </div>
+        </div>
+
+        <div className={`mt-[12px] rounded-[14px] p-[12px] ${dark ? "bg-[#1b1b1b]" : "bg-white"}`}>
+          <div className="text-[15px] font-medium">混合群发</div>
+          <div className="mt-[10px] flex flex-wrap gap-[16px] text-[14px]">
+            <label className="flex items-center gap-[6px]">
+              <input type="radio" name="mobile-mixed-order" checked={contentOrder === "text_first"} onChange={() => setContentOrder("text_first")} className="accent-[#07c160]" />
+              先文后{image && !file ? "图" : file && !image ? "文件" : "附件"}
+            </label>
+            <label className="flex items-center gap-[6px]">
+              <input type="radio" name="mobile-mixed-order" checked={contentOrder === "attachment_first"} onChange={() => setContentOrder("attachment_first")} className="accent-[#07c160]" />
+              先{image && !file ? "图" : file && !image ? "文件" : "附件"}后文
+            </label>
+          </div>
+          <div className="mt-[10px] grid grid-cols-2 gap-[8px]">
+            <button type="button" disabled={sending || (!message.trim() && !image && !file) || agentIds.length === 0 || selectedTargetTypes.length === 0} onClick={() => sendMixedBroadcast("nosrc")} className={`h-[42px] rounded-[10px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}>
+              {sending ? "发送中" : "底层混合群发"}
+            </button>
+            <button type="button" disabled={sending || (!message.trim() && !image && !file) || agentIds.length === 0 || selectedTargetTypes.length === 0} onClick={() => sendMixedBroadcast("normal")} className={`h-[42px] rounded-[10px] border ${dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:text-[#666]" : "border-[#07c160] text-[#07a854] disabled:text-[#aaa]"}`}>
+              正常混合群发
             </button>
           </div>
         </div>
@@ -4170,6 +4233,9 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
   const [resultText, setResultText] = useState("");
   const [progress, setProgress] = useState<BroadcastProgressState>({ total: 0, sent: 0, failed: 0, accountCounts: {} });
   const [concurrencyLimit, setConcurrencyLimit] = useState(10);
+  const [batchSize, setBatchSize] = useState(100);
+  const [batchInterval, setBatchInterval] = useState(5);
+  const [contentOrder, setContentOrder] = useState<BroadcastContentOrder>("text_first");
 
   useEffect(() => {
     const validIds = new Set(accounts.map((a) => a.id).filter(Boolean));
@@ -4258,7 +4324,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode, concurrencyLimit);
+      const res = await multiAccountBroadcastText(agentIds, selectedTargetTypes, message.trim(), mode, concurrencyLimit, batchSize, batchInterval);
       updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "正常群发文本" : "底层群发文本"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
@@ -4273,7 +4339,7 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastImageUploadStream(agentIds, selectedTargetTypes, image, mode, concurrencyLimit, updateProgressFromPayload);
+      const res = await multiAccountBroadcastImageUploadStream(agentIds, selectedTargetTypes, image, mode, concurrencyLimit, updateProgressFromPayload, batchSize, batchInterval);
       if (res?.account_counts) updateProgressFromPayload(res);
       else updateProgressFromResult(res);
       setResultText(`${mode === "normal" ? "正常群发图片" : "底层群发图片"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
@@ -4289,10 +4355,27 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
     setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
     try {
       await prepareProgress();
-      const res = await multiAccountBroadcastFileUploadStream(agentIds, selectedTargetTypes, file, concurrencyLimit, updateProgressFromPayload);
+      const res = await multiAccountBroadcastFileUploadStream(agentIds, selectedTargetTypes, file, concurrencyLimit, updateProgressFromPayload, batchSize, batchInterval);
       if (res?.account_counts) updateProgressFromPayload(res);
       else updateProgressFromResult(res);
       setResultText(`正常群发文件完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const sendMixedBroadcast = async (mode = "nosrc") => {
+    if ((!message.trim() && !image && !file) || selectedTargetTypes.length === 0 || agentIds.length === 0 || sending) return;
+    setSending(true);
+    setResultText("");
+    setProgress({ total: 0, sent: 0, failed: 0, accountCounts: {} });
+    try {
+      await prepareProgress();
+      const res = await multiAccountBroadcastMixedUpload(
+        agentIds, selectedTargetTypes, message.trim(), image ? [image] : [], file, contentOrder, mode, concurrencyLimit, batchSize, batchInterval,
+      );
+      updateProgressFromResult(res);
+      setResultText(`${mode === "normal" ? "正常混合群发" : "底层混合群发"}完成：成功 ${res?.sent || 0}，失败 ${res?.failed || 0}`);
     } finally {
       setSending(false);
     }
@@ -4406,6 +4489,15 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
             </div>
           </div>
 
+          <BroadcastBatchControls
+            dark={dark}
+            batchSize={batchSize}
+            batchInterval={batchInterval}
+            onBatchSizeChange={setBatchSize}
+            onBatchIntervalChange={setBatchInterval}
+            className="max-w-[420px]"
+          />
+
           <div>
             <div className="text-[13px] text-[#888] mb-[8px]">文本消息</div>
             <textarea
@@ -4495,12 +4587,66 @@ function MultiAccountBroadcastPanel({ accounts, theme }: { accounts: WeChatAccou
             </div>
           </div>
 
+          <div>
+            <div className="text-[13px] text-[#888] mb-[8px]">混合群发顺序（默认先文后附件）</div>
+            <div className="flex flex-wrap items-center gap-[18px] text-[13px]">
+              <label className="flex items-center gap-[6px] cursor-pointer">
+                <input type="radio" name="desktop-mixed-order" checked={contentOrder === "text_first"} onChange={() => setContentOrder("text_first")} className="accent-[#07c160]" />
+                先文后{image && !file ? "图" : file && !image ? "文件" : "附件"}
+              </label>
+              <label className="flex items-center gap-[6px] cursor-pointer">
+                <input type="radio" name="desktop-mixed-order" checked={contentOrder === "attachment_first"} onChange={() => setContentOrder("attachment_first")} className="accent-[#07c160]" />
+                先{image && !file ? "图" : file && !image ? "文件" : "附件"}后文
+              </label>
+            </div>
+            <div className="mt-[10px] flex flex-wrap gap-[8px]">
+              <button type="button" disabled={sending || (!message.trim() && !image && !file) || selectedTargetTypes.length === 0 || agentIds.length === 0} onClick={() => sendMixedBroadcast("nosrc")} className={`h-[36px] px-[18px] rounded-[4px] bg-[#07c160] text-white ${dark ? "disabled:bg-[#315541]" : "disabled:bg-[#b9d9c7]"}`}>
+                {sending ? "发送中" : "底层混合群发"}
+              </button>
+              <button type="button" disabled={sending || (!message.trim() && !image && !file) || selectedTargetTypes.length === 0 || agentIds.length === 0} onClick={() => sendMixedBroadcast("normal")} className={`h-[36px] px-[18px] rounded-[4px] border ${dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9] disabled:text-[#666]" : "border-[#07c160] bg-white text-[#07a854] disabled:text-[#aaa]"}`}>
+                正常混合群发
+              </button>
+            </div>
+          </div>
+
           <div className="text-[13px] text-[#888]">
             已选账号 {agentIds.length} 个，目标类型 {selectedTargetTypes.length} 个。{resultText}
           </div>
           <BroadcastProgressView accounts={accounts} progress={progress} dark={dark} />
         </div>
       </div>
+    </div>
+  );
+}
+
+function BroadcastBatchControls({
+  dark,
+  batchSize,
+  batchInterval,
+  onBatchSizeChange,
+  onBatchIntervalChange,
+  className = "",
+}: {
+  dark: boolean;
+  batchSize: number;
+  batchInterval: number;
+  onBatchSizeChange: (value: number) => void;
+  onBatchIntervalChange: (value: number) => void;
+  className?: string;
+}) {
+  const inputClass = `mt-[6px] w-full h-[38px] rounded-[6px] border px-[10px] outline-none ${
+    dark ? "bg-[#242424] border-[#333] text-[#eee]" : "bg-[#f7f7f7] border-[#ddd] text-[#111]"
+  }`;
+  return (
+    <div className={`${className} grid grid-cols-2 gap-[10px]`}>
+      <label className={`text-[13px] ${dark ? "text-[#aaa]" : "text-[#666]"}`}>
+        每批最多目标数
+        <input type="number" min={1} max={10000} value={batchSize} onChange={(e) => onBatchSizeChange(normalizeBatchSize(e.target.value))} className={inputClass} />
+      </label>
+      <label className={`text-[13px] ${dark ? "text-[#aaa]" : "text-[#666]"}`}>
+        批次间歇（秒）
+        <input type="number" min={0} max={3600} step={0.1} value={batchInterval} onChange={(e) => onBatchIntervalChange(normalizeBatchInterval(e.target.value))} className={inputClass} />
+      </label>
     </div>
   );
 }
@@ -4978,6 +5124,9 @@ function BroadcastPanel({
   const [sent, setSent] = useState(0);
   const [failed, setFailed] = useState(0);
   const [concurrencyLimit, setConcurrencyLimit] = useState(10);
+  const [batchSize, setBatchSize] = useState(100);
+  const [batchInterval, setBatchInterval] = useState(5);
+  const [contentOrder, setContentOrder] = useState<BroadcastContentOrder>("text_first");
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const imageOrdinalRef = useRef(1);
   const previewUrlsRef = useRef<string[]>([]);
@@ -4989,7 +5138,7 @@ function BroadcastPanel({
     !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q)
   );
   const payloadParts = buildBroadcastParts(message, broadcastImages);
-  const hasPayload = payloadParts.length > 0;
+  const hasPayload = payloadParts.length > 0 || !!broadcastFile;
   const selectedWxids = Array.from(selected).filter((wxid) => targetMap.has(wxid));
 
   useEffect(() => {
@@ -5076,97 +5225,20 @@ function BroadcastPanel({
   const sendBroadcast = async (mode = "nosrc") => {
     const parts = buildBroadcastParts(message, broadcastImages);
     const wxids = selectedWxids;
-    if (parts.length === 0 || wxids.length === 0 || sending) return;
+    if ((parts.length === 0 && !broadcastFile) || wxids.length === 0 || sending) return;
     setSending(true);
     setSent(0);
     setFailed(0);
-    const status = new Map(wxids.map((wxid) => [wxid, true]));
-    const updateProgress = () => {
-      let ok = 0;
-      let bad = 0;
-      for (const value of status.values()) {
-        if (value) ok += 1;
-        else bad += 1;
-      }
-      setSent(ok);
-      setFailed(bad);
-    };
-    const applyResult = (res: any, targets: string[]) => {
-      const rows = Array.isArray(res?.results) ? res.results : [];
-      if (rows.length === 0 && res?.error) {
-        for (const wxid of targets) status.set(wxid, false);
-        return;
-      }
-      const seen = new Set<string>();
-      for (const row of rows) {
-        const wxid = String(row?.wxid || "");
-        if (!wxid) continue;
-        seen.add(wxid);
-        if (!row?.ok) status.set(wxid, false);
-      }
-      for (const wxid of targets) {
-        if (!seen.has(wxid)) status.set(wxid, false);
-      }
-    };
     try {
-      for (const part of parts) {
-        const activeWxids = wxids.filter((wxid) => status.get(wxid));
-        if (activeWxids.length === 0) break;
-        try {
-          const res = part.type === "text"
-            ? await broadcastText(activeWxids, part.text, mode, concurrencyLimit)
-            : await broadcastImageUpload(activeWxids, part.image.file, mode, concurrencyLimit);
-          applyResult(res, activeWxids);
-        } catch {
-          for (const wxid of activeWxids) status.set(wxid, false);
-        }
-        updateProgress();
-        await new Promise((resolve) => window.setTimeout(resolve, 120));
-      }
-    } finally {
-      updateProgress();
-      setSending(false);
-    }
-  };
-
-  const sendFileBroadcast = async () => {
-    const wxids = selectedWxids;
-    if (!broadcastFile || wxids.length === 0 || sending) return;
-    setSending(true);
-    setSent(0);
-    setFailed(0);
-    const status = new Map(wxids.map((wxid) => [wxid, true]));
-    const updateProgress = () => {
-      let ok = 0;
-      let bad = 0;
-      for (const value of status.values()) {
-        if (value) ok += 1;
-        else bad += 1;
-      }
-      setSent(ok);
-      setFailed(bad);
-    };
-    try {
-      const res = await broadcastFileUpload(wxids, broadcastFile, concurrencyLimit);
-      const rows = Array.isArray(res?.results) ? res.results : [];
-      if (rows.length === 0 && res?.error) {
-        for (const wxid of wxids) status.set(wxid, false);
-      } else {
-        const seen = new Set<string>();
-        for (const row of rows) {
-          const wxid = String(row?.wxid || "");
-          if (!wxid) continue;
-          seen.add(wxid);
-          if (!row?.ok) status.set(wxid, false);
-        }
-        for (const wxid of wxids) {
-          if (!seen.has(wxid)) status.set(wxid, false);
-        }
-      }
+      const text = parts.filter((part): part is Extract<BroadcastPayloadPart, { type: "text" }> => part.type === "text").map((part) => part.text).join("\n");
+      const res = await broadcastMixedUpload(
+        wxids, text, broadcastImages.map((item) => item.file), broadcastFile, contentOrder, mode, concurrencyLimit, batchSize, batchInterval,
+      );
+      setSent(Number(res?.sent || 0));
+      setFailed(Number(res?.failed || 0));
     } catch {
-      for (const wxid of wxids) status.set(wxid, false);
+      setFailed(wxids.length);
     } finally {
-      updateProgress();
       setSending(false);
     }
   };
@@ -5210,6 +5282,15 @@ function BroadcastPanel({
           />
         </div>
       </div>
+
+      <BroadcastBatchControls
+        dark={dark}
+        batchSize={batchSize}
+        batchInterval={batchInterval}
+        onBatchSizeChange={setBatchSize}
+        onBatchIntervalChange={setBatchInterval}
+        className="px-[18px] pt-[10px] shrink-0"
+      />
 
       <div className="px-[18px] py-[12px] shrink-0">
         <div className={`text-[13px] mb-[6px] ${dark ? "text-[#888]" : "text-[#777]"}`}>文本消息</div>
@@ -5269,6 +5350,17 @@ function BroadcastPanel({
           />
           {broadcastFile?.name || "选择文件"}
         </label>
+        <div className={`mt-[10px] flex items-center gap-[18px] text-[13px] ${dark ? "text-[#bbb]" : "text-[#555]"}`}>
+          <span className={dark ? "text-[#888]" : "text-[#777]"}>混合顺序</span>
+          <label className="flex items-center gap-[6px] cursor-pointer">
+            <input type="radio" name="broadcast-order" checked={contentOrder === "text_first"} onChange={() => setContentOrder("text_first")} className="accent-[#07c160]" />
+            先文后附件
+          </label>
+          <label className="flex items-center gap-[6px] cursor-pointer">
+            <input type="radio" name="broadcast-order" checked={contentOrder === "attachment_first"} onChange={() => setContentOrder("attachment_first")} className="accent-[#07c160]" />
+            先附件后文
+          </label>
+        </div>
         <div className={`mt-[10px] flex flex-col gap-[8px] text-[13px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
           <span>已选 {selectedWxids.length} 个对象{sending ? `，已发送 ${sent}，失败 ${failed}` : ""}</span>
           <div className="grid grid-cols-1 min-[360px]:grid-cols-2 gap-[8px]">
@@ -5278,7 +5370,7 @@ function BroadcastPanel({
               onClick={() => sendBroadcast("nosrc")}
               className="h-[34px] min-w-0 rounded-[4px] bg-[#07c160] text-white disabled:bg-[#b9d9c7] active:opacity-80"
             >
-              {sending ? "发送中" : "底层发送文本/图片"}
+              {sending ? "发送中" : "底层混合群发"}
             </button>
             <button
               type="button"
@@ -5288,19 +5380,9 @@ function BroadcastPanel({
                 dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9]" : "border-[#07c160] bg-white text-[#07a854]"
               }`}
             >
-              普通发送文本/图片
+              正常混合群发
             </button>
           </div>
-          <button
-            type="button"
-            disabled={sending || selectedWxids.length === 0 || !broadcastFile}
-            onClick={sendFileBroadcast}
-            className={`h-[34px] w-full rounded-[4px] border disabled:opacity-50 active:opacity-80 ${
-              dark ? "border-[#2d6648] bg-[#1d2d25] text-[#dff8e9]" : "border-[#07c160] bg-white text-[#07a854]"
-            }`}
-          >
-            {sending ? "发送中" : "群发文件"}
-          </button>
         </div>
       </div>
 

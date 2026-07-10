@@ -49,11 +49,11 @@ async function fetchWithTimeout(url: string, options?: RequestInit, timeoutMs = 
   }
 }
 
-export async function fetchJSON(url: string, options?: RequestInit) {
+export async function fetchJSON(url: string, options?: RequestInit, timeoutMs = 30_000) {
   const res = await fetchWithTimeout(BASE + url, {
     ...options,
     headers: authHeaders({ "Content-Type": "application/json", ...(options?.headers || {}) }),
-  });
+  }, timeoutMs);
   return res.json();
 }
 
@@ -169,36 +169,94 @@ export const sendGifUpload = async (wxid: string, file: File) => {
   return res.json();
 };
 
-export const broadcastText = (wxids: string[], msg: string, mode = "nosrc", concurrencyLimit = 10) =>
+export const broadcastText = (wxids: string[], msg: string, mode = "nosrc", concurrencyLimit = 10, batchSize = 100, batchInterval = 5) =>
   fetchJSON("/api/broadcast/text", {
     method: "POST",
-    body: JSON.stringify({ wxids, msg, mode, concurrency_limit: concurrencyLimit }),
-  });
+    body: JSON.stringify({ wxids, msg, mode, concurrency_limit: concurrencyLimit, batch_size: batchSize, batch_interval: batchInterval }),
+  }, 86_400_000);
 
-export const broadcastImageUpload = async (wxids: string[], file: File, mode = "nosrc", concurrencyLimit = 10) => {
+export const broadcastImageUpload = async (wxids: string[], file: File, mode = "nosrc", concurrencyLimit = 10, batchSize = 100, batchInterval = 5) => {
   const form = new FormData();
   form.append("wxids", JSON.stringify(wxids));
   form.append("mode", mode);
   form.append("concurrency_limit", String(concurrencyLimit));
+  form.append("batch_size", String(batchSize));
+  form.append("batch_interval", String(batchInterval));
   form.append("file", file);
-  const res = await fetchWithTimeout("/api/broadcast/image-upload", { method: "POST", body: form, headers: authHeaders() }, 300_000);
+  const res = await fetchWithTimeout("/api/broadcast/image-upload", { method: "POST", body: form, headers: authHeaders() }, 86_400_000);
   return res.json();
 };
 
-export const broadcastFileUpload = async (wxids: string[], file: File, concurrencyLimit = 10) => {
+export const broadcastFileUpload = async (wxids: string[], file: File, concurrencyLimit = 10, batchSize = 100, batchInterval = 5) => {
   const form = new FormData();
   form.append("wxids", JSON.stringify(wxids));
   form.append("concurrency_limit", String(concurrencyLimit));
+  form.append("batch_size", String(batchSize));
+  form.append("batch_interval", String(batchInterval));
   form.append("file", file);
-  const res = await fetchWithTimeout("/api/broadcast/file-upload", { method: "POST", body: form, headers: authHeaders() }, 600_000);
+  const res = await fetchWithTimeout("/api/broadcast/file-upload", { method: "POST", body: form, headers: authHeaders() }, 86_400_000);
   return res.json();
 };
 
-export const multiAccountBroadcastText = (agentIds: string[], targetTypes: string[], msg: string, mode = "nosrc", concurrencyLimit = 10) =>
+export type BroadcastContentOrder = "text_first" | "attachment_first";
+
+export const broadcastMixedUpload = async (
+  wxids: string[],
+  msg: string,
+  images: File[],
+  attachment: File | null,
+  order: BroadcastContentOrder,
+  mode = "nosrc",
+  concurrencyLimit = 10,
+  batchSize = 100,
+  batchInterval = 5,
+) => {
+  const form = new FormData();
+  form.append("wxids", JSON.stringify(wxids));
+  form.append("msg", msg);
+  form.append("order", order);
+  form.append("mode", mode);
+  form.append("concurrency_limit", String(concurrencyLimit));
+  form.append("batch_size", String(batchSize));
+  form.append("batch_interval", String(batchInterval));
+  for (const image of images) form.append("images", image);
+  if (attachment) form.append("attachment", attachment);
+  const res = await fetchWithTimeout("/api/broadcast/mixed-upload", { method: "POST", body: form, headers: authHeaders() }, 86_400_000);
+  return res.json();
+};
+
+export const multiAccountBroadcastText = (agentIds: string[], targetTypes: string[], msg: string, mode = "nosrc", concurrencyLimit = 10, batchSize = 100, batchInterval = 5) =>
   fetchJSON("/api/accounts/broadcast/text", {
     method: "POST",
-    body: JSON.stringify({ agent_ids: agentIds, target_types: targetTypes, msg, mode, concurrency_limit: concurrencyLimit }),
-  });
+    body: JSON.stringify({ agent_ids: agentIds, target_types: targetTypes, msg, mode, concurrency_limit: concurrencyLimit, batch_size: batchSize, batch_interval: batchInterval }),
+  }, 86_400_000);
+
+export const multiAccountBroadcastMixedUpload = async (
+  agentIds: string[],
+  targetTypes: string[],
+  msg: string,
+  images: File[],
+  attachment: File | null,
+  order: BroadcastContentOrder,
+  mode = "nosrc",
+  concurrencyLimit = 10,
+  batchSize = 100,
+  batchInterval = 5,
+) => {
+  const form = new FormData();
+  form.append("agent_ids", JSON.stringify(agentIds));
+  form.append("target_types", JSON.stringify(targetTypes));
+  form.append("msg", msg);
+  form.append("order", order);
+  form.append("mode", mode);
+  form.append("concurrency_limit", String(concurrencyLimit));
+  form.append("batch_size", String(batchSize));
+  form.append("batch_interval", String(batchInterval));
+  for (const image of images) form.append("images", image);
+  if (attachment) form.append("attachment", attachment);
+  const res = await fetchWithTimeout("/api/accounts/broadcast/mixed-upload", { method: "POST", body: form, headers: authHeaders() }, 86_400_000);
+  return res.json();
+};
 
 export const getMultiAccountBroadcastTargets = (agentIds: string[], targetTypes: string[]) =>
   fetchJSON("/api/accounts/broadcast/targets", {
@@ -206,14 +264,16 @@ export const getMultiAccountBroadcastTargets = (agentIds: string[], targetTypes:
     body: JSON.stringify({ agent_ids: agentIds, target_types: targetTypes }),
   });
 
-export const multiAccountBroadcastImageUpload = async (agentIds: string[], targetTypes: string[], file: File, mode = "nosrc", concurrencyLimit = 10) => {
+export const multiAccountBroadcastImageUpload = async (agentIds: string[], targetTypes: string[], file: File, mode = "nosrc", concurrencyLimit = 10, batchSize = 100, batchInterval = 5) => {
   const form = new FormData();
   form.append("agent_ids", JSON.stringify(agentIds));
   form.append("target_types", JSON.stringify(targetTypes));
   form.append("mode", mode);
   form.append("concurrency_limit", String(concurrencyLimit));
+  form.append("batch_size", String(batchSize));
+  form.append("batch_interval", String(batchInterval));
   form.append("file", file);
-  const res = await fetchWithTimeout("/api/accounts/broadcast/image-upload", { method: "POST", body: form, headers: authHeaders() }, 600_000);
+  const res = await fetchWithTimeout("/api/accounts/broadcast/image-upload", { method: "POST", body: form, headers: authHeaders() }, 86_400_000);
   return res.json();
 };
 
@@ -229,12 +289,16 @@ export const multiAccountBroadcastImageUploadStream = async (
   mode = "nosrc",
   concurrencyLimit = 10,
   onProgress?: (event: MultiAccountBroadcastImageProgressEvent) => void,
+  batchSize = 100,
+  batchInterval = 5,
 ) => {
   const form = new FormData();
   form.append("agent_ids", JSON.stringify(agentIds));
   form.append("target_types", JSON.stringify(targetTypes));
   form.append("mode", mode);
   form.append("concurrency_limit", String(concurrencyLimit));
+  form.append("batch_size", String(batchSize));
+  form.append("batch_interval", String(batchInterval));
   form.append("file", file);
   const res = await fetchWithTimeout("/api/accounts/broadcast/image-upload-stream", { method: "POST", body: form, headers: authHeaders() }, 600_000);
   if (!res.body) {
@@ -275,11 +339,15 @@ export const multiAccountBroadcastFileUploadStream = async (
   file: File,
   concurrencyLimit = 10,
   onProgress?: (event: MultiAccountBroadcastImageProgressEvent) => void,
+  batchSize = 100,
+  batchInterval = 5,
 ) => {
   const form = new FormData();
   form.append("agent_ids", JSON.stringify(agentIds));
   form.append("target_types", JSON.stringify(targetTypes));
   form.append("concurrency_limit", String(concurrencyLimit));
+  form.append("batch_size", String(batchSize));
+  form.append("batch_interval", String(batchInterval));
   form.append("file", file);
   const res = await fetchWithTimeout("/api/accounts/broadcast/file-upload-stream", { method: "POST", body: form, headers: authHeaders() }, 600_000);
   if (!res.body) {

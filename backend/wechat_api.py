@@ -527,11 +527,18 @@ async def send_image(wxid: str, picpath: str, diyfilename: str = "", file_data: 
     return safe_json(r)
 
 
-async def send_image_file_no_src(wxid: str, picpath: str, file_data: str | None = None) -> dict:
+async def send_image_file_no_src(
+    wxid: str,
+    picpath: str,
+    file_data: str | None = None,
+    msgsource: str = "",
+) -> dict:
     """Send an image through SendImgMsg_NoSrc with picpath/fileData."""
     if not IS_HOOK:
         return {"error": "SendImgMsg_NoSrc is only supported in hook mode"}
     body = _attach_file_data({"wxid": wxid, "picpath": picpath}, "picpath", file_data)
+    if msgsource:
+        body["msgsource"] = msgsource
     r = await _post("/SendImgMsg_NoSrc", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
     return safe_json(r)
 
@@ -546,7 +553,13 @@ def _first_nested_dict(data: dict, *path: str) -> dict:
 
 
 def _cdn_upload_fields(raw: dict, filepath: str, blob: bytes, aeskey: str) -> dict:
-    data = _first_nested_dict(raw, "data", "data") or _first_nested_dict(raw, "data") or raw
+    data = (
+        _first_nested_dict(raw, "upload", "data", "data")
+        or _first_nested_dict(raw, "upload", "data")
+        or _first_nested_dict(raw, "data", "data")
+        or _first_nested_dict(raw, "data")
+        or raw
+    )
     fileid = (
         data.get("fileid")
         or data.get("file_id")
@@ -571,6 +584,11 @@ def _cdn_upload_fields(raw: dict, filepath: str, blob: bytes, aeskey: str) -> di
         "filepath": filepath,
         "raw": raw,
     }
+
+
+def cdn_fields_from_image_send(raw: dict, filepath: str, blob: bytes) -> dict:
+    """Extract reusable CDN fields from the first SendImgMsg_NoSrc(filehelper) response."""
+    return _cdn_upload_fields(raw, filepath, blob, "")
 
 
 async def cdn_upload_image(filepath: str, user_name: str = "filehelper", file_data: str | None = None) -> dict:
@@ -601,7 +619,7 @@ async def cdn_upload_image(filepath: str, user_name: str = "filehelper", file_da
     return fields
 
 
-async def send_image_no_src(wxidorgid: str, cdn_fields: dict) -> dict:
+async def send_image_no_src(wxidorgid: str, cdn_fields: dict, msgsource: str = "") -> dict:
     """Send an already-uploaded CDN image through the lower-level no-source endpoint."""
     if not IS_HOOK:
         return {"error": "SendImgMsg_NoSrc is only supported in hook mode"}
@@ -617,6 +635,8 @@ async def send_image_no_src(wxidorgid: str, cdn_fields: dict) -> dict:
         value = cdn_fields.get(key)
         if value not in (None, ""):
             body[key] = str(value)
+    if msgsource:
+        body["msgsource"] = msgsource
     r = await _post("/SendImgMsg_NoSrc", json=body, timeout=90.0 if IS_LOCAL_HOOK else 180.0)
     return safe_json(r)
 
