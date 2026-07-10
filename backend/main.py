@@ -1592,6 +1592,131 @@ async def refresh_contacts():
     return await _refresh_contacts_incremental(list_type="0", init_if_empty=True, force_details=True)
 
 
+@app.get("/api/local-contacts")
+async def get_local_contacts():
+    """Read the native local directory and merge ContactHeadImgUrl avatars."""
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    with wechat_api.use_agent(agent_id):
+        contacts_raw = await wechat_api.get_friend_and_chatroom_list("0")
+        avatars_raw = await wechat_api.query_db(
+            "MicroMsg.db",
+            "select * from ContactHeadImgUrl",
+            timeout=60.0,
+        )
+
+    if not isinstance(contacts_raw, dict) or contacts_raw.get("error"):
+        return {
+            "error": str((contacts_raw or {}).get("error") or "GetFriendAndChatRoomList failed"),
+            "categories": {"groups": [], "official": [], "service": [], "openim": [], "friends": []},
+        }
+
+    contacts = _contact_payload(contacts_raw)
+    if not isinstance(contacts, dict):
+        contacts = contacts_raw
+
+    avatar_rows = avatars_raw.get("data") if isinstance(avatars_raw, dict) else []
+    avatar_warning = str(avatars_raw.get("error") or "").strip() if isinstance(avatars_raw, dict) else ""
+    if isinstance(avatar_rows, dict):
+        avatar_rows = avatar_rows.get("data") or avatar_rows.get("rows") or []
+    if not isinstance(avatar_rows, list):
+        avatar_rows = []
+    avatar_map: dict[str, str] = {}
+    for row in avatar_rows:
+        if not isinstance(row, dict):
+            continue
+        wxid = str(_row_value(row, "usrName", "UsrName", "username", "wxid") or "").strip()
+        avatar = str(
+            _row_value(
+                row,
+                "smallHeadImgUrl", "SmallHeadImgUrl", "smallheadimgurl",
+                "bigHeadImgUrl", "BigHeadImgUrl", "bigheadimgurl",
+            ) or ""
+        ).strip()
+        if wxid and avatar:
+            avatar_map[wxid] = avatar
+
+    owner_wxid = _contact_owner_wxid()
+    cached = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+    categories: dict[str, list[dict]] = {
+        "groups": [], "official": [], "service": [], "openim": [], "friends": [],
+    }
+    seen: set[str] = set()
+
+    def add_entry(raw: dict, category: str, *, group: bool = False) -> None:
+        if not isinstance(raw, dict):
+            return
+        wxid = str(
+            raw.get("gid")
+            or raw.get("wxid")
+            or raw.get("UserName")
+            or raw.get("userName")
+            or ""
+        ).strip()
+        if not wxid or wxid in seen:
+            return
+        seen.add(wxid)
+        markname = str(raw.get("markname") or raw.get("Remark") or raw.get("remark") or "").strip()
+        nickname = str(
+            raw.get("gname")
+            or raw.get("nickname")
+            or raw.get("NickName")
+            or raw.get("name")
+            or ""
+        ).strip()
+        account = str(raw.get("account") or raw.get("Alias") or raw.get("alias") or "").strip()
+        name = markname or nickname or account or wxid
+        avatar = avatar_map.get(wxid, "")
+        profile = dict(raw)
+        profile.update({
+            "wxid": wxid,
+            "markname": markname,
+            "nickname": nickname,
+            "account": account,
+            "SmallHeadImgUrl": avatar,
+            "BigHeadImgUrl": avatar,
+        })
+        categories[category].append({
+            "wxid": wxid,
+            "name": name,
+            "markname": markname,
+            "nickname": nickname,
+            "account": account,
+            "avatar": avatar,
+            "is_group": group,
+            "category": category,
+            "profile": profile,
+        })
+
+    for raw in contacts.get("chatroom", []) if isinstance(contacts.get("chatroom"), list) else []:
+        add_entry(raw, "groups", group=True)
+    for raw in contacts.get("friend", []) if isinstance(contacts.get("friend"), list) else []:
+        add_entry(raw, "friends")
+    for raw in contacts.get("openim", []) if isinstance(contacts.get("openim"), list) else []:
+        add_entry(raw, "openim")
+    for raw in contacts.get("gh", []) if isinstance(contacts.get("gh"), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        wxid = str(raw.get("wxid") or "").strip()
+        cached_entry = cached.get(wxid) if wxid else None
+        cached_profile = cached_entry.get("profile") if isinstance(cached_entry, dict) and isinstance(cached_entry.get("profile"), dict) else {}
+        category = _contact_directory_category({**raw, **cached_profile}, wxid)
+        add_entry(raw, "service" if category == "service" else "official")
+
+    counts = {key: len(value) for key, value in categories.items()}
+    return {
+        "categories": categories,
+        "counts": counts,
+        "source_counts": {
+            "chatroom": _to_int(contacts.get("count_chatroom")),
+            "friend": _to_int(contacts.get("count_friend")),
+            "gh": _to_int(contacts.get("count_gh")),
+            "openim": _to_int(contacts.get("count_openim")),
+        },
+        "avatar_count": len(avatar_map),
+        "warning": f"头像查询失败：{avatar_warning}" if avatar_warning else "",
+    }
+
+
 @app.get("/api/contacts/{wxid}")
 async def get_contact_detail(wxid: str):
     """Get detailed info for a specific contact."""

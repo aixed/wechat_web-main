@@ -12,6 +12,7 @@ import {
   getAccessKey,
   getAccounts,
   getContacts,
+  getLocalContacts,
   getContactProfiles,
   getGroupMemberDetails,
   getGroupMemberNames,
@@ -394,6 +395,56 @@ interface DirectoryEntry {
   source: "friend" | "group";
   category?: ContactCategoryKey | "personal";
   badge?: string;
+}
+
+type LocalContactCategory = ContactCategoryKey | "friends";
+
+interface LocalContactsPayload {
+  categories?: Partial<Record<LocalContactCategory, Array<{
+    wxid?: string;
+    name?: string;
+    avatar?: string;
+    is_group?: boolean;
+    category?: LocalContactCategory;
+    profile?: Record<string, unknown>;
+  }>>>;
+  counts?: Partial<Record<LocalContactCategory, number>>;
+  error?: string;
+  warning?: string;
+}
+
+function localContactEntries(payload: LocalContactsPayload | null, category: LocalContactCategory): DirectoryEntry[] {
+  const rows = payload?.categories?.[category];
+  if (!Array.isArray(rows)) return [];
+  return sortDirectoryEntries(rows
+    .map((row) => {
+      const wxid = String(row?.wxid || "").trim();
+      if (!wxid) return null;
+      return {
+        wxid,
+        name: String(row?.name || wxid),
+        avatar: String(row?.avatar || ""),
+        is_group: Boolean(row?.is_group || category === "groups"),
+        source: (category === "groups" ? "group" : "friend") as "group" | "friend",
+        category: category === "friends" ? "personal" : category,
+        badge: category === "openim" ? "企微" : "",
+      };
+    })
+    .filter(Boolean) as DirectoryEntry[]);
+}
+
+function localContactProfile(payload: LocalContactsPayload | null, wxid: string): ContactProfile | undefined {
+  for (const category of ["friends", "groups", "official", "service", "openim"] as LocalContactCategory[]) {
+    const row = payload?.categories?.[category]?.find((item) => String(item?.wxid || "") === wxid);
+    if (!row) continue;
+    return {
+      wxid,
+      name: String(row.name || wxid),
+      avatar: String(row.avatar || ""),
+      profile: (row.profile || {}) as Record<string, unknown>,
+    } as ContactProfile;
+  }
+  return undefined;
 }
 
 interface ContactHydrationProgress {
@@ -874,6 +925,14 @@ const contactNameCollator = new Intl.Collator("zh-Hans-CN-u-co-pinyin", {
   numeric: true,
 });
 
+const pinyinInitialBoundaries: Array<[string, string]> = [
+  ["A", "阿"], ["B", "芭"], ["C", "擦"], ["D", "搭"], ["E", "蛾"],
+  ["F", "发"], ["G", "噶"], ["H", "哈"], ["J", "击"], ["K", "喀"],
+  ["L", "垃"], ["M", "妈"], ["N", "拿"], ["O", "哦"], ["P", "啪"],
+  ["Q", "期"], ["R", "然"], ["S", "撒"], ["T", "塌"], ["W", "挖"],
+  ["X", "昔"], ["Y", "压"], ["Z", "匝"],
+];
+
 function contactSortName(entry: DirectoryEntry): string {
   return (entry.name || entry.wxid || "").trim();
 }
@@ -887,9 +946,16 @@ function sortDirectoryEntries(entries: DirectoryEntry[]): DirectoryEntry[] {
 }
 
 function contactInitial(entry: DirectoryEntry): string {
-  const ch = contactSortName(entry).charAt(0).toUpperCase();
-  if (/^[A-Z]$/.test(ch)) return ch;
-  if (/^[0-9]$/.test(ch)) return "#";
+  const first = Array.from(contactSortName(entry))[0] || "";
+  const upper = first.toUpperCase();
+  if (/^[A-Z]$/.test(upper)) return upper;
+  if (/^[\u3400-\u9fff]$/.test(first)) {
+    let initial = "#";
+    for (const [letter, boundary] of pinyinInitialBoundaries) {
+      if (contactNameCollator.compare(first, boundary) >= 0) initial = letter;
+    }
+    return initial;
+  }
   return "#";
 }
 
@@ -1211,6 +1277,10 @@ export default function App() {
   const [mobileTab, setMobileTab] = useState<MobileTab>("chats");
   const [mobileContactCategory, setMobileContactCategory] = useState<ContactCategoryKey | null>(null);
   const [desktopContactCategory, setDesktopContactCategory] = useState<ContactCategoryKey | null>(null);
+  const [localContactsPayload, setLocalContactsPayload] = useState<LocalContactsPayload | null>(null);
+  const [localContactsLoading, setLocalContactsLoading] = useState(false);
+  const [localContactsError, setLocalContactsError] = useState("");
+  const [contactSource, setContactSource] = useState<"network" | "local">("network");
   const [mobileProfileDetailOpen, setMobileProfileDetailOpen] = useState(false);
   const [directoryProfileWxid, setDirectoryProfileWxid] = useState<string | null>(null);
   const [directoryProfileLoading, setDirectoryProfileLoading] = useState(false);
@@ -1237,6 +1307,7 @@ export default function App() {
   contactProfilesRef.current = contactProfiles;
   const selectedAccountIdRef = useRef(selectedAccountId);
   selectedAccountIdRef.current = selectedAccountId;
+  const localContactsLoadingRef = useRef(false);
   const routeAccountWxidRef = useRef(routeAccountWxid);
   routeAccountWxidRef.current = routeAccountWxid;
   const routeRef = useRef<AppRoute>(normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile));
@@ -1288,6 +1359,11 @@ export default function App() {
     setContactHydrationProgress(null);
     setMobileContactCategory(null);
     setDesktopContactCategory(null);
+    setLocalContactsPayload(null);
+    setLocalContactsLoading(false);
+    setLocalContactsError("");
+    setContactSource("network");
+    localContactsLoadingRef.current = false;
     pendingBriefWxids.current.clear();
     briefRequestedWxids.current.clear();
     groupProfileRequestedWxids.current.clear();
@@ -1561,6 +1637,36 @@ export default function App() {
     }
   }, [contactsHydrated, contactsHydrating]);
 
+  const loadLocalDirectoryContacts = useCallback(async () => {
+    if (localContactsLoadingRef.current) return;
+    localContactsLoadingRef.current = true;
+    const requestAccountId = selectedAccountIdRef.current;
+    setLocalContactsLoading(true);
+    setLocalContactsError("");
+    try {
+      const data = await getLocalContacts();
+      if (selectedAccountIdRef.current !== requestAccountId) return;
+      if (data?.error || data?.warning) {
+        setLocalContactsError(String(data.error || data.warning));
+      }
+      setLocalContactsPayload(data && typeof data === "object" ? data as LocalContactsPayload : null);
+    } catch (err) {
+      if (selectedAccountIdRef.current !== requestAccountId) return;
+      setLocalContactsError(err instanceof Error ? err.message : "加载本地联系人失败");
+    } finally {
+      localContactsLoadingRef.current = false;
+      if (selectedAccountIdRef.current === requestAccountId) setLocalContactsLoading(false);
+    }
+  }, []);
+
+  const switchContactSource = useCallback((source: "network" | "local") => {
+    setContactSource(source);
+    setDesktopContactCategory(null);
+    setDirectoryProfileWxid(null);
+    if (source === "local") loadLocalDirectoryContacts();
+    else hydrateDirectoryContacts();
+  }, [hydrateDirectoryContacts, loadLocalDirectoryContacts]);
+
   const openSelfProfileCard = useCallback(async () => {
     setSelfCardOpen(true);
     const wxid = effectiveSelfWxid;
@@ -1601,12 +1707,13 @@ export default function App() {
     if (mode !== "contacts") setDesktopContactCategory(null);
     if (mode === "contacts") {
       setDesktopContactCategory(null);
-      hydrateDirectoryContacts();
+      if (contactSource === "local") loadLocalDirectoryContacts();
+      else hydrateDirectoryContacts();
     }
     if (!options.skipRoute) {
       setRoute(mode === "contacts" ? "contact" : mode === "broadcast" ? "broadcast" : "chat");
     }
-  }, [hydrateDirectoryContacts, setRoute]);
+  }, [contactSource, hydrateDirectoryContacts, loadLocalDirectoryContacts, setRoute]);
 
   const switchMobileTab = useCallback((tab: MobileTab, options: { skipRoute?: boolean } = {}) => {
     setMobileTab(tab);
@@ -1637,6 +1744,14 @@ export default function App() {
       setDirectoryProfileLoading(false);
     }
   }, [ensureContactProfiles]);
+
+  const openLocalDirectoryProfile = useCallback((entry: DirectoryEntry) => {
+    if (!entry?.wxid) return;
+    setViewMode("contacts");
+    setActiveChat(null);
+    setDesktopContactCategory(null);
+    setDirectoryProfileWxid(entry.wxid);
+  }, []);
 
   const flushBriefQueue = useCallback(() => {
     if (briefInFlight.current) return;
@@ -2596,11 +2711,47 @@ export default function App() {
     service: serviceEntries.length,
     openim: openimEntries.length,
   };
+  const localFriendEntries = localContactEntries(localContactsPayload, "friends");
+  const localGroupEntries = localContactEntries(localContactsPayload, "groups");
+  const localOfficialEntries = localContactEntries(localContactsPayload, "official");
+  const localServiceEntries = localContactEntries(localContactsPayload, "service");
+  const localOpenimEntries = localContactEntries(localContactsPayload, "openim");
+  const localContactCategoryEntries: Record<ContactCategoryKey, DirectoryEntry[]> = {
+    groups: localGroupEntries,
+    official: localOfficialEntries,
+    service: localServiceEntries,
+    openim: localOpenimEntries,
+  };
+  const localContactCounts: ContactCounts = {
+    friends: localFriendEntries.length,
+    groups: localGroupEntries.length,
+    official: localOfficialEntries.length,
+    service: localServiceEntries.length,
+    openim: localOpenimEntries.length,
+  };
+  const localDirectoryEntryMap = new Map<string, DirectoryEntry>();
+  for (const entry of [...localFriendEntries, ...localGroupEntries, ...localOfficialEntries, ...localServiceEntries, ...localOpenimEntries]) {
+    localDirectoryEntryMap.set(entry.wxid, entry);
+  }
+  const localDirectoryProfileEntry = directoryProfileWxid ? localDirectoryEntryMap.get(directoryProfileWxid) || null : null;
+  const localDirectoryProfile = directoryProfileWxid ? localContactProfile(localContactsPayload, directoryProfileWxid) : undefined;
   const directoryEntryMap = new Map<string, DirectoryEntry>();
   for (const entry of [...friendEntries, ...groupEntries, ...officialEntries, ...serviceEntries, ...openimEntries]) {
     directoryEntryMap.set(entry.wxid, entry);
   }
   const directoryProfileEntry = directoryProfileWxid ? directoryEntryMap.get(directoryProfileWxid) || null : null;
+  const showingLocalContacts = contactSource === "local";
+  const activeContactFriends = showingLocalContacts ? localFriendEntries : friendEntries;
+  const activeContactGroups = showingLocalContacts ? localGroupEntries : groupEntries;
+  const activeContactOfficial = showingLocalContacts ? localOfficialEntries : officialEntries;
+  const activeContactService = showingLocalContacts ? localServiceEntries : serviceEntries;
+  const activeContactOpenim = showingLocalContacts ? localOpenimEntries : openimEntries;
+  const activeContactCounts = showingLocalContacts ? localContactCounts : contactCounts;
+  const activeContactCategoryEntries = showingLocalContacts ? localContactCategoryEntries : contactCategoryEntries;
+  const activeDirectoryProfileEntry = showingLocalContacts ? localDirectoryProfileEntry : directoryProfileEntry;
+  const activeDirectoryProfile = showingLocalContacts
+    ? localDirectoryProfile
+    : (activeDirectoryProfileEntry ? contactProfiles[activeDirectoryProfileEntry.wxid] : undefined);
   const selectedAccountProfile = selectedAccount?.profile || {};
   const selectedAccountName = selectedAccount
     ? (
@@ -2808,6 +2959,10 @@ export default function App() {
           sessions={sessions}
           friends={friendEntries}
           groups={groupEntries}
+          localFriends={localFriendEntries}
+          localGroups={localGroupEntries}
+          localContactsLoading={localContactsLoading}
+          localContactsError={localContactsError}
           official={officialEntries}
           service={serviceEntries}
           openim={openimEntries}
@@ -2824,6 +2979,7 @@ export default function App() {
           onSelectContact={openDirectoryProfile}
           onSelectContactCategory={setMobileContactCategory}
           onHydrateContacts={hydrateDirectoryContacts}
+          onLoadLocalContacts={loadLocalDirectoryContacts}
           onRefreshSessions={handleRefreshSessions}
           sessionsLoading={sessionsHydrating}
           onOpenSelfDetail={openMobileSelfProfileDetail}
@@ -2867,25 +3023,33 @@ export default function App() {
         )}
         {viewMode === "contacts" && (
           <ContactsPanel
-            friends={friendEntries}
-            groups={groupEntries}
-            official={officialEntries}
-            service={serviceEntries}
-            openim={openimEntries}
-            counts={contactCounts}
-            progress={contactHydrationProgress}
+            friends={activeContactFriends}
+            groups={activeContactGroups}
+            official={activeContactOfficial}
+            service={activeContactService}
+            openim={activeContactOpenim}
+            counts={activeContactCounts}
+            progress={showingLocalContacts ? null : contactHydrationProgress}
             selectedCategory={desktopContactCategory}
-            loading={contactsHydrating}
+            loading={showingLocalContacts ? localContactsLoading : contactsHydrating}
             dark={darkTheme}
-            onHydrate={hydrateDirectoryContacts}
-            onSelect={openDirectoryProfile}
+            onHydrate={showingLocalContacts ? loadLocalDirectoryContacts : hydrateDirectoryContacts}
+            onSelect={showingLocalContacts ? openLocalDirectoryProfile : openDirectoryProfile}
             onSelectCategory={setDesktopContactCategory}
+            error={showingLocalContacts ? localContactsError : ""}
+            source={contactSource}
+            onSourceChange={switchContactSource}
           />
         )}
         {viewMode === "broadcast" && (
           <BroadcastPanel
             friends={friendEntries}
             groups={groupEntries}
+            localFriends={localFriendEntries}
+            localGroups={localGroupEntries}
+            localLoading={localContactsLoading}
+            localError={localContactsError}
+            onLoadLocal={loadLocalDirectoryContacts}
             dark={darkTheme}
           />
         )}
@@ -2905,26 +3069,29 @@ export default function App() {
       <div className={`flex-1 min-w-0 min-h-0 h-full overflow-hidden ${darkTheme ? "bg-[#111111]" : "bg-[#ededed]"}`}>
         {viewMode === "contacts" && desktopContactCategory ? (
           <DirectoryCategoryPane
-            title={categoryTitle(desktopContactCategory)}
-            countLabel={categoryCountLabel(desktopContactCategory, contactCategoryEntries[desktopContactCategory].length)}
-            entries={contactCategoryEntries[desktopContactCategory]}
+            title={showingLocalContacts ? localCategoryTitle(desktopContactCategory) : categoryTitle(desktopContactCategory)}
+            countLabel={showingLocalContacts
+              ? `${activeContactCategoryEntries[desktopContactCategory].length} 个`
+              : categoryCountLabel(desktopContactCategory, activeContactCategoryEntries[desktopContactCategory].length)}
+            entries={activeContactCategoryEntries[desktopContactCategory]}
             dark={darkTheme}
             onSelect={(entry) => {
               setDesktopContactCategory(null);
-              openDirectoryProfile(entry);
+              if (showingLocalContacts) openLocalDirectoryProfile(entry);
+              else openDirectoryProfile(entry);
             }}
           />
-        ) : viewMode === "contacts" && directoryProfileEntry ? (
+        ) : viewMode === "contacts" && activeDirectoryProfileEntry ? (
           <DirectoryProfilePane
-            entry={directoryProfileEntry}
-            profile={contactProfiles[directoryProfileEntry.wxid]}
-            fallbackAvatar={directoryProfileEntry.avatar}
-            loading={directoryProfileLoading}
+            entry={activeDirectoryProfileEntry}
+            profile={activeDirectoryProfile}
+            fallbackAvatar={activeDirectoryProfileEntry.avatar}
+            loading={showingLocalContacts ? false : directoryProfileLoading}
             dark={darkTheme}
-            onMessage={() => handleSelectChat(directoryProfileEntry.wxid, {
-              nickname: directoryProfileEntry.name,
-              avatar: directoryProfileEntry.avatar,
-              is_group: directoryProfileEntry.is_group,
+            onMessage={() => handleSelectChat(activeDirectoryProfileEntry.wxid, {
+              nickname: activeDirectoryProfileEntry.name,
+              avatar: activeDirectoryProfileEntry.avatar,
+              is_group: activeDirectoryProfileEntry.is_group,
             })}
           />
         ) : activeChat && activeSession ? (
@@ -3714,6 +3881,10 @@ function MobileMainShell({
   sessions,
   friends,
   groups,
+  localFriends,
+  localGroups,
+  localContactsLoading,
+  localContactsError,
   official,
   service,
   openim,
@@ -3730,6 +3901,7 @@ function MobileMainShell({
   onSelectContact,
   onSelectContactCategory,
   onHydrateContacts,
+  onLoadLocalContacts,
   onRefreshSessions,
   sessionsLoading,
   onOpenSelfDetail,
@@ -3738,6 +3910,10 @@ function MobileMainShell({
   sessions: Session[];
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
+  localFriends: DirectoryEntry[];
+  localGroups: DirectoryEntry[];
+  localContactsLoading: boolean;
+  localContactsError: string;
   official: DirectoryEntry[];
   service: DirectoryEntry[];
   openim: DirectoryEntry[];
@@ -3754,6 +3930,7 @@ function MobileMainShell({
   onSelectContact: (entry: DirectoryEntry) => void;
   onSelectContactCategory: (category: ContactCategoryKey) => void;
   onHydrateContacts: (force?: boolean) => void;
+  onLoadLocalContacts: () => void;
   onRefreshSessions: () => void;
   sessionsLoading: boolean;
   onOpenSelfDetail: () => void;
@@ -3797,12 +3974,30 @@ function MobileMainShell({
       )}
       {tab === "broadcast" && (
         <div className="flex-1 min-h-0 overflow-hidden">
-          <BroadcastPanel friends={friends} groups={groups} dark={dark} />
+          <BroadcastPanel
+            friends={friends}
+            groups={groups}
+            localFriends={localFriends}
+            localGroups={localGroups}
+            localLoading={localContactsLoading}
+            localError={localContactsError}
+            onLoadLocal={onLoadLocalContacts}
+            dark={dark}
+          />
         </div>
       )}
       <MobileTabBar active={tab} onChange={onSwitchTab} dark={dark} />
     </div>
   );
+}
+
+function localCategoryTitle(category: ContactCategoryKey): string {
+  switch (category) {
+    case "groups": return "本地群聊";
+    case "official": return "本地公众号";
+    case "service": return "本地服务号";
+    case "openim": return "本地企业联系人";
+  }
 }
 
 function MobileChatsView({
@@ -3905,16 +4100,25 @@ function MobileContactsView({
   onSelectCategory: (category: ContactCategoryKey) => void;
 }) {
   const [query, setQuery] = useState("");
+  const contactListRef = useRef<HTMLDivElement>(null);
+  const contactSectionRefs = useRef(new Map<string, HTMLDivElement>());
   useEffect(() => {
     onHydrate();
   }, [onHydrate]);
   const q = query.trim().toLowerCase();
   const filteredFriends = friends.filter((entry) => !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q));
   const friendSections = groupDirectoryEntries(filteredFriends);
-  const indexLetters = ["⌕", ...friendSections.map((section) => section.title)];
+  const friendSectionLetters = new Set(friendSections.map((section) => section.title));
+  const scrollToMobileFriendSection = (letter: string, behavior: ScrollBehavior = "smooth") => {
+    const list = contactListRef.current;
+    const section = contactSectionRefs.current.get(letter);
+    if (!list || !section) return;
+    list.scrollTo({ top: section.offsetTop, behavior });
+  };
 
   return (
-    <div className="relative flex-1 min-h-0 overflow-y-auto pb-[10px]">
+    <div className="relative flex-1 min-h-0">
+      <div ref={contactListRef} className="relative h-full overflow-y-auto pb-[10px] pr-[22px]">
       <div className={`sticky top-0 z-20 ${dark ? "bg-[#111111]" : "bg-[#ededed]"}`}>
         <MobileTopBar dark={dark} title="Contacts" rightLabel="＋" />
         <div className="h-[44px] px-[12px] flex items-center">
@@ -3938,15 +4142,18 @@ function MobileContactsView({
         <MobileContactStaticRow dark={dark} color="#2d9bf0" label="WeCom Contacts" icon="wecom" count={openim.length} onClick={() => onSelectCategory("openim")} />
       </div>
       {friendSections.map((section) => (
-        <MobileContactSection key={section.title} dark={dark} title={section.title} entries={section.entries} onSelect={onSelect} />
-      ))}
-      {friendSections.length > 0 && (
-        <div className={`fixed right-[5px] top-[34%] z-10 flex flex-col items-center gap-[2px] text-[11px] leading-[13px] ${dark ? "text-[#888]" : "text-[#444]"}`}>
-          {indexLetters.map((letter) => (
-            <span key={letter}>{letter}</span>
-          ))}
+        <div
+          key={section.title}
+          ref={(node) => {
+            if (node) contactSectionRefs.current.set(section.title, node);
+            else contactSectionRefs.current.delete(section.title);
+          }}
+        >
+          <MobileContactSection dark={dark} title={section.title} entries={section.entries} onSelect={onSelect} />
         </div>
-      )}
+      ))}
+      </div>
+      <AlphabetIndex activeLetters={friendSectionLetters} onSelect={scrollToMobileFriendSection} dark={dark} />
     </div>
   );
 }
@@ -4882,6 +5089,77 @@ function EntryAvatar({ entry }: { entry: DirectoryEntry }) {
   );
 }
 
+function AlphabetIndex({
+  activeLetters,
+  onSelect,
+  dark,
+}: {
+  activeLetters: Set<string>;
+  onSelect: (letter: string, behavior?: ScrollBehavior) => void;
+  dark: boolean;
+}) {
+  const letters = [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ", "#"];
+  const [highlightedLetter, setHighlightedLetter] = useState("");
+  const updateAtPointer = (event: React.PointerEvent<HTMLDivElement>, navigate: boolean) => {
+    const element = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
+    const letter = element?.closest<HTMLElement>("[data-alphabet-letter]")?.dataset.alphabetLetter;
+    if (letter && activeLetters.has(letter)) {
+      setHighlightedLetter(letter);
+      if (navigate) onSelect(letter, "auto");
+    } else {
+      setHighlightedLetter("");
+    }
+  };
+
+  return (
+    <div
+      className={`absolute z-20 inset-y-[3px] right-[2px] w-[22px] flex flex-col justify-center items-end select-none ${dark ? "text-[#777]" : "text-[#777]"}`}
+      style={{ touchAction: "none" }}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+        updateAtPointer(event, true);
+      }}
+      onPointerMove={(event) => {
+        updateAtPointer(event, event.pointerType !== "mouse" || event.buttons === 1);
+      }}
+      onPointerUp={(event) => {
+        event.currentTarget.releasePointerCapture?.(event.pointerId);
+        if (event.pointerType !== "mouse") setHighlightedLetter("");
+      }}
+      onPointerCancel={() => setHighlightedLetter("")}
+      onPointerLeave={(event) => {
+        if (event.pointerType === "mouse" && event.buttons === 0) setHighlightedLetter("");
+      }}
+    >
+      {letters.map((letter) => {
+        const active = activeLetters.has(letter);
+        const highlighted = active && highlightedLetter === letter;
+        return (
+          <button
+            key={letter}
+            type="button"
+            data-alphabet-letter={letter}
+            disabled={!active}
+            aria-label={`定位到 ${letter}`}
+            onClick={() => onSelect(letter, "smooth")}
+            onFocus={() => active && setHighlightedLetter(letter)}
+            onBlur={() => setHighlightedLetter((current) => current === letter ? "" : current)}
+            className={`relative shrink-0 font-medium text-center transition-[width,height,line-height,color,background-color] duration-100 ${
+              highlighted
+                ? "z-30 w-[28px] h-[22px] leading-[22px] rounded-[4px] bg-[#07c160] text-[14px] text-white shadow-md"
+                : active
+                ? `w-[22px] h-[12px] leading-[12px] text-[10px] ${dark ? "text-[#9a9a9a] active:text-[#07c160]" : "text-[#555] active:text-[#07a854]"}`
+                : `w-[22px] h-[12px] leading-[12px] text-[10px] ${dark ? "text-[#3f3f3f]" : "text-[#bcbcbc]"}`
+            }`}
+          >
+            {letter}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function ContactsPanel({
   friends,
   groups,
@@ -4896,6 +5174,9 @@ function ContactsPanel({
   onHydrate,
   onSelect,
   onSelectCategory,
+  error = "",
+  source = "network",
+  onSourceChange,
 }: {
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
@@ -4910,17 +5191,32 @@ function ContactsPanel({
   onHydrate: (force?: boolean) => void;
   onSelect: (entry: DirectoryEntry) => void;
   onSelectCategory: (category: ContactCategoryKey) => void;
+  error?: string;
+  source?: "network" | "local";
+  onSourceChange?: (source: "network" | "local") => void;
 }) {
   const [query, setQuery] = useState("");
+  const contactListRef = useRef<HTMLDivElement>(null);
+  const contactSectionRefs = useRef(new Map<string, HTMLDivElement>());
   useEffect(() => {
     onHydrate();
   }, [onHydrate]);
+  useEffect(() => {
+    contactListRef.current?.scrollTo({ top: 0 });
+  }, [source]);
 
   const q = query.trim().toLowerCase();
   const filterEntry = (entry: DirectoryEntry) =>
     !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q);
   const visibleFriends = friends.filter(filterEntry);
   const friendSections = groupDirectoryEntries(visibleFriends);
+  const friendSectionLetters = new Set(friendSections.map((section) => section.title));
+  const scrollToFriendSection = (letter: string, behavior: ScrollBehavior = "smooth") => {
+    const list = contactListRef.current;
+    const section = contactSectionRefs.current.get(letter);
+    if (!list || !section) return;
+    list.scrollTo({ top: section.offsetTop, behavior });
+  };
 
   return (
     <div className={`h-full flex flex-col ${dark ? "bg-[#191919] text-[#e8e8e8]" : "bg-[#e9e8e8] text-[#111]"}`}>
@@ -4939,7 +5235,7 @@ function ContactsPanel({
         <button
           type="button"
           className={`w-[38px] h-[38px] rounded-[4px] flex items-center justify-center ${dark ? "bg-[#262626] text-[#999] active:bg-[#303030]" : "bg-[#dcdcdc] text-[#555] active:bg-[#d0d0d0]"}`}
-          title="刷新详情"
+          title={source === "local" ? "刷新本地联系人" : "刷新详情"}
           onClick={() => onHydrate(true)}
         >
           <svg className="w-[23px] h-[23px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
@@ -4947,18 +5243,56 @@ function ContactsPanel({
           </svg>
         </button>
       </div>
+      {onSourceChange && (
+        <div className="px-[18px] pb-[10px] shrink-0">
+          <div className={`h-[34px] rounded-[4px] p-[3px] grid grid-cols-2 gap-[3px] ${dark ? "bg-[#242424]" : "bg-[#dcdcdc]"}`}>
+            <button
+              type="button"
+              onClick={() => onSourceChange("network")}
+              className={`rounded-[3px] text-[13px] transition-colors ${source === "network" ? (dark ? "bg-[#3a3a3a] text-white" : "bg-white text-[#111]") : (dark ? "text-[#888]" : "text-[#777]")}`}
+            >
+              联系人
+            </button>
+            <button
+              type="button"
+              onClick={() => onSourceChange("local")}
+              className={`rounded-[3px] text-[13px] transition-colors ${source === "local" ? (dark ? "bg-[#3a3a3a] text-white" : "bg-white text-[#111]") : (dark ? "text-[#888]" : "text-[#777]")}`}
+            >
+              本地联系人
+            </button>
+          </div>
+        </div>
+      )}
       <ContactCountBar counts={counts} dark={dark} />
 
       <ContactHydrationStatus progress={progress} loading={loading} dark={dark} />
+      {error && (
+        <div className="px-[18px] pb-[8px] shrink-0">
+          <div className={`rounded-[4px] px-[10px] py-[7px] text-[12px] break-words ${dark ? "bg-[#3a2020] text-[#e5a0a0]" : "bg-[#fdecec] text-[#b42318]"}`}>
+            {error}
+          </div>
+        </div>
+      )}
 
-      <div className="session-list-scroll flex-1 overflow-y-auto">
-        <ContactCategoryRow dark={dark} color="#07c160" label="群聊" count={groups.length} active={selectedCategory === "groups"} onClick={() => onSelectCategory("groups")} />
-        <ContactCategoryRow dark={dark} color="#1688f0" label="公众号" count={official.length} active={selectedCategory === "official"} onClick={() => onSelectCategory("official")} />
-        <ContactCategoryRow dark={dark} color="#21a8f4" label="服务号" count={service.length} active={selectedCategory === "service"} onClick={() => onSelectCategory("service")} />
-        <ContactCategoryRow dark={dark} color="#2d9bf0" label="企业联系人" count={openim.length} active={selectedCategory === "openim"} onClick={() => onSelectCategory("openim")} badge="企微" />
-        {friendSections.map((section) => (
-          <ContactSection key={section.title} dark={dark} title={section.title} entries={section.entries} onSelect={onSelect} />
-        ))}
+      <div className="relative flex-1 min-h-0">
+        <div ref={contactListRef} className="session-list-scroll relative h-full overflow-y-auto pr-[22px]">
+          <ContactCategoryRow dark={dark} color="#07c160" label="群聊" count={groups.length} active={selectedCategory === "groups"} onClick={() => onSelectCategory("groups")} />
+          <ContactCategoryRow dark={dark} color="#1688f0" label="公众号" count={official.length} active={selectedCategory === "official"} onClick={() => onSelectCategory("official")} />
+          <ContactCategoryRow dark={dark} color="#21a8f4" label="服务号" count={service.length} active={selectedCategory === "service"} onClick={() => onSelectCategory("service")} />
+          <ContactCategoryRow dark={dark} color="#2d9bf0" label="企业联系人" count={openim.length} active={selectedCategory === "openim"} onClick={() => onSelectCategory("openim")} badge="企微" />
+          {friendSections.map((section) => (
+            <div
+              key={section.title}
+              ref={(node) => {
+                if (node) contactSectionRefs.current.set(section.title, node);
+                else contactSectionRefs.current.delete(section.title);
+              }}
+            >
+              <ContactSection dark={dark} title={section.title} entries={section.entries} onSelect={onSelect} />
+            </div>
+          ))}
+        </div>
+        <AlphabetIndex activeLetters={friendSectionLetters} onSelect={scrollToFriendSection} dark={dark} />
       </div>
     </div>
   );
@@ -5109,10 +5443,20 @@ function ContactSection({
 function BroadcastPanel({
   friends,
   groups,
+  localFriends,
+  localGroups,
+  localLoading,
+  localError,
+  onLoadLocal,
   dark,
 }: {
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
+  localFriends: DirectoryEntry[];
+  localGroups: DirectoryEntry[];
+  localLoading: boolean;
+  localError: string;
+  onLoadLocal: () => void;
   dark: boolean;
 }) {
   const [query, setQuery] = useState("");
@@ -5128,19 +5472,42 @@ function BroadcastPanel({
   const [batchInterval, setBatchInterval] = useState(5);
   const [contentOrder, setContentOrder] = useState<BroadcastContentOrder>("text_first");
   const [composerCollapsed, setComposerCollapsed] = useState(false);
+  const [targetSource, setTargetSource] = useState<"network" | "local">("network");
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const imageOrdinalRef = useRef(1);
   const previewUrlsRef = useRef<string[]>([]);
+  const targetListRef = useRef<HTMLDivElement>(null);
+  const targetSectionRefs = useRef(new Map<string, HTMLDivElement>());
 
-  const targets = [...friends, ...groups];
+  const activeFriends = targetSource === "local" ? localFriends : friends;
+  const activeGroups = targetSource === "local" ? localGroups : groups;
+  const targets = [...activeFriends, ...activeGroups];
   const targetMap = new Map(targets.map((entry) => [entry.wxid, entry]));
   const q = query.trim().toLowerCase();
   const visible = targets.filter((entry) =>
     !q || entry.name.toLowerCase().includes(q) || entry.wxid.toLowerCase().includes(q)
   );
+  const visibleSections = groupDirectoryEntries(visible);
+  const visibleSectionLetters = new Set(visibleSections.map((section) => section.title));
   const payloadParts = buildBroadcastParts(message, broadcastImages);
   const hasPayload = payloadParts.length > 0 || !!broadcastFile;
   const selectedWxids = Array.from(selected).filter((wxid) => targetMap.has(wxid));
+
+  const switchTargetSource = (source: "network" | "local") => {
+    if (source === targetSource) return;
+    setTargetSource(source);
+    setSelected(new Set());
+    setQuery("");
+    targetListRef.current?.scrollTo({ top: 0 });
+    if (source === "local") onLoadLocal();
+  };
+
+  const scrollToTargetSection = (letter: string, behavior: ScrollBehavior = "smooth") => {
+    const list = targetListRef.current;
+    const section = targetSectionRefs.current.get(letter);
+    if (!list || !section) return;
+    list.scrollTo({ top: section.offsetTop, behavior });
+  };
 
   useEffect(() => {
     return () => {
@@ -5249,7 +5616,7 @@ function BroadcastPanel({
       <div className={`${composerCollapsed ? "h-[48px]" : "h-[92px]"} px-[18px] flex items-center gap-[8px] shrink-0`}>
         {composerCollapsed ? (
           <div className={`min-w-0 flex-1 text-[13px] truncate ${dark ? "text-[#999]" : "text-[#666]"}`}>
-            群发设置已收起 · 已选 {selectedWxids.length} 个对象{sending ? ` · 已发送 ${sent}，失败 ${failed}` : ""}
+            {targetSource === "local" ? "本地联系人" : "联系人"} · 群发设置已收起 · 已选 {selectedWxids.length} 个对象{sending ? ` · 已发送 ${sent}，失败 ${failed}` : ""}
           </div>
         ) : (
           <div className={`flex-1 h-[38px] rounded-[4px] flex items-center px-[10px] ${dark ? "bg-[#262626]" : "bg-[#dcdcdc]"}`}>
@@ -5282,9 +5649,39 @@ function BroadcastPanel({
 
       {!composerCollapsed && (
         <>
+      <div className="px-[18px] pb-[10px] shrink-0">
+        <div className={`h-[34px] rounded-[4px] p-[3px] grid grid-cols-2 gap-[3px] ${dark ? "bg-[#242424]" : "bg-[#dcdcdc]"}`}>
+          <button
+            type="button"
+            onClick={() => switchTargetSource("network")}
+            className={`rounded-[3px] text-[13px] transition-colors ${targetSource === "network" ? (dark ? "bg-[#3a3a3a] text-white" : "bg-white text-[#111]") : (dark ? "text-[#888]" : "text-[#777]")}`}
+          >
+            联系人
+          </button>
+          <button
+            type="button"
+            onClick={() => switchTargetSource("local")}
+            className={`rounded-[3px] text-[13px] transition-colors ${targetSource === "local" ? (dark ? "bg-[#3a3a3a] text-white" : "bg-white text-[#111]") : (dark ? "text-[#888]" : "text-[#777]")}`}
+          >
+            本地联系人
+          </button>
+        </div>
+      </div>
+      {targetSource === "local" && (localLoading || localError) && (
+        <div className="px-[18px] pb-[8px] shrink-0">
+          {localLoading && (
+            <div className={`text-[12px] ${dark ? "text-[#888]" : "text-[#666]"}`}>正在读取本地联系人...</div>
+          )}
+          {localError && (
+            <div className={`mt-[4px] rounded-[4px] px-[10px] py-[7px] text-[12px] break-words ${dark ? "bg-[#3a2020] text-[#e5a0a0]" : "bg-[#fdecec] text-[#b42318]"}`}>
+              {localError}
+            </div>
+          )}
+        </div>
+      )}
       <div className="px-[18px] flex flex-wrap gap-[8px] shrink-0">
-        <BroadcastSelectButton dark={dark} label={`全选好友 ${friends.length}`} onClick={() => selectEntries(friends)} />
-        <BroadcastSelectButton dark={dark} label={`全选群 ${groups.length}`} onClick={() => selectEntries(groups)} />
+        <BroadcastSelectButton dark={dark} label={`全选好友 ${activeFriends.length}`} onClick={() => selectEntries(activeFriends)} />
+        <BroadcastSelectButton dark={dark} label={`全选群 ${activeGroups.length}`} onClick={() => selectEntries(activeGroups)} />
         <BroadcastSelectButton dark={dark} label="清空" onClick={() => setSelected(new Set())} />
       </div>
 
@@ -5411,25 +5808,41 @@ function BroadcastPanel({
         </>
       )}
 
-      <div className={`session-list-scroll flex-1 overflow-y-auto border-t ${dark ? "border-[#2a2a2a]" : "border-[#d8d8d8]"}`}>
-        {visible.map((entry) => (
-          <label
-            key={`${entry.source}_${entry.wxid}`}
-            className={`h-[60px] px-[14px] flex items-center gap-[10px] cursor-pointer ${dark ? "hover:bg-[#242424]" : "hover:bg-[#dedede]"}`}
+      <div className="relative flex-1 min-h-0">
+        <div ref={targetListRef} className={`session-list-scroll relative h-full overflow-y-auto border-t pr-[22px] ${dark ? "border-[#2a2a2a]" : "border-[#d8d8d8]"}`}>
+          {visibleSections.map((section) => (
+          <div
+            key={section.title}
+            ref={(node) => {
+              if (node) targetSectionRefs.current.set(section.title, node);
+              else targetSectionRefs.current.delete(section.title);
+            }}
           >
-            <input
-              type="checkbox"
-              checked={selected.has(entry.wxid)}
-              onChange={() => toggle(entry.wxid)}
-              className="w-[16px] h-[16px] accent-[#07c160] shrink-0"
-            />
-            <EntryAvatar entry={entry} />
-            <div className="min-w-0 flex-1">
-              <div className="text-[16px] truncate">{entry.name || entry.wxid}</div>
-              <div className={`text-[12px] truncate ${dark ? "text-[#666]" : "text-[#999]"}`}>{entry.is_group ? "群聊" : "好友"} · {entry.wxid}</div>
+            <div className={`h-[28px] px-[14px] flex items-center text-[13px] font-medium ${dark ? "bg-[#1d1d1d] text-[#777]" : "bg-[#e4e4e4] text-[#777]"}`}>
+              {section.title}
             </div>
-          </label>
-        ))}
+            {section.entries.map((entry) => (
+              <label
+                key={`${entry.source}_${entry.wxid}`}
+                className={`h-[60px] px-[14px] flex items-center gap-[10px] cursor-pointer ${dark ? "hover:bg-[#242424]" : "hover:bg-[#dedede]"}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(entry.wxid)}
+                  onChange={() => toggle(entry.wxid)}
+                  className="w-[16px] h-[16px] accent-[#07c160] shrink-0"
+                />
+                <EntryAvatar entry={entry} />
+                <div className="min-w-0 flex-1">
+                  <div className="text-[16px] truncate">{entry.name || entry.wxid}</div>
+                  <div className={`text-[12px] truncate ${dark ? "text-[#666]" : "text-[#999]"}`}>{entry.is_group ? "群聊" : "好友"} · {entry.wxid}</div>
+                </div>
+              </label>
+            ))}
+          </div>
+          ))}
+        </div>
+        <AlphabetIndex activeLetters={visibleSectionLetters} onSelect={scrollToTargetSection} dark={dark} />
       </div>
     </div>
   );
