@@ -5127,6 +5127,7 @@ function BroadcastPanel({
   const [batchSize, setBatchSize] = useState(100);
   const [batchInterval, setBatchInterval] = useState(5);
   const [contentOrder, setContentOrder] = useState<BroadcastContentOrder>("text_first");
+  const [composerCollapsed, setComposerCollapsed] = useState(false);
   const messageInputRef = useRef<HTMLTextAreaElement>(null);
   const imageOrdinalRef = useRef(1);
   const previewUrlsRef = useRef<string[]>([]);
@@ -5245,20 +5246,42 @@ function BroadcastPanel({
 
   return (
     <div className={`h-full flex flex-col ${dark ? "bg-[#191919] text-[#e8e8e8]" : "bg-[#e9e8e8] text-[#111]"}`} onPaste={handlePaste}>
-      <div className="h-[92px] px-[18px] flex items-center">
-        <div className={`flex-1 h-[38px] rounded-[4px] flex items-center px-[10px] ${dark ? "bg-[#262626]" : "bg-[#dcdcdc]"}`}>
-          <svg className={`w-[18px] h-[18px] shrink-0 ${dark ? "text-[#666]" : "text-[#777]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+      <div className={`${composerCollapsed ? "h-[48px]" : "h-[92px]"} px-[18px] flex items-center gap-[8px] shrink-0`}>
+        {composerCollapsed ? (
+          <div className={`min-w-0 flex-1 text-[13px] truncate ${dark ? "text-[#999]" : "text-[#666]"}`}>
+            群发设置已收起 · 已选 {selectedWxids.length} 个对象{sending ? ` · 已发送 ${sent}，失败 ${failed}` : ""}
+          </div>
+        ) : (
+          <div className={`flex-1 h-[38px] rounded-[4px] flex items-center px-[10px] ${dark ? "bg-[#262626]" : "bg-[#dcdcdc]"}`}>
+            <svg className={`w-[18px] h-[18px] shrink-0 ${dark ? "text-[#666]" : "text-[#777]"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg>
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              className={`ml-[8px] bg-transparent outline-none text-[15px] w-full ${dark ? "text-[#ddd] placeholder-[#5c5c5c]" : "text-[#111] placeholder-[#888]"}`}
+              placeholder="搜索群发对象"
+            />
+          </div>
+        )}
+        <button
+          type="button"
+          aria-expanded={!composerCollapsed}
+          onClick={() => setComposerCollapsed((value) => !value)}
+          className={`h-[38px] px-[10px] rounded-[4px] border flex items-center gap-[5px] text-[13px] shrink-0 active:opacity-75 ${
+            dark ? "border-[#333] bg-[#222] text-[#bbb]" : "border-[#d4d4d4] bg-white text-[#555]"
+          }`}
+          title={composerCollapsed ? "展开群发设置" : "收起群发设置，显示更多目标"}
+        >
+          <svg className={`w-[14px] h-[14px] transition-transform ${composerCollapsed ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="m6 15 6-6 6 6" />
           </svg>
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            className={`ml-[8px] bg-transparent outline-none text-[15px] w-full ${dark ? "text-[#ddd] placeholder-[#5c5c5c]" : "text-[#111] placeholder-[#888]"}`}
-            placeholder="搜索群发对象"
-          />
-        </div>
+          {composerCollapsed ? "展开" : "收起"}
+        </button>
       </div>
 
+      {!composerCollapsed && (
+        <>
       <div className="px-[18px] flex flex-wrap gap-[8px] shrink-0">
         <BroadcastSelectButton dark={dark} label={`全选好友 ${friends.length}`} onClick={() => selectEntries(friends)} />
         <BroadcastSelectButton dark={dark} label={`全选群 ${groups.length}`} onClick={() => selectEntries(groups)} />
@@ -5385,6 +5408,8 @@ function BroadcastPanel({
           </div>
         </div>
       </div>
+        </>
+      )}
 
       <div className={`session-list-scroll flex-1 overflow-y-auto border-t ${dark ? "border-[#2a2a2a]" : "border-[#d8d8d8]"}`}>
         {visible.map((entry) => (
