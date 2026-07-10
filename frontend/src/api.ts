@@ -76,6 +76,7 @@ export const activateAccount = (agentId: string) =>
 export const getSelf = () => fetchJSON("/api/self");
 export const getContacts = () => fetchJSON("/api/contacts");
 export const refreshContacts = () => fetchJSON("/api/contacts/refresh");
+export const getLocalContacts = () => fetchJSON("/api/local-contacts", undefined, 120_000);
 export const getContactDetail = (wxid: string) => fetchJSON(`/api/contacts/${wxid}`);
 export const getContactAvatar = (wxid: string) => fetchJSON(`/api/contacts/${wxid}/avatar`);
 export const batchGetContactBrief = (wxids: string[]) =>
