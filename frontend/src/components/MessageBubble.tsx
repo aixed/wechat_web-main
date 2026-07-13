@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, type ReactNode, type WheelEvent } from "react";
+import { useState, useEffect, useMemo, useRef, type ReactNode, type WheelEvent, type MouseEvent } from "react";
 import type { ChatMessage } from "../types";
 import { getImageUrl, getDbImageUrl, downloadImage, authQuery } from "../api";
 import { replaceWechatEmojis } from "../utils/wechatEmoji";
@@ -362,17 +362,39 @@ export default function MessageBubble({
   const [enlargedImg, setEnlargedImg] = useState<string | null>(null);
   const [previewScale, setPreviewScale] = useState(1);
   const [previewOrigin, setPreviewOrigin] = useState("50% 50%");
+  const [previewOffset, setPreviewOffset] = useState({ x: 0, y: 0 });
+  const [isPreviewDragging, setIsPreviewDragging] = useState(false);
   const previewImageRef = useRef<HTMLImageElement | null>(null);
+  const previewDragStartRef = useRef<{ startX: number; startY: number; offsetX: number; offsetY: number } | null>(null);
+  const didPreviewDragRef = useRef(false);
 
   useEffect(() => {
     setPreviewScale(1);
     setPreviewOrigin("50% 50%");
+    setPreviewOffset({ x: 0, y: 0 });
+    setIsPreviewDragging(false);
+    previewDragStartRef.current = null;
+    didPreviewDragRef.current = false;
   }, [enlargedImg]);
 
   const closeImagePreview = () => {
     setEnlargedImg(null);
     setPreviewScale(1);
     setPreviewOrigin("50% 50%");
+    setPreviewOffset({ x: 0, y: 0 });
+    setIsPreviewDragging(false);
+    previewDragStartRef.current = null;
+    didPreviewDragRef.current = false;
+  };
+
+  const handleImagePreviewOverlayClick = (event: MouseEvent<HTMLDivElement>) => {
+    if (didPreviewDragRef.current) {
+      event.preventDefault();
+      event.stopPropagation();
+      didPreviewDragRef.current = false;
+      return;
+    }
+    closeImagePreview();
   };
 
   const handleImagePreviewWheel = (event: WheelEvent<HTMLDivElement>) => {
@@ -391,6 +413,41 @@ export default function MessageBubble({
       const next = clampPreviewScale(current * factor);
       return Math.round(next * 100) / 100;
     });
+  };
+
+  const handleImagePreviewMouseDown = (event: MouseEvent<HTMLImageElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    previewDragStartRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      offsetX: previewOffset.x,
+      offsetY: previewOffset.y,
+    };
+    didPreviewDragRef.current = false;
+    setIsPreviewDragging(true);
+  };
+
+  const handleImagePreviewMouseMove = (event: MouseEvent<HTMLDivElement>) => {
+    if (!previewDragStartRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const { startX, startY, offsetX, offsetY } = previewDragStartRef.current;
+    const deltaX = event.clientX - startX;
+    const deltaY = event.clientY - startY;
+    if (Math.abs(deltaX) + Math.abs(deltaY) > 3) {
+      didPreviewDragRef.current = true;
+    }
+    setPreviewOffset({
+      x: offsetX + deltaX,
+      y: offsetY + deltaY,
+    });
+  };
+
+  const stopImagePreviewDragging = () => {
+    previewDragStartRef.current = null;
+    setIsPreviewDragging(false);
   };
 
   const renderContent = () => {
@@ -697,27 +754,47 @@ export default function MessageBubble({
       {enlargedImg && (
         <div
           className="fixed inset-0 z-[9999] bg-black/90 flex items-center justify-center"
-          onClick={closeImagePreview}
+          onClick={handleImagePreviewOverlayClick}
           onWheel={handleImagePreviewWheel}
+          onMouseMove={handleImagePreviewMouseMove}
+          onMouseUp={stopImagePreviewDragging}
+          onMouseLeave={stopImagePreviewDragging}
         >
-          <img
-            ref={previewImageRef}
-            src={enlargedImg}
-            alt=""
-            className="max-w-[95vw] max-h-[90vh] object-contain"
+          <div
+            className="select-none"
             style={{
-              transform: `scale(${previewScale})`,
-              transformOrigin: previewOrigin,
-              transition: "transform 80ms ease-out",
+              cursor: isPreviewDragging ? "grabbing" : "grab",
+              transform: `translate3d(${previewOffset.x}px, ${previewOffset.y}px, 0)`,
               willChange: "transform",
             }}
-            onClick={(event) => event.stopPropagation()}
-            onDoubleClick={(event) => {
+            onClick={(event) => {
               event.stopPropagation();
-              setPreviewScale(1);
-              setPreviewOrigin("50% 50%");
+              didPreviewDragRef.current = false;
             }}
-          />
+          >
+            <img
+              ref={previewImageRef}
+              src={enlargedImg}
+              alt=""
+              className="max-w-[95vw] max-h-[90vh] object-contain"
+              draggable={false}
+              style={{
+                transform: `scale(${previewScale})`,
+                transformOrigin: previewOrigin,
+                transition: isPreviewDragging ? "none" : "transform 80ms ease-out",
+                willChange: "transform",
+              }}
+              onMouseDown={handleImagePreviewMouseDown}
+              onDoubleClick={(event) => {
+                event.stopPropagation();
+                setPreviewScale(1);
+                setPreviewOrigin("50% 50%");
+                setPreviewOffset({ x: 0, y: 0 });
+                didPreviewDragRef.current = false;
+                stopImagePreviewDragging();
+              }}
+            />
+          </div>
         </div>
       )}
     </div>
