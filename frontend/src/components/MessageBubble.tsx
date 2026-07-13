@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, type ReactNode } from "react";
+import { useState, useEffect, useMemo, useRef, type ReactNode, type WheelEvent } from "react";
 import type { ChatMessage } from "../types";
 import { getImageUrl, getDbImageUrl, downloadImage, authQuery } from "../api";
 import { replaceWechatEmojis } from "../utils/wechatEmoji";
@@ -25,6 +25,8 @@ function parseRefermsg(xml: string) {
     return {
       title,
       refer: {
+        type: refermsg.querySelector("type")?.textContent || "",
+        svrid: refermsg.querySelector("svrid")?.textContent || "",
         displayname: refermsg.querySelector("displayname")?.textContent || "",
         content: refermsg.querySelector("content")?.textContent || "",
       },
@@ -206,8 +208,14 @@ function EmojiSticker({ msgXml }: { msgXml: string }) {
  * For DB images, sends BytesExtraHex to backend which finds the file on disk.
  */
 const IMAGE_RETRY_DELAYS = [15, 30, 60]; // seconds between retries
+const PREVIEW_MIN_SCALE = 0.35;
+const PREVIEW_MAX_SCALE = 5;
 const URL_REGEX = /((?:https?:\/\/|www\.)[^\s<>"']+)/gi;
 const URL_TRAILING_PUNCTUATION = /[),.;!?，。！？、；：]+$/;
+
+function clampPreviewScale(value: number): number {
+  return Math.min(PREVIEW_MAX_SCALE, Math.max(PREVIEW_MIN_SCALE, value));
+}
 
 function linkHref(url: string): string {
   return /^https?:\/\//i.test(url) ? url : `https://${url}`;
@@ -258,7 +266,11 @@ function renderTextWithLinks(text: string, isSelf: boolean, mobile: boolean, dar
   return nodes.length > 0 ? nodes : replaceWechatEmojis(normalized);
 }
 
-function ChatImage({ message, onEnlarge }: { message: ChatMessage; onEnlarge: (url: string) => void }) {
+function ChatImage({ message, onEnlarge, compact = false }: {
+  message: ChatMessage;
+  onEnlarge: (url: string) => void;
+  compact?: boolean;
+}) {
   const [src, setSrc] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -335,7 +347,7 @@ function ChatImage({ message, onEnlarge }: { message: ChatMessage; onEnlarge: (u
     <img
       src={src}
       alt="图片"
-      className="max-w-[200px] max-h-[200px] rounded-[4px] cursor-pointer object-cover"
+      className={`${compact ? "max-w-[72px] max-h-[72px]" : "max-w-[200px] max-h-[200px]"} rounded-[4px] cursor-pointer object-cover`}
       loading="lazy"
       onClick={() => onEnlarge(src)}
       onError={() => setFailed(true)}
@@ -348,6 +360,38 @@ export default function MessageBubble({
 }: MessageBubbleProps) {
   const msgtype = String(message.msgtype);
   const [enlargedImg, setEnlargedImg] = useState<string | null>(null);
+  const [previewScale, setPreviewScale] = useState(1);
+  const [previewOrigin, setPreviewOrigin] = useState("50% 50%");
+  const previewImageRef = useRef<HTMLImageElement | null>(null);
+
+  useEffect(() => {
+    setPreviewScale(1);
+    setPreviewOrigin("50% 50%");
+  }, [enlargedImg]);
+
+  const closeImagePreview = () => {
+    setEnlargedImg(null);
+    setPreviewScale(1);
+    setPreviewOrigin("50% 50%");
+  };
+
+  const handleImagePreviewWheel = (event: WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const rect = previewImageRef.current?.getBoundingClientRect();
+    if (rect && rect.width > 0 && rect.height > 0) {
+      const x = ((event.clientX - rect.left) / rect.width) * 100;
+      const y = ((event.clientY - rect.top) / rect.height) * 100;
+      setPreviewOrigin(`${Math.min(100, Math.max(0, x))}% ${Math.min(100, Math.max(0, y))}%`);
+    }
+
+    const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+    setPreviewScale((current) => {
+      const next = clampPreviewScale(current * factor);
+      return Math.round(next * 100) / 100;
+    });
+  };
 
   const renderContent = () => {
     switch (msgtype) {
@@ -455,6 +499,7 @@ export default function MessageBubble({
 
           if (appType === "57") {
             const parsed = parseRefermsg(message.msg);
+            const quotedImage = parsed.refer?.type === "3" && Boolean(parsed.refer.content);
             return (
               <div className="min-w-[220px] max-w-[420px]">
                 <div className="whitespace-pre-wrap break-words text-[17px] leading-[1.4]">
@@ -466,8 +511,29 @@ export default function MessageBubble({
                       ? "bg-[#dff6d4] text-[#668060]"
                       : dark ? "bg-[#3a3a3a] text-[#aaa]" : "bg-[#f0f0f0] text-[#777]"
                   }`}>
-                    <span className="font-medium">{parsed.refer.displayname}: </span>
-                    <span>{replaceWechatEmojis(parsed.refer.content?.substring(0, 60) || "")}</span>
+                    {quotedImage ? (
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium shrink-0 self-start">{parsed.refer.displayname}:</span>
+                        <ChatImage
+                          compact
+                          message={{
+                            ...message,
+                            id: parsed.refer.svrid || message.id,
+                            msgtype: "3",
+                            msg: parsed.refer.content,
+                            bytesExtraHex: "",
+                            img_path: undefined,
+                            db_image_id: undefined,
+                          }}
+                          onEnlarge={setEnlargedImg}
+                        />
+                      </div>
+                    ) : (
+                      <>
+                        <span className="font-medium">{parsed.refer.displayname}: </span>
+                        <span>{replaceWechatEmojis(parsed.refer.content?.substring(0, 60) || "")}</span>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -631,12 +697,26 @@ export default function MessageBubble({
       {enlargedImg && (
         <div
           className="fixed inset-0 z-[9999] bg-black/90 flex items-center justify-center"
-          onClick={() => setEnlargedImg(null)}
+          onClick={closeImagePreview}
+          onWheel={handleImagePreviewWheel}
         >
           <img
+            ref={previewImageRef}
             src={enlargedImg}
             alt=""
             className="max-w-[95vw] max-h-[90vh] object-contain"
+            style={{
+              transform: `scale(${previewScale})`,
+              transformOrigin: previewOrigin,
+              transition: "transform 80ms ease-out",
+              willChange: "transform",
+            }}
+            onClick={(event) => event.stopPropagation()}
+            onDoubleClick={(event) => {
+              event.stopPropagation();
+              setPreviewScale(1);
+              setPreviewOrigin("50% 50%");
+            }}
           />
         </div>
       )}

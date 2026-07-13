@@ -22,6 +22,7 @@ import io
 import shutil
 import re
 import html
+import subprocess
 from typing import Any
 
 import config
@@ -3591,7 +3592,16 @@ async def get_older_messages(wxid: str, before: int = 0, limit: int = 100, db: s
     limit = max(1, min(int(limit or 100), 100))
     owner_wxid = _contact_owner_wxid()
     cached = sqlite_cache.get_messages(wxid, limit, before=before, owner_wxid=owner_wxid)
-    if cached:
+    # Older caches written before sender extraction was fixed may identify the
+    # chatroom itself as the sender.  Do not serve those rows forever: re-query
+    # the native DB so the real member wxid/profile can replace them.
+    unresolved_group_sender = wxid.endswith("@chatroom") and any(
+        str(message.get("sendorrecv", "")) == "2"
+        and str(message.get("fromid", "") or "") in ("", wxid)
+        for message in cached
+        if isinstance(message, dict)
+    )
+    if cached and not unresolved_group_sender:
         message_store.add_history_no_flag(wxid, cached)
         return {"data": cached, "source": "sqlite"}
 
@@ -5724,14 +5734,152 @@ os.makedirs(_IMG_CACHE_DIR, exist_ok=True)
 
 
 def _image_file_response(path: str, msg_id: str = ""):
+    response_path = _ensure_browser_image_file(path) or path
     if msg_id and path:
         try:
-            updated = sqlite_cache.update_image_path_by_msg_id(str(msg_id), path, owner_wxid=_contact_owner_wxid())
+            updated = sqlite_cache.update_image_path_by_msg_id(str(msg_id), response_path, owner_wxid=_contact_owner_wxid())
             if updated:
-                _log(f"[SQLITE_CACHE] image path cached for msg_id={msg_id}: {path}")
+                _log(f"[SQLITE_CACHE] image path cached for msg_id={msg_id}: {response_path}")
         except Exception as e:
             _log(f"[SQLITE_CACHE] image path update failed: {type(e).__name__}: {e}")
-    return FileResponse(path)
+    return FileResponse(response_path, media_type=_image_media_type_for_path(response_path))
+
+
+def _image_magic(data: bytes) -> str:
+    if data[:3] == b"GIF":
+        return "gif"
+    if data[:4] == b"\x89PNG":
+        return "png"
+    if data[:2] == b"\xff\xd8":
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:4] == b"wxgf":
+        return "wxgf"
+    return ""
+
+
+def _image_media_type_for_path(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            kind = _image_magic(f.read(16))
+    except Exception:
+        kind = ""
+    return {
+        "gif": "image/gif",
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "webp": "image/webp",
+    }.get(kind, "application/octet-stream")
+
+
+def _ffmpeg_executable() -> str:
+    configured = os.environ.get("FFMPEG_PATH", "").strip()
+    if configured:
+        return configured
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg  # type: ignore
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+
+def _find_wxgf_partitions(data: bytes) -> list[tuple[int, int, float]]:
+    """Find HEVC Annex B partitions inside WeChat wxgf/wxam data."""
+    if len(data) < 15 or data[:4] != b"wxgf":
+        return []
+    header_len = data[4]
+    if header_len >= len(data):
+        return []
+
+    for pattern in (b"\x00\x00\x00\x01", b"\x00\x00\x01"):
+        partitions: list[tuple[int, int, float]] = []
+        offset = 0
+        while header_len + offset <= len(data):
+            idx = data.find(pattern, header_len + offset)
+            if idx < 0:
+                break
+            if idx < 4:
+                offset = idx - header_len + 1
+                continue
+            size = int.from_bytes(data[idx - 4:idx], "big", signed=False)
+            if 0 < size and idx + size <= len(data):
+                partitions.append((idx, size, size / len(data)))
+                offset = idx - header_len + size
+            else:
+                offset = idx - header_len + 1
+        if partitions:
+            return partitions
+    return []
+
+
+def _convert_wxgf_to_jpeg(data: bytes) -> bytes:
+    partitions = _find_wxgf_partitions(data)
+    if not partitions:
+        raise ValueError("no wxgf HEVC partition found")
+    offset, size, _ratio = max(partitions, key=lambda item: item[1])
+    hevc_data = data[offset:offset + size]
+    cmd = [
+        _ffmpeg_executable(),
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "hevc",
+        "-i", "pipe:0",
+        "-frames:v", "1",
+        "-c:v", "mjpeg",
+        "-q:v", "4",
+        "-f", "image2pipe",
+        "pipe:1",
+    ]
+    proc = subprocess.run(
+        cmd,
+        input=hevc_data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg failed ({proc.returncode}): {stderr[:300]}")
+    if _image_magic(proc.stdout[:16]) != "jpg":
+        raise RuntimeError("ffmpeg did not return jpeg data")
+    return proc.stdout
+
+
+def _ensure_browser_image_file(path: str) -> str:
+    if not _nonempty_file(path):
+        return ""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+        kind = _image_magic(head)
+        if kind and kind != "wxgf":
+            return path
+        if kind != "wxgf":
+            return path
+
+        decoded_path = os.path.splitext(path)[0] + ".decoded.jpg"
+        if _nonempty_file(decoded_path):
+            with open(decoded_path, "rb") as f:
+                if _image_magic(f.read(16)) == "jpg":
+                    return decoded_path
+
+        with open(path, "rb") as f:
+            data = f.read()
+        jpeg_data = _convert_wxgf_to_jpeg(data)
+        tmp_path = decoded_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(jpeg_data)
+        os.replace(tmp_path, decoded_path)
+        _log(f"[WXGF] converted {path} -> {decoded_path} ({len(jpeg_data)} bytes)")
+        return decoded_path
+    except Exception as e:
+        _log(f"[WXGF] convert failed for {path}: {type(e).__name__}: {e}")
+        return path
 
 
 def _safe_media_filename_part(value: str, fallback: str = "media", limit: int = 80) -> str:

@@ -1154,13 +1154,16 @@ async def get_chat_history(wxid: str, limit: int = 50, before_time: int = 0, dbs
         return {"data": []}
 
     is_group = "@chatroom" in wxid
-    # Always include BytesExtra (for group sender extraction + image paths)
-    # and CompressContent (for type 49 fallback)
+    # Query BLOBs as hex explicitly.  Remote QueryDB transports SQLite BLOB
+    # columns as JSON strings, which is lossy/ambiguous; treating that value as
+    # hex made group sender extraction silently fail and fromid fell back to the
+    # chatroom id.  SQLite's hex() gives the parser a stable representation in
+    # both local and remote hook modes.
     time_filter = f"AND CreateTime < {before_time}" if before_time > 0 else ""
     safe_wxid = _sql_literal(wxid)
     sql = (
         f"SELECT TalkerId, CreateTime, StrTalker, StrContent, MsgSvrID, Type, IsSender, "
-        f"BytesExtra, CompressContent "
+        f"hex(BytesExtra) AS BytesExtraHex, hex(CompressContent) AS CompressHex "
         f"FROM MSG WHERE StrTalker = '{safe_wxid}' {time_filter} "
         f"ORDER BY localId DESC LIMIT {limit}"
     )

@@ -8,3 +8,4 @@ pyyaml>=6.0.2
 requests>=2.32.3
 Pillow>=11.0.0
 python-multipart>=0.0.20
+imageio-ffmpeg>=0.5.1,<1.0
