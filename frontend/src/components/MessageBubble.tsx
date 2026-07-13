@@ -15,6 +15,12 @@ interface MessageBubbleProps {
   dark?: boolean;
 }
 
+type ParsedFileMessage = {
+  title: string;
+  extension: string;
+  sizeText: string;
+};
+
 function parseRefermsg(xml: string) {
   try {
     const parser = new DOMParser();
@@ -34,6 +40,100 @@ function parseRefermsg(xml: string) {
   } catch {
     return { title: "", refer: null };
   }
+}
+
+function extractXmlPayload(text: string): string {
+  const raw = text || "";
+  const xmlStart = raw.indexOf("<?xml");
+  if (xmlStart >= 0) return raw.slice(xmlStart);
+  const msgStart = raw.indexOf("<msg");
+  if (msgStart >= 0) return raw.slice(msgStart);
+  const appmsgStart = raw.indexOf("<appmsg");
+  if (appmsgStart >= 0) return `<msg>${raw.slice(appmsgStart)}</msg>`;
+  return raw;
+}
+
+function formatFileSize(bytesText: string): string {
+  const bytes = Number.parseInt(bytesText || "", 10);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)}K`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)}M`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}G`;
+}
+
+function extensionFromFilename(filename: string): string {
+  const match = filename.trim().match(/\.([a-z0-9]{1,8})$/i);
+  return match?.[1]?.toLowerCase() || "";
+}
+
+function parseFileAppMessage(xmlOrText: string): ParsedFileMessage | null {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(extractXmlPayload(xmlOrText), "text/xml");
+    if (doc.querySelector("parsererror")) return null;
+
+    const appType = doc.querySelector("appmsg > type")?.textContent || doc.querySelector("type")?.textContent || "";
+    if (appType !== "6" && appType !== "74") return null;
+
+    const title = (doc.querySelector("appmsg > title")?.textContent || doc.querySelector("title")?.textContent || "文件").trim();
+    const extension = (
+      doc.querySelector("appattach > fileext")?.textContent?.trim() ||
+      extensionFromFilename(title) ||
+      "file"
+    ).toLowerCase();
+    const totalLen = doc.querySelector("appattach > totallen")?.textContent || "";
+    return {
+      title,
+      extension,
+      sizeText: formatFileSize(totalLen),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function fileIconColor(extension: string): string {
+  const ext = extension.toLowerCase();
+  if (ext === "pdf") return "#ef4444";
+  if (["doc", "docx", "wps"].includes(ext)) return "#3b82f6";
+  if (["xls", "xlsx", "csv"].includes(ext)) return "#22c55e";
+  if (["ppt", "pptx"].includes(ext)) return "#f97316";
+  if (["zip", "rar", "7z"].includes(ext)) return "#eab308";
+  return "#8b8f98";
+}
+
+function FileTypeIcon({ extension, compact = false }: { extension: string; compact?: boolean }) {
+  const label = (extension || "file").toUpperCase().slice(0, compact ? 4 : 5);
+  return (
+    <span
+      className={`relative flex shrink-0 items-center justify-center rounded-[3px] font-bold text-white shadow-sm ${
+        compact ? "h-9 w-8 text-[9px]" : "h-12 w-10 text-[11px]"
+      }`}
+      style={{ backgroundColor: fileIconColor(extension) }}
+    >
+      <span className="absolute right-0 top-0 h-0 w-0 border-b-[9px] border-l-[9px] border-b-black/15 border-l-white/80" />
+      <span className="mt-1">{label}</span>
+    </span>
+  );
+}
+
+function FileMessageCard({ file, compact = false }: { file: ParsedFileMessage; compact?: boolean }) {
+  return (
+    <div className={`flex min-w-0 items-center gap-2.5 ${compact ? "max-w-[250px]" : "w-[250px]"}`}>
+      <div className="min-w-0 flex-1">
+        <div className={`${compact ? "text-[13px]" : "text-[17px]"} truncate text-inherit`}>
+          {file.title}
+        </div>
+        {file.sizeText && (
+          <div className={`${compact ? "text-[12px]" : "text-[13px]"} mt-0.5 truncate opacity-70`}>
+            {file.sizeText}
+          </div>
+        )}
+      </div>
+      <FileTypeIcon extension={file.extension} compact={compact} />
+    </div>
+  );
 }
 
 function parseLocation(xml: string) {
@@ -557,6 +657,7 @@ export default function MessageBubble({
           if (appType === "57") {
             const parsed = parseRefermsg(message.msg);
             const quotedImage = parsed.refer?.type === "3" && Boolean(parsed.refer.content);
+            const quotedFile = parsed.refer?.content ? parseFileAppMessage(parsed.refer.content) : null;
             return (
               <div className="min-w-[220px] max-w-[420px]">
                 <div className="whitespace-pre-wrap break-words text-[17px] leading-[1.4]">
@@ -585,6 +686,11 @@ export default function MessageBubble({
                           onEnlarge={setEnlargedImg}
                         />
                       </div>
+                    ) : quotedFile ? (
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium shrink-0 self-start">{parsed.refer.displayname}:</span>
+                        <FileMessageCard file={quotedFile} compact />
+                      </div>
                     ) : (
                       <>
                         <span className="font-medium">{parsed.refer.displayname}: </span>
@@ -598,12 +704,15 @@ export default function MessageBubble({
           }
 
           if (appType === "6" || appType === "74") {
-            const title = doc.querySelector("title")?.textContent || "文件";
+            const file = parseFileAppMessage(message.msg);
             return (
-              <div className="flex items-center gap-3 w-[220px]">
-                <span className="text-2xl">📄</span>
-                <span className="text-[17px] truncate">{title}</span>
-              </div>
+              <FileMessageCard
+                file={file || {
+                  title: doc.querySelector("title")?.textContent || "文件",
+                  extension: extensionFromFilename(doc.querySelector("title")?.textContent || ""),
+                  sizeText: "",
+                }}
+              />
             );
           }
 
@@ -760,6 +869,23 @@ export default function MessageBubble({
           onMouseUp={stopImagePreviewDragging}
           onMouseLeave={stopImagePreviewDragging}
         >
+          <button
+            type="button"
+            aria-label="关闭图片预览"
+            title="关闭"
+            className="absolute right-5 top-5 z-[10000] flex h-10 w-10 items-center justify-center rounded-full bg-red-600/95 text-[32px] leading-none text-white shadow-lg shadow-black/40 transition hover:bg-red-500 active:scale-95 active:bg-red-700"
+            onMouseDown={(event) => {
+              event.stopPropagation();
+              stopImagePreviewDragging();
+            }}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              closeImagePreview();
+            }}
+          >
+            ×
+          </button>
           <div
             className="select-none"
             style={{
