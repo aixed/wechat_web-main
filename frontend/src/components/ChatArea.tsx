@@ -598,7 +598,7 @@ export default function ChatArea({
       ) : (
         <div
           ref={messagesContainerRef}
-          className={`flex-1 overflow-y-auto min-h-0 ${pageBg}`}
+          className={`chat-message-scroll ${dark ? "chat-message-scroll-dark" : "chat-message-scroll-light"} flex-1 min-h-0 ${pageBg}`}
         >
           <div className="py-2 pb-1">
             {/* Load older messages indicator */}
