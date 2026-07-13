@@ -1,7 +1,7 @@
 {
 	"info": {
-		"_postman_id": "60101e09-e91f-44c1-aa97-d3ade497e975",
-		"name": "PCWeChat_391016",
+		"_postman_id": "6192f1f1-aade-445c-8b8a-8ca8fb4b0ff4",
+		"name": "PCWeChat_391016_",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
 	},
 	"item": [
@@ -547,7 +547,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "{\r\n    \"wxidorgid\": \"filehelper\",\r\n    \"msg\": \"大展宏图\"\r\n}",
+									"raw": "{\r\n    \"wxidorgid\": \"filehelper\",\r\n    \"msg\": \"大展宏图\",\r\n    \"msgsource\": \"<msgsource><sec_msg_node><alnode><fr>1</fr></alnode></sec_msg_node><pua>1</pua></msgsource>\"\r\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -603,7 +603,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"picpath\": \"C:\\\\Y.jpg\",\r\n    \"fileData\": \"\"\r\n }",
+									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"picpath\": \"C:\\\\1.jpg\",\r\n    \"fileData\": \"\"\r\n }",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -659,7 +659,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": " {\r\n    \"wxidorgid\": \"filehelper\",\r\n    \"fileid\": \"3057020100044b30490201000204442ca62502032f54cd0204cdbb99db020467eca06a042466303033303632642d353466642d343936342d393636332d3762636435623031333266620204051410020201000405004c4c0900\",\r\n    \"authkey\": \"6a8e2a0deb1db39e4624861d4ec33771\",\r\n    \"filemd5\": \"586663f1d532883c945b216e6614e387\",\r\n    \"filesize\": \"258660\",\r\n    \"filecrc32\": \"4105508126\"\r\n  }\r\n\r\n\r\n",
+									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"picpath\": \"C:\\\\1.jpg\",\r\n    \"fileData\": \"\",\r\n    \"msgsource\": \"<msgsource><sec_msg_node><alnode><fr>1</fr></alnode></sec_msg_node></msgsource>\"\r\n }",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -681,7 +681,35 @@
 							"response": []
 						},
 						{
-							"name": "[已实现] 发送文件",
+							"name": "[已实现] 发送图片_无源  显式",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"body": {
+									"mode": "raw",
+									"raw": " {\r\n    \"wxidorgid\": \"filehelper\",\r\n    \"fileid\": \"305f020100044b30490201000204ea9587b102032df98b02049500932402046a468e4b042435666637633530382d396662662d343662662d396663372d646134623861616363316464020405141802020100040d004c4dff000000000000000000\",\r\n    \"authkey\": \"edfa1964dc0e96d3780c8a8ff5d444be\",\r\n    \"filemd5\": \"7043d783da65accd0b4c3d2a424845f8\",\r\n    \"filesize\": \"1700766\",\r\n    \"filecrc32\": \"3615981147\",\r\n    \"rawmidimgsize\": \"1700766\",\r\n    \"rawthumbsize\": \"10748\",\r\n    \"thumbheight\": \"50\",\r\n    \"thumbwidth\": \"150\"\r\n    \r\n  }\r\n\r\n\r\n",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "http://{{host}}:{{port}}/SendImgMsg_NoSrc",
+									"protocol": "http",
+									"host": [
+										"{{host}}"
+									],
+									"port": "{{port}}",
+									"path": [
+										"SendImgMsg_NoSrc"
+									]
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "[已实现] 发送文件 exe",
 							"request": {
 								"method": "POST",
 								"header": [],
@@ -703,6 +731,146 @@
 									"port": "{{port}}",
 									"path": [
 										"SendFileMsg"
+									]
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "[已实现] 发送文件 xlsx",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"body": {
+									"mode": "raw",
+									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"filepath\": \"C:\\\\1.xlsx\",\r\n    \"fileData\": \"\"\r\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "http://{{host}}:{{port}}/SendFileMsg",
+									"protocol": "http",
+									"host": [
+										"{{host}}"
+									],
+									"port": "{{port}}",
+									"path": [
+										"SendFileMsg"
+									]
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "[已实现] 发送文件 zip",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"body": {
+									"mode": "raw",
+									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"filepath\": \"C:\\\\1.zip\",\r\n    \"fileData\": \"\"\r\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "http://{{host}}:{{port}}/SendFileMsg",
+									"protocol": "http",
+									"host": [
+										"{{host}}"
+									],
+									"port": "{{port}}",
+									"path": [
+										"SendFileMsg"
+									]
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "[已实现] 发送文件 txt",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"body": {
+									"mode": "raw",
+									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"filepath\": \"C:\\\\1.txt\",\r\n    \"fileData\": \"\"\r\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "http://{{host}}:{{port}}/SendFileMsg",
+									"protocol": "http",
+									"host": [
+										"{{host}}"
+									],
+									"port": "{{port}}",
+									"path": [
+										"SendFileMsg"
+									]
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "[已实现] 发送文件_无源",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"body": {
+									"mode": "raw",
+									"raw": " {\r\n    \"wxid\": \"filehelper\",\r\n    \"filepath\": \"C:\\\\1.txt\",\r\n    \"fileData\": \"\"\r\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "http://{{host}}:{{port}}/SendFileMsg_NoSrc",
+									"protocol": "http",
+									"host": [
+										"{{host}}"
+									],
+									"port": "{{port}}",
+									"path": [
+										"SendFileMsg_NoSrc"
+									]
+								}
+							},
+							"response": []
+						},
+						{
+							"name": "[已实现] 发送文件_无源 显式参数",
+							"request": {
+								"method": "POST",
+								"header": [],
+								"body": {
+									"mode": "raw",
+									"raw": "{\r\n  \"wxid\": \"filehelper\",\r\n  \"filepath\": \"C:\\\\1.xlsx\",\r\n  \"clientmsgid\": \"4a2962dbb4f7741f653781a9865e9624\",\r\n  \"fileName\": \"1.xlsx\",\r\n  \"fileExt\": \"xlsx\",\r\n  \"filemd5\": \"60ed3873eea1794e85735ece2ee57c72\",\r\n  \"filesize\": 222628,\r\n  \"action\": 1,\r\n  \"version\": 1,\r\n  \"laninfo\": \"\"\r\n}",
+									"options": {
+										"raw": {
+											"language": "json"
+										}
+									}
+								},
+								"url": {
+									"raw": "http://{{host}}:{{port}}/SendFileMsg_NoSrc",
+									"protocol": "http",
+									"host": [
+										"{{host}}"
+									],
+									"port": "{{port}}",
+									"path": [
+										"SendFileMsg_NoSrc"
 									]
 								}
 							},
@@ -1323,13 +1491,13 @@
 							"response": []
 						},
 						{
-							"name": "[已实现] 转发任意消息(Crash)",
+							"name": "[已实现] 转发任意消息",
 							"request": {
 								"method": "POST",
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "{\r\n    \"msgsvrid\": \"14972457342319592772\",\r\n    \"wxid\": \"filehelper\"\r\n}",
+									"raw": "{\r\n    \"msgsvrid\": \"9041821388909176891\",\r\n    \"wxid\": \"thexed\"\r\n}",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -1619,7 +1787,7 @@
 								"header": [],
 								"body": {
 									"mode": "raw",
-									"raw": "{\r\n    \"msg_id\":\"5146872837865087707\"\r\n}\r\n\r\n",
+									"raw": "{\r\n    \"msg_id\":\"3015177577691070980\"\r\n}\r\n\r\n",
 									"options": {
 										"raw": {
 											"language": "json"
@@ -2420,7 +2588,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "{\r\n    \"type\": \"1\"\r\n}",
+							"raw": "{\r\n    \"type\": \"0\"\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -3089,7 +3257,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "{\r\n    \"wxids\": [\r\n        \"wxid_pz2aow723u6s22\",\r\n        \"wxid_nofwran4d89122\",\r\n        \"wxid_qm007xsuesnh22\"\r\n    ]\r\n}",
+							"raw": "{\r\n    \"wxids\": [\r\n        \"wxid_wo9zhdv45nbs22\",\r\n        \"1551431899@chatroom\",\r\n        \"23269296042@chatroom\",\r\n        \"gh_1f8c59b6c4a5\",\r\n        \"47399779013@chatroom\"\r\n    ]\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -3434,7 +3602,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "{\r\n    \"gid\": \"1234@chatroom\",\r\n    \"wxid\": \"thexkid\"\r\n}",
+							"raw": "{\r\n    \"gid\": \"39036650575@chatroom\",\r\n    \"wxid\": \"thexkid\"\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -4110,6 +4278,34 @@
 			"item": [
 				{
 					"name": "[已实现] 批量获取联系人简明信息(每次100个)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n    \"wxidlist\": \"SZUPAUL\"\r\n}\r\n",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "http://{{host}}:{{port}}/BatchGetContactBriefInfo",
+							"protocol": "http",
+							"host": [
+								"{{host}}"
+							],
+							"port": "{{port}}",
+							"path": [
+								"BatchGetContactBriefInfo"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "[已实现] 批量获取联系人简明信息(每次100个) Copy",
 					"request": {
 						"method": "POST",
 						"header": [],
@@ -5002,7 +5198,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "{\r\n    \"dbname\":\"MSG0.db\",\r\n    \"sql\":\"select name from sqlite_master where type='table' order by name\"\r\n}",
+							"raw": "{\r\n    \"dbname\":\"MicroMsg.db\",\r\n    \"sql\":\"select name from sqlite_master where type='table' order by name\"\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -5192,6 +5388,62 @@
 					"response": []
 				},
 				{
+					"name": "[已实现] 查询所有联系人",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n    \"dbname\":\"MicroMsg.db\",\r\n    \"sql\":\"select * from Contact\"\r\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "http://{{host}}:{{port}}/QueryDB",
+							"protocol": "http",
+							"host": [
+								"{{host}}"
+							],
+							"port": "{{port}}",
+							"path": [
+								"QueryDB"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "[已实现] 查询头像",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n    \"dbname\":\"MicroMsg.db\",\r\n    \"sql\":\"select * from ContactHeadImgUrl\"\r\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "http://{{host}}:{{port}}/QueryDB",
+							"protocol": "http",
+							"host": [
+								"{{host}}"
+							],
+							"port": "{{port}}",
+							"path": [
+								"QueryDB"
+							]
+						}
+					},
+					"response": []
+				},
+				{
 					"name": "[已实现] 查询所有公众号ID和名称",
 					"request": {
 						"method": "POST",
@@ -5226,7 +5478,7 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "{\r\n    \"dbname\":\"MicroMsg.db\",\r\n    \"sql\":\"select strUsrName, strNickName from Session order by nOrder desc\"\r\n}",
+							"raw": "{\r\n    \"dbname\":\"MicroMsg.db\",\r\n    \"sql\":\"select * from Session order by nOrder desc\"\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -10326,13 +10578,42 @@
 			"name": "CDN协议层上下传",
 			"item": [
 				{
-					"name": "[已实现] CDN协议上传",
+					"name": "[已实现] CDN协议上传 图片",
 					"request": {
 						"method": "POST",
 						"header": [],
 						"body": {
 							"mode": "raw",
 							"raw": "{\r\n    \"fileType\": 2,\r\n    \"aeskey\": \"edfa1964dc0e96d3780c8a8ff5d444be\",\r\n    \"filePath\": \"C:\\\\up.jpg\",\r\n    \"fileData\": \"\",\r\n    \"userName\": \"filehelper\",\r\n    \"chatType\": 0\r\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "http://{{host}}:{{port}}/upload",
+							"protocol": "http",
+							"host": [
+								"{{host}}"
+							],
+							"port": "{{port}}",
+							"path": [
+								"upload"
+							]
+						},
+						"description": "route: upload\nstatus: implemented\ncode: version/src/cdn/cdn_client.cpp\nnotes: protocol-layer CDN image upload, adapted from D:\\xweixin\\VxHook\\4.1.x CDNMgr::upload/uploadmidimg"
+					},
+					"response": []
+				},
+				{
+					"name": "[已实现] CDN协议上传 文件",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\r\n    \"fileType\": 5,\r\n    \"aeskey\": \"edfa1964dc0e96d3780c8a8ff5d444be\",\r\n    \"filePath\": \"C:\\\\1.txt\",\r\n    \"fileData\": \"\",\r\n    \"userName\": \"filehelper\",\r\n    \"chatType\": 0\r\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -11049,7 +11330,35 @@
 						"header": [],
 						"body": {
 							"mode": "raw",
-							"raw": "  {\r\n      \"filepath\": \"C:\\\\1.JPG\",\r\n      \"fileData\": \"\"\r\n  }\r\n\r\n\r\n",
+							"raw": "  {\r\n      \"filepath\": \"C:\\\\2.JPG\",\r\n      \"fileData\": \"\"\r\n  }\r\n\r\n\r\n",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "http://{{host}}:{{port}}/Get_File_crc32",
+							"protocol": "http",
+							"host": [
+								"{{host}}"
+							],
+							"port": "{{port}}",
+							"path": [
+								"Get_File_crc32"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "[已实现] 取文件crc32 Copy",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "  {\r\n      \"filepath\": \"C:\\\\2.JPG\",\r\n      \"fileData\": \"\"\r\n  }\r\n\r\n\r\n",
 							"options": {
 								"raw": {
 									"language": "json"
