@@ -393,7 +393,7 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
     """Poll /IsLoginStatus and update account-card metadata.
 
     Status 3 is the only state that may continue into expensive initialization.
-    GetSelfLoginInfo is only called after status 3. Earlier login states can
+    GetSelfProfile is only called after status 3. Earlier login states can
     leave WeChat half-ready and should not receive profile/detail calls.
     """
     agent_id = str(agent_id or "").strip()
@@ -445,7 +445,7 @@ async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
             profile = identity.get("profile") or {}
             _agent_self_profile_refreshed.add(agent_id)
         except Exception as e:
-            _log(f"[LOGIN_STATUS] GetSelfLoginInfo failed agent={agent_id}: {type(e).__name__}: {e}")
+            _log(f"[LOGIN_STATUS] GetSelfProfile failed agent={agent_id}: {type(e).__name__}: {e}")
 
     if wxid:
         _self_wxid_to_agent_id[wxid] = agent_id
@@ -1120,7 +1120,7 @@ async def _run_initialization_after_agent():
         while not agent_manager.is_connected():
             _log(f"[INIT] Waiting for DLL agent on {config.AGENT_WS_PATH} ...")
             await asyncio.sleep(1)
-        # Do not call IsLoginStatus/GetSelfLoginInfo/CDN_Init/InitContact here.
+        # Do not call IsLoginStatus/GetSelfProfile/CDN_Init/InitContact here.
         # Account cards are refreshed by /api/accounts, and opening an account
         # only performs the single Session QueryDB requested by the UI.
         await asyncio.sleep(5)

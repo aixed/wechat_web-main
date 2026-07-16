@@ -368,14 +368,14 @@
 						"method": "POST",
 						"header": [],
 						"url": {
-							"raw": "http://{{host}}:{{port}}/GetSelfLoginInfo",
+							"raw": "http://{{host}}:{{port}}/GetSelfProfile",
 							"protocol": "http",
 							"host": [
 								"{{host}}"
 							],
 							"port": "{{port}}",
 							"path": [
-								"GetSelfLoginInfo"
+								"GetSelfProfile"
 							]
 						}
 					},
