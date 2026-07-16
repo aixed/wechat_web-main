@@ -493,7 +493,7 @@ async def get_current_session() -> dict:
 async def send_text(wxid: str, msg: str) -> dict:
     """Send text message."""
     if IS_HOOK:
-        r = await _post("/SendTextMsg", json={"wxid": wxid, "msg": msg})
+        r = await _post("/SendTextMsg", json={"toid": wxid, "msg": msg})
     else:
         r = await _post("/newsendmsg/", json={
             "userName": wxid, "content": msg, "msgType": 1
@@ -504,7 +504,7 @@ async def send_text(wxid: str, msg: str) -> dict:
 async def send_text_no_src(wxidorgid: str, msg: str) -> dict:
     """Send text through the lower-level no-source Hook endpoint."""
     if IS_HOOK:
-        r = await _post("/SendTextMsg_NoSrc", json={"wxidorgid": wxidorgid, "msg": msg})
+        r = await _post("/SendTextMsg_NoSrc", json={"toid": wxidorgid, "msg": msg})
         return safe_json(r)
     return await send_text(wxidorgid, msg)
 
@@ -512,7 +512,7 @@ async def send_text_no_src(wxidorgid: str, msg: str) -> dict:
 async def send_image(wxid: str, picpath: str, diyfilename: str = "", file_data: str | None = None) -> dict:
     """Send image (local path, URL, or hex fileData)."""
     if IS_HOOK:
-        body = {"wxid": wxid, "picpath": picpath}
+        body = {"toid": wxid, "picpath": picpath}
         if diyfilename:
             body["diyfilename"] = diyfilename
         body = _attach_file_data(body, "picpath", file_data)
@@ -536,7 +536,7 @@ async def send_image_file_no_src(
     """Send an image through SendImgMsg_NoSrc with picpath/fileData."""
     if not IS_HOOK:
         return {"error": "SendImgMsg_NoSrc is only supported in hook mode"}
-    body = _attach_file_data({"wxid": wxid, "picpath": picpath}, "picpath", file_data)
+    body = _attach_file_data({"toid": wxid, "picpath": picpath}, "picpath", file_data)
     if msgsource:
         body["msgsource"] = msgsource
     r = await _post("/SendImgMsg_NoSrc", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
@@ -624,7 +624,7 @@ async def send_image_no_src(wxidorgid: str, cdn_fields: dict, msgsource: str = "
     if not IS_HOOK:
         return {"error": "SendImgMsg_NoSrc is only supported in hook mode"}
     body = {
-        "wxidorgid": wxidorgid,
+        "toid": wxidorgid,
         "fileid": str(cdn_fields.get("fileid", "")),
         "authkey": str(cdn_fields.get("authkey", "")),
         "filemd5": str(cdn_fields.get("filemd5", "")),
@@ -647,7 +647,7 @@ async def forward_all_msg(msgsvrid: str, wxid: str) -> dict:
         return {"error": "ForwardAllMsg is only supported in hook mode"}
     r = await _post(
         "/ForwardAllMsg",
-        json={"msgsvrid": str(msgsvrid), "wxid": wxid},
+        json={"msgsvrid": str(msgsvrid), "toid": wxid},
         timeout=90.0 if IS_LOCAL_HOOK else 180.0,
     )
     return safe_json(r)
@@ -656,7 +656,7 @@ async def forward_all_msg(msgsvrid: str, wxid: str) -> dict:
 async def send_file(wxid: str, filepath: str, file_data: str | None = None) -> dict:
     """Send file."""
     if IS_HOOK:
-        body = _attach_file_data({"wxid": wxid, "filepath": filepath}, "filepath", file_data)
+        body = _attach_file_data({"toid": wxid, "filepath": filepath}, "filepath", file_data)
         r = await _post("/SendFileMsg", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
     else:
         r = await _post("/sendfileuploadmsg/", json={
@@ -670,7 +670,7 @@ async def send_file_no_src(wxid: str, filepath: str, file_data: str | None = Non
     """Send a file through the lower-level no-source endpoint."""
     if not IS_HOOK:
         return {"error": "SendFileMsg_NoSrc is only supported in hook mode"}
-    body = _attach_file_data({"wxid": wxid, "filepath": filepath}, "filepath", file_data)
+    body = _attach_file_data({"toid": wxid, "filepath": filepath}, "filepath", file_data)
     r = await _post("/SendFileMsg_NoSrc", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
     return safe_json(r)
 
@@ -678,7 +678,7 @@ async def send_file_no_src(wxid: str, filepath: str, file_data: str | None = Non
 async def send_video(wxid: str, videopath: str, file_data: str | None = None) -> dict:
     """Send video."""
     if IS_HOOK:
-        body = _attach_file_data({"wxid": wxid, "videopath": videopath}, "videopath", file_data)
+        body = _attach_file_data({"toid": wxid, "videopath": videopath}, "videopath", file_data)
         r = await _post("/SendVideoMsg", json=body, timeout=300.0 if IS_LOCAL_HOOK else 600.0)
     else:
         r = await _post("/uploadvideo/", json={
@@ -692,7 +692,7 @@ async def send_voice(wxid: str, voice_file: str, time_ms: int, file_data: str | 
     """Send voice (SILK format)."""
     if IS_HOOK:
         body = _attach_file_data({
-            "wxid": wxid, "voice_file": voice_file, "time_ms": time_ms
+            "toid": wxid, "voice_file": voice_file, "time_ms": time_ms
         }, "voice_file", file_data)
         r = await _post("/SendVoiceMsg", json=body, timeout=120.0 if IS_LOCAL_HOOK else 180.0)
         return safe_json(r)
@@ -704,7 +704,7 @@ async def send_voice(wxid: str, voice_file: str, time_ms: int, file_data: str | 
 async def send_gif(wxid: str, gifpath: str, file_data: str | None = None) -> dict:
     """Send GIF."""
     if IS_HOOK:
-        body = _attach_file_data({"wxid": wxid, "gifpath": gifpath}, "gifpath", file_data)
+        body = _attach_file_data({"toid": wxid, "gifpath": gifpath}, "gifpath", file_data)
         r = await _post("/SendGIFMsg", json=body, timeout=120.0 if IS_LOCAL_HOOK else 180.0)
     else:
         r = await _post("/sendemoji/", json={
@@ -719,7 +719,7 @@ async def send_quote(towxid: str, title: str, svrid: str,
     """Send quote/reply message."""
     if IS_HOOK:
         r = await _post("/SendQuoteMsg", json={
-            "towxid": towxid, "title": title, "svrid": svrid,
+            "toid": towxid, "title": title, "svrid": svrid,
             "fromusr": fromusr, "displayname": displayname, "chatusr": chatusr
         })
     else:
@@ -752,7 +752,7 @@ async def send_at(gid: str, wxidlist: str, nicknamelist: str, msg: str) -> dict:
 async def send_pat(wxid: str, gid: str = "") -> dict:
     """Send pat message."""
     if IS_HOOK:
-        r = await _post("/SendPatMsg", json={"wxid": wxid, "gid": gid})
+        r = await _post("/SendPatMsg", json={"toid": wxid, "gid": gid})
     else:
         r = await _post("/sendpat/", json={
             "userName": wxid, "chatRoomUserName": gid
@@ -764,7 +764,7 @@ async def send_card(towxid: str, fromwxid: str, nickname: str) -> dict:
     """Forward contact card."""
     if IS_HOOK:
         r = await _post("/SendCardMsg", json={
-            "towxid": towxid, "fromwxid": fromwxid, "nickname": nickname
+            "toid": towxid, "fromwxid": fromwxid, "nickname": nickname
         })
         return safe_json(r)
     else:
@@ -775,7 +775,7 @@ async def send_card(towxid: str, fromwxid: str, nickname: str) -> dict:
 async def send_location(wxid: str, msg: str) -> dict:
     """Send location message (msg is XML)."""
     if IS_HOOK:
-        r = await _post("/SendLocationMsg", json={"wxid": wxid, "msg": msg})
+        r = await _post("/SendLocationMsg", json={"toid": wxid, "msg": msg})
         return safe_json(r)
     else:
         _log("[API] Remote mode: SendLocationMsg not directly supported")
