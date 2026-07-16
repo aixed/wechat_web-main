@@ -841,12 +841,12 @@ def _post_login_verify():
         log(f"  → ❌ API 端口不通: {e}")
         log("  → 微信进程可能在登录后崩溃了")
 
-    # 3. 尝试获取详细登录信息 (GetSelfLoginInfo)
+    # 3. 尝试获取详细登录信息 (GetSelfProfile)
     try:
         log("[登录后验证] 获取详细登录信息...")
-        r = _post(f"{API_URL}/GetSelfLoginInfo", body={}, timeout=10)
+        r = _post(f"{API_URL}/GetSelfProfile", body={}, timeout=10)
         data = r.json()
-        log(f"  → GetSelfLoginInfo: {data}")
+        log(f"  → GetSelfProfile: {data}")
     except Exception as e:
         log(f"  → ⚠ 获取登录信息失败: {e}")
 

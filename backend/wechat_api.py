@@ -358,7 +358,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
 async def get_self_info() -> dict:
     """Get current logged-in user info."""
     if IS_HOOK:
-        r = await _post("/GetSelfLoginInfo", json={})
+        r = await _post("/GetSelfProfile", json={})
     else:
         r = await _post("/getprofile/", json={})
     return safe_json(r)
