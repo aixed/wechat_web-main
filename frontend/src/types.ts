@@ -27,13 +27,28 @@ export interface SmartReplyRule {
   id: string;
   keyword: string;
   reply: string;
+  use_regex: boolean;
+  reply_with_matched_line: boolean;
 }
+
+export type SmartReplyMessageType =
+  | "text"
+  | "image"
+  | "gif"
+  | "voice"
+  | "video"
+  | "file"
+  | "xml"
+  | "system"
+  | "recall"
+  | "quote";
 
 export interface SmartReplyConfig {
   chat_id: string;
   chat_name: string;
   avatar?: string;
   enabled: boolean;
+  message_types: SmartReplyMessageType[];
   target_senders: string[];
   rules: SmartReplyRule[];
   reply_count?: number;

@@ -1229,13 +1229,16 @@ class ActivateAccountRequest(BaseModel):
 class SmartReplyRuleRequest(BaseModel):
     id: str = ""
     keyword: str
-    reply: str
+    reply: str = ""
+    use_regex: bool = False
+    reply_with_matched_line: bool = False
 
 
 class SmartReplyConfigRequest(BaseModel):
     chat_name: str = ""
     avatar: str = ""
     enabled: bool = True
+    message_types: list[str] = Field(default_factory=lambda: ["text"])
     target_senders: list[str] = Field(default_factory=list)
     rules: list[SmartReplyRuleRequest] = Field(default_factory=list)
 
@@ -1318,18 +1321,43 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
     if len(target_senders) > 10000:
         raise HTTPException(status_code=400, detail="too many target senders")
 
-    rules: list[dict[str, str]] = []
+    allowed_message_types = {
+        "text", "image", "gif", "voice", "video", "file",
+        "xml", "system", "recall", "quote",
+    }
+    message_types: list[str] = []
+    for value in req.message_types:
+        message_type = str(value or "").strip().lower()
+        if message_type not in allowed_message_types:
+            raise HTTPException(status_code=400, detail=f"unsupported smart reply message type: {message_type}")
+        if message_type not in message_types:
+            message_types.append(message_type)
+    if not message_types:
+        raise HTTPException(status_code=400, detail="at least one message type is required")
+
+    rules: list[dict[str, Any]] = []
     for index, rule in enumerate(req.rules[:100]):
         keyword = str(rule.keyword or "").strip()
         reply = str(rule.reply or "").strip()
-        if not keyword or not reply:
+        reply_with_matched_line = bool(rule.reply_with_matched_line)
+        if not keyword or (not reply_with_matched_line and not reply):
             raise HTTPException(status_code=400, detail="every rule requires a keyword and reply")
         if len(keyword) > 200 or len(reply) > 4000:
             raise HTTPException(status_code=400, detail="a keyword or reply is too long")
+        if rule.use_regex:
+            try:
+                re.compile(keyword, re.IGNORECASE | re.MULTILINE)
+            except re.error as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid regular expression in rule {index + 1}: {exc}",
+                ) from exc
         rules.append({
             "id": str(rule.id or f"rule_{index + 1}")[:100],
             "keyword": keyword,
             "reply": reply,
+            "use_regex": bool(rule.use_regex),
+            "reply_with_matched_line": reply_with_matched_line,
         })
     if not rules:
         raise HTTPException(status_code=400, detail="at least one keyword rule is required")
@@ -1341,6 +1369,7 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
         "chat_name": str(req.chat_name or cached_contact.get("name") or chat_id).strip()[:200],
         "avatar": str(req.avatar or cached_contact.get("avatar") or "").strip()[:2000],
         "enabled": bool(req.enabled),
+        "message_types": message_types,
         "target_senders": target_senders,
         "rules": rules,
     }
@@ -1399,21 +1428,37 @@ async def _process_smart_reply_message(
     if not decision.should_send:
         return
     try:
-        with wechat_api.use_agent(agent_id):
-            result = await wechat_api.send_text(chat_id, decision.reply)
-        if not _send_result_ok(result):
-            _log(f"[SMART_REPLY] send failed chat={chat_id} reason={decision.reason} result={result}")
+        async def _send_one(reply: str):
+            with wechat_api.use_agent(agent_id):
+                return await wechat_api.send_text(chat_id, reply)
+
+        results = await asyncio.gather(
+            *(_send_one(reply) for reply in decision.replies),
+            return_exceptions=True,
+        )
+        sent_replies: list[str] = []
+        for reply, result in zip(decision.replies, results):
+            if isinstance(result, BaseException) or not _send_result_ok(result):
+                _log(
+                    f"[SMART_REPLY] send failed chat={chat_id} reason={decision.reason} "
+                    f"reply={reply!r} result={result}"
+                )
+                continue
+            sent_replies.append(reply)
+        if not sent_replies:
             return
         updated = sqlite_cache.record_smart_reply_trigger(
             chat_id,
             owner_wxid=owner_wxid,
             disable=decision.disable_after_send,
+            increment=len(sent_replies),
         )
-        await _broadcast_local_sent_for_agent(agent_id, chat_id, "1", decision.reply)
+        for reply in sent_replies:
+            await _broadcast_local_sent_for_agent(agent_id, chat_id, "1", reply)
         await manager.broadcast({"type": "smart_reply_updated", "data": {"config": updated}})
         _log(
             f"[SMART_REPLY] sent chat={chat_id} sender={message.get('fromid', '')} "
-            f"reason={decision.reason} disabled={decision.disable_after_send}"
+            f"reason={decision.reason} count={len(sent_replies)} disabled={decision.disable_after_send}"
         )
     except Exception as exc:
         _log(f"[SMART_REPLY] error chat={chat_id}: {type(exc).__name__}: {exc}")
