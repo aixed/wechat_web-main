@@ -466,8 +466,18 @@ export const saveSmartReply = (chatId: string, config: {
   chat_name: string;
   avatar?: string;
   enabled: boolean;
+  message_types: Array<
+    "text" | "image" | "gif" | "voice" | "video" | "file" |
+    "xml" | "system" | "recall" | "quote"
+  >;
   target_senders: string[];
-  rules: Array<{ id: string; keyword: string; reply: string }>;
+  rules: Array<{
+    id: string;
+    keyword: string;
+    reply: string;
+    use_regex: boolean;
+    reply_with_matched_line: boolean;
+  }>;
 }) => fetchJSON(`/api/smart-replies/${encodeURIComponent(chatId)}`, {
   method: "PUT",
   body: JSON.stringify(config),

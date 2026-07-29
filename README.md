@@ -70,7 +70,7 @@ cp config.example.yaml config.yaml
 
 ### 2. 启动后端
 
-后端推荐使用 Python 3.13；`start-all.bat` / `start-all.sh` 会优先使用 Python 3.13。若系统里有多个 Python，可通过 `PYTHON_BIN` 指定 3.13 解释器。
+后端使用 Python 3.13。Windows 上运行 `start-all.bat` 时会自动检查 Python 3.13；未安装时会优先通过 `winget` 安装，无法使用 `winget` 时改用 Python 官网安装程序。若系统里有多个 Python，可通过 `PYTHON_BIN` 指定 3.13 解释器。
 
 ```bash
 cd backend
@@ -90,6 +90,8 @@ npm run dev
 ```
 
 前端开发服务默认由 Vite 启动，接口通过同源代理访问后端。
+
+Windows Server 2012 R2 不在当前 Node.js 的官方支持范围内。`start-all.bat` 会在检测到该系统时自动设置 `NODE_SKIP_PLATFORM_CHECK=1` 并验证 Node/npm 是否能够实际运行；如果仍出现系统 API 或 DLL 缺失错误，需要升级到 Windows Server 2016 或更高版本。
 
 ## 常用命令
 

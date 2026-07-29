@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { deleteSmartReply, getGroupMemberDetails, getSmartReplies, saveSmartReply } from "../api";
-import type { SmartReplyConfig, SmartReplyRule, SmartReplyTarget } from "../types";
+import type { SmartReplyConfig, SmartReplyMessageType, SmartReplyRule, SmartReplyTarget } from "../types";
 
 interface GroupMember {
   wxid: string;
@@ -15,11 +15,30 @@ interface SmartReplyManagerProps {
   mobile?: boolean;
 }
 
+const MESSAGE_TYPE_OPTIONS: Array<{ value: SmartReplyMessageType; label: string }> = [
+  { value: "text", label: "文本消息" },
+  { value: "image", label: "图片消息" },
+  { value: "gif", label: "GIF 消息" },
+  { value: "voice", label: "语音消息" },
+  { value: "video", label: "视频消息" },
+  { value: "file", label: "文件消息" },
+  { value: "xml", label: "XML 消息" },
+  { value: "system", label: "系统消息" },
+  { value: "recall", label: "撤回消息" },
+  { value: "quote", label: "引用消息" },
+];
+
 function makeRule(): SmartReplyRule {
   const suffix = typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
     : `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  return { id: `rule_${suffix}`, keyword: "", reply: "" };
+  return {
+    id: `rule_${suffix}`,
+    keyword: "",
+    reply: "",
+    use_regex: false,
+    reply_with_matched_line: false,
+  };
 }
 
 function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
@@ -28,6 +47,7 @@ function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
     chat_name: target.name || target.wxid,
     avatar: target.avatar || "",
     enabled: true,
+    message_types: ["text"],
     target_senders: [],
     rules: [makeRule()],
     reply_count: 0,
@@ -38,9 +58,52 @@ function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
 function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
   return {
     ...config,
+    message_types: config.message_types?.length ? [...config.message_types] : ["text"],
     target_senders: [...(config.target_senders || [])],
-    rules: (config.rules || []).map((rule) => ({ ...rule })),
+    rules: (config.rules || []).map((rule) => ({
+      ...rule,
+      use_regex: Boolean(rule.use_regex),
+      reply_with_matched_line: Boolean(rule.reply_with_matched_line),
+    })),
   };
+}
+
+function parseImportedRules(value: unknown): SmartReplyRule[] {
+  const rawRules = Array.isArray(value)
+    ? value
+    : value && typeof value === "object" && Array.isArray((value as { rules?: unknown }).rules)
+      ? (value as { rules: unknown[] }).rules
+      : null;
+  if (!rawRules || rawRules.length === 0) {
+    throw new Error("JSON 中没有可导入的规则");
+  }
+  if (rawRules.length > 100) {
+    throw new Error("一次最多导入 100 条规则");
+  }
+
+  return rawRules.map((value, index) => {
+    if (!value || typeof value !== "object") {
+      throw new Error(`第 ${index + 1} 条规则格式错误`);
+    }
+    const item = value as Record<string, unknown>;
+    const keyword = String(item.keyword || "").trim();
+    const reply = String(item.reply || "").trim();
+    const useRegex = Boolean(item.use_regex);
+    const replyWithMatchedLine = Boolean(item.reply_with_matched_line);
+    if (!keyword || (!replyWithMatchedLine && !reply)) {
+      throw new Error(`第 ${index + 1} 条规则缺少关键词或回复内容`);
+    }
+    if (keyword.length > 200 || reply.length > 4000) {
+      throw new Error(`第 ${index + 1} 条规则内容过长`);
+    }
+    return {
+      ...makeRule(),
+      keyword,
+      reply,
+      use_regex: useRegex,
+      reply_with_matched_line: replyWithMatchedLine,
+    };
+  });
 }
 
 function errorText(value: unknown): string {
@@ -77,9 +140,23 @@ export default function SmartReplyManager({
   const [listQuery, setListQuery] = useState("");
   const [pickerQuery, setPickerQuery] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [activeMessageType, setActiveMessageType] = useState<SmartReplyMessageType>("text");
   const [expandedRuleId, setExpandedRuleId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!expandedRuleId) return;
+    const collapseOnOutsideClick = (event: PointerEvent) => {
+      if (!(event.target instanceof Element)) return;
+      const ruleElement = event.target.closest("[data-smart-reply-rule-id]");
+      if (ruleElement?.getAttribute("data-smart-reply-rule-id") !== expandedRuleId) {
+        setExpandedRuleId(null);
+      }
+    };
+    document.addEventListener("pointerdown", collapseOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", collapseOnOutsideClick);
+  }, [expandedRuleId]);
 
   const loadMembers = useCallback(async (chatId: string) => {
     setMembersLoading(true);
@@ -106,6 +183,8 @@ export default function SmartReplyManager({
 
   const openConfig = useCallback((config: SmartReplyConfig) => {
     setDraft(cloneConfig(config));
+    setActiveMessageType("text");
+    setExpandedRuleId(null);
     setError("");
     setNotice("");
     loadMembers(config.chat_id);
@@ -158,7 +237,11 @@ export default function SmartReplyManager({
       setError("请选择至少一位目标发送人");
       return;
     }
-    if (rules.length === 0 || rules.some((rule) => !rule.keyword || !rule.reply)) {
+    if (draft.message_types.length === 0) {
+      setError("请至少选择一种消息类型");
+      return;
+    }
+    if (rules.length === 0 || rules.some((rule) => !rule.keyword || (!rule.reply_with_matched_line && !rule.reply))) {
       setError("请完整填写关键词和回复内容");
       return;
     }
@@ -169,6 +252,7 @@ export default function SmartReplyManager({
         chat_name: draft.chat_name,
         avatar: draft.avatar,
         enabled: draft.enabled,
+        message_types: draft.message_types,
         target_senders: draft.target_senders,
         rules,
       });
@@ -222,12 +306,72 @@ export default function SmartReplyManager({
     } : prev);
   };
 
+  const importRules = async (file: File) => {
+    if (!draft) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setError("JSON 文件不能超过 5 MB");
+      return;
+    }
+    try {
+      const imported = parseImportedRules(JSON.parse(await file.text()));
+      const onlyBlankRule = draft.rules.length === 1
+        && !draft.rules[0].keyword.trim()
+        && !draft.rules[0].reply.trim();
+      const rules = onlyBlankRule ? imported : [...draft.rules, ...imported];
+      if (rules.length > 100) {
+        setError("规则总数不能超过 100 条");
+        return;
+      }
+      updateDraft({ rules });
+      setExpandedRuleId(null);
+      setError("");
+      setNotice(`已导入 ${imported.length} 条规则，请保存`);
+    } catch (value) {
+      setError(value instanceof Error ? value.message : "规则 JSON 解析失败");
+    }
+  };
+
+  const exportRules = () => {
+    if (!draft) return;
+    const payload = {
+      version: 1,
+      chat_id: draft.chat_id,
+      chat_name: draft.chat_name,
+      rules: draft.rules.map((rule) => ({
+        keyword: rule.keyword,
+        reply: rule.reply,
+        use_regex: Boolean(rule.use_regex),
+        reply_with_matched_line: Boolean(rule.reply_with_matched_line),
+      })),
+    };
+    const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    const safeName = (draft.chat_name || draft.chat_id).replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+    anchor.href = url;
+    anchor.download = `${safeName || "smart-reply"}-rules.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
   const toggleSender = (wxid: string) => {
     if (!draft) return;
     const selected = new Set(draft.target_senders);
     if (selected.has(wxid)) selected.delete(wxid);
     else selected.add(wxid);
     updateDraft({ target_senders: Array.from(selected) });
+  };
+
+  const toggleMessageType = (messageType: SmartReplyMessageType) => {
+    if (!draft) return;
+    const selected = new Set(draft.message_types);
+    if (selected.has(messageType)) selected.delete(messageType);
+    else selected.add(messageType);
+    updateDraft({
+      message_types: MESSAGE_TYPE_OPTIONS
+        .map((option) => option.value)
+        .filter((value) => selected.has(value)),
+    });
   };
 
   const memberRows = useMemo(() => {
@@ -254,6 +398,9 @@ export default function SmartReplyManager({
       .filter((target) => !query || target.name.toLocaleLowerCase().includes(query) || target.wxid.toLocaleLowerCase().includes(query))
       .slice(0, 300);
   }, [availableTargets, pickerQuery]);
+
+  const activeMessageTypeOption = MESSAGE_TYPE_OPTIONS.find((option) => option.value === activeMessageType)
+    || MESSAGE_TYPE_OPTIONS[0];
 
   const listPane = (
     <div className={`h-full flex flex-col ${dark ? "bg-[#191919]" : "bg-[#e9e8e8]"}`}>
@@ -364,6 +511,52 @@ export default function SmartReplyManager({
           </section>
 
           <section className={`py-[24px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+            <div>
+              <h2 className="text-[15px] font-medium">消息类别</h2>
+              <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>已启用 {draft.message_types.length} 类</div>
+            </div>
+            <div role="tablist" className={`mt-[14px] flex flex-wrap items-center gap-x-[20px] gap-y-[4px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+              {MESSAGE_TYPE_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="tab"
+                  aria-selected={activeMessageType === option.value}
+                  onClick={() => {
+                    setActiveMessageType(option.value);
+                    setExpandedRuleId(null);
+                  }}
+                  className={`h-[38px] flex items-center gap-[7px] border-b-2 text-[13px] ${
+                    activeMessageType === option.value
+                      ? "border-[#07c160] text-[#07c160]"
+                      : `border-transparent ${dark ? "text-[#aaa] hover:text-white" : "text-[#666] hover:text-black"}`
+                  }`}
+                >
+                  <span>{option.label}</span>
+                  <span className={`w-[6px] h-[6px] rounded-full ${draft.message_types.includes(option.value) ? "bg-[#07c160]" : (dark ? "bg-[#555]" : "bg-[#bbb]")}`} />
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className={`py-[24px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+            <div className="flex items-center justify-between gap-[18px]">
+              <div>
+                <h2 className="text-[15px] font-medium">{activeMessageTypeOption.label}</h2>
+                <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>
+                  {draft.message_types.includes(activeMessageType) ? "已启用" : "未启用"}
+                </div>
+              </div>
+              <Toggle
+                checked={draft.message_types.includes(activeMessageType)}
+                onChange={() => toggleMessageType(activeMessageType)}
+              />
+            </div>
+          </section>
+
+          {activeMessageType === "text" ? (
+            <>
+          <section className={`py-[24px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
             <div className="flex items-center justify-between gap-[12px]">
               <div>
                 <h2 className="text-[15px] font-medium">目标发送人</h2>
@@ -409,22 +602,48 @@ export default function SmartReplyManager({
           </section>
 
           <section className="py-[24px]">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-start justify-between gap-[10px]">
               <div>
                 <h2 className="text-[15px] font-medium">关键词规则</h2>
                 <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>{draft.rules.length} 条</div>
               </div>
-              <button
-                type="button"
-                onClick={() => updateDraft({ rules: [...draft.rules, makeRule()] })}
-                className={`h-[32px] px-[11px] rounded-[5px] border text-[13px] ${dark ? "border-[#3b3b3b] hover:bg-[#222]" : "border-[#d2d2d2] bg-white hover:bg-[#f0f0f0]"}`}
-              >
-                添加规则
-              </button>
+              <div className="flex flex-wrap items-center justify-end gap-[8px]">
+                <label className={`h-[32px] px-[11px] inline-flex items-center rounded-[5px] border text-[13px] cursor-pointer ${dark ? "border-[#3b3b3b] hover:bg-[#222]" : "border-[#d2d2d2] bg-white hover:bg-[#f0f0f0]"}`}>
+                  导入规则
+                  <input
+                    type="file"
+                    accept="application/json,.json"
+                    className="hidden"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      event.target.value = "";
+                      if (file) void importRules(file);
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={exportRules}
+                  className={`h-[32px] px-[11px] rounded-[5px] border text-[13px] ${dark ? "border-[#3b3b3b] hover:bg-[#222]" : "border-[#d2d2d2] bg-white hover:bg-[#f0f0f0]"}`}
+                >
+                  导出规则
+                </button>
+                <button
+                  type="button"
+                  onClick={() => updateDraft({ rules: [...draft.rules, makeRule()] })}
+                  className={`h-[32px] px-[11px] rounded-[5px] border text-[13px] ${dark ? "border-[#3b3b3b] hover:bg-[#222]" : "border-[#d2d2d2] bg-white hover:bg-[#f0f0f0]"}`}
+                >
+                  添加规则
+                </button>
+              </div>
             </div>
             <div className="mt-[14px] space-y-[10px]">
               {draft.rules.map((rule, index) => (
-                <div key={rule.id} className={`rounded-[6px] border p-[14px] ${dark ? "border-[#303030] bg-[#181818]" : "border-[#dcdcdc] bg-white"}`}>
+                <div
+                  key={rule.id}
+                  data-smart-reply-rule-id={rule.id}
+                  className={`rounded-[6px] border p-[14px] ${dark ? "border-[#303030] bg-[#181818]" : "border-[#dcdcdc] bg-white"}`}
+                >
                   <div className="flex items-center gap-[10px]">
                     <span className={`text-[12px] w-[22px] shrink-0 ${dark ? "text-[#666]" : "text-[#999]"}`}>{index + 1}</span>
                     <input
@@ -447,28 +666,60 @@ export default function SmartReplyManager({
                     </button>
                   </div>
                   {expandedRuleId === rule.id ? (
-                    <textarea
-                      autoFocus
-                      value={rule.reply}
-                      onChange={(event) => updateRule(rule.id, { reply: event.target.value })}
-                      maxLength={4000}
-                      rows={5}
-                      placeholder="回复内容"
-                      className={`mt-[10px] block w-full h-[120px] resize-none overflow-y-auto rounded-[5px] border px-[10px] py-[8px] leading-[20px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}
-                    />
+                    <div className="mt-[10px]">
+                      <div className={`min-h-[38px] flex flex-wrap items-center gap-x-[22px] gap-y-[8px] rounded-[5px] border px-[10px] py-[8px] text-[13px] ${dark ? "border-[#393939] bg-[#111] text-[#ccc]" : "border-[#d8d8d8] bg-[#fafafa] text-[#333]"}`}>
+                        <label className="flex items-center gap-[7px] cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={rule.use_regex}
+                            onChange={(event) => updateRule(rule.id, { use_regex: event.target.checked })}
+                            className="w-[16px] h-[16px] accent-[#07c160]"
+                          />
+                          <span>使用正则表达式</span>
+                        </label>
+                        <label className="flex items-center gap-[7px] cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={rule.reply_with_matched_line}
+                            onChange={(event) => updateRule(rule.id, { reply_with_matched_line: event.target.checked })}
+                            className="w-[16px] h-[16px] accent-[#07c160]"
+                          />
+                          <span>发送命中行（去除末尾数字）</span>
+                        </label>
+                      </div>
+                      {!rule.reply_with_matched_line && (
+                        <textarea
+                          autoFocus
+                          value={rule.reply}
+                          onChange={(event) => updateRule(rule.id, { reply: event.target.value })}
+                          maxLength={4000}
+                          rows={5}
+                          placeholder="回复内容"
+                          className={`mt-[10px] block w-full h-[120px] resize-none overflow-y-auto rounded-[5px] border px-[10px] py-[8px] leading-[20px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}
+                        />
+                      )}
+                    </div>
                   ) : (
                     <button
                       type="button"
                       onClick={() => setExpandedRuleId(rule.id)}
                       className={`mt-[10px] block w-full h-[38px] rounded-[5px] border px-[10px] text-left text-[14px] leading-[36px] truncate ${dark ? "border-[#393939] bg-[#111] text-[#ddd]" : "border-[#d8d8d8] bg-[#fafafa] text-[#222]"}`}
                     >
-                      {rule.reply || <span className={dark ? "text-[#666]" : "text-[#999]"}>回复内容</span>}
+                      {rule.reply_with_matched_line
+                        ? "发送命中行（去除末尾数字）"
+                        : rule.reply || <span className={dark ? "text-[#666]" : "text-[#999]"}>回复内容</span>}
                     </button>
                   )}
                 </div>
               ))}
             </div>
           </section>
+            </>
+          ) : (
+            <section className={`py-[56px] text-center border-b ${dark ? "border-[#292929] text-[#666]" : "border-[#ddd] text-[#999]"}`}>
+              <div className="text-[13px]">暂无配置项</div>
+            </section>
+          )}
 
           {configs.some((config) => config.chat_id === draft.chat_id) && (
             <div className={`pt-[20px] border-t flex justify-end ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>

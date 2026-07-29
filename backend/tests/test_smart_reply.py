@@ -16,8 +16,15 @@ def config(**overrides):
         "chat_id": CHAT_ID,
         "chat_name": "Test group",
         "enabled": True,
+        "message_types": ["text"],
         "target_senders": [SENDER],
-        "rules": [{"id": "rule_1", "keyword": "urgent", "reply": "received"}],
+        "rules": [{
+            "id": "rule_1",
+            "keyword": "urgent",
+            "reply": "received",
+            "use_regex": False,
+            "reply_with_matched_line": False,
+        }],
     }
     value.update(overrides)
     return value
@@ -55,6 +62,150 @@ class SmartReplyEngineTests(unittest.TestCase):
         self.assertEqual("received", decision.reply)
         self.assertEqual("keyword_matched", decision.reason)
 
+    def test_keyword_matches_single_line_and_final_line(self):
+        single_line = self.evaluate("urgent")
+        self.assertEqual(("received",), single_line.replies)
+
+        final_line = self.evaluate("first\nsecond\nurgent", now=12.0)
+        self.assertEqual(("received",), final_line.replies)
+
+    def test_regular_expression_rule(self):
+        regex_config = config(rules=[{
+            "id": "regex",
+            "keyword": r"order-\d+$",
+            "reply": "matched",
+            "use_regex": True,
+            "reply_with_matched_line": False,
+        }])
+        decision = self.evaluate("heading\nORDER-42", cfg=regex_config)
+        self.assertEqual(("matched",), decision.replies)
+
+    def test_all_plain_and_regex_fixed_reply_rules_are_applied(self):
+        multi_config = config(rules=[
+            {
+                "id": "plain",
+                "keyword": "和田",
+                "reply": "和田回复",
+                "use_regex": False,
+                "reply_with_matched_line": False,
+            },
+            {
+                "id": "regex",
+                "keyword": r"喀什\d+$",
+                "reply": "喀什回复",
+                "use_regex": True,
+                "reply_with_matched_line": False,
+            },
+            {
+                "id": "not-matched",
+                "keyword": "酒泉",
+                "reply": "酒泉回复",
+                "use_regex": False,
+                "reply_with_matched_line": False,
+            },
+        ])
+        decision = self.evaluate("和田市场\n今天喀什8", cfg=multi_config)
+        self.assertEqual(("和田回复", "喀什回复"), decision.replies)
+
+    def test_fixed_and_matched_line_rules_are_combined(self):
+        multi_config = config(rules=[
+            {
+                "id": "line",
+                "keyword": "和田",
+                "reply": "",
+                "use_regex": False,
+                "reply_with_matched_line": True,
+            },
+            {
+                "id": "fixed",
+                "keyword": r"喀什\d+$",
+                "reply": "喀什固定回复",
+                "use_regex": True,
+                "reply_with_matched_line": False,
+            },
+        ])
+        decision = self.evaluate("和田市场99\n今天喀什8", cfg=multi_config)
+        self.assertEqual(("和田市场", "喀什固定回复"), decision.replies)
+
+    def test_matched_lines_are_returned_without_trailing_digits(self):
+        line_config = config(rules=[{
+            "id": "lines",
+            "keyword": "和田",
+            "reply": "",
+            "use_regex": False,
+            "reply_with_matched_line": True,
+        }])
+        decision = self.evaluate(
+            "和田钢材市场455\n我在和田888\n今天和田2\n和田钢材拉不拉\n说和田玉\n没有命中",
+            cfg=line_config,
+        )
+        self.assertEqual("matched_lines", decision.reason)
+        self.assertEqual((
+            "和田钢材市场",
+            "我在和田",
+            "今天和田",
+            "和田钢材拉不拉",
+            "说和田玉",
+        ), decision.replies)
+
+    def test_matched_lines_are_combined_across_all_keyword_rules(self):
+        line_config = config(rules=[
+            {
+                "id": "hetian",
+                "keyword": "和田",
+                "reply": "",
+                "use_regex": False,
+                "reply_with_matched_line": True,
+            },
+            {
+                "id": "kashi",
+                "keyword": "喀什",
+                "reply": "",
+                "use_regex": False,
+                "reply_with_matched_line": True,
+            },
+            {
+                "id": "jiuquan",
+                "keyword": "酒泉",
+                "reply": "",
+                "use_regex": False,
+                "reply_with_matched_line": True,
+            },
+        ])
+        decision = self.evaluate(
+            "和田钢材市场455\n我在和田888\n今天和田2\n和田钢材拉不拉\n说和田玉\n喀什远方\n我在喀什8",
+            cfg=line_config,
+        )
+        self.assertEqual((
+            "和田钢材市场",
+            "我在和田",
+            "今天和田",
+            "和田钢材拉不拉",
+            "说和田玉",
+            "喀什远方",
+            "我在喀什",
+        ), decision.replies)
+
+    def test_line_matching_multiple_rules_is_sent_once(self):
+        line_config = config(rules=[
+            {
+                "id": "hetian",
+                "keyword": "和田",
+                "reply": "",
+                "use_regex": False,
+                "reply_with_matched_line": True,
+            },
+            {
+                "id": "kashi",
+                "keyword": "喀什",
+                "reply": "",
+                "use_regex": False,
+                "reply_with_matched_line": True,
+            },
+        ])
+        decision = self.evaluate("标题\n和田喀什99\n结束", cfg=line_config)
+        self.assertEqual(("和田喀什",), decision.replies)
+
     def test_unknown_direction_is_allowed_when_sender_is_not_self(self):
         decision = self.evaluate("title\nbody\nurgent", sendorrecv="")
         self.assertTrue(decision.should_send)
@@ -73,8 +224,62 @@ class SmartReplyEngineTests(unittest.TestCase):
     def test_empty_location_image_and_non_text_messages_are_filtered(self):
         self.assertEqual("empty_message", self.evaluate(" ").reason)
         self.assertEqual("ignored_prefix", self.evaluate("[位置]\na\nurgent").reason)
-        self.assertEqual("ignored_prefix", self.evaluate("[图片] caption\na\nurgent").reason)
-        self.assertEqual("non_text_message", self.evaluate("a\nb\nurgent", msgtype="3").reason)
+        self.assertEqual("message_type_not_enabled", self.evaluate("[图片] caption\na\nurgent").reason)
+        self.assertEqual("message_type_not_enabled", self.evaluate("a\nb\nurgent", msgtype="3").reason)
+
+    def test_enabled_non_text_categories_do_not_use_text_rules(self):
+        samples = {
+            "image": ("3", "urgent image"),
+            "gif": ("47", "urgent gif"),
+            "voice": ("34", "urgent voice"),
+            "video": ("43", "urgent video"),
+            "file": ("49", "<msg><appmsg><type>6</type><title>urgent file</title></appmsg></msg>"),
+            "xml": ("49", "<msg><appmsg><type>5</type><title>urgent xml</title></appmsg></msg>"),
+            "system": ("10000", "<sysmsg><content>urgent system</content></sysmsg>"),
+            "recall": ("10000", "<sysmsg type=\"revokemsg\"><revokemsg><replacemsg>urgent recall</replacemsg></revokemsg></sysmsg>"),
+            "quote": ("49", "<msg><appmsg><type>57</type><title>urgent quote</title><refermsg><content>original</content></refermsg></appmsg></msg>"),
+        }
+        for index, (message_type, (msg_type, content)) in enumerate(samples.items()):
+            with self.subTest(message_type=message_type):
+                enabled = self.evaluate(
+                    content,
+                    now=20.0 + index * 2,
+                    cfg=config(message_types=[message_type]),
+                    msgtype=msg_type,
+                )
+                self.assertEqual("keyword_not_matched", enabled.reason)
+                self.assertFalse(enabled.should_send)
+
+        disabled = self.evaluate(
+            samples["xml"][1],
+            now=40.0,
+            cfg=config(message_types=["text"]),
+            msgtype="49",
+        )
+        self.assertEqual("message_type_not_enabled", disabled.reason)
+
+    def test_empty_media_categories_remain_inert_without_dedicated_rules(self):
+        samples = {
+            "image": ("3", "[图片]"),
+            "gif": ("47", "[GIF]"),
+            "voice": ("34", "[语音]"),
+            "video": ("43", "[视频]"),
+        }
+        for index, (message_type, (msg_type, placeholder)) in enumerate(samples.items()):
+            with self.subTest(message_type=message_type):
+                media_config = config(
+                    message_types=[message_type],
+                    rules=[{
+                        "id": message_type,
+                        "keyword": placeholder,
+                        "reply": "media received",
+                        "use_regex": False,
+                        "reply_with_matched_line": False,
+                    }],
+                )
+                decision = self.evaluate("", now=60.0 + index * 2, cfg=media_config, msgtype=msg_type)
+                self.assertEqual("keyword_not_matched", decision.reason)
+                self.assertFalse(decision.should_send)
 
     def test_single_line_messages_are_filtered(self):
         self.assertEqual("pure_single_line", self.evaluate("English").reason)
@@ -119,6 +324,7 @@ class SmartReplyStorageTests(unittest.TestCase):
     def test_crud_stats_and_owner_isolation(self):
         saved = self.cache.upsert_smart_reply_config(config(), owner_wxid=OWNER)
         self.assertTrue(saved["enabled"])
+        self.assertEqual(["text"], saved["message_types"])
         self.assertEqual([SENDER], saved["target_senders"])
         self.assertEqual([], self.cache.list_smart_reply_configs(owner_wxid="other_owner"))
 
@@ -126,18 +332,19 @@ class SmartReplyStorageTests(unittest.TestCase):
             CHAT_ID,
             owner_wxid=OWNER,
             disable=True,
+            increment=3,
             triggered_at=123,
         )
         self.assertIsNotNone(updated)
         self.assertFalse(updated["enabled"])
-        self.assertEqual(1, updated["reply_count"])
+        self.assertEqual(3, updated["reply_count"])
         self.assertEqual(123, updated["last_triggered_at"])
 
         self.cache.upsert_smart_reply_config(config(enabled=True), owner_wxid=OWNER)
         reenabled = self.cache.get_smart_reply_config(CHAT_ID, owner_wxid=OWNER)
         self.assertIsNotNone(reenabled)
         self.assertTrue(reenabled["enabled"])
-        self.assertEqual(1, reenabled["reply_count"])
+        self.assertEqual(3, reenabled["reply_count"])
         self.assertTrue(self.cache.delete_smart_reply_config(CHAT_ID, owner_wxid=OWNER))
         self.assertIsNone(self.cache.get_smart_reply_config(CHAT_ID, owner_wxid=OWNER))
 
