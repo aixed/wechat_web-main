@@ -77,6 +77,7 @@ export default function SmartReplyManager({
   const [listQuery, setListQuery] = useState("");
   const [pickerQuery, setPickerQuery] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [expandedRuleId, setExpandedRuleId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
@@ -445,14 +446,25 @@ export default function SmartReplyManager({
                       </svg>
                     </button>
                   </div>
-                  <textarea
-                    value={rule.reply}
-                    onChange={(event) => updateRule(rule.id, { reply: event.target.value })}
-                    maxLength={4000}
-                    rows={3}
-                    placeholder="回复内容"
-                    className={`mt-[10px] w-full resize-y min-h-[74px] rounded-[5px] border px-[10px] py-[8px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}
-                  />
+                  {expandedRuleId === rule.id ? (
+                    <textarea
+                      autoFocus
+                      value={rule.reply}
+                      onChange={(event) => updateRule(rule.id, { reply: event.target.value })}
+                      maxLength={4000}
+                      rows={5}
+                      placeholder="回复内容"
+                      className={`mt-[10px] block w-full h-[120px] resize-none overflow-y-auto rounded-[5px] border px-[10px] py-[8px] leading-[20px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setExpandedRuleId(rule.id)}
+                      className={`mt-[10px] block w-full h-[38px] rounded-[5px] border px-[10px] text-left text-[14px] leading-[36px] truncate ${dark ? "border-[#393939] bg-[#111] text-[#ddd]" : "border-[#d8d8d8] bg-[#fafafa] text-[#222]"}`}
+                    >
+                      {rule.reply || <span className={dark ? "text-[#666]" : "text-[#999]"}>回复内容</span>}
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
