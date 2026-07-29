@@ -23,6 +23,31 @@ export interface Session {
   is_group: boolean;
 }
 
+export interface SmartReplyRule {
+  id: string;
+  keyword: string;
+  reply: string;
+}
+
+export interface SmartReplyConfig {
+  chat_id: string;
+  chat_name: string;
+  avatar?: string;
+  enabled: boolean;
+  target_senders: string[];
+  rules: SmartReplyRule[];
+  reply_count?: number;
+  last_triggered_at?: number;
+  created_at?: number;
+  updated_at?: number;
+}
+
+export interface SmartReplyTarget {
+  wxid: string;
+  name: string;
+  avatar?: string;
+}
+
 export interface ContactProfile {
   wxid: string;
   name: string;
@@ -197,6 +222,15 @@ export interface WSContactsHydrationProgress {
   };
 }
 
+export interface WSSmartReplyUpdated {
+  type: "smart_reply_updated";
+  data: {
+    config?: SmartReplyConfig;
+    chat_id?: string;
+    deleted?: boolean;
+  };
+}
+
 export type WSMessage =
   | WSInitMessage
   | WSCallbackMessage
@@ -204,4 +238,5 @@ export type WSMessage =
   | WSMarkRead
   | WSContactProfiles
   | WSContactsSnapshot
-  | WSContactsHydrationProgress;
+  | WSContactsHydrationProgress
+  | WSSmartReplyUpdated;

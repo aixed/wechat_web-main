@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef, type FormEvent, type ReactNod
 import { useWebSocket } from "./useWebSocket";
 import SessionList, { type SessionMenuAction } from "./components/SessionList";
 import ChatArea from "./components/ChatArea";
+import SmartReplyManager from "./components/SmartReplyManager";
 import {
   activateAccount,
   batchGetContactBrief,
@@ -34,14 +35,14 @@ import {
   unpinChat,
 } from "./api";
 import type { BroadcastContentOrder } from "./api";
-import type { ContactProfile, Session, ChatMessage, WSMessage, WeChatAccount } from "./types";
+import type { ContactProfile, Session, ChatMessage, SmartReplyTarget, WSMessage, WeChatAccount } from "./types";
 import { replaceWechatEmojis } from "./utils/wechatEmoji";
 
-type ViewMode = "chats" | "contacts" | "broadcast";
-type MobileTab = "chats" | "contacts" | "me" | "broadcast";
+type ViewMode = "chats" | "contacts" | "broadcast" | "smart-reply";
+type MobileTab = "chats" | "contacts" | "me" | "broadcast" | "smart-reply";
 type PortalTheme = "dark" | "light";
 type ContactCategoryKey = "groups" | "official" | "service" | "openim";
-type AppRoute = "root" | "chat" | "contact" | "broadcast" | "me";
+type AppRoute = "root" | "chat" | "contact" | "broadcast" | "smart-reply" | "me";
 type ParsedAppRoute = { accountWxid: string; route: AppRoute };
 const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
@@ -66,6 +67,8 @@ function routeFromSegment(segment: string | undefined): AppRoute | null {
       return "contact";
     case "broadcast":
       return "broadcast";
+    case "smart-reply":
+      return "smart-reply";
     case "me":
       return "me";
     default:
@@ -113,6 +116,8 @@ function pathForRoute(route: AppRoute, accountWxid = ""): string {
       return `${base}/contact`;
     case "broadcast":
       return `${base}/broadcast`;
+    case "smart-reply":
+      return `${base}/smart-reply`;
     case "me":
       return `${base}/me`;
     case "chat":
@@ -131,12 +136,14 @@ function normalizeRouteForDevice(route: AppRoute, isMobile: boolean): AppRoute {
 function desktopModeFromRoute(route: AppRoute): ViewMode {
   if (route === "contact") return "contacts";
   if (route === "broadcast") return "broadcast";
+  if (route === "smart-reply") return "smart-reply";
   return "chats";
 }
 
 function mobileTabFromRoute(route: AppRoute): MobileTab {
   if (route === "contact") return "contacts";
   if (route === "broadcast") return "broadcast";
+  if (route === "smart-reply") return "smart-reply";
   if (route === "me") return "me";
   return "chats";
 }
@@ -1275,6 +1282,7 @@ export default function App() {
   const [selfProfileLoading, setSelfProfileLoading] = useState(false);
   const [selfImageOpen, setSelfImageOpen] = useState(false);
   const [mobileTab, setMobileTab] = useState<MobileTab>("chats");
+  const [smartReplyTarget, setSmartReplyTarget] = useState<SmartReplyTarget | null>(null);
   const [mobileContactCategory, setMobileContactCategory] = useState<ContactCategoryKey | null>(null);
   const [desktopContactCategory, setDesktopContactCategory] = useState<ContactCategoryKey | null>(null);
   const [localContactsPayload, setLocalContactsPayload] = useState<LocalContactsPayload | null>(null);
@@ -1351,6 +1359,7 @@ export default function App() {
     setSessionsHydrating(false);
     setSessionsHydrated(false);
     setMobileTab("chats");
+    setSmartReplyTarget(null);
     setMobileProfileDetailOpen(false);
     setDirectoryProfileWxid(null);
     setDirectoryProfileLoading(false);
@@ -1711,7 +1720,7 @@ export default function App() {
       else hydrateDirectoryContacts();
     }
     if (!options.skipRoute) {
-      setRoute(mode === "contacts" ? "contact" : mode === "broadcast" ? "broadcast" : "chat");
+      setRoute(mode === "contacts" ? "contact" : mode === "broadcast" ? "broadcast" : mode === "smart-reply" ? "smart-reply" : "chat");
     }
   }, [contactSource, hydrateDirectoryContacts, loadLocalDirectoryContacts, setRoute]);
 
@@ -1725,7 +1734,7 @@ export default function App() {
       hydrateDirectoryContacts();
     }
     if (!options.skipRoute) {
-      setRoute(tab === "contacts" ? "contact" : tab === "me" ? "me" : tab === "broadcast" ? "broadcast" : "chat");
+      setRoute(tab === "contacts" ? "contact" : tab === "me" ? "me" : tab === "broadcast" ? "broadcast" : tab === "smart-reply" ? "smart-reply" : "chat");
     }
   }, [hydrateDirectoryContacts, setRoute]);
 
@@ -2399,6 +2408,11 @@ export default function App() {
   const handleSessionMenuAction = async (action: SessionMenuAction, session: Session) => {
     const wxid = session.wxid;
     try {
+      if (action === "smart_reply") {
+        setSmartReplyTarget({ wxid, name: session.nickname || wxid, avatar: session.avatar || "" });
+        switchMode("smart-reply");
+        return;
+      }
       if (action === "pin") {
         await stickyChat(wxid);
         setSessions((prev) => sortSessionsForDisplay(prev.map((s) =>
@@ -2456,7 +2470,7 @@ export default function App() {
     setRoute(
       isMobile
         ? (mobileTab === "contacts" ? "contact" : mobileTab === "me" ? "me" : "chat")
-        : (viewMode === "contacts" ? "contact" : viewMode === "broadcast" ? "broadcast" : "chat")
+        : (viewMode === "contacts" ? "contact" : viewMode === "broadcast" ? "broadcast" : viewMode === "smart-reply" ? "smart-reply" : "chat")
     );
   };
 
@@ -2674,6 +2688,11 @@ export default function App() {
     });
   }
   const groupEntries = sortDirectoryEntries(Array.from(groupEntryMap.values()));
+  const smartReplyTargets: SmartReplyTarget[] = groupEntries.map((entry) => ({
+    wxid: entry.wxid,
+    name: entry.name,
+    avatar: entry.avatar,
+  }));
   const friendEntries = allNonGroupEntries.filter((entry) => entry.category === "personal");
   const officialEntries = allNonGroupEntries.filter((entry) => entry.category === "official");
   const serviceEntries = allNonGroupEntries.filter((entry) => entry.category === "service");
@@ -2983,6 +3002,9 @@ export default function App() {
           onRefreshSessions={handleRefreshSessions}
           sessionsLoading={sessionsHydrating}
           onOpenSelfDetail={openMobileSelfProfileDetail}
+          smartReplyInitialTarget={smartReplyTarget}
+          smartReplyTargets={smartReplyTargets}
+          theme={portalTheme}
         />
       </MobileSwipeFrame>
     );
@@ -3006,6 +3028,14 @@ export default function App() {
         onBackToAccounts={handleLeaveAccount}
       />
 
+      {viewMode === "smart-reply" ? (
+        <SmartReplyManager
+          theme={portalTheme}
+          initialTarget={smartReplyTarget}
+          availableTargets={smartReplyTargets}
+        />
+      ) : (
+      <>
       <div
         className={`relative shrink-0 border-r h-full ${darkTheme ? "border-[#2a2a2a] bg-[#191919]" : "border-[#d8d8d8] bg-[#e9e8e8]"}`}
         style={{ width: sidePanelWidth }}
@@ -3112,6 +3142,8 @@ export default function App() {
           <EmptyChatPane dark={darkTheme} />
         )}
       </div>
+      </>
+      )}
 
       {selfCardOpen && (
         <SelfProfileCard
@@ -3905,6 +3937,9 @@ function MobileMainShell({
   onRefreshSessions,
   sessionsLoading,
   onOpenSelfDetail,
+  smartReplyInitialTarget,
+  smartReplyTargets,
+  theme,
 }: {
   tab: MobileTab;
   sessions: Session[];
@@ -3934,6 +3969,9 @@ function MobileMainShell({
   onRefreshSessions: () => void;
   sessionsLoading: boolean;
   onOpenSelfDetail: () => void;
+  smartReplyInitialTarget: SmartReplyTarget | null;
+  smartReplyTargets: SmartReplyTarget[];
+  theme: PortalTheme;
 }) {
   return (
     <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
@@ -3985,6 +4023,14 @@ function MobileMainShell({
             dark={dark}
           />
         </div>
+      )}
+      {tab === "smart-reply" && (
+        <SmartReplyManager
+          mobile
+          theme={theme}
+          initialTarget={smartReplyInitialTarget}
+          availableTargets={smartReplyTargets}
+        />
       )}
       <MobileTabBar active={tab} onChange={onSwitchTab} dark={dark} />
     </div>
@@ -4386,9 +4432,10 @@ function MobileProfileRow({ label, value, image, onClick, dark }: { label: strin
 
 function MobileTabBar({ active, onChange, dark }: { active: MobileTab; onChange: (tab: MobileTab) => void; dark: boolean }) {
   return (
-    <div className={`shrink-0 h-[64px] pb-[env(safe-area-inset-bottom)] border-t grid grid-cols-3 ${dark ? "bg-[#111111]/95 border-[#242424]" : "bg-white/95 border-[#dedede]"}`}>
+    <div className={`shrink-0 h-[64px] pb-[env(safe-area-inset-bottom)] border-t grid grid-cols-4 ${dark ? "bg-[#111111]/95 border-[#242424]" : "bg-white/95 border-[#dedede]"}`}>
       <MobileTabButton active={active === "chats"} label="Chats" onClick={() => onChange("chats")} icon="chat" dark={dark} />
       <MobileTabButton active={active === "contacts"} label="Contacts" onClick={() => onChange("contacts")} icon="contacts" dark={dark} />
+      <MobileTabButton active={active === "smart-reply"} label="Reply" onClick={() => onChange("smart-reply")} icon="reply" dark={dark} />
       <MobileTabButton active={active === "me"} label="Me" onClick={() => onChange("me")} icon="me" dark={dark} />
     </div>
   );
@@ -4400,6 +4447,7 @@ function MobileTabButton({ active, label, icon, onClick, dark }: { active: boole
       <svg className="w-[25px] h-[25px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
         {icon === "chat" && <path strokeLinecap="round" strokeLinejoin="round" d="M4 6.5A3.5 3.5 0 0 1 7.5 3h9A3.5 3.5 0 0 1 20 6.5v5A3.5 3.5 0 0 1 16.5 15H11l-5 4v-4.35A3.5 3.5 0 0 1 4 11.5v-5Z" />}
         {icon === "contacts" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 11a4 4 0 1 0-8 0 4 4 0 0 0 8 0ZM4.5 21c.8-4.2 3.3-6.3 7.5-6.3s6.7 2.1 7.5 6.3M18 6v4M20 8h-4" />}
+        {icon === "reply" && <path strokeLinecap="round" strokeLinejoin="round" d="M5 5h14v11H9l-4 3V5Zm4 4h6m-6 3h4" />}
         {icon === "me" && <path strokeLinecap="round" strokeLinejoin="round" d="M16 8a4 4 0 1 1-8 0 4 4 0 0 1 8 0ZM5 21c.8-4 3.1-6 7-6s6.2 2 7 6" />}
       </svg>
       <span className="text-[11px] leading-[13px]">{label}</span>
@@ -5019,6 +5067,12 @@ function WorkspaceSidebar({
           title="群发"
           onClick={() => onModeChange("broadcast")}
           icon={<path d="M5 7.5h8.5a3.5 3.5 0 0 1 0 7H8l-4 3v-6A4 4 0 0 1 5 7.5Zm11.5 2.2 3.5-2.2v7l-3.5-2.2V9.7Z" />}
+        />
+        <SidebarIconButton
+          active={mode === "smart-reply"}
+          title="智能回复"
+          onClick={() => onModeChange("smart-reply")}
+          icon={<path d="M5 5h14v11H9l-4 3V5Zm4 4h6m-6 3h4" />}
         />
       </div>
 

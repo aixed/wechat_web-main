@@ -132,15 +132,12 @@ _client_wss_default_port = 443 if CLIENT_WSS_SCHEME == "wss" else 80
 _client_wss_port_part = "" if CLIENT_WSS_PORT == _client_wss_default_port else f":{CLIENT_WSS_PORT}"
 CLIENT_WSS_URL = f"{CLIENT_WSS_SCHEME}://{CLIENT_WSS_HOST}{_client_wss_port_part}{AGENT_WS_PATH}"
 
-# Callback (use public IP/domain so remote client DLLs can reach us outbound)
-CALLBACK_PORT = int(_cfg.get("callback_port", SERVER_PORT))
-CALLBACK_HOST = str(_cfg.get("callback_host", SERVER_HOST) or SERVER_HOST)
-CALLBACK_PATH = str(_cfg.get("callback_path", "/api/callback") or "/api/callback")
-if not CALLBACK_PATH.startswith("/"):
-    CALLBACK_PATH = "/" + CALLBACK_PATH
-CALLBACK_PUBLIC_PORT = int(_cfg.get("callback_public_port", CALLBACK_PORT))
-_callback_public_port_part = "" if CALLBACK_PUBLIC_PORT == 80 else f":{CALLBACK_PUBLIC_PORT}"
-CALLBACK_URL = f"http://{PUBLIC_IP}{_callback_public_port_part}{CALLBACK_PATH}"
+# Local Hook callbacks share the main backend listener. Remote Hook callbacks
+# travel over CLIENT_WSS_URL and do not need a separately reachable HTTP URL.
+CALLBACK_HOST = SERVER_HOST
+CALLBACK_PORT = SERVER_PORT
+CALLBACK_PATH = "/api/callback"
+CALLBACK_URL = f"http://127.0.0.1:{SERVER_PORT}{CALLBACK_PATH}"
 RECV_TYPE = int(_cfg.get("recvtype", _cfg.get("recv_type", 2)))
 if RECV_TYPE not in (1, 2):
     print(f"[CONFIG] ⚠ invalid recv_type={RECV_TYPE!r}, using 2", flush=True)
@@ -154,7 +151,7 @@ MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL = int(_cfg.get("max_restarts_after_button_l
 
 print(f"[CONFIG] wechat_mode={WECHAT_MODE}  mode={LOGIN_MODE}  host={HOOK_HOST}  "
       f"api_port={HOOK_PORT}  mgr_port={MGR_PORT}  "
-      f"server={SERVER_HOST}:{SERVER_PORT}  callback={CALLBACK_URL}  callback_bind={CALLBACK_HOST}:{CALLBACK_PORT}  "
+      f"server={SERVER_HOST}:{SERVER_PORT}  "
       f"hook_api_concurrency={HOOK_API_CONCURRENCY}  "
       f"agent_ws={'on' if AGENT_WS_ENABLED else 'off'}  "
       f"client_wss={CLIENT_WSS_URL}  "

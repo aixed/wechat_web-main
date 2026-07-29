@@ -457,3 +457,21 @@ export const getGroupDetail = (gid: string) => fetchJSON(`/api/group/${gid}`);
 export const getGroupMembers = (gid: string) => fetchJSON(`/api/group/${gid}/members`);
 export const getGroupMemberNames = (gid: string) => fetchJSON(`/api/group/${gid}/member-names`);
 export const getGroupMemberDetails = (gid: string) => fetchJSON(`/api/group/${gid}/member-details`);
+
+// ─── Smart replies ───────────────────────────────────────────────
+
+export const getSmartReplies = () => fetchJSON("/api/smart-replies");
+
+export const saveSmartReply = (chatId: string, config: {
+  chat_name: string;
+  avatar?: string;
+  enabled: boolean;
+  target_senders: string[];
+  rules: Array<{ id: string; keyword: string; reply: string }>;
+}) => fetchJSON(`/api/smart-replies/${encodeURIComponent(chatId)}`, {
+  method: "PUT",
+  body: JSON.stringify(config),
+});
+
+export const deleteSmartReply = (chatId: string) =>
+  fetchJSON(`/api/smart-replies/${encodeURIComponent(chatId)}`, { method: "DELETE" });

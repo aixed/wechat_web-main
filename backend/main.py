@@ -4,10 +4,10 @@ FastAPI server that bridges the WeChat Hook API with the frontend.
 """
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.staticfiles import StaticFiles
 from datetime import datetime
 
@@ -32,6 +32,7 @@ from ws_manager import manager
 from message_store import MessageStore
 from sqlite_cache import SqliteMessageCache
 from pb_parser import parse_raw_pb
+from smart_reply import SmartReplyEngine
 
 
 def _log(msg: str):
@@ -219,6 +220,7 @@ app_state = {
 
 message_store = MessageStore()
 sqlite_cache = SqliteMessageCache()
+smart_reply_engine = SmartReplyEngine()
 _active_agent_id = ""
 _account_runtimes: dict[str, dict] = {}
 _self_wxid_to_agent_id: dict[str, str] = {}
@@ -1110,7 +1112,9 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     _log(f"Login mode: {config.LOGIN_MODE}  |  API: {config.HOOK_BASE_URL}")
     if config.AGENT_WS_ENABLED:
         _log(f"Agent WS: {config.CLIENT_WSS_URL}  path={config.AGENT_WS_PATH}")
-    _log(f"Callback URL: {config.CALLBACK_URL}")
+        _log("Callback transport: Agent WebSocket")
+    else:
+        _log(f"Callback URL: {config.CALLBACK_URL}")
     _log("=" * 60)
     return True
 
@@ -1222,6 +1226,20 @@ class ActivateAccountRequest(BaseModel):
     agent_id: str
 
 
+class SmartReplyRuleRequest(BaseModel):
+    id: str = ""
+    keyword: str
+    reply: str
+
+
+class SmartReplyConfigRequest(BaseModel):
+    chat_name: str = ""
+    avatar: str = ""
+    enabled: bool = True
+    target_senders: list[str] = Field(default_factory=list)
+    rules: list[SmartReplyRuleRequest] = Field(default_factory=list)
+
+
 class MultiBroadcastTextRequest(BaseModel):
     wxids: list[str] = []
     msg: str
@@ -1283,6 +1301,142 @@ async def activate_account(req: ActivateAccountRequest):
     return {"ok": True, "active_id": agent_id, "account": agent_manager.get_agent(agent_id)}
 
 
+def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -> dict[str, Any]:
+    chat_id = str(chat_id or "").strip()
+    if not chat_id.endswith("@chatroom"):
+        raise HTTPException(status_code=400, detail="smart replies are only supported for group chats")
+
+    target_senders: list[str] = []
+    seen_senders: set[str] = set()
+    for value in req.target_senders:
+        sender = str(value or "").strip()
+        if sender and sender not in seen_senders:
+            seen_senders.add(sender)
+            target_senders.append(sender)
+    if not target_senders:
+        raise HTTPException(status_code=400, detail="at least one target sender is required")
+    if len(target_senders) > 10000:
+        raise HTTPException(status_code=400, detail="too many target senders")
+
+    rules: list[dict[str, str]] = []
+    for index, rule in enumerate(req.rules[:100]):
+        keyword = str(rule.keyword or "").strip()
+        reply = str(rule.reply or "").strip()
+        if not keyword or not reply:
+            raise HTTPException(status_code=400, detail="every rule requires a keyword and reply")
+        if len(keyword) > 200 or len(reply) > 4000:
+            raise HTTPException(status_code=400, detail="a keyword or reply is too long")
+        rules.append({
+            "id": str(rule.id or f"rule_{index + 1}")[:100],
+            "keyword": keyword,
+            "reply": reply,
+        })
+    if not rules:
+        raise HTTPException(status_code=400, detail="at least one keyword rule is required")
+
+    owner_wxid = _contact_owner_wxid()
+    cached_contact = sqlite_cache.get_contacts([chat_id], owner_wxid=owner_wxid).get(chat_id, {})
+    return {
+        "chat_id": chat_id,
+        "chat_name": str(req.chat_name or cached_contact.get("name") or chat_id).strip()[:200],
+        "avatar": str(req.avatar or cached_contact.get("avatar") or "").strip()[:2000],
+        "enabled": bool(req.enabled),
+        "target_senders": target_senders,
+        "rules": rules,
+    }
+
+
+@app.get("/api/smart-replies")
+async def list_smart_replies():
+    owner_wxid = _contact_owner_wxid()
+    return {"configs": sqlite_cache.list_smart_reply_configs(owner_wxid=owner_wxid)}
+
+
+@app.get("/api/smart-replies/{chat_id}")
+async def get_smart_reply(chat_id: str):
+    owner_wxid = _contact_owner_wxid()
+    config_row = sqlite_cache.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
+    if config_row is None:
+        raise HTTPException(status_code=404, detail="smart reply config not found")
+    return {"config": config_row}
+
+
+@app.put("/api/smart-replies/{chat_id}")
+async def save_smart_reply(chat_id: str, req: SmartReplyConfigRequest):
+    owner_wxid = _contact_owner_wxid()
+    config_row = sqlite_cache.upsert_smart_reply_config(
+        _normalized_smart_reply_config(chat_id, req),
+        owner_wxid=owner_wxid,
+    )
+    await manager.broadcast({"type": "smart_reply_updated", "data": {"config": config_row}})
+    return {"ok": True, "config": config_row}
+
+
+@app.delete("/api/smart-replies/{chat_id}")
+async def delete_smart_reply(chat_id: str):
+    owner_wxid = _contact_owner_wxid()
+    deleted = sqlite_cache.delete_smart_reply_config(chat_id, owner_wxid=owner_wxid)
+    await manager.broadcast({"type": "smart_reply_updated", "data": {"chat_id": chat_id, "deleted": deleted}})
+    return {"ok": True, "deleted": deleted}
+
+
+async def _process_smart_reply_message(
+    *,
+    owner_wxid: str,
+    agent_id: str,
+    self_wxid: str,
+    chat_id: str,
+    message: dict[str, Any],
+) -> None:
+    config_row = sqlite_cache.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
+    decision = smart_reply_engine.evaluate(
+        owner_wxid=owner_wxid,
+        chat_id=chat_id,
+        self_wxid=self_wxid,
+        message=message,
+        config=config_row,
+    )
+    if not decision.should_send:
+        return
+    try:
+        with wechat_api.use_agent(agent_id):
+            result = await wechat_api.send_text(chat_id, decision.reply)
+        if not _send_result_ok(result):
+            _log(f"[SMART_REPLY] send failed chat={chat_id} reason={decision.reason} result={result}")
+            return
+        updated = sqlite_cache.record_smart_reply_trigger(
+            chat_id,
+            owner_wxid=owner_wxid,
+            disable=decision.disable_after_send,
+        )
+        await _broadcast_local_sent_for_agent(agent_id, chat_id, "1", decision.reply)
+        await manager.broadcast({"type": "smart_reply_updated", "data": {"config": updated}})
+        _log(
+            f"[SMART_REPLY] sent chat={chat_id} sender={message.get('fromid', '')} "
+            f"reason={decision.reason} disabled={decision.disable_after_send}"
+        )
+    except Exception as exc:
+        _log(f"[SMART_REPLY] error chat={chat_id}: {type(exc).__name__}: {exc}")
+
+
+def _schedule_smart_reply_message(
+    *,
+    owner_wxid: str,
+    agent_id: str,
+    self_wxid: str,
+    chat_id: str,
+    message: dict[str, Any],
+) -> None:
+    task = asyncio.create_task(_process_smart_reply_message(
+        owner_wxid=owner_wxid,
+        agent_id=agent_id,
+        self_wxid=self_wxid,
+        chat_id=chat_id,
+        message=dict(message),
+    ))
+    _track_background_send(task, "smart_reply")
+
+
 # ─── WeChat Hook Callback (receives messages from Hook) ────────────
 
 @app.post("/api/callback")
@@ -1302,6 +1456,11 @@ async def wechat_callback(request: Request):
     original_path = request.headers.get("x-original-callback-path", "")
     if original_path:
         data.setdefault("_callback_path", original_path)
+    return await _process_wechat_callback(data)
+
+
+async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
+    """Process a callback received through HTTP or the agent WebSocket."""
     _log_callback_sample(data)
 
     # Log top-level callback keys for debugging CDN download callbacks
@@ -1491,7 +1650,24 @@ async def wechat_callback(request: Request):
         },
     })
 
+    callback_owner_wxid = _contact_owner_wxid(self_wxid)
+    for chat_id, normalized in pre_messages:
+        _schedule_smart_reply_message(
+            owner_wxid=callback_owner_wxid,
+            agent_id=callback_agent_id,
+            self_wxid=self_wxid,
+            chat_id=chat_id,
+            message=normalized,
+        )
+
     return {"status": "success"}
+
+
+async def _receive_agent_callback(data: dict[str, Any]) -> None:
+    await _process_wechat_callback(data)
+
+
+agent_manager.set_callback_handler(_receive_agent_callback)
 
 
 _CALLBACK_PATH_ALIASES = {
