@@ -137,7 +137,7 @@ npm run lint
 - `server_host` / `server_port`：后端主服务监听地址和端口；DLL 直连 `ws://公网IP:5000/agent` 时用 `server_host: "0.0.0.0"`，只走前端或 Nginx 代理时可用 `127.0.0.1`。
 - `web_access_key`：Web 前端和 `/api/*` 接口访问密钥；不要提交真实值，可在本地 `config.yaml` 或环境变量 `WECHAT_WEB_ACCESS_KEY` 中配置。
 - `hook_api_concurrency`：Hook/API 并发数；本地 Hook 默认 `1`，远程 Hook/远程协议默认 `10`，用于避免慢查询阻塞 `GetContact`、头像、发送消息等交互接口。
-- `frontend_host` / `frontend_port`：前端开发服务器监听地址和端口；Windows/Linux 启动脚本不覆盖这些值，由 Vite 直接读取 `config.yaml`。
+- `frontend_host` / `frontend_port`：前端开发服务器监听地址和端口，由 Vite 直接读取 `config.yaml`。Windows 的 `start-all.bat` 会从 `frontend_port` 开始检查最多 10 个连续端口，将首个空闲端口回写到 `config.yaml`，并在页面可访问后自动打开 `http://127.0.0.1:<frontend_port>`。
 - `agent_ws_enabled`：是否启用远程客户端 DLL 主动连接本后端的 `/agent` WebSocket 通道；启用后 Hook API 调用会通过这条长连接发给 DLL。
 - `agent_ws_path`：DLL 连接路径，默认 `/agent`。
 - `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；无证书直连后端可用 `client_wss_scheme: "ws"`、`client_wss_port: 5000`，DLL 配置 `RemoteWS="ws://1.14.149.2:5000/agent"`；正式 TLS 部署用 `client_wss_scheme: "wss"`、`client_wss_port: 443`，DLL 配置 `RemoteWS="wss://1.14.149.2/agent"`。

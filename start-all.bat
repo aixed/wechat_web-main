@@ -13,10 +13,18 @@ if "%LEGACY_NODE_PLATFORM%"=="1" (
 
 set "ROOT=%~dp0"
 set "RUN_DIR=%ROOT%.run"
+set "START_ROOT=%ROOT%"
 if not exist "%RUN_DIR%" mkdir "%RUN_DIR%"
 
 if not exist "%ROOT%config.yaml" (
-  echo [WARN] config.yaml not found. Please create it before starting the backend.
+  if exist "%ROOT%config.example.yaml" (
+    echo [SETUP] config.yaml not found. Creating it from config.example.yaml.
+    copy /y "%ROOT%config.example.yaml" "%ROOT%config.yaml" >nul
+  ) else (
+    echo [ERROR] config.yaml and config.example.yaml were not found.
+    pause
+    exit /b 1
+  )
 )
 
 call :ensure_python
@@ -35,7 +43,6 @@ if errorlevel 1 (
   exit /b 1
 )
 
-set "START_ROOT=%ROOT%"
 set "VENV_PY=%ROOT%backend\.venv\Scripts\python.exe"
 
 if exist "%VENV_PY%" (
@@ -68,6 +75,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
+call :select_frontend_port
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+
 echo Starting backend...
 set "START_PYTHON_CMD=%PYTHON_CMD%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$cmd='title WeChat Web Backend && cd /d \"' + $env:START_ROOT + 'backend\" && ' + $env:START_PYTHON_CMD + ' main.py'; $p=Start-Process -FilePath cmd.exe -ArgumentList @('/k', $cmd) -PassThru; Set-Content -Path ($env:START_ROOT + '.run\backend.pid') -Value $p.Id -Encoding ASCII"
@@ -77,11 +90,42 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 2"
 echo Starting frontend...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$cmd='title WeChat Web Frontend && cd /d \"' + $env:START_ROOT + 'frontend\" && if not exist node_modules (npm install && npm run dev) else (npm run dev)'; $p=Start-Process -FilePath cmd.exe -ArgumentList @('/k', $cmd) -PassThru; Set-Content -Path ($env:START_ROOT + '.run\frontend.pid') -Value $p.Id -Encoding ASCII"
 
+set "FRONTEND_URL=http://127.0.0.1:%FRONTEND_PORT%"
+set "START_FRONTEND_URL=%FRONTEND_URL%"
+echo [SETUP] Waiting for %FRONTEND_URL% ...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline=[DateTime]::UtcNow.AddSeconds(180); while ([DateTime]::UtcNow -lt $deadline) { try { $response=Invoke-WebRequest -UseBasicParsing -Uri $env:START_FRONTEND_URL -TimeoutSec 2; if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) { exit 0 } } catch {}; Start-Sleep -Seconds 1 }; exit 1"
+if errorlevel 1 (
+  echo [WARN] Frontend did not respond within 180 seconds. Browser was not opened.
+) else (
+  echo [READY] Frontend is available at %FRONTEND_URL%
+  start "" "%FRONTEND_URL%"
+)
+
 echo.
 echo Backend and frontend startup commands were launched.
-echo Frontend and backend host/port are configured by config.yaml.
+echo Frontend port %FRONTEND_PORT% was written to config.yaml.
 
 endlocal
+exit /b 0
+
+:select_frontend_port
+set "FRONTEND_PORT="
+set "FRONTEND_PORT_FILE=%RUN_DIR%\frontend.port.tmp"
+del /f /q "%FRONTEND_PORT_FILE%" >nul 2>nul
+echo [SETUP] Checking up to 10 frontend ports from config.yaml...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\select-frontend-port.ps1" -ConfigPath "%ROOT%config.yaml" -MaxAttempts 10 > "%FRONTEND_PORT_FILE%"
+if errorlevel 1 (
+  echo [ERROR] Could not find an available frontend port in 10 attempts.
+  del /f /q "%FRONTEND_PORT_FILE%" >nul 2>nul
+  exit /b 1
+)
+set /p FRONTEND_PORT=<"%FRONTEND_PORT_FILE%"
+del /f /q "%FRONTEND_PORT_FILE%" >nul 2>nul
+if not defined FRONTEND_PORT (
+  echo [ERROR] Frontend port selection returned no port.
+  exit /b 1
+)
+echo [SETUP] Frontend will use port %FRONTEND_PORT%.
 exit /b 0
 
 :ensure_python

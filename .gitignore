@@ -7,6 +7,9 @@ config.yaml
 *.log
 login.log
 
+# Local deployment archives may include config.yaml and runtime caches
+*.rar
+
 # Python
 __pycache__/
 *.py[cod]

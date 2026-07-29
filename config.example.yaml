@@ -43,7 +43,8 @@ web_access_key: ""
 hook_api_concurrency: 10
 
 # --- 前端服务 ---
-# Vite 会直接读取 frontend_host/frontend_port；启动脚本不再覆盖这些值。
+# Vite 会直接读取 frontend_host/frontend_port。
+# Windows 启动脚本发现端口被占用时，会向后尝试最多 10 个端口并回写 frontend_port。
 frontend_host: "0.0.0.0"
 frontend_port: 3001
 
