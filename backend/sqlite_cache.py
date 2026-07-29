@@ -7,8 +7,9 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from threading import RLock
-from typing import Any
+from typing import Any, Iterator
 
 
 class SqliteMessageCache:
@@ -26,12 +27,17 @@ class SqliteMessageCache:
         self._lock = RLock()
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._lock, self._connect() as conn:
@@ -134,6 +140,23 @@ class SqliteMessageCache:
                 CREATE INDEX IF NOT EXISTS idx_group_members_owner_gid_order
                     ON group_members (owner_wxid, gid, display_order);
 
+                CREATE TABLE IF NOT EXISTS smart_reply_configs (
+                    owner_wxid TEXT NOT NULL DEFAULT '',
+                    chat_id TEXT NOT NULL,
+                    chat_name TEXT NOT NULL DEFAULT '',
+                    avatar TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    target_senders_json TEXT NOT NULL DEFAULT '[]',
+                    rules_json TEXT NOT NULL DEFAULT '[]',
+                    reply_count INTEGER NOT NULL DEFAULT 0,
+                    last_triggered_at INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (owner_wxid, chat_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_smart_reply_owner_updated
+                    ON smart_reply_configs (owner_wxid, updated_at DESC);
+
                 CREATE TABLE IF NOT EXISTS cache_meta (
                     owner_wxid TEXT NOT NULL DEFAULT '',
                     key TEXT NOT NULL,
@@ -143,6 +166,131 @@ class SqliteMessageCache:
                 );
                 """
             )
+
+    @staticmethod
+    def _smart_reply_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        try:
+            target_senders = json.loads(row["target_senders_json"] or "[]")
+        except Exception:
+            target_senders = []
+        try:
+            rules = json.loads(row["rules_json"] or "[]")
+        except Exception:
+            rules = []
+        if not isinstance(target_senders, list):
+            target_senders = []
+        if not isinstance(rules, list):
+            rules = []
+        return {
+            "chat_id": str(row["chat_id"] or ""),
+            "chat_name": str(row["chat_name"] or row["chat_id"] or ""),
+            "avatar": str(row["avatar"] or ""),
+            "enabled": bool(int(row["enabled"] or 0)),
+            "target_senders": [str(item) for item in target_senders if str(item or "").strip()],
+            "rules": [item for item in rules if isinstance(item, dict)],
+            "reply_count": int(row["reply_count"] or 0),
+            "last_triggered_at": int(row["last_triggered_at"] or 0),
+            "created_at": int(row["created_at"] or 0),
+            "updated_at": int(row["updated_at"] or 0),
+        }
+
+    def get_smart_reply_config(self, chat_id: str, *, owner_wxid: str = "") -> dict[str, Any] | None:
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            return None
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM smart_reply_configs WHERE owner_wxid = ? AND chat_id = ?",
+                (owner_wxid, chat_id),
+            ).fetchone()
+        return self._smart_reply_row(row)
+
+    def list_smart_reply_configs(self, *, owner_wxid: str = "") -> list[dict[str, Any]]:
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM smart_reply_configs WHERE owner_wxid = ? ORDER BY updated_at DESC, chat_name ASC",
+                (owner_wxid,),
+            ).fetchall()
+        return [config for row in rows if (config := self._smart_reply_row(row)) is not None]
+
+    def upsert_smart_reply_config(self, config: dict[str, Any], *, owner_wxid: str = "") -> dict[str, Any]:
+        owner_wxid = str(owner_wxid or "").strip()
+        chat_id = str(config.get("chat_id") or "").strip()
+        if not chat_id:
+            raise ValueError("chat_id is required")
+        now = int(time.time())
+        target_senders = config.get("target_senders") if isinstance(config.get("target_senders"), list) else []
+        rules = config.get("rules") if isinstance(config.get("rules"), list) else []
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO smart_reply_configs (
+                    owner_wxid, chat_id, chat_name, avatar, enabled,
+                    target_senders_json, rules_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_wxid, chat_id) DO UPDATE SET
+                    chat_name=excluded.chat_name,
+                    avatar=excluded.avatar,
+                    enabled=excluded.enabled,
+                    target_senders_json=excluded.target_senders_json,
+                    rules_json=excluded.rules_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    owner_wxid,
+                    chat_id,
+                    str(config.get("chat_name") or chat_id),
+                    str(config.get("avatar") or ""),
+                    1 if bool(config.get("enabled", True)) else 0,
+                    json.dumps(target_senders, ensure_ascii=False),
+                    json.dumps(rules, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        saved = self.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
+        if saved is None:
+            raise RuntimeError("smart reply config was not saved")
+        return saved
+
+    def delete_smart_reply_config(self, chat_id: str, *, owner_wxid: str = "") -> bool:
+        chat_id = str(chat_id or "").strip()
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM smart_reply_configs WHERE owner_wxid = ? AND chat_id = ?",
+                (owner_wxid, chat_id),
+            )
+        return cursor.rowcount > 0
+
+    def record_smart_reply_trigger(
+        self,
+        chat_id: str,
+        *,
+        owner_wxid: str = "",
+        disable: bool = False,
+        triggered_at: int | None = None,
+    ) -> dict[str, Any] | None:
+        chat_id = str(chat_id or "").strip()
+        owner_wxid = str(owner_wxid or "").strip()
+        timestamp = int(triggered_at or time.time())
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE smart_reply_configs
+                SET reply_count = reply_count + 1,
+                    last_triggered_at = ?,
+                    enabled = CASE WHEN ? THEN 0 ELSE enabled END,
+                    updated_at = ?
+                WHERE owner_wxid = ? AND chat_id = ?
+                """,
+                (timestamp, 1 if disable else 0, timestamp, owner_wxid, chat_id),
+            )
+        return self.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
 
     @staticmethod
     def _message_id(msg: dict[str, Any]) -> str:

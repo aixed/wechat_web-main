@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { Session } from "../types";
 
-export type SessionMenuAction = "pin" | "unpin" | "mark_unread" | "mute" | "unmute" | "delete";
+export type SessionMenuAction = "pin" | "unpin" | "mark_unread" | "mute" | "unmute" | "smart_reply" | "delete";
 
 interface SessionListProps {
   sessions: Session[];
@@ -92,8 +92,8 @@ export default function SessionList({
     e.preventDefault();
     e.stopPropagation();
     setMenu({
-      x: Math.min(e.clientX, window.innerWidth - 188),
-      y: Math.min(e.clientY, window.innerHeight - 220),
+      x: Math.max(8, Math.min(e.clientX, window.innerWidth - 188)),
+      y: Math.max(8, Math.min(e.clientY, window.innerHeight - (session.is_group ? 256 : 220))),
       session,
     });
   };
@@ -211,6 +211,9 @@ export default function SessionList({
           <ContextMenuItem dark={dark} onClick={() => runAction(menu.session.muted ? "unmute" : "mute")}>
             {menu.session.muted ? "开启新消息提醒" : "消息免打扰"}
           </ContextMenuItem>
+          {menu.session.is_group && (
+            <ContextMenuItem dark={dark} onClick={() => runAction("smart_reply")}>自动回复</ContextMenuItem>
+          )}
           <div className={`h-px my-[4px] ${dark ? "bg-[#3a3a3a]" : "bg-[#e2e2e2]"}`} />
           <ContextMenuItem dark={dark} danger onClick={() => runAction("delete")}>删除聊天</ContextMenuItem>
         </div>

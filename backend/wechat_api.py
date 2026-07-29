@@ -1437,10 +1437,10 @@ async def configure_msg_receive(enable: bool, url: str, recv_type: int = 2) -> d
     if IS_HOOK:
         if not enable:
             return {}
-        r = await _post("/ConfigureMsgReciveFullURL", json={
-            "RecvType": recv_type,
-            "CallBackURL": url,
-        })
+        payload = {"RecvType": recv_type}
+        if IS_LOCAL_HOOK or not AGENT_WS_ENABLED:
+            payload["CallBackURL"] = url
+        r = await _post("/ConfigureMsgReciveFullURL", json=payload)
         return safe_json(r)
     else:
         # Remote: callback is configured at StartWechat time, not dynamically

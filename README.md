@@ -112,12 +112,12 @@ npm run lint
 
 ### 远程 Hook DLL 启动参数
 
-使用远程 Hook 模式时，DLL 启动微信的参数必须带 `RemoteWS`。该参数用于让远程微信客户端主动建立到 Web 后端的 WebSocket 长连接，后端后续的接口调用会通过这条连接转发给对应的 Hook 客户端。
+使用远程 Hook 模式时，DLL 启动微信的参数必须带 `RemoteWS`。该参数用于让远程微信客户端主动建立到 Web 后端的 WebSocket 长连接。后端的 Hook API 调用和 DLL 的实时消息回调都会复用这条连接，不再需要配置 `CallBackURL`。
 
 示例：
 
 ```text
-"C:\Program Files (x86)\Tencent\WeChat391016\WeChat\WeChat.exe" CallBackURL=http://localhost/receiveChatBotMsg/msg&RecvType=1&ConnectType=http&RemoteWS="ws://1.14.149.2:5000/agent"&StartPort=30001&RDV=<客户端自己的RDV>
+"C:\Program Files (x86)\Tencent\WeChat391016\WeChat\WeChat.exe" RecvType=1&ConnectType=http&RemoteWS="ws://1.14.149.2:5000/agent"&StartPort=30001&RDV=<客户端自己的RDV>
 ```
 
 `RemoteWS` 支持两种形式：
@@ -131,7 +131,7 @@ npm run lint
 
 - `wechat_mode`：微信使用方式，`1`=本地 Hook，`2`=远程客户端 Hook（客户端 DLL 主动连本后端 WS/WSS），`3`=远程服务器协议。旧配置 `login` 仍兼容，可选 `local_hook`、`remote_hook`、`remote_protocol`。
 - `*_host` / `*_api_port` / `*_mgr_port`：不同模式下的服务地址和端口。
-- `ip`：公网 IP 或域名，用于生成远程客户端 DLL 可访问的回调地址。
+- `ip`：部署机器的 IP 或域名，作为相关网络配置的默认主机值。
 - `server_host` / `server_port`：后端主服务监听地址和端口；DLL 直连 `ws://公网IP:5000/agent` 时用 `server_host: "0.0.0.0"`，只走前端或 Nginx 代理时可用 `127.0.0.1`。
 - `web_access_key`：Web 前端和 `/api/*` 接口访问密钥；不要提交真实值，可在本地 `config.yaml` 或环境变量 `WECHAT_WEB_ACCESS_KEY` 中配置。
 - `hook_api_concurrency`：Hook/API 并发数；本地 Hook 默认 `1`，远程 Hook/远程协议默认 `10`，用于避免慢查询阻塞 `GetContact`、头像、发送消息等交互接口。
@@ -140,7 +140,6 @@ npm run lint
 - `agent_ws_path`：DLL 连接路径，默认 `/agent`。
 - `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；无证书直连后端可用 `client_wss_scheme: "ws"`、`client_wss_port: 5000`，DLL 配置 `RemoteWS="ws://1.14.149.2:5000/agent"`；正式 TLS 部署用 `client_wss_scheme: "wss"`、`client_wss_port: 443`，DLL 配置 `RemoteWS="wss://1.14.149.2/agent"`。
 - 使用前端端口代理 `/agent` 时，后端 `server_port` 不需要暴露公网；直连 `server_port` 时，需要云服务器安全组放行该端口。若使用 Nginx/Caddy，也需要保留 WebSocket Upgrade 头。
-- `callback_host` / `callback_port`：回调服务本机监听地址；`callback_public_port` / `callback_path`：远程客户端 Hook 实际访问的公网端口和路径。
 - `recvtype`：Hook 消息接收类型，默认 `1`；`1` 为 Hook 直接返回 `msglist`，`2` 为 protobuf/raw `pb_msg`。旧配置 `recv_type` 仍兼容。
 - `WECHAT_FILES_BASE`：可选环境变量，用于指定本机微信文件目录；不设置时会按默认微信文件目录推导。
 

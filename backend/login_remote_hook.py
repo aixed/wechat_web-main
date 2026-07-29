@@ -24,7 +24,7 @@ import requests
 sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     HOOK_HOST, HOOK_PORT, MGR_PORT,
-    RDV, CALLBACK_URL,
+    RDV, CLIENT_WSS_URL,
     RECV_TYPE,
     RESTART_ON_BUTTON_LOGIN_FAIL, MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL,
 )
@@ -373,9 +373,10 @@ def start_wechat() -> dict | None:
     url = f"{MGR_URL}/StartWechat"
     body = {
         "StartPort": str(HOOK_PORT),
-        "CallBackURL": CALLBACK_URL,
         "RDV": RDV,
         "RecvType": str(RECV_TYPE),
+        "ConnectType": "http",
+        "RemoteWS": CLIENT_WSS_URL,
     }
     try:
         r = _post(url, body, timeout=TIMEOUT)
@@ -863,7 +864,7 @@ def main():
     log("Remote Hook 登录 (自动选择免扫码 / 扫码)")
     log(f"  管理端口: {MGR_URL}")
     log(f"  API 端口: {API_URL}")
-    log(f"  回调地址: {CALLBACK_URL}")
+    log(f"  远程 WebSocket: {CLIENT_WSS_URL}")
     log(f"  RDV: {RDV}")
     log("=" * 50)
 

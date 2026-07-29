@@ -12,7 +12,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -56,6 +56,14 @@ class AgentWebSocketManager:
         self._connections: dict[str, AgentConnection] = {}
         self._active_id: str = ""
         self._lock = asyncio.Lock()
+        self._callback_handler: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+        self._callback_tasks: set[asyncio.Task[None]] = set()
+
+    def set_callback_handler(
+        self,
+        handler: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        self._callback_handler = handler
 
     def is_connected(self, agent_id: str | None = None) -> bool:
         if agent_id:
@@ -322,6 +330,12 @@ class AgentWebSocketManager:
                     future.set_exception(ConnectionError("agent websocket closed"))
             await self._close_socket(conn.websocket, code=1001, reason="server shutdown")
 
+        callback_tasks = list(self._callback_tasks)
+        for task in callback_tasks:
+            task.cancel()
+        if callback_tasks:
+            await asyncio.gather(*callback_tasks, return_exceptions=True)
+
     async def _handle_message(self, conn: AgentConnection, payload: str | bytes) -> None:
         try:
             if isinstance(payload, bytes):
@@ -367,6 +381,9 @@ class AgentWebSocketManager:
             return
         if msg_type == "pong":
             return
+        if msg_type == "callback":
+            self._dispatch_callback(conn, message)
+            return
         if msg_type != "response":
             print(f"[AGENT_WS] ignored message type={msg_type or 'unknown'}", flush=True)
             return
@@ -384,6 +401,49 @@ class AgentWebSocketManager:
             return
         if not future.done():
             future.set_result(message)
+
+    def _dispatch_callback(
+        self,
+        conn: AgentConnection,
+        message: dict[str, Any],
+    ) -> None:
+        handler = self._callback_handler
+        if handler is None:
+            print("[AGENT_WS] callback ignored: handler is not registered", flush=True)
+            return
+
+        body = message.get("body")
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except Exception:
+                body = None
+        if not isinstance(body, dict):
+            print("[AGENT_WS] callback ignored: body must be a JSON object", flush=True)
+            return
+
+        callback = dict(body)
+        callback.setdefault("agent_id", conn.id)
+        if conn.wxid:
+            callback.setdefault("selfwxid", conn.wxid)
+        if conn.server_port:
+            callback.setdefault("ServerPort", conn.server_port)
+
+        task = asyncio.create_task(self._run_callback_handler(handler, callback))
+        self._callback_tasks.add(task)
+        task.add_done_callback(self._callback_tasks.discard)
+
+    @staticmethod
+    async def _run_callback_handler(
+        handler: Callable[[dict[str, Any]], Awaitable[None]],
+        callback: dict[str, Any],
+    ) -> None:
+        try:
+            await handler(callback)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[AGENT_WS] callback handler error: {type(exc).__name__}: {exc}", flush=True)
 
     def _agent_id_from_body(self, body: Any) -> str:
         if isinstance(body, str):

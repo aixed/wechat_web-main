@@ -59,13 +59,8 @@ client_wss_host: "127.0.0.1"
 client_wss_port: 5000
 agent_ws_request_timeout: 30
 
-# --- 回调 ---
-# callback_host/callback_port 是后端本机监听地址；
-# callback_public_port 是外部客户端访问前端代理的端口。
-callback_host: "127.0.0.1"
-callback_port: 5000
-callback_public_port: 80
-callback_path: "/receiveChatBotMsg/msg"
+# --- 实时消息 ---
+# 远程 Hook 的回调复用上面的 Agent WebSocket，无需配置 HTTP 回调地址或端口。
 # 消息接收类型：
 #   1 = Hook 直接返回 msglist
 #   2 = protobuf/raw pb_msg

@@ -28,9 +28,10 @@ if errorlevel 1 (
   echo [WARN] Python 3.13 was not found. Set PYTHON_BIN to a Python 3.13 executable to run the backend on Python 3.13.
 )
 
-where npm >nul 2>nul
+call :ensure_node
 if errorlevel 1 (
-  echo [ERROR] npm was not found in PATH.
+  echo [ERROR] Failed to install Node.js LTS and npm.
+  echo Please check your network connection, approve the Windows installer prompt, and try again.
   pause
   exit /b 1
 )
@@ -82,3 +83,40 @@ echo Backend and frontend startup commands were launched.
 echo Frontend and backend host/port are configured by config.yaml.
 
 endlocal
+exit /b 0
+
+:ensure_node
+call :refresh_path
+where node >nul 2>nul
+if errorlevel 1 goto install_node
+where npm.cmd >nul 2>nul
+if not errorlevel 1 exit /b 0
+
+:install_node
+echo [SETUP] npm was not found. Installing Node.js LTS ^(includes npm^)...
+where winget >nul 2>nul
+if errorlevel 1 goto install_node_from_web
+
+winget install --id OpenJS.NodeJS.LTS --exact --source winget --accept-package-agreements --accept-source-agreements --silent --force
+if not errorlevel 1 goto verify_node
+echo [WARN] winget could not install Node.js. Trying the official Node.js installer...
+
+:install_node_from_web
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $releases=Invoke-RestMethod 'https://nodejs.org/dist/index.json'; $release=$releases | Where-Object { $_.lts } | Select-Object -First 1; if (-not $release) { throw 'Could not find the current Node.js LTS release.' }; $preferredArch=if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::Arm64) { 'arm64' } elseif ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }; $arch=if ($release.files -contains ('win-' + $preferredArch + '-msi')) { $preferredArch } elseif ($release.files -contains 'win-x64-msi') { 'x64' } else { 'x86' }; $msi=Join-Path $env:TEMP ('node-' + [Guid]::NewGuid().ToString('N') + '.msi'); try { $url='https://nodejs.org/dist/' + $release.version + '/node-' + $release.version + '-' + $arch + '.msi'; Write-Host ('[SETUP] Downloading ' + $url); Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $msi; $signature=Get-AuthenticodeSignature -FilePath $msi; if ($signature.Status -ne 'Valid') { throw ('Invalid installer signature: ' + $signature.Status) }; $process=Start-Process -FilePath 'msiexec.exe' -Verb RunAs -ArgumentList @('/i', ('"' + $msi + '"'), '/passive', '/norestart') -Wait -PassThru; if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) { throw ('Node.js installer exited with code ' + $process.ExitCode) } } finally { Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue }"
+if errorlevel 1 exit /b 1
+
+:verify_node
+call :refresh_path
+where node >nul 2>nul
+if errorlevel 1 exit /b 1
+where npm.cmd >nul 2>nul
+if errorlevel 1 exit /b 1
+for /f "delims=" %%V in ('node --version') do echo [SETUP] Node.js %%V is ready.
+for /f "delims=" %%V in ('npm.cmd --version') do echo [SETUP] npm %%V is ready.
+exit /b 0
+
+:refresh_path
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"`) do set "PATH=%PATH%;%%P"
+if exist "%ProgramFiles%\nodejs\npm.cmd" set "PATH=%ProgramFiles%\nodejs;%PATH%"
+if exist "%LocalAppData%\Programs\nodejs\npm.cmd" set "PATH=%LocalAppData%\Programs\nodejs;%PATH%"
+exit /b 0
