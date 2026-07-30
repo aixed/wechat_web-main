@@ -73,6 +73,95 @@ export const activateAccount = (agentId: string) =>
     body: JSON.stringify({ agent_id: agentId }),
   });
 
+// ─── Protocol Login ───────────────────────────────────────────────
+
+export type ProtocolProxyConfig = {
+  Proxy_Type?: string;
+  Proxy_IP?: string;
+  Proxy_Port?: string;
+  Proxy_Usr?: string;
+  Proxy_Pwd?: string;
+};
+
+export type ProtocolRdvMappingEntry = {
+  wxid?: string;
+  userName?: string;
+  port?: string;
+  nickname?: string;
+  avatar?: string;
+  account?: string;
+  phone?: string;
+  region?: string;
+  signature?: string;
+  profile?: Record<string, any>;
+  proxy?: ProtocolProxyConfig;
+};
+
+export type ProtocolStartWechatPayload = {
+  rdv: string;
+  callback_url?: string;
+  proxy_type?: string;
+  proxy_ip?: string;
+  proxy_port?: string;
+  proxy_usr?: string;
+  proxy_pwd?: string;
+};
+
+export const getProtocolRdvMapping = () => fetchJSON("/api/protocol/rdv-mapping");
+
+export const saveProtocolRdvMapping = (
+  rdv: string,
+  wxid: string,
+  port = "",
+  proxy: ProtocolProxyConfig = {},
+  identity: Partial<ProtocolRdvMappingEntry> = {},
+) =>
+  fetchJSON("/api/protocol/rdv-mapping", {
+    method: "POST",
+    body: JSON.stringify({ rdv, wxid, port, proxy, ...identity }),
+  });
+
+export const deleteProtocolRdvMapping = (rdv: string) =>
+  fetchJSON(`/api/protocol/rdv-mapping/${encodeURIComponent(rdv)}`, {
+    method: "DELETE",
+  });
+
+export const startProtocolWechat = (payload: ProtocolStartWechatPayload) =>
+  fetchJSON("/api/protocol/start-wechat", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, 45_000);
+
+export const getProtocolLoginQRCode = (sessionId: string) =>
+  fetchJSON("/api/protocol/get-qrcode", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId }),
+  }, 35_000);
+
+export const getProtocolLoginStatus = (sessionId: string) =>
+  fetchJSON("/api/protocol/get-login-status", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+
+export const pushProtocolLoginUrl = (sessionId: string, wxid: string) =>
+  fetchJSON("/api/protocol/push-login-url", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId, wxid }),
+  }, 30_000);
+
+export const getProtocolProfile = (sessionId: string) =>
+  fetchJSON("/api/protocol/get-profile", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId }),
+  }, 25_000);
+
+export const terminateProtocolSession = (sessionId: string) =>
+  fetchJSON("/api/protocol/terminate", {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+
 // ─── Contacts & Sessions ─────────────────────────────────────────
 
 export const getSelf = () => fetchJSON("/api/self");
