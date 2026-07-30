@@ -141,6 +141,7 @@ npm run lint
 - `server_host` / `server_port`：后端主服务监听地址和端口；DLL 直连 `ws://公网IP:5000/agent` 时用 `server_host: "0.0.0.0"`，只走前端或 Nginx 代理时可用 `127.0.0.1`。
 - `web_access_key`：Web 前端和 `/api/*` 接口访问密钥；首次启动未配置时默认使用 `admin`，建议在本地 `config.yaml` 中改成自己的值。不要提交真实值，也可通过环境变量 `WECHAT_WEB_ACCESS_KEY` 配置。
 - `hook_api_concurrency`：Hook/API 并发数；本地 Hook 默认 `1`，远程 Hook/远程协议默认 `10`，用于避免慢查询阻塞 `GetContact`、头像、发送消息等交互接口。
+- `QueryDB` 历史查询：不再使用旧的全局查询锁；同一账号的同一个数据库文件最多并发 `4` 路，第 5 个请求最多等待 `10` 秒，超时返回空结果并在日志中记录 `pooled connection unavailable`。
 - `frontend_host` / `frontend_port`：前端开发服务器监听地址和端口，由 Vite 直接读取 `config.yaml`。Windows 的 `start-all.bat` 会从 `frontend_port` 开始检查最多 10 个连续端口，将首个空闲端口回写到 `config.yaml`，并在页面可访问后自动打开 `http://127.0.0.1:<frontend_port>`。
 - `agent_ws_enabled`：是否启用远程客户端 DLL 主动连接本后端的 `/agent` WebSocket 通道；启用后 Hook API 调用会通过这条长连接发给 DLL。
 - `agent_ws_path`：DLL 连接路径，默认 `/agent`。
