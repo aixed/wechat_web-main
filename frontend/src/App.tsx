@@ -3033,6 +3033,7 @@ export default function App() {
           theme={portalTheme}
           initialTarget={smartReplyTarget}
           availableTargets={smartReplyTargets}
+          selfWxid={effectiveSelfWxid}
         />
       ) : (
       <>
@@ -4030,6 +4031,7 @@ function MobileMainShell({
           theme={theme}
           initialTarget={smartReplyInitialTarget}
           availableTargets={smartReplyTargets}
+          selfWxid={selfWxid}
         />
       )}
       <MobileTabBar active={tab} onChange={onSwitchTab} dark={dark} />
