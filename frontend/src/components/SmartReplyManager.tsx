@@ -12,6 +12,7 @@ interface SmartReplyManagerProps {
   theme: "dark" | "light";
   initialTarget?: SmartReplyTarget | null;
   availableTargets: SmartReplyTarget[];
+  selfWxid?: string;
   mobile?: boolean;
 }
 
@@ -127,9 +128,11 @@ export default function SmartReplyManager({
   theme,
   initialTarget,
   availableTargets,
+  selfWxid = "",
   mobile = false,
 }: SmartReplyManagerProps) {
   const dark = theme === "dark";
+  const normalizedSelfWxid = selfWxid.trim();
   const [configs, setConfigs] = useState<SmartReplyConfig[]>([]);
   const [draft, setDraft] = useState<SmartReplyConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -358,7 +361,15 @@ export default function SmartReplyManager({
     if (!draft) return;
     const selected = new Set(draft.target_senders);
     if (selected.has(wxid)) selected.delete(wxid);
-    else selected.add(wxid);
+    else {
+      if (normalizedSelfWxid && wxid === normalizedSelfWxid) {
+        const confirmed = window.confirm(
+          `“${wxid}”是当前登录账号。自己的消息会被系统过滤，通常不需要加入目标发送人。仍要选中吗？`,
+        );
+        if (!confirmed) return;
+      }
+      selected.add(wxid);
+    }
     updateDraft({ target_senders: Array.from(selected) });
   };
 
@@ -384,6 +395,18 @@ export default function SmartReplyManager({
       !query || member.name.toLocaleLowerCase().includes(query) || member.wxid.toLocaleLowerCase().includes(query)
     );
   }, [draft?.target_senders, memberQuery, members]);
+
+  const selectableMemberWxids = useMemo(
+    () => members
+      .filter((member) => !normalizedSelfWxid || member.wxid !== normalizedSelfWxid)
+      .map((member) => member.wxid),
+    [members, normalizedSelfWxid],
+  );
+  const allSelectableMembersSelected = selectableMemberWxids.length > 0
+    && selectableMemberWxids.every((wxid) => draft?.target_senders.includes(wxid));
+  const selfSelected = Boolean(
+    normalizedSelfWxid && draft?.target_senders.includes(normalizedSelfWxid),
+  );
 
   const filteredConfigs = useMemo(() => {
     const query = listQuery.trim().toLocaleLowerCase();
@@ -561,16 +584,21 @@ export default function SmartReplyManager({
               <div>
                 <h2 className="text-[15px] font-medium">目标发送人</h2>
                 <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>已选择 {draft.target_senders.length} 人</div>
+                {selfSelected && (
+                  <div role="alert" className={`mt-[5px] text-[12px] ${dark ? "text-[#d4a657]" : "text-[#a76b00]"}`}>
+                    当前登录账号已被选中，建议取消以避免误配置。
+                  </div>
+                )}
               </div>
-              {members.length > 0 && (
+              {selectableMemberWxids.length > 0 && (
                 <button
                   type="button"
                   onClick={() => updateDraft({
-                    target_senders: draft.target_senders.length === members.length ? [] : members.map((member) => member.wxid),
+                    target_senders: allSelectableMembersSelected ? [] : selectableMemberWxids,
                   })}
                   className={`text-[13px] ${dark ? "text-[#9a9a9a] hover:text-white" : "text-[#666] hover:text-black"}`}
                 >
-                  {draft.target_senders.length === members.length ? "取消全选" : "全选"}
+                  {allSelectableMembersSelected ? "取消全选" : "全选"}
                 </button>
               )}
             </div>
@@ -586,12 +614,26 @@ export default function SmartReplyManager({
               <div className="mt-[12px] grid grid-cols-1 xl:grid-cols-2 gap-x-[28px] max-h-[280px] overflow-y-auto pane-scroll">
                 {memberRows.map((member) => {
                   const checked = draft.target_senders.includes(member.wxid);
+                  const isSelf = Boolean(normalizedSelfWxid && member.wxid === normalizedSelfWxid);
                   return (
-                    <label key={member.wxid} className={`h-[52px] flex items-center gap-[10px] border-b cursor-pointer ${dark ? "border-[#252525]" : "border-[#e5e5e5]"}`}>
-                      <input type="checkbox" checked={checked} onChange={() => toggleSender(member.wxid)} className="w-[16px] h-[16px] accent-[#07c160]" />
-                      <TargetAvatar target={member} size={34} />
+                    <label
+                      key={member.wxid}
+                      title={isSelf ? "当前登录账号" : undefined}
+                      className={`h-[52px] flex items-center gap-[10px] border-b cursor-pointer ${
+                        dark ? "border-[#252525]" : "border-[#e5e5e5]"
+                      } ${isSelf ? (dark ? "bg-[#151515] text-[#686868]" : "bg-[#f1f1f1] text-[#999]") : ""}`}
+                    >
+                      <input type="checkbox" checked={checked} onChange={() => toggleSender(member.wxid)} className={`w-[16px] h-[16px] accent-[#07c160] ${isSelf ? "opacity-60" : ""}`} />
+                      <div className={isSelf ? "opacity-55 grayscale" : ""}>
+                        <TargetAvatar target={member} size={34} />
+                      </div>
                       <div className="min-w-0 flex-1">
-                        <div className="text-[13px] truncate">{member.name}</div>
+                        <div className="flex items-center gap-[7px] min-w-0">
+                          <span className="text-[13px] truncate">{member.name}</span>
+                          {isSelf && (
+                            <span className={`shrink-0 text-[10px] ${dark ? "text-[#626262]" : "text-[#999]"}`}>自己</span>
+                          )}
+                        </div>
                         <div className={`text-[10px] truncate mt-[1px] ${dark ? "text-[#606060]" : "text-[#aaa]"}`}>{member.wxid}</div>
                       </div>
                     </label>

@@ -27,6 +27,12 @@ if not exist "%ROOT%config.yaml" (
   )
 )
 
+call :cleanup_stale_processes
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+
 call :ensure_python
 if errorlevel 1 (
   echo [ERROR] Failed to install Python 3.13.
@@ -106,6 +112,15 @@ echo Backend and frontend startup commands were launched.
 echo Frontend port %FRONTEND_PORT% was written to config.yaml.
 
 endlocal
+exit /b 0
+
+:cleanup_stale_processes
+echo [SETUP] Stopping stale backend/frontend processes...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\stop-project-processes.ps1" -RootPath "%ROOT%." -ConfigPath "%ROOT%config.yaml" -RequireBackendPortFree
+if errorlevel 1 (
+  echo [ERROR] Stale project processes could not be stopped or the backend port is still occupied.
+  exit /b 1
+)
 exit /b 0
 
 :select_frontend_port

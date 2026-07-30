@@ -93,6 +93,8 @@ npm run dev
 
 Windows Server 2012 R2 不在当前 Node.js 的官方支持范围内。`start-all.bat` 会在检测到该系统时自动设置 `NODE_SKIP_PLATFORM_CHECK=1` 并验证 Node/npm 是否能够实际运行；如果仍出现系统 API 或 DLL 缺失错误，需要升级到 Windows Server 2016 或更高版本。
 
+Windows 启动时会先清理当前项目遗留的后端、Vite 和 npm 进程，并等待 `server_port` 确认可用后再启动；`stop-all.bat` 也使用相同的进程识别和端口复检逻辑。若后端端口被其他项目占用，脚本会显示占用 PID 并停止，不会误杀无关进程。
+
 ## 常用命令
 
 ```bash
