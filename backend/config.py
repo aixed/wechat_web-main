@@ -8,6 +8,8 @@ Reads from ../config.yaml and exposes settings for three modes:
 
 import os
 import sys
+from typing import Any
+
 import yaml
 
 # Windows redirects stdout/stderr with the system code page by default.
@@ -110,6 +112,195 @@ SERVER_HOST = str(_cfg.get("server_host", "127.0.0.1") or "127.0.0.1")
 SERVER_PORT = int(_cfg.get("server_port", 5000))
 WEB_ACCESS_KEY = str(_cfg.get("web_access_key", os.environ.get("WECHAT_WEB_ACCESS_KEY", ""))).strip()
 
+# AI smart replies. Secrets may live in the ignored config.yaml or environment.
+AI_ACTIVE_PROFILE_ID = ""
+AI_PROFILES: list[dict[str, Any]] = []
+AI_BASE_URL = ""
+AI_API_KEY = ""
+AI_MODEL = ""
+AI_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("ai_timeout_seconds", 60)))
+AI_MAX_CONCURRENCY = max(1, min(20, int(_cfg.get("ai_max_concurrency", 3))))
+
+
+def _normalize_ai_profile(raw: Any, index: int = 0) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    profile_id = str(raw.get("id") or f"ai_profile_{index + 1}").strip()[:100]
+    base_url = str(raw.get("base_url") or raw.get("api_base_url") or "").strip().rstrip("/")
+    api_key = str(raw.get("api_key") or "").strip()
+    model = str(raw.get("model") or "").strip()
+    name = str(raw.get("name") or model or base_url or f"AI 配置 {index + 1}").strip()[:80]
+    return {
+        "id": profile_id or f"ai_profile_{index + 1}",
+        "name": name or f"AI 配置 {index + 1}",
+        "base_url": base_url,
+        "api_key": api_key,
+        "model": model,
+    }
+
+
+def _legacy_ai_profile(document: dict[str, Any]) -> dict[str, Any] | None:
+    base_url = str(document.get("ai_base_url", os.environ.get("OPENAI_BASE_URL", ""))).strip().rstrip("/")
+    api_key = str(document.get("ai_api_key", os.environ.get("OPENAI_API_KEY", ""))).strip()
+    model = str(document.get("ai_model", os.environ.get("OPENAI_MODEL", ""))).strip()
+    if not (base_url or api_key or model):
+        return None
+    return {
+        "id": "default",
+        "name": str(document.get("ai_profile_name") or model or "默认配置").strip()[:80],
+        "base_url": base_url,
+        "api_key": api_key,
+        "model": model,
+    }
+
+
+def _resolve_ai_settings(document: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    raw_profiles = document.get("ai_profiles")
+    profiles: list[dict[str, Any]] = []
+    if isinstance(raw_profiles, list):
+        for index, raw in enumerate(raw_profiles):
+            profile = _normalize_ai_profile(raw, index)
+            if profile:
+                profiles.append(profile)
+
+    if not profiles:
+        legacy = _legacy_ai_profile(document)
+        if legacy:
+            profiles.append(legacy)
+
+    active_profile_id = str(document.get("ai_active_profile_id") or document.get("active_ai_profile_id") or "").strip()
+    active = next((item for item in profiles if item.get("id") == active_profile_id), None)
+    if active is None:
+        active = next((item for item in profiles if item.get("base_url") and item.get("api_key") and item.get("model")), None)
+    if active is None and profiles:
+        active = profiles[0]
+    if active is None:
+        active = {"id": "", "name": "", "base_url": "", "api_key": "", "model": ""}
+    active_profile_id = str(active.get("id") or "")
+    return profiles, active_profile_id, active
+
+
+def _apply_ai_settings(document: dict[str, Any]) -> dict:
+    global AI_ACTIVE_PROFILE_ID, AI_PROFILES, AI_BASE_URL, AI_API_KEY, AI_MODEL
+    profiles, active_profile_id, active = _resolve_ai_settings(document)
+    AI_PROFILES = profiles
+    AI_ACTIVE_PROFILE_ID = active_profile_id
+    AI_BASE_URL = str(active.get("base_url") or "").strip().rstrip("/")
+    AI_API_KEY = str(active.get("api_key") or "").strip()
+    AI_MODEL = str(active.get("model") or "").strip()
+    return {
+        "configured": bool(AI_BASE_URL and AI_API_KEY and AI_MODEL),
+        "base_url": AI_BASE_URL,
+        "model": AI_MODEL,
+        "active_profile_id": AI_ACTIVE_PROFILE_ID,
+        "api_key_configured": bool(AI_API_KEY),
+        "profiles": [
+            {
+                "id": str(profile.get("id") or ""),
+                "name": str(profile.get("name") or ""),
+                "base_url": str(profile.get("base_url") or ""),
+                "model": str(profile.get("model") or ""),
+                "configured": bool(profile.get("base_url") and profile.get("api_key") and profile.get("model")),
+                "api_key_configured": bool(profile.get("api_key")),
+            }
+            for profile in AI_PROFILES
+        ],
+    }
+
+
+_apply_ai_settings(_cfg)
+
+
+def reload_ai_settings() -> dict:
+    """Reload AI settings from config.yaml without restarting the backend."""
+    document = _load_yaml()
+    return _apply_ai_settings(document)
+
+
+def save_ai_settings(
+    *,
+    base_url: str = "",
+    api_key: str = "",
+    model: str = "",
+    profiles: list[dict[str, Any]] | None = None,
+    active_profile_id: str = "",
+) -> dict:
+    """Persist AI settings while preserving config.yaml comments and formatting."""
+    from ruamel.yaml import YAML
+
+    parser = YAML()
+    parser.preserve_quotes = True
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as stream:
+            document = parser.load(stream) or {}
+    except FileNotFoundError:
+        document = {}
+
+    existing_profiles = {
+        str(profile.get("id") or ""): profile
+        for profile in _resolve_ai_settings(document)[0]
+    }
+    normalized_profiles: list[dict[str, Any]] = []
+    if profiles is not None:
+        seen_ids: set[str] = set()
+        for index, raw_profile in enumerate(profiles):
+            profile = _normalize_ai_profile(raw_profile, index)
+            if not profile:
+                continue
+            if not profile["api_key"]:
+                profile["api_key"] = str(existing_profiles.get(profile["id"], {}).get("api_key") or "")
+            base_id = profile["id"] or f"ai_profile_{index + 1}"
+            profile_id = base_id
+            suffix = 2
+            while profile_id in seen_ids:
+                profile_id = f"{base_id}_{suffix}"
+                suffix += 1
+            profile["id"] = profile_id
+            seen_ids.add(profile_id)
+            normalized_profiles.append(profile)
+    else:
+        normalized_profiles.append({
+            "id": active_profile_id or "default",
+            "name": model or "默认配置",
+            "base_url": str(base_url or "").strip().rstrip("/"),
+            "api_key": str(api_key or "").strip(),
+            "model": str(model or "").strip(),
+        })
+
+    if not normalized_profiles:
+        normalized_profiles.append({
+            "id": "default",
+            "name": "默认配置",
+            "base_url": "",
+            "api_key": "",
+            "model": "",
+        })
+
+    selected_id = str(active_profile_id or "").strip()
+    active = next((item for item in normalized_profiles if item.get("id") == selected_id), None)
+    if active is None:
+        active = next((item for item in normalized_profiles if item.get("base_url") and item.get("api_key") and item.get("model")), None)
+    if active is None:
+        active = normalized_profiles[0]
+    selected_id = str(active.get("id") or "")
+
+    document["ai_profiles"] = normalized_profiles
+    document["ai_active_profile_id"] = selected_id
+    # Keep legacy keys in sync with the active profile so older deployments and
+    # manual edits continue to work.
+    document["ai_base_url"] = str(active.get("base_url") or "").strip().rstrip("/")
+    document["ai_api_key"] = str(active.get("api_key") or "").strip()
+    document["ai_model"] = str(active.get("model") or "").strip()
+    temp_path = _CONFIG_PATH + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as stream:
+            parser.dump(document, stream)
+        os.replace(temp_path, _CONFIG_PATH)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    return _apply_ai_settings(document)
+
 # Hook/API request concurrency. Local Hook keeps the conservative single-call
 # path by default; remote Hook/Protocol can handle parallel calls.
 HOOK_API_CONCURRENCY = int(_cfg.get("hook_api_concurrency", 1 if IS_LOCAL_HOOK else 10))
@@ -157,5 +348,7 @@ print(f"[CONFIG] wechat_mode={WECHAT_MODE}  mode={LOGIN_MODE}  host={HOOK_HOST} 
       f"client_wss={CLIENT_WSS_URL}  "
       f"recv_type={RECV_TYPE}  "
       f"ip={PUBLIC_IP}  RDV={RDV}  "
+      f"ai={'on' if AI_BASE_URL and AI_API_KEY and AI_MODEL else 'off'}  "
+      f"ai_model={AI_MODEL or '-'}  "
       f"restart_on_button_fail={RESTART_ON_BUTTON_LOGIN_FAIL}  "
       f"max_restart_button_fail={MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL}", flush=True)

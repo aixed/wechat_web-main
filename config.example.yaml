@@ -70,3 +70,26 @@ recvtype: 1
 # --- 登录流程行为开关 ---
 restart_on_button_login_fail: true
 max_restarts_after_button_login_fail: 1
+
+# --- AI 智能回复 ---
+# 真实地址和密钥只填写在不受 Git 管理的 config.yaml 中。
+ai_base_url: ""
+ai_api_key: ""
+ai_model: ""
+ai_active_profile_id: ""
+ai_profiles: []
+# 多模型示例（真实密钥只放 config.yaml，不要提交到 Git）：
+# ai_active_profile_id: "deepseek"
+# ai_profiles:
+#   - id: "deepseek"
+#     name: "DeepSeek"
+#     base_url: "https://api.deepseek.com"
+#     api_key: ""
+#     model: "deepseek-v4-flash"
+#   - id: "lingsuan"
+#     name: "灵算"
+#     base_url: "https://lingsuan.top"
+#     api_key: ""
+#     model: "gpt-5.6-sol"
+ai_timeout_seconds: 60
+ai_max_concurrency: 3

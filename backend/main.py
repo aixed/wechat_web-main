@@ -6,7 +6,7 @@ FastAPI server that bridges the WeChat Hook API with the frontend.
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.staticfiles import StaticFiles
 from datetime import datetime
@@ -33,11 +33,18 @@ from message_store import MessageStore
 from sqlite_cache import SqliteMessageCache
 from pb_parser import parse_raw_pb
 from smart_reply import SmartReplyEngine
+from ai_service import AiService, AiServiceError
 
 
 def _log(msg: str):
     """Flush-safe print."""
     print(msg, flush=True)
+    try:
+        os.makedirs(_RUN_DIR, exist_ok=True)
+        with open(os.path.join(os.path.dirname(__file__), "main.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}]{msg}\n")
+    except Exception:
+        pass
 
 
 _RUN_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".run")
@@ -221,6 +228,13 @@ app_state = {
 message_store = MessageStore()
 sqlite_cache = SqliteMessageCache()
 smart_reply_engine = SmartReplyEngine()
+ai_service = AiService(
+    base_url=config.AI_BASE_URL,
+    api_key=config.AI_API_KEY,
+    model=config.AI_MODEL,
+    timeout_seconds=config.AI_TIMEOUT_SECONDS,
+    max_concurrency=config.AI_MAX_CONCURRENCY,
+)
 _active_agent_id = ""
 _account_runtimes: dict[str, dict] = {}
 _self_wxid_to_agent_id: dict[str, str] = {}
@@ -779,6 +793,11 @@ def _normalize_callback_message(msg: dict, sendorrecv: str, self_wxid: str) -> t
         "file_len": msg.get("file_len"),
         "info": msg.get("info"),
         "msgsource": msg.get("msgsource"),
+        "atuserlist": (
+            msg.get("atuserlist")
+            or msg.get("atUserList")
+            or msg.get("at_user_list")
+        ),
     }
     return chat_id, normalized
 
@@ -1161,6 +1180,7 @@ async def lifespan(app: FastAPI):
         pass
     await agent_manager.close()
     await wechat_api.client.aclose()
+    await ai_service.close()
     _log("[SHUTDOWN] Done.")
 
 
@@ -1234,13 +1254,51 @@ class SmartReplyRuleRequest(BaseModel):
     reply_with_matched_line: bool = False
 
 
+class SmartReplyAiTaskRequest(BaseModel):
+    id: str = ""
+    name: str = ""
+    enabled: bool = True
+    skill_type: str = "custom"
+    skill_id: str = ""
+    instruction: str = ""
+    confidence: int = Field(default=85, ge=0, le=100)
+    output_mode: str = "result"
+    reply_template: str = "{{result}}"
+    preserve_formatting: bool = True
+    send_items_separately: bool = False
+    max_parallel: int = Field(default=1, ge=1, le=10)
+
+
 class SmartReplyConfigRequest(BaseModel):
     chat_name: str = ""
     avatar: str = ""
     enabled: bool = True
+    mention_only: bool = False
     message_types: list[str] = Field(default_factory=lambda: ["text"])
     target_senders: list[str] = Field(default_factory=list)
     rules: list[SmartReplyRuleRequest] = Field(default_factory=list)
+    ai_tasks: list[SmartReplyAiTaskRequest] = Field(default_factory=list)
+
+
+class AiProfileRequest(BaseModel):
+    id: str = ""
+    name: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+
+
+class AiSettingsRequest(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    active_profile_id: str = ""
+    profiles: list[AiProfileRequest] = Field(default_factory=list)
+
+
+class AiAnalyzeRequest(BaseModel):
+    message: str
+    task: SmartReplyAiTaskRequest
 
 
 class MultiBroadcastTextRequest(BaseModel):
@@ -1304,10 +1362,212 @@ async def activate_account(req: ActivateAccountRequest):
     return {"ok": True, "active_id": agent_id, "account": agent_manager.get_agent(agent_id)}
 
 
+def _normalize_ai_task(task: SmartReplyAiTaskRequest, index: int = 0) -> dict[str, Any]:
+    allowed_output_modes = {"result", "template", "silent"}
+    output_mode = str(task.output_mode or "result").strip().lower()
+    if output_mode not in allowed_output_modes:
+        raise HTTPException(status_code=400, detail=f"unsupported AI output mode: {output_mode}")
+    task_id = str(task.id or f"ai_skill_{index + 1}")[:100]
+    skill_id = str(task.skill_id or task_id).strip()
+    instruction = str(task.instruction or "").strip()
+    if not instruction:
+        raise HTTPException(status_code=400, detail="custom Skills require an instruction")
+    reply_template = str(task.reply_template or "").strip()
+    if output_mode == "template" and not reply_template:
+        raise HTTPException(status_code=400, detail="template AI replies require a reply template")
+    return {
+        "id": task_id,
+        "name": str(task.name or f"Skill {index + 1}").strip()[:80],
+        "enabled": bool(task.enabled),
+        "skill_type": "custom",
+        "skill_id": skill_id[:120],
+        "instruction": instruction[:4000],
+        "confidence": max(0, min(100, int(task.confidence))),
+        "output_mode": output_mode,
+        "reply_template": reply_template[:4000],
+        "preserve_formatting": bool(task.preserve_formatting),
+        "send_items_separately": bool(task.send_items_separately),
+        "max_parallel": max(1, min(10, int(task.max_parallel))),
+    }
+
+
+def _ai_settings_payload(*, include_api_key: bool = False) -> dict[str, Any]:
+    status = ai_service.status()
+    profile_keys = {
+        str(profile.get("id") or ""): str(profile.get("api_key") or "")
+        for profile in config.AI_PROFILES
+    }
+    profiles = []
+    for profile in config.AI_PROFILES:
+        profile_payload = {
+            "id": str(profile.get("id") or ""),
+            "name": str(profile.get("name") or ""),
+            "base_url": str(profile.get("base_url") or ""),
+            "model": str(profile.get("model") or ""),
+            "configured": bool(profile.get("base_url") and profile.get("api_key") and profile.get("model")),
+            "api_key_configured": bool(profile.get("api_key")),
+        }
+        if include_api_key:
+            profile_payload["api_key"] = profile_keys.get(profile_payload["id"], "")
+        profiles.append(profile_payload)
+    payload = {
+        **status,
+        "api_key_configured": bool(config.AI_API_KEY),
+        "active_profile_id": config.AI_ACTIVE_PROFILE_ID,
+        "profiles": profiles,
+    }
+    if include_api_key:
+        payload["api_key"] = config.AI_API_KEY
+    return payload
+
+
+@app.get("/api/ai/settings")
+async def get_ai_settings(include_api_key: bool = False):
+    config.reload_ai_settings()
+    ai_service.configure(
+        base_url=config.AI_BASE_URL,
+        api_key=config.AI_API_KEY,
+        model=config.AI_MODEL,
+    )
+    payload = _ai_settings_payload(include_api_key=include_api_key)
+    if include_api_key:
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+    return payload
+
+
+def _profile_payload_from_request(req: AiSettingsRequest) -> dict[str, str]:
+    if req.profiles:
+        existing_profiles = {
+            str(profile.get("id") or ""): profile
+            for profile in config.AI_PROFILES
+        }
+        active_id = str(req.active_profile_id or "").strip()
+        raw_profile = next((profile for profile in req.profiles if str(profile.id or "").strip() == active_id), None)
+        if raw_profile is None:
+            raw_profile = next(
+                (
+                    profile for profile in req.profiles
+                    if str(profile.base_url or "").strip()
+                    and str(profile.model or "").strip()
+                    and (
+                        str(profile.api_key or "").strip()
+                        or str(existing_profiles.get(str(profile.id or "").strip(), {}).get("api_key") or "")
+                    )
+                ),
+                req.profiles[0],
+            )
+        profile_id = str(raw_profile.id or "").strip()
+        api_key = str(raw_profile.api_key or "").strip()
+        if not api_key:
+            api_key = str(existing_profiles.get(profile_id, {}).get("api_key") or "")
+        return {
+            "id": profile_id,
+            "name": str(raw_profile.name or "").strip(),
+            "base_url": str(raw_profile.base_url or "").strip().rstrip("/"),
+            "api_key": api_key,
+            "model": str(raw_profile.model or "").strip(),
+        }
+    return {
+        "id": str(req.active_profile_id or "default").strip(),
+        "name": str(req.model or "默认配置").strip(),
+        "base_url": str(req.base_url or "").strip().rstrip("/"),
+        "api_key": str(req.api_key or "").strip() or config.AI_API_KEY,
+        "model": str(req.model or "").strip(),
+    }
+
+
+def _normalize_ai_settings_request(req: AiSettingsRequest) -> tuple[str, str, str]:
+    profile = _profile_payload_from_request(req)
+    base_url = str(profile.get("base_url") or "").strip().rstrip("/")
+    model = str(profile.get("model") or "").strip()
+    api_key = str(profile.get("api_key") or "").strip()
+    try:
+        parsed_url = httpx.URL(base_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid AI API URL") from exc
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.host:
+        raise HTTPException(status_code=400, detail="AI API URL must use http or https")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="AI API key is required")
+    if not model:
+        raise HTTPException(status_code=400, detail="AI model is required")
+    return base_url, api_key, model
+
+
+@app.post("/api/ai/settings/validate")
+async def validate_ai_settings(req: AiSettingsRequest):
+    base_url, api_key, model = _normalize_ai_settings_request(req)
+    candidate = AiService(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=config.AI_TIMEOUT_SECONDS,
+        max_concurrency=1,
+    )
+    try:
+        result = await candidate.probe()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"AI connection failed: {exc}") from exc
+    finally:
+        await candidate.close()
+    return {"ok": True, "model": model, "models_url": result.get("models_url", "")}
+
+
+@app.put("/api/ai/settings")
+async def save_ai_settings(req: AiSettingsRequest):
+    _normalize_ai_settings_request(req)
+    if req.profiles:
+        existing_profiles = {
+            str(profile.get("id") or ""): profile
+            for profile in config.AI_PROFILES
+        }
+        profiles: list[dict[str, str]] = []
+        for index, profile in enumerate(req.profiles):
+            profile_id = str(profile.id or f"ai_profile_{index + 1}").strip()
+            profiles.append({
+                "id": profile_id,
+                "name": str(profile.name or profile.model or f"AI 配置 {index + 1}").strip(),
+                "base_url": str(profile.base_url or "").strip().rstrip("/"),
+                "api_key": str(profile.api_key or "").strip() or str(existing_profiles.get(profile_id, {}).get("api_key") or ""),
+                "model": str(profile.model or "").strip(),
+            })
+        config.save_ai_settings(
+            profiles=profiles,
+            active_profile_id=str(req.active_profile_id or "").strip(),
+        )
+    else:
+        profile = _profile_payload_from_request(req)
+        config.save_ai_settings(
+            base_url=str(profile.get("base_url") or ""),
+            api_key=str(profile.get("api_key") or ""),
+            model=str(profile.get("model") or ""),
+        )
+    ai_service.configure(
+        base_url=config.AI_BASE_URL,
+        api_key=config.AI_API_KEY,
+        model=config.AI_MODEL,
+    )
+    return {"ok": True, **_ai_settings_payload()}
+
+
+@app.post("/api/ai/analyze")
+async def analyze_ai_message(req: AiAnalyzeRequest):
+    message = str(req.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    task = _normalize_ai_task(req.task)
+    try:
+        result = await ai_service.analyze(message, task)
+    except AiServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "result": result}
+
+
 def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -> dict[str, Any]:
     chat_id = str(chat_id or "").strip()
-    if not chat_id.endswith("@chatroom"):
-        raise HTTPException(status_code=400, detail="smart replies are only supported for group chats")
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat id is required")
+    is_group = chat_id.endswith("@chatroom")
 
     target_senders: list[str] = []
     seen_senders: set[str] = set()
@@ -1316,7 +1576,9 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
         if sender and sender not in seen_senders:
             seen_senders.add(sender)
             target_senders.append(sender)
-    if not target_senders:
+    if not is_group:
+        target_senders = [chat_id]
+    elif not target_senders:
         raise HTTPException(status_code=400, detail="at least one target sender is required")
     if len(target_senders) > 10000:
         raise HTTPException(status_code=400, detail="too many target senders")
@@ -1359,8 +1621,9 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
             "use_regex": bool(rule.use_regex),
             "reply_with_matched_line": reply_with_matched_line,
         })
-    if not rules:
-        raise HTTPException(status_code=400, detail="at least one keyword rule is required")
+    ai_tasks = [_normalize_ai_task(task, index) for index, task in enumerate(req.ai_tasks[:20])]
+    if not rules and not ai_tasks:
+        raise HTTPException(status_code=400, detail="at least one keyword rule or AI task is required")
 
     owner_wxid = _contact_owner_wxid()
     cached_contact = sqlite_cache.get_contacts([chat_id], owner_wxid=owner_wxid).get(chat_id, {})
@@ -1369,9 +1632,11 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
         "chat_name": str(req.chat_name or cached_contact.get("name") or chat_id).strip()[:200],
         "avatar": str(req.avatar or cached_contact.get("avatar") or "").strip()[:2000],
         "enabled": bool(req.enabled),
+        "mention_only": is_group and bool(req.mention_only),
         "message_types": message_types,
         "target_senders": target_senders,
         "rules": rules,
+        "ai_tasks": ai_tasks,
     }
 
 
@@ -1409,6 +1674,73 @@ async def delete_smart_reply(chat_id: str):
     return {"ok": True, "deleted": deleted}
 
 
+def _render_ai_template(template: str, result: dict[str, Any], item: str = "") -> str:
+    replacements = {
+        "{{result}}": item or str(result.get("result") or result.get("reply") or ""),
+        "{{reply}}": str(result.get("reply") or ""),
+        "{{item}}": item,
+    }
+    rendered = str(template or "")
+    for marker, value in replacements.items():
+        rendered = rendered.replace(marker, value)
+    return rendered.strip()
+
+
+def _ai_result_replies(task: dict[str, Any], result: dict[str, Any]) -> tuple[str, ...]:
+    if not bool(result.get("matched")):
+        return ()
+    if int(result.get("confidence") or 0) < int(task.get("confidence") or 0):
+        return ()
+    output_mode = str(task.get("output_mode") or "result")
+    if output_mode == "silent":
+        return ()
+    items = [str(item).strip() for item in (result.get("items") or []) if str(item or "").strip()]
+    if bool(task.get("send_items_separately")) and items:
+        if output_mode == "template":
+            replies = tuple(_render_ai_template(str(task.get("reply_template") or "{{item}}"), result, item) for item in items)
+        else:
+            replies = tuple(items)
+    elif output_mode == "template":
+        replies = (_render_ai_template(str(task.get("reply_template") or "{{result}}"), result),)
+    else:
+        replies = (str(result.get("reply") or result.get("result") or "").strip(),)
+    if not bool(task.get("preserve_formatting", True)):
+        replies = tuple(" ".join(reply.split()) for reply in replies)
+    return tuple(reply for reply in replies if reply)
+
+
+def _preview_text(value: Any, limit: int = 80) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = " ".join(text.split())
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+async def _evaluate_ai_tasks(content: str, tasks: list[dict[str, Any]]) -> tuple[str, ...]:
+    enabled_tasks = [task for task in tasks if isinstance(task, dict) and bool(task.get("enabled"))]
+    if not enabled_tasks:
+        _log("[AI_REPLY] skipped: no enabled AI tasks")
+        return ()
+    if not ai_service.configured:
+        _log("[AI_REPLY] skipped: AI service is not configured")
+        return ()
+    results = await asyncio.gather(
+        *(ai_service.analyze(content, task) for task in enabled_tasks),
+        return_exceptions=True,
+    )
+    replies: list[str] = []
+    for task, result in zip(enabled_tasks, results):
+        if isinstance(result, BaseException):
+            _log(f"[AI_REPLY] task failed id={task.get('id', '')}: {type(result).__name__}: {result}")
+            continue
+        task_replies = _ai_result_replies(task, result)
+        _log(
+            f"[AI_REPLY] task result id={task.get('id', '')} matched={result.get('matched')} "
+            f"confidence={result.get('confidence')} replies={len(task_replies)}"
+        )
+        replies.extend(task_replies)
+    return tuple(replies)
+
+
 async def _process_smart_reply_message(
     *,
     owner_wxid: str,
@@ -1418,6 +1750,8 @@ async def _process_smart_reply_message(
     message: dict[str, Any],
 ) -> None:
     config_row = sqlite_cache.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
+    if not config_row:
+        return
     decision = smart_reply_engine.evaluate(
         owner_wxid=owner_wxid,
         chat_id=chat_id,
@@ -1426,7 +1760,39 @@ async def _process_smart_reply_message(
         config=config_row,
     )
     if not decision.should_send:
-        return
+        ai_tasks = config_row.get("ai_tasks") if isinstance(config_row, dict) else []
+        if (
+            str(message.get("msgtype") or "") != "1"
+            or decision.reason not in {"keyword_not_matched", "too_few_lines", "pure_single_line"}
+            or not ai_tasks
+        ):
+            _log(
+                f"[SMART_REPLY] skipped chat={chat_id} sender={message.get('fromid', '')} "
+                f"reason={decision.reason} msgtype={message.get('msgtype', '')} ai_tasks={len(ai_tasks or [])}"
+            )
+            return
+        raw_content = str(message.get("msg") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        _log(
+            f"[SMART_REPLY] evaluating AI chat={chat_id} sender={message.get('fromid', '')} "
+            f"reason={decision.reason} text={_preview_text(raw_content)!r}"
+        )
+        ai_replies = await _evaluate_ai_tasks(raw_content, ai_tasks)
+        decision = smart_reply_engine.reserve_ai_replies(
+            owner_wxid=owner_wxid,
+            chat_id=chat_id,
+            message=message,
+            replies=ai_replies,
+        )
+        if not decision.should_send:
+            _log(
+                f"[SMART_REPLY] AI produced no send chat={chat_id} sender={message.get('fromid', '')} "
+                f"reason={decision.reason} replies={len(ai_replies)}"
+            )
+            return
+        _log(
+            f"[SMART_REPLY] AI reserved chat={chat_id} sender={message.get('fromid', '')} "
+            f"count={len(decision.replies)}"
+        )
     try:
         async def _send_one(reply: str):
             with wechat_api.use_agent(agent_id):

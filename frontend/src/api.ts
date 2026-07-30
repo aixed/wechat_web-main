@@ -1,3 +1,5 @@
+import type { AiProfile, SmartReplyAiTask } from "./types";
+
 const BASE = "";  // Same origin via Vite proxy
 export const ACCESS_KEY_STORAGE = "wechat_web_access_key";
 export const ACTIVE_AGENT_STORAGE = "wechat_web_active_agent_id";
@@ -466,6 +468,7 @@ export const saveSmartReply = (chatId: string, config: {
   chat_name: string;
   avatar?: string;
   enabled: boolean;
+  mention_only: boolean;
   message_types: Array<
     "text" | "image" | "gif" | "voice" | "video" | "file" |
     "xml" | "system" | "recall" | "quote"
@@ -478,6 +481,7 @@ export const saveSmartReply = (chatId: string, config: {
     use_regex: boolean;
     reply_with_matched_line: boolean;
   }>;
+  ai_tasks: SmartReplyAiTask[];
 }) => fetchJSON(`/api/smart-replies/${encodeURIComponent(chatId)}`, {
   method: "PUT",
   body: JSON.stringify(config),
@@ -485,3 +489,32 @@ export const saveSmartReply = (chatId: string, config: {
 
 export const deleteSmartReply = (chatId: string) =>
   fetchJSON(`/api/smart-replies/${encodeURIComponent(chatId)}`, { method: "DELETE" });
+
+export const getAiSettings = (includeApiKey = false) =>
+  fetchJSON(`/api/ai/settings${includeApiKey ? "?include_api_key=true" : ""}`);
+
+export type AiSettingsPayload = {
+  base_url?: string;
+  api_key?: string;
+  model?: string;
+  active_profile_id?: string;
+  profiles?: Array<Pick<AiProfile, "id" | "name" | "base_url" | "model"> & { api_key?: string }>;
+};
+
+export const validateAiSettings = (settings: AiSettingsPayload) =>
+  fetchJSON("/api/ai/settings/validate", {
+    method: "POST",
+    body: JSON.stringify(settings),
+  }, 75_000);
+
+export const saveAiSettings = (settings: AiSettingsPayload) =>
+  fetchJSON("/api/ai/settings", {
+    method: "PUT",
+    body: JSON.stringify(settings),
+  }, 75_000);
+
+export const analyzeAiMessage = (message: string, task: SmartReplyAiTask) =>
+  fetchJSON("/api/ai/analyze", {
+    method: "POST",
+    body: JSON.stringify({ message, task }),
+  }, 75_000);

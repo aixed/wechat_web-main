@@ -5,6 +5,7 @@ websockets>=14.1,<16.0
 pydantic>=2.10.4,<3.0
 lz4>=4.4.4,<5.0
 pyyaml>=6.0.2
+ruamel.yaml>=0.18.6,<0.19
 requests>=2.32.3
 Pillow>=11.0.0
 python-multipart>=0.0.20

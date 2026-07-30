@@ -127,6 +127,48 @@ def _strip_trailing_digits(value: str) -> str:
     return re.sub(r"\d+\s*$", "", value).rstrip()
 
 
+def _mention_targets(message: dict[str, Any]) -> set[str]:
+    values: list[Any] = []
+    direct_value = message.get("atuserlist")
+    if direct_value not in (None, ""):
+        values.append(direct_value)
+
+    msgsource = str(message.get("msgsource") or "").strip()
+    if msgsource:
+        try:
+            root = ElementTree.fromstring(msgsource)
+            values.extend(
+                element.text or ""
+                for element in root.iter()
+                if element.tag.rsplit("}", 1)[-1].casefold() == "atuserlist"
+            )
+        except ElementTree.ParseError:
+            values.extend(
+                match.group(1).replace("<![CDATA[", "").replace("]]>", "")
+                for match in re.finditer(
+                    r"<atuserlist\b[^>]*>(.*?)</atuserlist>",
+                    msgsource,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+            )
+
+    targets: set[str] = set()
+    for value in values:
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in items:
+            targets.update(
+                token
+                for token in re.split(r"[,;\s]+", str(item or "").strip())
+                if token
+            )
+    return targets
+
+
+def _mentions_self(message: dict[str, Any], self_wxid: str) -> bool:
+    self_wxid = str(self_wxid or "").strip()
+    return bool(self_wxid and self_wxid in _mention_targets(message))
+
+
 class SmartReplyEngine:
     """Evaluates messages while maintaining de-duplication and cooldown state."""
 
@@ -156,7 +198,7 @@ class SmartReplyEngine:
     ) -> SmartReplyDecision:
         if not config or not bool(config.get("enabled")):
             return SmartReplyDecision(reason="disabled")
-        if not chat_id.endswith("@chatroom") or str(config.get("chat_id") or "") != chat_id:
+        if str(config.get("chat_id") or "") != chat_id:
             return SmartReplyDecision(reason="chat_not_configured")
 
         sender = str(message.get("fromid") or "").strip()
@@ -198,6 +240,8 @@ class SmartReplyEngine:
         }
         if sender not in target_senders:
             return SmartReplyDecision(reason="sender_not_allowed")
+        if chat_id.endswith("@chatroom") and bool(config.get("mention_only")) and not _mentions_self(message, self_wxid):
+            return SmartReplyDecision(reason="mention_required")
 
         lowered = content.casefold()
         if any(lowered.startswith(prefix.casefold()) for prefix in _IGNORED_PREFIXES):
@@ -241,6 +285,15 @@ class SmartReplyEngine:
                 replies=matched_line_replies + tuple(fixed_replies),
                 reason="matched_lines" if matched_line_replies else "keyword_matched",
             )
+
+        # Keyword rules remain the fast path. When AI tasks are enabled, let the
+        # async AI stage handle unmatched text before legacy line-count replies.
+        ai_tasks = config.get("ai_tasks") if isinstance(config, dict) else []
+        if not candidate.should_send and any(
+            isinstance(task, dict) and bool(task.get("enabled"))
+            for task in (ai_tasks or [])
+        ):
+            return candidate
 
         # Configured keywords take priority over the legacy line-count rules so a
         # match at any position, including the final line, always triggers.
@@ -289,3 +342,37 @@ class SmartReplyEngine:
             if seen_at > cutoff:
                 break
             self._seen.popitem(last=False)
+
+    def reserve_ai_replies(
+        self,
+        *,
+        owner_wxid: str,
+        chat_id: str,
+        message: dict[str, Any],
+        replies: tuple[str, ...],
+        now: float | None = None,
+    ) -> SmartReplyDecision:
+        """Apply the same de-duplication and cooldown gates to AI-generated replies."""
+        normalized_replies = tuple(str(reply or "").strip() for reply in replies if str(reply or "").strip())
+        if not normalized_replies:
+            return SmartReplyDecision(reason="ai_no_reply")
+        sender = str(message.get("fromid") or "").strip()
+        content = str(message.get("msg") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not sender or not content:
+            return SmartReplyDecision(reason="empty_message")
+        current = time.monotonic() if now is None else float(now)
+        dedup_key = (str(owner_wxid or ""), chat_id, sender, content)
+        cooldown_key = (str(owner_wxid or ""), chat_id)
+        with self._lock:
+            self._purge_seen(current)
+            if dedup_key in self._seen:
+                return SmartReplyDecision(reason="duplicate")
+            self._seen[dedup_key] = current
+            self._seen.move_to_end(dedup_key)
+            while len(self._seen) > self.dedup_limit:
+                self._seen.popitem(last=False)
+            last_sent = self._last_sent.get(cooldown_key)
+            if last_sent is not None and current - last_sent < self.cooldown:
+                return SmartReplyDecision(reason="cooldown")
+            self._last_sent[cooldown_key] = current
+        return SmartReplyDecision(replies=normalized_replies, reason="ai_matched")

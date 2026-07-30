@@ -31,6 +31,51 @@ export interface SmartReplyRule {
   reply_with_matched_line: boolean;
 }
 
+export type SmartReplyAiOutputMode = "result" | "template" | "silent";
+
+export interface SmartReplyAiTask {
+  id: string;
+  name: string;
+  enabled: boolean;
+  skill_type: "custom";
+  skill_id: string;
+  instruction: string;
+  confidence: number;
+  output_mode: SmartReplyAiOutputMode;
+  reply_template: string;
+  preserve_formatting: boolean;
+  send_items_separately: boolean;
+  max_parallel: number;
+}
+
+export interface AiProfile {
+  id: string;
+  name: string;
+  configured: boolean;
+  api_key_configured: boolean;
+  api_key?: string;
+  base_url: string;
+  model: string;
+}
+
+export interface AiSettings {
+  configured: boolean;
+  api_key_configured: boolean;
+  api_key?: string;
+  base_url: string;
+  model: string;
+  active_profile_id: string;
+  profiles: AiProfile[];
+}
+
+export interface AiAnalysisResult {
+  matched: boolean;
+  confidence: number;
+  result: string;
+  items: string[];
+  reply: string;
+}
+
 export type SmartReplyMessageType =
   | "text"
   | "image"
@@ -48,9 +93,11 @@ export interface SmartReplyConfig {
   chat_name: string;
   avatar?: string;
   enabled: boolean;
+  mention_only: boolean;
   message_types: SmartReplyMessageType[];
   target_senders: string[];
   rules: SmartReplyRule[];
+  ai_tasks: SmartReplyAiTask[];
   reply_count?: number;
   last_triggered_at?: number;
   created_at?: number;
@@ -125,6 +172,7 @@ export interface ChatMessage {
   file_path?: string;
   info?: string;
   msgsource?: string;
+  atuserlist?: string | string[];
 }
 
 // ─── WebSocket Messages ──────────────────────────────────────────

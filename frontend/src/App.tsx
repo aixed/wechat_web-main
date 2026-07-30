@@ -2688,7 +2688,7 @@ export default function App() {
     });
   }
   const groupEntries = sortDirectoryEntries(Array.from(groupEntryMap.values()));
-  const smartReplyTargets: SmartReplyTarget[] = groupEntries.map((entry) => ({
+  const smartReplyTargets: SmartReplyTarget[] = [...groupEntries, ...allNonGroupEntries].map((entry) => ({
     wxid: entry.wxid,
     name: entry.name,
     avatar: entry.avatar,
@@ -4099,7 +4099,15 @@ function MobileChatsView({
 
 function MobileSessionRow({ session, onClick, dark }: { session: Session; onClick: () => void; dark: boolean }) {
   return (
-    <button type="button" onClick={onClick} className={`w-full h-[64px] pl-[12px] pr-[10px] flex items-center gap-[10px] text-left ${dark ? "active:bg-[#242424]" : "active:bg-[#f4f4f4]"}`}>
+    <button
+      type="button"
+      onClick={onClick}
+      className={`w-full h-[64px] pl-[12px] pr-[10px] flex items-center gap-[10px] text-left ${
+        dark
+          ? (session.pinned ? "bg-[#232323] active:bg-[#2d2d2d]" : "active:bg-[#242424]")
+          : (session.pinned ? "bg-[#e2e2e2] active:bg-[#d6d6d6]" : "active:bg-[#f4f4f4]")
+      }`}
+    >
       <MobileAvatar name={session.nickname || session.wxid} avatar={session.avatar} group={session.is_group} size={44} pinned={session.pinned} />
       <div className={`min-w-0 flex-1 h-full border-b flex flex-col justify-center ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
         <div className="flex items-baseline gap-[7px]">

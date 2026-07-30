@@ -93,7 +93,7 @@ export default function SessionList({
     e.stopPropagation();
     setMenu({
       x: Math.max(8, Math.min(e.clientX, window.innerWidth - 188)),
-      y: Math.max(8, Math.min(e.clientY, window.innerHeight - (session.is_group ? 256 : 220))),
+      y: Math.max(8, Math.min(e.clientY, window.innerHeight - 256)),
       session,
     });
   };
@@ -150,8 +150,16 @@ export default function SessionList({
               onContextMenu={(e) => openContextMenu(e, session)}
               className={`flex items-center px-0 py-0 cursor-pointer transition-colors ${
                 dark
-                  ? (isActive ? "bg-[#2f2f2f] hover:bg-[#2f2f2f]" : "hover:bg-[#242424] active:bg-[#2a2a2a]")
-                  : (isActive ? "bg-[#d0d0d0] hover:bg-[#d0d0d0]" : "hover:bg-[#dedede] active:bg-[#d3d3d3]")
+                  ? (isActive
+                    ? "bg-[#2f2f2f] hover:bg-[#2f2f2f]"
+                    : session.pinned
+                      ? "bg-[#232323] hover:bg-[#292929] active:bg-[#2d2d2d]"
+                      : "hover:bg-[#242424] active:bg-[#2a2a2a]")
+                  : (isActive
+                    ? "bg-[#d0d0d0] hover:bg-[#d0d0d0]"
+                    : session.pinned
+                      ? "bg-[#d9d9d9] hover:bg-[#d3d3d3] active:bg-[#cecece]"
+                      : "hover:bg-[#dedede] active:bg-[#d3d3d3]")
               }`}
             >
               {/* Avatar — keyed to prevent React reuse issues */}
@@ -211,9 +219,7 @@ export default function SessionList({
           <ContextMenuItem dark={dark} onClick={() => runAction(menu.session.muted ? "unmute" : "mute")}>
             {menu.session.muted ? "开启新消息提醒" : "消息免打扰"}
           </ContextMenuItem>
-          {menu.session.is_group && (
-            <ContextMenuItem dark={dark} onClick={() => runAction("smart_reply")}>自动回复</ContextMenuItem>
-          )}
+          <ContextMenuItem dark={dark} onClick={() => runAction("smart_reply")}>智能回复</ContextMenuItem>
           <div className={`h-px my-[4px] ${dark ? "bg-[#3a3a3a]" : "bg-[#e2e2e2]"}`} />
           <ContextMenuItem dark={dark} danger onClick={() => runAction("delete")}>删除聊天</ContextMenuItem>
         </div>

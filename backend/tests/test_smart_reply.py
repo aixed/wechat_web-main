@@ -16,6 +16,7 @@ def config(**overrides):
         "chat_id": CHAT_ID,
         "chat_name": "Test group",
         "enabled": True,
+        "mention_only": False,
         "message_types": ["text"],
         "target_senders": [SENDER],
         "rules": [{
@@ -210,6 +211,34 @@ class SmartReplyEngineTests(unittest.TestCase):
         decision = self.evaluate("title\nbody\nurgent", sendorrecv="")
         self.assertTrue(decision.should_send)
 
+    def test_private_chat_processes_messages_from_that_contact(self):
+        private_wxid = "wxid_friend"
+        decision = self.engine.evaluate(
+            owner_wxid=OWNER,
+            chat_id=private_wxid,
+            self_wxid=OWNER,
+            message=message("urgent", fromid=private_wxid),
+            config=config(chat_id=private_wxid, target_senders=[private_wxid]),
+            now=10.0,
+        )
+        self.assertEqual(("received",), decision.replies)
+
+    def test_private_chat_does_not_apply_group_mention_filter(self):
+        private_wxid = "wxid_friend"
+        decision = self.engine.evaluate(
+            owner_wxid=OWNER,
+            chat_id=private_wxid,
+            self_wxid=OWNER,
+            message=message("urgent", fromid=private_wxid),
+            config=config(
+                chat_id=private_wxid,
+                target_senders=[private_wxid],
+                mention_only=True,
+            ),
+            now=10.0,
+        )
+        self.assertEqual(("received",), decision.replies)
+
     def test_two_lines_reply_one_and_stop_group_listener(self):
         decision = self.evaluate("first\nsecond")
         self.assertEqual("1", decision.reply)
@@ -220,6 +249,41 @@ class SmartReplyEngineTests(unittest.TestCase):
         self.assertEqual("sender_not_allowed", denied.reason)
         own = self.evaluate("a\nb\nurgent", sendorrecv="1")
         self.assertEqual("self_message", own.reason)
+
+    def test_mention_filter_is_optional_and_defaults_to_all_target_messages(self):
+        decision = self.evaluate(
+            "urgent without mention",
+            cfg=config(mention_only=False),
+            msgsource="<msgsource><atuserlist>wxid_other</atuserlist></msgsource>",
+        )
+        self.assertEqual(("received",), decision.replies)
+
+    def test_mention_filter_requires_current_account_in_msgsource(self):
+        missing = self.evaluate(
+            "urgent without self mention",
+            cfg=config(mention_only=True),
+            msgsource="<msgsource><atuserlist>wxid_other,notify@all</atuserlist></msgsource>",
+        )
+        self.assertEqual("mention_required", missing.reason)
+
+        mentioned = self.evaluate(
+            "urgent with self mention",
+            now=12.0,
+            cfg=config(mention_only=True),
+            msgsource=(
+                "<msgsource><atuserlist><![CDATA[wxid_other,wxid_owner]]>"
+                "</atuserlist></msgsource>"
+            ),
+        )
+        self.assertEqual(("received",), mentioned.replies)
+
+    def test_mention_filter_supports_direct_callback_field(self):
+        decision = self.evaluate(
+            "urgent direct mention",
+            cfg=config(mention_only=True),
+            atuserlist=["wxid_other", OWNER],
+        )
+        self.assertEqual(("received",), decision.replies)
 
     def test_empty_location_image_and_non_text_messages_are_filtered(self):
         self.assertEqual("empty_message", self.evaluate(" ").reason)
@@ -311,6 +375,46 @@ class SmartReplyEngineTests(unittest.TestCase):
             self.assertTrue(decision.should_send)
         self.assertEqual(3, len(engine._seen))
 
+    def test_ai_replies_use_dedup_and_cooldown_gates(self):
+        first = self.engine.reserve_ai_replies(
+            owner_wxid=OWNER,
+            chat_id=CHAT_ID,
+            message=message("sql one"),
+            replies=("analysis one",),
+            now=10.0,
+        )
+        duplicate = self.engine.reserve_ai_replies(
+            owner_wxid=OWNER,
+            chat_id=CHAT_ID,
+            message=message("sql one"),
+            replies=("analysis one",),
+            now=20.0,
+        )
+        cooldown = self.engine.reserve_ai_replies(
+            owner_wxid=OWNER,
+            chat_id=CHAT_ID,
+            message=message("sql two"),
+            replies=("analysis two",),
+            now=10.5,
+        )
+        self.assertEqual(("analysis one",), first.replies)
+        self.assertEqual("duplicate", duplicate.reason)
+        self.assertEqual("cooldown", cooldown.reason)
+
+    def test_ai_tasks_can_process_single_line_chinese_text(self):
+        ai_config = config(
+            rules=[],
+            ai_tasks=[{
+                "id": "ai_task_1",
+                "name": "简要答复",
+                "enabled": True,
+                "instruction": "进行简要回复",
+            }],
+        )
+        decision = self.evaluate("我想要办社保卡，在哪里办", cfg=ai_config)
+        self.assertEqual("keyword_not_matched", decision.reason)
+        self.assertFalse(decision.should_send)
+
 
 class SmartReplyStorageTests(unittest.TestCase):
     def setUp(self):
@@ -322,10 +426,29 @@ class SmartReplyStorageTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_crud_stats_and_owner_isolation(self):
-        saved = self.cache.upsert_smart_reply_config(config(), owner_wxid=OWNER)
+        ai_tasks = [{
+            "id": "ai_task_1",
+            "name": "SQL analyzer",
+            "enabled": True,
+            "skill_type": "custom",
+            "skill_id": "sql_analyzer",
+            "instruction": "Analyze SQL",
+            "confidence": 85,
+            "output_mode": "result",
+            "reply_template": "{{result}}",
+            "preserve_formatting": True,
+            "send_items_separately": False,
+            "max_parallel": 3,
+        }]
+        saved = self.cache.upsert_smart_reply_config(
+            config(ai_tasks=ai_tasks, mention_only=True),
+            owner_wxid=OWNER,
+        )
         self.assertTrue(saved["enabled"])
+        self.assertTrue(saved["mention_only"])
         self.assertEqual(["text"], saved["message_types"])
         self.assertEqual([SENDER], saved["target_senders"])
+        self.assertEqual(ai_tasks, saved["ai_tasks"])
         self.assertEqual([], self.cache.list_smart_reply_configs(owner_wxid="other_owner"))
 
         updated = self.cache.record_smart_reply_trigger(
@@ -340,13 +463,98 @@ class SmartReplyStorageTests(unittest.TestCase):
         self.assertEqual(3, updated["reply_count"])
         self.assertEqual(123, updated["last_triggered_at"])
 
-        self.cache.upsert_smart_reply_config(config(enabled=True), owner_wxid=OWNER)
+        self.cache.upsert_smart_reply_config(config(enabled=True, ai_tasks=ai_tasks), owner_wxid=OWNER)
         reenabled = self.cache.get_smart_reply_config(CHAT_ID, owner_wxid=OWNER)
         self.assertIsNotNone(reenabled)
         self.assertTrue(reenabled["enabled"])
+        self.assertEqual(ai_tasks, reenabled["ai_tasks"])
         self.assertEqual(3, reenabled["reply_count"])
         self.assertTrue(self.cache.delete_smart_reply_config(CHAT_ID, owner_wxid=OWNER))
         self.assertIsNone(self.cache.get_smart_reply_config(CHAT_ID, owner_wxid=OWNER))
+
+
+class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_ai_reply_reaches_send_stage(self):
+        import main
+
+        private_wxid = "kingloveliu"
+        temp_dir = tempfile.TemporaryDirectory()
+        cache = SqliteMessageCache(os.path.join(temp_dir.name, "cache.sqlite3"))
+        sent: list[tuple[str, str]] = []
+
+        class FakeAiService:
+            configured = True
+
+            async def analyze(self, _content, _task):
+                return {
+                    "matched": True,
+                    "confidence": 95,
+                    "result": "您可以在当地社保局或银行办理社保卡。",
+                    "items": [],
+                    "reply": "您可以在当地社保局或银行办理社保卡。",
+                }
+
+        async def fake_send_text(wxid, text):
+            sent.append((wxid, text))
+            return {"SendTextMsg": "1"}
+
+        async def noop_broadcast(*_args, **_kwargs):
+            return None
+
+        async def noop_local_sent(*_args, **_kwargs):
+            return None
+
+        old_cache = main.sqlite_cache
+        old_engine = main.smart_reply_engine
+        old_ai_service = main.ai_service
+        old_send_text = main.wechat_api.send_text
+        old_broadcast = main.manager.broadcast
+        old_local_sent = main._broadcast_local_sent_for_agent
+        try:
+            main.sqlite_cache = cache
+            main.smart_reply_engine = SmartReplyEngine(cooldown=0)
+            main.ai_service = FakeAiService()
+            main.wechat_api.send_text = fake_send_text
+            main.manager.broadcast = noop_broadcast
+            main._broadcast_local_sent_for_agent = noop_local_sent
+            cache.upsert_smart_reply_config(
+                config(
+                    chat_id=private_wxid,
+                    target_senders=[private_wxid],
+                    rules=[],
+                    ai_tasks=[{
+                        "id": "ai_task_1",
+                        "name": "简要答复",
+                        "enabled": True,
+                        "instruction": "进行简要回复，限制50字以内，不限内容",
+                        "confidence": 85,
+                        "output_mode": "result",
+                        "reply_template": "{{result}}",
+                        "preserve_formatting": True,
+                        "send_items_separately": False,
+                        "max_parallel": 3,
+                    }],
+                ),
+                owner_wxid=OWNER,
+            )
+
+            await main._process_smart_reply_message(
+                owner_wxid=OWNER,
+                agent_id="agent_1",
+                self_wxid=OWNER,
+                chat_id=private_wxid,
+                message=message("我想要办社保卡，在哪里办", fromid=private_wxid),
+            )
+        finally:
+            main.sqlite_cache = old_cache
+            main.smart_reply_engine = old_engine
+            main.ai_service = old_ai_service
+            main.wechat_api.send_text = old_send_text
+            main.manager.broadcast = old_broadcast
+            main._broadcast_local_sent_for_agent = old_local_sent
+            temp_dir.cleanup()
+
+        self.assertEqual([(private_wxid, "您可以在当地社保局或银行办理社保卡。")], sent)
 
 
 if __name__ == "__main__":
