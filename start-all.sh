@@ -52,6 +52,57 @@ hash_file() {
   fi
 }
 
+normalize_yaml_scalar() {
+  printf '%s' "$1" |
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      -e 's/^"//' -e 's/"$//' \
+      -e "s/^'//" -e "s/'$//"
+}
+
+ensure_config() {
+  cfg="$ROOT_DIR/config.yaml"
+  default_key="admin"
+
+  if [ ! -f "$cfg" ]; then
+    if [ -f "$ROOT_DIR/config.example.yaml" ]; then
+      log "[SETUP] config.yaml not found. Creating it from config.example.yaml."
+      cp "$ROOT_DIR/config.example.yaml" "$cfg"
+    else
+      log "[ERROR] config.yaml and config.example.yaml were not found."
+      exit 1
+    fi
+  fi
+
+  raw_value=$(sed -n 's/^[[:space:]]*web_access_key[[:space:]]*:[[:space:]]*\([^#]*\).*$/\1/p' "$cfg" | head -n 1 || true)
+  key_value=$(normalize_yaml_scalar "$raw_value")
+  uses_default=0
+
+  if ! grep -q '^[[:space:]]*web_access_key[[:space:]]*:' "$cfg"; then
+    printf '\nweb_access_key: "%s"\n' "$default_key" >> "$cfg"
+    log "[SETUP] web_access_key was not configured. Set default value: $default_key"
+    uses_default=1
+  elif [ -z "$key_value" ] || [ "$key_value" = "~" ] || [ "$(printf '%s' "$key_value" | tr '[:upper:]' '[:lower:]')" = "null" ]; then
+    tmp_file="$RUN_DIR/config.web_access_key.tmp"
+    awk -v default_key="$default_key" '
+      /^[[:space:]]*web_access_key[[:space:]]*:/ && !done {
+        sub(/:.*/, ": \"" default_key "\"")
+        done = 1
+      }
+      { print }
+    ' "$cfg" > "$tmp_file"
+    mv "$tmp_file" "$cfg"
+    log "[SETUP] web_access_key was not configured. Set default value: $default_key"
+    uses_default=1
+  elif [ "$key_value" = "$default_key" ]; then
+    uses_default=1
+  fi
+
+  if [ "$uses_default" -eq 1 ]; then
+    log "[WARN] Using default web access key: $default_key"
+    log "[WARN] Please edit config.yaml and change the web_access_key parameter before exposing this service."
+  fi
+}
+
 ensure_python_stack() {
   PYTHON_BASE="${PYTHON_BIN:-}"
   if [ -z "$PYTHON_BASE" ]; then
@@ -147,10 +198,7 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
-if [ ! -f "$ROOT_DIR/config.yaml" ]; then
-  log "[WARN] config.yaml not found. Please create it before starting the backend."
-fi
-
+ensure_config
 ensure_python_stack
 ensure_node_stack
 

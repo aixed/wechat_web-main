@@ -2,10 +2,26 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
 import config
+
+
+class WebAccessKeyTests(unittest.TestCase):
+    def test_missing_web_access_key_defaults_to_admin(self):
+        with patch.dict(os.environ, {"WECHAT_WEB_ACCESS_KEY": ""}, clear=False):
+            self.assertEqual(("admin", True), config._resolve_web_access_key({}))
+            self.assertEqual(("admin", True), config._resolve_web_access_key({"web_access_key": ""}))
+
+    def test_configured_web_access_key_is_used(self):
+        with patch.dict(os.environ, {"WECHAT_WEB_ACCESS_KEY": ""}, clear=False):
+            self.assertEqual(("custom-key", False), config._resolve_web_access_key({"web_access_key": "custom-key"}))
+
+    def test_environment_web_access_key_overrides_config(self):
+        with patch.dict(os.environ, {"WECHAT_WEB_ACCESS_KEY": "env-key"}, clear=False):
+            self.assertEqual(("env-key", False), config._resolve_web_access_key({"web_access_key": "config-key"}))
 
 
 class AiConfigReloadTests(unittest.TestCase):

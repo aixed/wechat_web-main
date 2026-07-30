@@ -110,7 +110,23 @@ MGR_BASE_URL = f"http://{HOOK_HOST}:{MGR_PORT}"
 # ports directly is intentional.
 SERVER_HOST = str(_cfg.get("server_host", "127.0.0.1") or "127.0.0.1")
 SERVER_PORT = int(_cfg.get("server_port", 5000))
-WEB_ACCESS_KEY = str(_cfg.get("web_access_key", os.environ.get("WECHAT_WEB_ACCESS_KEY", ""))).strip()
+DEFAULT_WEB_ACCESS_KEY = "admin"
+
+
+def _resolve_web_access_key(document: dict[str, Any]) -> tuple[str, bool]:
+    env_key = str(os.environ.get("WECHAT_WEB_ACCESS_KEY") or "").strip()
+    raw_key = env_key or document.get("web_access_key")
+    access_key = str(raw_key or "").strip() or DEFAULT_WEB_ACCESS_KEY
+    return access_key, access_key == DEFAULT_WEB_ACCESS_KEY
+
+
+WEB_ACCESS_KEY, WEB_ACCESS_KEY_IS_DEFAULT = _resolve_web_access_key(_cfg)
+if WEB_ACCESS_KEY_IS_DEFAULT:
+    print(
+        "[CONFIG] WARNING: using default web_access_key=admin. "
+        "Please edit config.yaml and change the web_access_key parameter.",
+        flush=True,
+    )
 
 # AI smart replies. Secrets may live in the ignored config.yaml or environment.
 AI_ACTIVE_PROFILE_ID = ""

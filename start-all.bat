@@ -27,6 +27,12 @@ if not exist "%ROOT%config.yaml" (
   )
 )
 
+call :ensure_web_access_key
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+
 call :cleanup_stale_processes
 if errorlevel 1 (
   pause
@@ -111,7 +117,17 @@ echo.
 echo Backend and frontend startup commands were launched.
 echo Frontend port %FRONTEND_PORT% was written to config.yaml.
 
-endlocal
+set "START_ALL_CLOSE_CMD=0"
+set "START_ALL_CMDLINE=%CMDCMDLINE%"
+if /i not "%START_ALL_CMDLINE:start-all.bat=%"=="%START_ALL_CMDLINE%" set "START_ALL_CLOSE_CMD=1"
+if "%START_ALL_CLOSE_CMD%"=="1" (endlocal & exit 0) else (endlocal & exit /b 0)
+
+:ensure_web_access_key
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\ensure-web-access-key.ps1" -ConfigPath "%ROOT%config.yaml" -DefaultKey "admin"
+if errorlevel 1 (
+  echo [ERROR] Failed to configure web_access_key in config.yaml.
+  exit /b 1
+)
 exit /b 0
 
 :cleanup_stale_processes
