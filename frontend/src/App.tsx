@@ -50,6 +50,16 @@ const PINNED_ORDER_THRESHOLD = 1_000_000_000_000;
 const MOBILE_SWIPE_DIRECTION_EPSILON = 0.25;
 const MOBILE_BROWSER_SWIPE_EDGE_PX = 44;
 const MOBILE_SWIPE_MAX_DRAG_PX = 120;
+const BACKEND_UNAVAILABLE_MESSAGE = "后端服务正在启动或暂时不可用，请稍后重试。";
+
+function backendUnavailableText(data: unknown): string {
+  if (!data || typeof data !== "object") return "";
+  const payload = data as { error?: unknown; message?: unknown };
+  if (payload.error !== "backend_unavailable") return "";
+  return typeof payload.message === "string" && payload.message.trim()
+    ? payload.message
+    : BACKEND_UNAVAILABLE_MESSAGE;
+}
 
 function decodeRouteSegment(segment: string): string {
   try {
@@ -1406,6 +1416,12 @@ export default function App() {
     try {
       setAccessKey(key);
       const data = await loginWithKey(key);
+      const unavailableMessage = backendUnavailableText(data);
+      if (unavailableMessage) {
+        clearAccessKey();
+        setAuthError(unavailableMessage);
+        return false;
+      }
       if (!data?.ok) {
         clearAccessKey();
         setAuthError("密钥不正确");
