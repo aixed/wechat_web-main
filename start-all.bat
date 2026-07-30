@@ -100,7 +100,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "$cmd='title WeChat Web B
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Sleep -Seconds 2"
 
 echo Starting frontend...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$cmd='title WeChat Web Frontend && cd /d \"' + $env:START_ROOT + 'frontend\" && if not exist node_modules\.bin\vite.cmd (echo [SETUP] installing frontend dependencies && npm install && npm run dev) else (npm run dev)'; $p=Start-Process -FilePath cmd.exe -ArgumentList @('/k', $cmd) -PassThru; Set-Content -Path ($env:START_ROOT + '.run\frontend.pid') -Value $p.Id -Encoding ASCII"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$cmd='title WeChat Web Frontend && call \"' + $env:START_ROOT + 'scripts\start-frontend-dev.bat\" \"' + $env:START_ROOT + 'frontend\"'; $p=Start-Process -FilePath cmd.exe -ArgumentList @('/k', $cmd) -PassThru; Set-Content -Path ($env:START_ROOT + '.run\frontend.pid') -Value $p.Id -Encoding ASCII"
 
 set "FRONTEND_URL=http://127.0.0.1:%FRONTEND_PORT%"
 set "START_FRONTEND_URL=%FRONTEND_URL%"

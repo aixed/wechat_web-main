@@ -212,6 +212,30 @@ def safe_json(response: httpx.Response) -> dict:
         return {"raw": response.text, "status_code": response.status_code}
 
 
+def _protocol_payload(endpoint: str, body: dict | None, session_id: str) -> dict | None:
+    """Attach the active protocol session_id to business calls.
+
+    In protocol mode a logged-in account is selected by session_id, while the
+    old Hook path selected accounts through the agent WebSocket.  Reusing the
+    same context variable keeps the rest of the backend call sites small.
+    """
+    if not IS_PROTOCOL or not session_id:
+        return body
+    route = str(endpoint or "").strip().strip("/").lower()
+    if route in {
+        "startwechat",
+        "getsessionlist",
+        "get_wechatprocessnumber",
+        "terminate_thiswechat",
+        "terminatethiswechat",
+        "convertqrcodehex",
+    }:
+        return body
+    next_body = dict(body or {})
+    next_body.setdefault("session_id", session_id)
+    return next_body
+
+
 async def _post(endpoint: str, json: dict = None, timeout: float = None,
                 *, bypass_circuit_breaker: bool = False) -> httpx.Response:
     """Logged POST wrapper with mode-aware concurrency control."""
@@ -219,12 +243,13 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
 
     use_agent_ws = AGENT_WS_ENABLED and IS_HOOK
     agent_id = _CURRENT_AGENT_ID.get() or ""
+    request_json = _protocol_payload(endpoint, json, agent_id)
     full_url = f"agent-ws://{agent_id or 'active'}/{endpoint.lstrip('/')}" if use_agent_ws else f"{HOOK_BASE_URL}{endpoint}"
     query_db_call = _is_query_db_endpoint(endpoint)
 
     if not bypass_circuit_breaker and _circuit_open():
         backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
-        log_json = _scrub_payload_for_log(json or {})
+        log_json = _scrub_payload_for_log(request_json or {})
         _log(f"[API] ⏸ Circuit breaker OPEN — skipping {full_url} (failures={_consecutive_failures}, backoff={backoff}s)")
         await _append_main_log(
             f"[{_ts()}]POST {full_url}\n"
@@ -238,7 +263,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
     async with _hook_api_slot(query_db_call):
         _req_id += 1
         rid = _req_id
-        log_json = _scrub_payload_for_log(json or {})
+        log_json = _scrub_payload_for_log(request_json or {})
         transport = "AGENT" if use_agent_ws else "POST"
         _log(f"[API #{rid}] → {transport} {full_url} agent={agent_id or '-'} body={_console_payload(log_json)}")
         t0 = time.time()
@@ -249,7 +274,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
                     _log("[API] QueryDB via /agent with clean body (no body.agent_id injection)")
                 agent_response = await agent_manager.request(
                     route,
-                    json or {},
+                    request_json or {},
                     timeout=timeout or AGENT_WS_REQUEST_TIMEOUT,
                     agent_id=_CURRENT_AGENT_ID.get() or None,
                     inject_agent_id=not query_db_call,
@@ -262,7 +287,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
                     request=httpx.Request("POST", f"http://agent.local/{route}"),
                 )
             else:
-                r = await client.post(endpoint, json=json, timeout=timeout)
+                r = await client.post(endpoint, json=request_json, timeout=timeout)
             ms = int((time.time() - t0) * 1000)
             body_preview = _truncate(r.text if r.text else "(empty)", 1200).replace("\n", " ")
             _log(f"[API #{rid}] ← {transport} {full_url} status={r.status_code} time={ms}ms len={len(r.text)} body={body_preview}")
@@ -311,7 +336,7 @@ async def get_self_info() -> dict:
     if IS_HOOK:
         r = await _post("/GetSelfProfile", json={})
     else:
-        r = await _post("/getprofile/", json={})
+        r = await _post("/getprofile", json={})
     return safe_json(r)
 
 
@@ -320,7 +345,28 @@ async def is_login_status() -> dict:
     if IS_HOOK:
         r = await _post("/IsLoginStatus", json={}, timeout=5.0, bypass_circuit_breaker=True)
         return safe_json(r)
-    return {"msg": "登陆完成！", "onlinestatus": "3"}
+    session_id = _CURRENT_AGENT_ID.get() or ""
+    if not session_id:
+        return {"msg": "未选择协议 session", "onlinestatus": ""}
+    r = await _post(
+        "/getprofile",
+        json={"session_id": session_id},
+        timeout=20.0,
+        bypass_circuit_breaker=True,
+    )
+    data = safe_json(r)
+    if data.get("ok") and str(data.get("state") or "") == "logged_in":
+        profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+        return {
+            "msg": "登陆完成！",
+            "onlinestatus": "3",
+            "selfwxid": profile.get("user_name") or "",
+            "nickname": profile.get("nick_name") or "",
+        }
+    return {
+        "msg": str(data.get("error") or data.get("state") or "未登录"),
+        "onlinestatus": "",
+    }
 
 
 async def init_contact() -> dict:
@@ -331,7 +377,7 @@ async def init_contact() -> dict:
     if IS_HOOK:
         r = await _post("/InitContact", json={}, timeout=60.0)
     else:
-        r = await _post("/initcontact/", json={"contactSeq": 0, "chatRoomContactSeq": 0}, timeout=60.0)
+        r = await _post("/initcontact", json={"contactSeq": 0, "chatRoomContactSeq": 0}, timeout=60.0)
     return safe_json(r)
 
 
@@ -342,7 +388,7 @@ async def get_friend_and_chatroom_list(list_type: str | int = "1") -> dict:
         return safe_json(r)
     else:
         # Remote: initcontact returns the contact list directly
-        r = await _post("/initcontact/", json={"contactSeq": 0, "chatRoomContactSeq": 0})
+        r = await _post("/initcontact", json={"contactSeq": 0, "chatRoomContactSeq": 0})
         return safe_json(r)
 
 
@@ -353,7 +399,7 @@ async def batch_get_contact_brief_info(wxid_list: str) -> dict:
     else:
         # Remote expects array of userNames
         names = [w.strip() for w in wxid_list.split(",") if w.strip()]
-        r = await _post("/batchgetcontactbriefinfo/", json={"userNames": names})
+        r = await _post("/batchgetcontactbriefinfo", json={"userNames": names})
     return safe_json(r)
 
 
@@ -383,7 +429,7 @@ async def get_contact(wxids: list[str]) -> dict:
     if IS_HOOK:
         r = await _post("/GetContact", json={"wxids": names})
     else:
-        r = await _post("/getcontact/", json={"userNames": names, "chatRoomUserName": ""})
+        r = await _post("/getcontact", json={"userNames": names, "chatRoomUserName": ""})
     return safe_json(r)
 
 
@@ -402,9 +448,9 @@ async def get_contact_label_list() -> dict:
     """Get contact label id/name list."""
     if IS_HOOK:
         r = await _post("/GetContactLabelList", json={})
+        return safe_json(r)
     else:
-        r = await _post("/getcontactlabellist", json={})
-    return safe_json(r)
+        return {}
 
 
 async def get_head_img(wxid: str) -> dict:
@@ -413,7 +459,7 @@ async def get_head_img(wxid: str) -> dict:
         r = await _post("/GetHeadIMG", json={"wxid": wxid})
     else:
         # Remote: use getcontact to get avatar info
-        r = await _post("/getcontact/", json={"userNames": [wxid], "chatRoomUserName": ""})
+        r = await _post("/getcontact", json={"userNames": [wxid], "chatRoomUserName": ""})
     return safe_json(r)
 
 
@@ -422,7 +468,7 @@ async def get_friend_detail_info(wxid_or_gid: str) -> dict:
     if IS_HOOK:
         r = await _post("/GetFriendOrChatroomDetailInfo", json={"wxidorgid": wxid_or_gid})
     else:
-        r = await _post("/getcontact/", json={"userNames": [wxid_or_gid], "chatRoomUserName": ""})
+        r = await _post("/getcontact", json={"userNames": [wxid_or_gid], "chatRoomUserName": ""})
     return safe_json(r)
 
 
@@ -446,7 +492,7 @@ async def send_text(wxid: str, msg: str) -> dict:
     if IS_HOOK:
         r = await _post("/SendTextMsg", json={"toid": wxid, "msg": msg})
     else:
-        r = await _post("/newsendmsg/", json={
+        r = await _post("/newsendmsg", json={
             "userName": wxid, "content": msg, "msgType": 1
         })
     return safe_json(r)
@@ -471,7 +517,7 @@ async def send_image(wxid: str, picpath: str, diyfilename: str = "", file_data: 
     else:
         # Remote: uploadmsgimg requires CDN pre-upload params.
         # For simple cases, we try sending as-is; the server handles upload.
-        r = await _post("/uploadmsgimg/", json={
+        r = await _post("/uploadmsgimg", json={
             "userName": wxid,
             "picpath": picpath,
         })
@@ -610,7 +656,7 @@ async def send_file(wxid: str, filepath: str, file_data: str | None = None) -> d
         body = _attach_file_data({"toid": wxid, "filepath": filepath}, "filepath", file_data)
         r = await _post("/SendFileMsg", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
     else:
-        r = await _post("/sendfileuploadmsg/", json={
+        r = await _post("/sendfileuploadmsg", json={
             "userName": wxid,
             "filepath": filepath,
         })
@@ -632,7 +678,7 @@ async def send_video(wxid: str, videopath: str, file_data: str | None = None) ->
         body = _attach_file_data({"toid": wxid, "videopath": videopath}, "videopath", file_data)
         r = await _post("/SendVideoMsg", json=body, timeout=300.0 if IS_LOCAL_HOOK else 600.0)
     else:
-        r = await _post("/uploadvideo/", json={
+        r = await _post("/uploadvideo", json={
             "userName": wxid,
             "videopath": videopath,
         })
@@ -658,7 +704,7 @@ async def send_gif(wxid: str, gifpath: str, file_data: str | None = None) -> dic
         body = _attach_file_data({"toid": wxid, "gifpath": gifpath}, "gifpath", file_data)
         r = await _post("/SendGIFMsg", json=body, timeout=120.0 if IS_LOCAL_HOOK else 180.0)
     else:
-        r = await _post("/sendemoji/", json={
+        r = await _post("/sendemoji", json={
             "userName": wxid,
             "gifpath": gifpath,
         })
@@ -675,7 +721,7 @@ async def send_quote(towxid: str, title: str, svrid: str,
         })
     else:
         # Remote: use sendappmsg with quote XML
-        r = await _post("/sendappmsg/", json={
+        r = await _post("/sendappmsg", json={
             "userName": towxid,
             "content": title,
             "msgType": 57,

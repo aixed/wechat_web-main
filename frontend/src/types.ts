@@ -137,6 +137,15 @@ export interface WeChatAccount {
   login_message?: string;
   login_status_updated_at?: number;
   active?: boolean;
+  source?: "hook" | "protocol";
+  session_id?: string;
+  protocol_state?: string;
+  rdv?: string;
+  start_port?: number;
+  callback_url?: string;
+  qrcode_ready?: boolean;
+  saved_mapping?: boolean;
+  proxy?: Record<string, any>;
 }
 
 // ─── Messages ────────────────────────────────────────────────────

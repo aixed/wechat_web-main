@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, type FormEvent, type ReactNode, type TouchEvent } from "react";
+import { useState, useCallback, useEffect, useRef, type FormEvent, type MouseEvent, type ReactNode, type TouchEvent } from "react";
 import { useWebSocket } from "./useWebSocket";
 import SessionList, { type SessionMenuAction } from "./components/SessionList";
 import ChatArea from "./components/ChatArea";
@@ -9,12 +9,17 @@ import {
   broadcastMixedUpload,
   clearActiveAgentId,
   clearAccessKey,
+  deleteProtocolRdvMapping,
   getActiveAgentId,
   getAccessKey,
   getAccounts,
   getContacts,
   getLocalContacts,
   getContactProfiles,
+  getProtocolLoginQRCode,
+  getProtocolLoginStatus,
+  getProtocolProfile,
+  getProtocolRdvMapping,
   getGroupMemberDetails,
   getGroupMemberNames,
   getMultiAccountBroadcastTargets,
@@ -26,31 +31,73 @@ import {
   multiAccountBroadcastMixedUpload,
   multiAccountBroadcastText,
   muteSession,
+  pushProtocolLoginUrl,
   refreshContacts,
   refreshSessions,
+  saveProtocolRdvMapping,
   setActiveAgentId,
   setAccessKey,
+  startProtocolWechat,
   stickyChat,
+  terminateProtocolSession,
   unmuteSession,
   unpinChat,
 } from "./api";
-import type { BroadcastContentOrder } from "./api";
+import type { BroadcastContentOrder, ProtocolProxyConfig, ProtocolRdvMappingEntry } from "./api";
 import type { ContactProfile, Session, ChatMessage, SmartReplyTarget, WSMessage, WeChatAccount } from "./types";
 import { replaceWechatEmojis } from "./utils/wechatEmoji";
 
 type ViewMode = "chats" | "contacts" | "broadcast" | "smart-reply";
 type MobileTab = "chats" | "contacts" | "me" | "broadcast" | "smart-reply";
 type PortalTheme = "dark" | "light";
+type AccountPortalTool = "broadcast" | "qr-login" | "old-login";
+type AccountPortalSource = "hook" | "protocol";
+type ProtocolLoginPhase = "idle" | "starting" | "waiting" | "scanned" | "success" | "error";
+type ProtocolLoginForm = {
+  rdv: string;
+  proxyEnabled: boolean;
+  proxyType: string;
+  proxyIP: string;
+  proxyPort: string;
+  proxyUsr: string;
+  proxyPwd: string;
+  wxid: string;
+};
+type ProtocolLoginStorage = Partial<ProtocolLoginForm> & {
+  settingsSaved?: boolean;
+};
+type ProtocolProxyDraft = Pick<ProtocolLoginForm, "rdv" | "proxyEnabled" | "proxyType" | "proxyIP" | "proxyPort" | "proxyUsr" | "proxyPwd">;
+type ProtocolCachedQr = {
+  qrSrc: string;
+  uuid: string;
+  expiresAt: number;
+};
 type ContactCategoryKey = "groups" | "official" | "service" | "openim";
 type AppRoute = "root" | "chat" | "contact" | "broadcast" | "smart-reply" | "me";
 type ParsedAppRoute = { accountWxid: string; route: AppRoute };
 const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
+const PROTOCOL_LOGIN_FORM_STORAGE = "wechat_protocol_login_form";
+const PROTOCOL_RDV_RULE_TEXT = "RDV 必填：自定义取值范围（十六进制）10000000~7fffffff";
+const PROTOCOL_ACCOUNT_POLL_INTERVAL_MS = 10_000;
+const PROTOCOL_QRCODE_CHECK_INTERVAL_MS = 10_000;
+const PROTOCOL_QRCODE_CACHE_GRACE_MS = 2_000;
+const PROTOCOL_ACCOUNT_TAB_EXCLUDED_STATES = new Set(["failed"]);
+const PROTOCOL_QRCODE_CACHE: Record<string, ProtocolCachedQr> = {};
 const PINNED_ORDER_THRESHOLD = 1_000_000_000_000;
 const MOBILE_SWIPE_DIRECTION_EPSILON = 0.25;
 const MOBILE_BROWSER_SWIPE_EDGE_PX = 44;
 const MOBILE_SWIPE_MAX_DRAG_PX = 120;
 const BACKEND_UNAVAILABLE_MESSAGE = "后端服务正在启动或暂时不可用，请稍后重试。";
+
+function accountPortalSourceFromPayload(data: any, accounts: WeChatAccount[]): AccountPortalSource {
+  if (data?.source === "protocol") return "protocol";
+  return accounts.some((account) => account.source === "protocol") ? "protocol" : "hook";
+}
+
+function defaultAccountPortalTool(source: AccountPortalSource): AccountPortalTool {
+  return source === "protocol" ? "qr-login" : "broadcast";
+}
 
 function backendUnavailableText(data: unknown): string {
   if (!data || typeof data !== "object") return "";
@@ -182,6 +229,187 @@ function normalizeBatchInterval(value: number | string): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 5;
   return Math.min(3600, Math.max(0, Math.round(parsed * 10) / 10));
+}
+
+function normalizeProtocolRdv(value: string): string {
+  return String(value || "").trim().toLowerCase().replace(/^0x/, "");
+}
+
+function validateProtocolRdv(value: string): string {
+  const rdv = normalizeProtocolRdv(value);
+  if (!/^[0-9a-f]{8}$/.test(rdv)) return "RDV 必须是 10000000 到 7fffffff 范围内的 8 位十六进制";
+  const numeric = Number.parseInt(rdv, 16);
+  if (numeric < 0x10000000 || numeric > 0x7fffffff) return "RDV 必须是 10000000 到 7fffffff 范围内的 8 位十六进制";
+  return "";
+}
+
+function randomProtocolRdv(): string {
+  const bytes = new Uint32Array(1);
+  if (window.crypto?.getRandomValues) {
+    window.crypto.getRandomValues(bytes);
+  } else {
+    bytes[0] = Math.floor(Math.random() * 0xffffffff);
+  }
+  const value = 0x10000000 + (bytes[0] % 0x70000000);
+  return value.toString(16).padStart(8, "0");
+}
+
+function protocolPayloadValue(payload: any, keys: string[]): unknown {
+  const scopes = [
+    payload,
+    payload?.data,
+    payload?.result,
+    payload?.session,
+  ].filter((item) => item && typeof item === "object");
+  for (const scope of scopes) {
+    for (const key of keys) {
+      const value = scope[key];
+      if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+    }
+  }
+  return "";
+}
+
+function protocolSessionIdFromPayload(payload: any): string {
+  return String(protocolPayloadValue(payload, ["session_id", "sessionId", "SessionID", "sessionID"]) || "").trim();
+}
+
+function protocolStartPortFromPayload(payload: any): number | undefined {
+  const value = Number(protocolPayloadValue(payload, ["start_port", "startPort", "StartPort"]));
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function pngHexToDataUrl(hex: string): string {
+  const clean = String(hex || "").replace(/\s+/g, "");
+  if (!clean || clean.length % 2 !== 0) return "";
+  let binary = "";
+  for (let i = 0; i < clean.length; i += 2) {
+    binary += String.fromCharCode(Number.parseInt(clean.slice(i, i + 2), 16));
+  }
+  return `data:image/png;base64,${window.btoa(binary)}`;
+}
+
+function protocolExpirySeconds(value: unknown): number {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  const nowSeconds = Date.now() / 1000;
+  if (raw > nowSeconds + 30) return Math.max(0, Math.ceil(raw - nowSeconds));
+  return Math.ceil(raw);
+}
+
+type ProtocolLoginStatusState =
+  | "waiting_scan"
+  | "scanned"
+  | "confirmed"
+  | "authenticating"
+  | "redirect_retry"
+  | "logged_in"
+  | "canceled"
+  | "expired"
+  | "failed"
+  | "logged_out";
+
+function protocolLoginStatusState(payload: any): ProtocolLoginStatusState {
+  const check = payload?.check_status || payload?.data || {};
+  if (payload?.logged_in === true) return "logged_in";
+  const state = String(payload?.state || payload?.raw_state || "").trim().toLowerCase();
+  if (state === "waiting_scan" || state === "scanned" || state === "confirmed" || state === "authenticating"
+    || state === "redirect_retry" || state === "logged_in" || state === "canceled" || state === "expired"
+    || state === "failed" || state === "logged_out") {
+    return state;
+  }
+  const numericState = Number(check?.state ?? payload?.check_status_state);
+  if (numericState === 1) return "scanned";
+  if (numericState === 2) return "authenticating";
+  return "waiting_scan";
+}
+
+function protocolStableWxid(value: unknown, sessionId = ""): string {
+  const wxid = String(value || "").trim();
+  const currentSessionId = String(sessionId || "").trim();
+  if (!wxid) return "";
+  if (currentSessionId && wxid.toLowerCase() === currentSessionId.toLowerCase()) return "";
+  if (/^[0-9a-f]{32}$/i.test(wxid)) return "";
+  return wxid;
+}
+
+function protocolMappingWxid(entry: ProtocolRdvMappingEntry | undefined): string {
+  return protocolStableWxid(entry?.wxid || entry?.userName || "");
+}
+
+function protocolMappingProxy(entry: ProtocolRdvMappingEntry | undefined): ProtocolProxyConfig {
+  return entry?.proxy && typeof entry.proxy === "object" ? entry.proxy : {};
+}
+
+function protocolProfileIdentity(payload: any): {
+  wxid: string;
+  nickname: string;
+  avatar: string;
+  account: string;
+  phone: string;
+  region: string;
+  signature: string;
+  profile: Record<string, any>;
+} {
+  const nested = payload?.data && typeof payload.data === "object" ? payload.data : {};
+  const result = payload?.result && typeof payload.result === "object" ? payload.result : {};
+  const profile =
+    payload?.profile ||
+    payload?.profile_result?.profile ||
+    payload?.account?.profile ||
+    nested?.profile ||
+    nested?.profile_result?.profile ||
+    result?.profile ||
+    {};
+  const account = payload?.account || nested?.account || result?.account || {};
+  const wxid = protocolStableWxid(
+    account.wxid ||
+    account.user_name ||
+    account.userName ||
+    account.UserName ||
+    profile.user_name ||
+    profile.wxid ||
+    profile.UserName ||
+    ""
+  );
+  const nickname = String(
+    account.nickname ||
+    profile.nick_name ||
+    profile.nickname ||
+    profile.NickName ||
+    ""
+  ).trim();
+  const avatar = String(
+    account.avatar ||
+    profile.big_head_url ||
+    profile.small_head_url ||
+    profile.head_big ||
+    profile.headimgurl ||
+    ""
+  ).trim();
+  const accountName = String(
+    account.wechat_account ||
+    profile.account ||
+    profile.alias ||
+    profile.Alias ||
+    profile.userName ||
+    ""
+  ).trim();
+  const phone = String(account.phone || profile.tel || profile.Tel || profile.phone || profile.Phone || "").trim();
+  const region = String(account.region || profileArea(profile)).trim();
+  const signature = String(account.signature || profile.diy_sign || profile.signature || profile.Signature || profile.sign || "").trim();
+  return { wxid, nickname, avatar, account: accountName, phone, region, signature, profile };
+}
+
+function protocolMappingDisplayIdentity(entry: ProtocolRdvMappingEntry | undefined): {
+  nickname: string;
+  avatar: string;
+} {
+  const cached = protocolProfileIdentity({ profile: entry?.profile });
+  return {
+    nickname: String(entry?.nickname || cached.nickname || "").trim(),
+    avatar: String(entry?.avatar || cached.avatar || "").trim(),
+  };
 }
 
 function useIsMobileViewport() {
@@ -1273,6 +1501,11 @@ export default function App() {
   const [routeAccountWxid, setRouteAccountWxid] = useState(() => initialRouteAccountWxid);
   const [accounts, setAccounts] = useState<WeChatAccount[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(false);
+  const [accountPortalSource, setAccountPortalSource] = useState<AccountPortalSource>("protocol");
+  const [accountManagerOpen, setAccountManagerOpen] = useState(false);
+  const [protocolLoginAccount, setProtocolLoginAccount] = useState<WeChatAccount | null>(null);
+  const [localProtocolAccounts, setLocalProtocolAccounts] = useState<WeChatAccount[]>([]);
+  const [hiddenProtocolSessionIds, setHiddenProtocolSessionIds] = useState<Set<string>>(new Set());
   const [authError, setAuthError] = useState("");
   const [selfWxid, setSelfWxid] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -1399,13 +1632,31 @@ export default function App() {
         setAuthenticated(false);
         setSelectedAccountId("");
         setAccounts([]);
+        setAccountPortalSource("hook");
+        setAccountManagerOpen(false);
         resetChatState();
-        return;
+        return [];
       }
-      const rows = Array.isArray(data?.accounts) ? data.accounts : [];
+      const rows: WeChatAccount[] = Array.isArray(data?.accounts) ? data.accounts : [];
+      const upstreamSessions = Array.isArray(data?.upstream?.sessions) ? data.upstream.sessions : [];
+      const upstreamStateBySessionId = new Map<string, string>();
+      upstreamSessions.forEach((session: any) => {
+        const sessionId = String(session?.session_id || "").trim();
+        if (sessionId) upstreamStateBySessionId.set(sessionId, String(session?.state || "").trim().toLowerCase());
+      });
+      setLocalProtocolAccounts((current) => {
+        const next = current.filter((account) => {
+          const state = upstreamStateBySessionId.get(protocolSessionId(account));
+          return !state || !PROTOCOL_ACCOUNT_TAB_EXCLUDED_STATES.has(state);
+        });
+        return next.length === current.length ? current : next;
+      });
       setAccounts(rows);
+      setAccountPortalSource(accountPortalSourceFromPayload(data, rows));
+      return rows;
     } catch (err) {
       console.error("[ACCOUNTS] load failed:", err);
+      return [];
     } finally {
       setAccountsLoading(false);
     }
@@ -1483,6 +1734,10 @@ export default function App() {
     }
     setActiveAgentId(agentId);
     setSelectedAccountId(agentId);
+    setAccountManagerOpen(false);
+    if (account.source === "protocol") {
+      setProtocolLoginAccount(account);
+    }
     setRouteAccount(accountPathKey);
     const currentRoute = normalizeRouteForDevice(routeFromPath(window.location.pathname), isMobile);
     const nextRoute = options.route || (currentRoute === "root" ? "chat" : currentRoute);
@@ -1490,13 +1745,18 @@ export default function App() {
   }, [isMobile, loadAccounts, resetChatState, setRoute, setRouteAccount]);
 
   const handleLeaveAccount = useCallback(() => {
+    const returningAccount = accounts.find((account) => account.id === selectedAccountId);
     clearActiveAgentId();
     resetChatState();
     setSelectedAccountId("");
+    setAccountManagerOpen(true);
+    if (returningAccount?.source === "protocol") {
+      setProtocolLoginAccount(returningAccount);
+    }
     setRouteAccount("");
     window.history.replaceState({ route: "root" }, "", "/");
     loadAccounts();
-  }, [loadAccounts, resetChatState, setRouteAccount]);
+  }, [accounts, loadAccounts, resetChatState, selectedAccountId, setRouteAccount]);
 
   const handleLogout = useCallback(() => {
     clearActiveAgentId();
@@ -1505,9 +1765,53 @@ export default function App() {
     setSelectedAccountId("");
     setRouteAccount("");
     setAccounts([]);
+    setAccountPortalSource("hook");
+    setAccountManagerOpen(false);
+    setProtocolLoginAccount(null);
+    setLocalProtocolAccounts([]);
+    setHiddenProtocolSessionIds(new Set());
     resetChatState();
     window.history.replaceState({ route: "root" }, "", "/");
   }, [resetChatState, setRouteAccount]);
+
+  const handleOpenAccountManager = useCallback(() => {
+    setProtocolLoginAccount(null);
+    setAccountManagerOpen(true);
+    loadAccounts();
+  }, [loadAccounts]);
+
+  const handleProtocolSessionStarted = useCallback((nextAccount: WeChatAccount, previousSessionId = "") => {
+    const nextSessionId = protocolSessionId(nextAccount);
+    if (previousSessionId) {
+      setHiddenProtocolSessionIds((prev) => new Set(prev).add(previousSessionId));
+    }
+    setLocalProtocolAccounts((prev) => [
+      nextAccount,
+      ...prev.filter((account) => {
+        const id = protocolSessionId(account);
+        return id && id !== nextSessionId && id !== previousSessionId;
+      }),
+    ]);
+    setProtocolLoginAccount(nextAccount);
+    loadAccounts();
+  }, [loadAccounts]);
+
+  const handleTerminateProtocolAccount = useCallback(async (account: WeChatAccount) => {
+    const sessionId = protocolSessionId(account);
+    if (!sessionId) return;
+    setHiddenProtocolSessionIds((prev) => new Set(prev).add(sessionId));
+    setLocalProtocolAccounts((prev) => prev.filter((item) => protocolSessionId(item) !== sessionId));
+    setProtocolLoginAccount((prev) => (protocolSessionId(prev) === sessionId ? null : prev));
+    await terminateProtocolSession(sessionId).catch((err) => console.error("[PROTO_LOGIN] terminate failed:", err));
+    await loadAccounts();
+  }, [loadAccounts]);
+
+  useEffect(() => {
+    if (!authenticated || selectedAccountId || accountManagerOpen || accountPortalSource !== "protocol") return;
+    const readyAccount = accounts.find(isLoggedInAccount);
+    if (!readyAccount) return;
+    handleSelectAccount(readyAccount, { route: "chat", replace: true });
+  }, [accountManagerOpen, accountPortalSource, accounts, authenticated, handleSelectAccount, selectedAccountId]);
 
   const setPortalTheme = useCallback((theme: PortalTheme) => {
     setPortalThemeState(theme);
@@ -2334,7 +2638,7 @@ export default function App() {
   useEffect(() => {
     if (!authenticated || selectedAccountId) return;
     loadAccounts();
-    const timer = window.setInterval(loadAccounts, 1000);
+    const timer = window.setInterval(loadAccounts, PROTOCOL_ACCOUNT_POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
   }, [authenticated, selectedAccountId, loadAccounts]);
 
@@ -2832,18 +3136,35 @@ export default function App() {
     muted: false,
   } as Session : null);
   const activeMsgs = activeChat ? (chatMessages[activeChat] || []) : [];
+  const managedAccounts = mergeProtocolAccounts(accounts, localProtocolAccounts, hiddenProtocolSessionIds);
 
   if (!authenticated) {
     return <AccessGate onLogin={handleLogin} error={authError} />;
   }
 
   if (!selectedAccountId) {
+    if (accountPortalSource === "protocol" && !accountManagerOpen) {
+      return (
+        <ProtocolLoginOnlyPortal
+          accounts={managedAccounts}
+          account={protocolLoginAccount || undefined}
+          theme={portalTheme}
+          onThemeChange={setPortalTheme}
+          onRefresh={loadAccounts}
+          onLogout={handleLogout}
+          onOpenAccountManager={handleOpenAccountManager}
+          onSelectAccount={handleSelectAccount}
+          onSessionStarted={handleProtocolSessionStarted}
+        />
+      );
+    }
     if (isMobile) {
       return (
         <MobileAccountPortal
-          accounts={accounts}
+          accounts={managedAccounts}
           loading={accountsLoading}
           theme={portalTheme}
+          source={accountPortalSource}
           onThemeChange={setPortalTheme}
           onRefresh={loadAccounts}
           onSelectAccount={handleSelectAccount}
@@ -2853,13 +3174,17 @@ export default function App() {
     }
     return (
       <AccountPortal
-        accounts={accounts}
+        accounts={managedAccounts}
+        account={protocolLoginAccount || undefined}
         loading={accountsLoading}
         theme={portalTheme}
+        source={accountPortalSource}
         onThemeChange={setPortalTheme}
         onRefresh={loadAccounts}
         onSelectAccount={handleSelectAccount}
         onLogout={handleLogout}
+        onSessionStarted={handleProtocolSessionStarted}
+        onTerminateProtocolAccount={handleTerminateProtocolAccount}
       />
     );
   }
@@ -3255,6 +3580,88 @@ function accountStatusMeta(account: WeChatAccount, dark: boolean): { text: strin
   return { text: message || "等待登录", className: neutral };
 }
 
+function hasProtocolSession(account: WeChatAccount | null | undefined): boolean {
+  return Boolean(String(account?.session_id || "").trim());
+}
+
+function isProtocolAccountTabVisible(account: WeChatAccount): boolean {
+  return account.source === "protocol"
+    && hasProtocolSession(account)
+    && !PROTOCOL_ACCOUNT_TAB_EXCLUDED_STATES.has(String(account.protocol_state || "").trim().toLowerCase());
+}
+
+function isLoggedInAccount(account: WeChatAccount): boolean {
+  if (account.source === "protocol") {
+    return account.initialized
+      || String(account.login_status || "") === "3"
+      || String(account.protocol_state || "").trim().toLowerCase() === "logged_in";
+  }
+  return account.initialized || String(account.login_status || "") === "3" || Boolean(account.wxid);
+}
+
+function protocolSessionId(account: WeChatAccount | null | undefined): string {
+  if (account?.source === "protocol") return String(account.session_id || "").trim();
+  return String(account?.session_id || account?.id || "").trim();
+}
+
+function accountStableKey(account: WeChatAccount | null | undefined): string {
+  return String(account?.session_id || account?.id || account?.rdv || account?.wxid || account?.account_id || "").trim();
+}
+
+function protocolAccountTabKey(account: WeChatAccount | null | undefined): string {
+  const rdv = normalizeProtocolRdv(String(account?.rdv || ""));
+  return rdv ? `rdv:${rdv}` : accountStableKey(account);
+}
+
+function protocolAccountTabRank(account: WeChatAccount): [number, number] {
+  return [
+    isLoggedInAccount(account) ? 1 : 0,
+    Number(account.last_seen_at || account.connected_at || 0),
+  ];
+}
+
+function dedupeProtocolAccountTabs(accounts: WeChatAccount[]): WeChatAccount[] {
+  const selected = new Map<string, WeChatAccount>();
+  accounts.forEach((account) => {
+    const key = protocolAccountTabKey(account);
+    const current = selected.get(key);
+    const nextRank = protocolAccountTabRank(account);
+    const currentRank = current ? protocolAccountTabRank(current) : null;
+    if (!current || !currentRank || nextRank[0] > currentRank[0] || (nextRank[0] === currentRank[0] && nextRank[1] > currentRank[1])) {
+      selected.set(key, account);
+    }
+  });
+  return Array.from(selected.values());
+}
+
+function accountDisplayName(account: WeChatAccount): string {
+  return (
+    (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
+    account.wxid ||
+    account.account_id ||
+    (account.rdv ? `RDV ${account.rdv}` : "") ||
+    "微信"
+  );
+}
+
+function mergeProtocolAccounts(
+  accounts: WeChatAccount[],
+  localAccounts: WeChatAccount[],
+  hiddenSessionIds: Set<string>,
+): WeChatAccount[] {
+  const backendIds = new Set(accounts.map(accountStableKey).filter(Boolean));
+  return [
+    ...localAccounts.filter((account) => {
+      const id = accountStableKey(account);
+      return id && !backendIds.has(id) && !hiddenSessionIds.has(id);
+    }),
+    ...accounts.filter((account) => {
+      const id = accountStableKey(account);
+      return id && !hiddenSessionIds.has(id);
+    }),
+  ];
+}
+
 function accountProfileLine(account: WeChatAccount, keys: string[]): string {
   const raw = account.profile || {};
   const values = keys.map((key) => {
@@ -3267,29 +3674,309 @@ function accountProfileLine(account: WeChatAccount, keys: string[]): string {
   return values.filter(Boolean).join(" · ");
 }
 
+function ProtocolLoginOnlyPortal({
+  accounts,
+  account,
+  theme,
+  onThemeChange,
+  onRefresh,
+  onLogout,
+  onOpenAccountManager,
+  onSelectAccount,
+  onSessionStarted,
+}: {
+  accounts: WeChatAccount[];
+  account?: WeChatAccount;
+  theme: PortalTheme;
+  onThemeChange: (theme: PortalTheme) => void;
+  onRefresh: () => void;
+  onLogout: () => void;
+  onOpenAccountManager: () => void;
+  onSelectAccount: (account: WeChatAccount) => void;
+  onSessionStarted: (account: WeChatAccount, previousSessionId?: string) => void;
+}) {
+  const dark = theme === "dark";
+  const [mode, setMode] = useState<"qr" | "old">("qr");
+  const [selectedAccount, setSelectedAccount] = useState<WeChatAccount | null>(account || null);
+  useEffect(() => {
+    if (account) setSelectedAccount(account);
+  }, [account]);
+  const protocolAccounts = accounts.filter(isProtocolAccountTabVisible);
+  const activeTabKey = protocolAccountTabKey(selectedAccount);
+  const handleAccountTab = (target: WeChatAccount) => {
+    if (isLoggedInAccount(target)) {
+      onSelectAccount(target);
+      return;
+    }
+    setSelectedAccount(target);
+    setMode(hasProtocolSession(target) ? "qr" : "old");
+  };
+  return (
+    <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+      <div className={`h-[58px] px-[20px] border-b flex items-center justify-between ${dark ? "border-[#242424]" : "border-[#dedede]"}`}>
+        <div className="flex items-center gap-[8px]">
+          <div className="text-[20px] font-medium">Weixin</div>
+        </div>
+        <div className="flex items-center gap-[8px]">
+          <button
+            type="button"
+            onClick={onOpenAccountManager}
+            className={`w-[34px] h-[34px] rounded-[6px] border flex items-center justify-center text-[22px] leading-none active:opacity-85 ${
+              dark ? "border-[#333] bg-[#1d1d1d] text-[#ddd]" : "border-[#d8d8d8] bg-white text-[#333]"
+            }`}
+            title="新增微信 / 多账号管理"
+            aria-label="新增微信 / 多账号管理"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode(mode === "qr" ? "old" : "qr")}
+            className={`h-[32px] px-[12px] rounded-[6px] border text-[13px] active:opacity-85 ${dark ? "border-[#333] bg-[#1d1d1d] text-[#ddd]" : "border-[#d8d8d8] bg-white text-[#333]"}`}
+          >
+            {mode === "qr" ? "老号登录" : "扫码上号"}
+          </button>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className={`h-[32px] px-[12px] rounded-[6px] border text-[13px] active:opacity-85 ${dark ? "border-[#333] bg-[#1d1d1d] text-[#ddd]" : "border-[#d8d8d8] bg-white text-[#333]"}`}
+          >
+            刷新
+          </button>
+          <ThemeSwitch theme={theme} onChange={onThemeChange} />
+          <button
+            type="button"
+            onClick={onLogout}
+            className={`h-[32px] px-[12px] rounded-[6px] border text-[13px] active:opacity-85 ${dark ? "border-[#333] bg-[#1d1d1d] text-[#ddd]" : "border-[#d8d8d8] bg-white text-[#333]"}`}
+          >
+            退出
+          </button>
+        </div>
+      </div>
+      {protocolAccounts.length > 0 && (
+        <ProtocolAccountTabStrip
+          accounts={protocolAccounts}
+          activeKey={activeTabKey}
+          dark={dark}
+          onSelect={handleAccountTab}
+        />
+      )}
+      <div className="flex-1 min-h-0 overflow-hidden">
+        <ProtocolLoginPanel
+          key={`${mode}:${activeTabKey || "new"}`}
+          mode={mode}
+          theme={theme}
+          onRefresh={onRefresh}
+          account={selectedAccount || undefined}
+          onSessionStarted={onSessionStarted}
+          onEnterAccount={onSelectAccount}
+        />
+      </div>
+    </div>
+  );
+}
+
 function AccountPortal({
   accounts,
+  account,
   loading,
   theme,
+  source,
   onThemeChange,
   onRefresh,
   onSelectAccount,
   onLogout,
+  onSessionStarted,
+  onTerminateProtocolAccount,
 }: {
   accounts: WeChatAccount[];
+  account?: WeChatAccount;
   loading: boolean;
   theme: PortalTheme;
+  source: AccountPortalSource;
   onThemeChange: (theme: PortalTheme) => void;
   onRefresh: () => void;
   onSelectAccount: (account: WeChatAccount) => void;
   onLogout: () => void;
+  onSessionStarted: (account: WeChatAccount, previousSessionId?: string) => void;
+  onTerminateProtocolAccount: (account: WeChatAccount) => void;
 }) {
   const dark = theme === "dark";
-  const accountDisplayName = (account: WeChatAccount) =>
-    (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
-    account.wxid ||
-    account.account_id ||
-    "微信";
+  const [tool, setTool] = useState<AccountPortalTool>(() => defaultAccountPortalTool(source));
+  const [loginAccount, setLoginAccount] = useState<WeChatAccount | null>(account || null);
+  const [loginPanelNonce, setLoginPanelNonce] = useState(0);
+  const [contextMenu, setContextMenu] = useState<{ account: WeChatAccount; x: number; y: number } | null>(null);
+  useEffect(() => {
+    setTool(defaultAccountPortalTool(source));
+  }, [source]);
+  useEffect(() => {
+    if (!account) return;
+    setLoginAccount(account);
+    setTool(hasProtocolSession(account) ? "qr-login" : "old-login");
+  }, [account]);
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("blur", close);
+    };
+  }, [contextMenu]);
+  const portalAccounts = accounts;
+  const protocolAccounts = portalAccounts.filter(isProtocolAccountTabVisible);
+  const handleAddProtocolLogin = () => {
+    setLoginAccount(null);
+    setTool("qr-login");
+    setLoginPanelNonce((value) => value + 1);
+  };
+  const handleAccountForLogin = (account: WeChatAccount) => {
+    if (isLoggedInAccount(account)) {
+      onSelectAccount(account);
+      return;
+    }
+    setLoginAccount(account);
+    setTool(hasProtocolSession(account) ? "qr-login" : "old-login");
+  };
+  const handleProtocolSessionStarted = (account: WeChatAccount, previousSessionId = "") => {
+    setLoginAccount(account);
+    onSessionStarted(account, previousSessionId);
+  };
+  const handleTerminateAccount = async (account: WeChatAccount) => {
+    const sessionId = protocolSessionId(account);
+    if (!sessionId) return;
+    setContextMenu(null);
+    if (loginAccount && protocolSessionId(loginAccount) === sessionId) {
+      setLoginAccount(null);
+    }
+    await onTerminateProtocolAccount(account);
+  };
+  const renderToolButton = (tab: { id: AccountPortalTool; label: string }) => {
+    const selected = tool === tab.id;
+    return (
+      <button
+        key={tab.id}
+        type="button"
+        onClick={() => setTool(tab.id)}
+        className={`h-[32px] px-[14px] rounded-[6px] text-[13px] active:opacity-85 ${
+          selected
+            ? "bg-[#07c160] text-white"
+            : dark
+              ? "bg-[#1d1d1d] text-[#cfcfcf] border border-[#303030]"
+              : "bg-white text-[#333] border border-[#d8d8d8]"
+        }`}
+      >
+        {tab.label}
+      </button>
+    );
+  };
+  const protocolToolButtons: Array<{ id: AccountPortalTool; label: string }> = [
+    { id: "qr-login", label: "扫码上号" },
+    { id: "old-login", label: "老号登录" },
+    { id: "broadcast", label: "多号群发" },
+  ];
+  const protocolPanel = (
+    <div className="flex-1 min-h-0 overflow-hidden">
+      {tool === "broadcast" && <MultiAccountBroadcastPanel accounts={portalAccounts} theme={theme} />}
+      {tool === "qr-login" && (
+        <ProtocolLoginPanel
+          key={`qr:${accountStableKey(loginAccount) || loginPanelNonce}`}
+          mode="qr"
+          theme={theme}
+          onRefresh={onRefresh}
+          account={loginAccount || undefined}
+          onSessionStarted={handleProtocolSessionStarted}
+          onEnterAccount={onSelectAccount}
+        />
+      )}
+      {tool === "old-login" && (
+        <ProtocolLoginPanel
+          key={`old:${accountStableKey(loginAccount) || loginPanelNonce}`}
+          mode="old"
+          theme={theme}
+          onRefresh={onRefresh}
+          account={loginAccount || undefined}
+          onSessionStarted={handleProtocolSessionStarted}
+        />
+      )}
+    </div>
+  );
+  const contextMenuNode = contextMenu && (
+    <div
+      className={`fixed z-[200] min-w-[138px] rounded-[6px] border py-[6px] shadow-xl ${dark ? "bg-[#202020] border-[#3a3a3a] text-[#e8e8e8]" : "bg-white border-[#d8d8d8] text-[#222]"}`}
+      style={{ left: contextMenu.x, top: contextMenu.y }}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <button
+        type="button"
+        onClick={() => handleTerminateAccount(contextMenu.account)}
+        className={`w-full h-[34px] px-[12px] text-left text-[13px] ${dark ? "hover:bg-[#2c2c2c] text-[#ff9a9a]" : "hover:bg-[#f6f6f6] text-[#c53030]"}`}
+      >
+        结束实例
+      </button>
+    </div>
+  );
+
+  if (source === "protocol") {
+    return (
+      <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#f4f4f4] text-[#111]"}`}>
+        <div className={`h-[58px] px-[20px] border-b flex items-center gap-[8px] ${dark ? "border-[#242424]" : "border-[#dedede]"}`}>
+          <button
+            type="button"
+            onClick={handleAddProtocolLogin}
+            className={`w-[34px] h-[34px] rounded-[6px] border flex items-center justify-center text-[22px] leading-none active:opacity-85 ${
+              dark ? "border-[#303030] bg-[#1d1d1d] text-[#ddd]" : "border-[#d8d8d8] bg-white text-[#333]"
+            }`}
+            title="新增微信"
+            aria-label="新增微信"
+          >
+            +
+          </button>
+          <ThemeSwitch theme={theme} onChange={onThemeChange} />
+          <button
+            type="button"
+            onClick={onLogout}
+            className={`h-[32px] px-[12px] rounded-[6px] border text-[13px] active:opacity-85 ${dark ? "border-[#333] bg-[#1d1d1d] text-[#ddd]" : "border-[#d8d8d8] bg-white text-[#333]"}`}
+          >
+            退出
+          </button>
+          <div className="ml-[10px] flex items-center gap-[8px]">
+            {protocolToolButtons.map(renderToolButton)}
+          </div>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className={`ml-auto h-[32px] px-[12px] rounded-[6px] border text-[13px] active:opacity-85 ${dark ? "border-[#333] bg-[#1d1d1d] text-[#ddd]" : "border-[#d8d8d8] bg-white text-[#333]"}`}
+          >
+            刷新
+          </button>
+        </div>
+        {protocolAccounts.length > 0 && (
+          <ProtocolAccountTabStrip
+            accounts={protocolAccounts}
+            activeKey={protocolAccountTabKey(loginAccount)}
+            dark={dark}
+            onSelect={(account) => {
+              handleAccountForLogin(account);
+            }}
+            onContextMenu={(account, event) => {
+              if (!hasProtocolSession(account)) return;
+              event.preventDefault();
+              setContextMenu({ account, x: event.clientX, y: event.clientY });
+            }}
+          />
+        )}
+        {loading && protocolAccounts.length === 0 && (
+          <div className={`h-[38px] px-[20px] border-b flex items-center text-[13px] ${dark ? "border-[#242424] text-[#777]" : "border-[#dedede] text-[#888]"}`}>
+            正在读取微信连接...
+          </div>
+        )}
+        {protocolPanel}
+        {contextMenuNode}
+      </div>
+    );
+  }
 
   return (
     <div className={`h-dvh w-screen overflow-hidden flex ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#f4f4f4] text-[#111]"}`}>
@@ -3297,7 +3984,7 @@ function AccountPortal({
         <div className={`h-[96px] px-[24px] flex items-center justify-between border-b ${dark ? "border-[#242424]" : "border-[#e0e0e0]"}`}>
           <div>
             <div className="text-[22px] font-medium">微信账号</div>
-            <div className={`text-[12px] mt-[3px] ${dark ? "text-[#777]" : "text-[#888]"}`}>连接 {accounts.length} 个</div>
+            <div className={`text-[12px] mt-[3px] ${dark ? "text-[#777]" : "text-[#888]"}`}>连接 {portalAccounts.length} 个</div>
             <div className="mt-[9px]">
               <ThemeSwitch theme={theme} onChange={onThemeChange} />
             </div>
@@ -3320,20 +4007,32 @@ function AccountPortal({
           </div>
         </div>
         <div className="pane-scroll flex-1 min-h-0 overflow-y-auto p-[18px]">
-          {loading && accounts.length === 0 && <div className="text-[#777] text-[14px]">正在读取微信连接...</div>}
-          {accounts.length === 0 && !loading && (
+          {loading && portalAccounts.length === 0 && <div className="text-[#777] text-[14px]">正在读取微信连接...</div>}
+          {portalAccounts.length === 0 && !loading && (
             <div className="text-[#777] text-[14px] leading-[24px]">
-              暂无连接的微信。请让客户端 DLL 连接到当前后端 `/agent`。
+              暂无连接的微信。可在右侧扫码上号或使用老号登录。
             </div>
           )}
           <div className="space-y-[12px]">
-            {accounts.map((account) => {
+            {portalAccounts.map((account) => {
               const meta = accountStatusMeta(account, dark);
+              const handleClick = () => {
+                if (account.source === "protocol" && !isLoggedInAccount(account)) {
+                  handleAccountForLogin(account);
+                  return;
+                }
+                onSelectAccount(account);
+              };
               return (
             <button
                 key={account.id}
                 type="button"
-                onClick={() => onSelectAccount(account)}
+                onClick={handleClick}
+                onContextMenu={(event) => {
+                  if (account.source !== "protocol" || !hasProtocolSession(account)) return;
+                  event.preventDefault();
+                  setContextMenu({ account, x: event.clientX, y: event.clientY });
+                }}
                 className={`w-full min-h-[100px] rounded-[6px] border p-[14px] flex items-center gap-[14px] text-left active:opacity-90 ${
                   dark ? "bg-[#1b1b1b] hover:bg-[#242424] border-[#2b2b2b]" : "bg-white hover:bg-[#f7f7f7] border-[#e3e3e3]"
                 }`}
@@ -3353,7 +4052,14 @@ function AccountPortal({
                     </div>
                   )}
                   <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{account.peer || "connected"}</div>
-                  <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#555]" : "text-[#aaa]"}`} title={account.id}>WS {account.id}</div>
+                  <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#555]" : "text-[#aaa]"}`} title={account.id}>
+                    {account.source === "protocol" ? "Session" : "WS"} {account.id}
+                  </div>
+                  {account.rdv && (
+                    <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#555]" : "text-[#aaa]"}`}>
+                      RDV {account.rdv}{account.start_port ? ` · Port ${account.start_port}` : ""}
+                    </div>
+                  )}
                 </div>
                 <div className={`text-[12px] px-[7px] py-[3px] rounded-[4px] ${meta.className}`}>
                   {meta.text}
@@ -3365,7 +4071,1058 @@ function AccountPortal({
         </div>
       </div>
       <div className="flex-1 min-w-0 min-h-0 h-full overflow-hidden">
-        <MultiAccountBroadcastPanel accounts={accounts} theme={theme} />
+        <div className={`h-full min-h-0 flex flex-col ${dark ? "bg-[#111111]" : "bg-[#f4f4f4]"}`}>
+          <AccountPortalToolTabs active={tool} dark={dark} source={source} onChange={setTool} onAdd={handleAddProtocolLogin} />
+          <div className="flex-1 min-h-0 overflow-hidden">
+            {tool === "broadcast" && <MultiAccountBroadcastPanel accounts={portalAccounts} theme={theme} />}
+            {tool === "qr-login" && (
+              <ProtocolLoginPanel
+                key={`qr:${accountStableKey(loginAccount) || loginPanelNonce}`}
+                mode="qr"
+                theme={theme}
+                onRefresh={onRefresh}
+                account={loginAccount || undefined}
+                onSessionStarted={handleProtocolSessionStarted}
+                onEnterAccount={onSelectAccount}
+              />
+            )}
+            {tool === "old-login" && (
+              <ProtocolLoginPanel
+                key={`old:${accountStableKey(loginAccount) || loginPanelNonce}`}
+                mode="old"
+                theme={theme}
+                onRefresh={onRefresh}
+                account={loginAccount || undefined}
+                onSessionStarted={handleProtocolSessionStarted}
+                onEnterAccount={onSelectAccount}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+      {contextMenu && (
+        <div
+          className={`fixed z-[200] min-w-[138px] rounded-[6px] border py-[6px] shadow-xl ${dark ? "bg-[#202020] border-[#3a3a3a] text-[#e8e8e8]" : "bg-white border-[#d8d8d8] text-[#222]"}`}
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={() => handleTerminateAccount(contextMenu.account)}
+            className={`w-full h-[34px] px-[12px] text-left text-[13px] ${dark ? "hover:bg-[#2c2c2c] text-[#ff9a9a]" : "hover:bg-[#f6f6f6] text-[#c53030]"}`}
+          >
+            结束实例
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AccountPortalToolTabs({
+  active,
+  dark,
+  source,
+  onChange,
+  onAdd,
+}: {
+  active: AccountPortalTool;
+  dark: boolean;
+  source: AccountPortalSource;
+  onChange: (tool: AccountPortalTool) => void;
+  onAdd: () => void;
+}) {
+  const tabs: Array<{ id: AccountPortalTool; label: string }> = source === "protocol"
+    ? [
+        { id: "qr-login", label: "扫码上号" },
+        { id: "old-login", label: "老号登录" },
+        { id: "broadcast", label: "多号群发" },
+      ]
+    : [
+        { id: "broadcast", label: "多号群发" },
+        { id: "qr-login", label: "扫码上号" },
+        { id: "old-login", label: "老号登录" },
+      ];
+  return (
+    <div className={`h-[56px] px-[24px] border-b flex items-center gap-[8px] ${dark ? "border-[#242424]" : "border-[#dedede]"}`}>
+      {source === "protocol" && (
+        <button
+          type="button"
+          onClick={onAdd}
+          className={`w-[32px] h-[32px] rounded-[6px] border flex items-center justify-center text-[21px] leading-none active:opacity-85 ${
+            dark ? "border-[#303030] bg-[#1d1d1d] text-[#ddd]" : "border-[#d8d8d8] bg-white text-[#333]"
+          }`}
+          title="新增微信"
+          aria-label="新增微信"
+        >
+          +
+        </button>
+      )}
+      {tabs.map((tab) => {
+        const selected = active === tab.id;
+        return (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => onChange(tab.id)}
+            className={`h-[32px] px-[14px] rounded-[6px] text-[13px] active:opacity-85 ${
+              selected
+                ? "bg-[#07c160] text-white"
+                : dark
+                  ? "bg-[#1d1d1d] text-[#cfcfcf] border border-[#303030]"
+                  : "bg-white text-[#333] border border-[#d8d8d8]"
+            }`}
+          >
+            {tab.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ProtocolAccountTabStrip({
+  accounts,
+  activeKey,
+  dark,
+  onSelect,
+  onContextMenu,
+}: {
+  accounts: WeChatAccount[];
+  activeKey: string;
+  dark: boolean;
+  onSelect: (account: WeChatAccount) => void;
+  onContextMenu?: (account: WeChatAccount, event: MouseEvent<HTMLButtonElement>) => void;
+}) {
+  const tabAccounts = dedupeProtocolAccountTabs(accounts);
+  if (tabAccounts.length === 0) return null;
+  return (
+    <div className={`max-h-[104px] min-h-[46px] border-b px-[20px] py-[7px] overflow-y-auto overflow-x-hidden ${dark ? "border-[#242424] bg-[#111111]" : "border-[#dedede] bg-[#ededed]"}`}>
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(128px,148px))] gap-[6px]">
+      {tabAccounts.map((account) => {
+        const key = protocolAccountTabKey(account);
+        const selected = Boolean(activeKey && key === activeKey);
+        const rdv = account.rdv || String(account.session_id || account.id || "").slice(0, 8);
+        const loggedIn = isLoggedInAccount(account);
+        const nickname = loggedIn && account.nickname && account.nickname !== account.id
+          ? account.nickname
+          : "";
+        const avatar = loggedIn ? String(account.avatar || "") : "";
+        return (
+          <button
+            key={key || account.id}
+            type="button"
+            onClick={() => onSelect(account)}
+            onContextMenu={(event) => onContextMenu?.(account, event)}
+            className={`h-[32px] rounded-[6px] border px-[8px] text-left active:opacity-85 ${
+              selected
+                ? "border-[#07c160] bg-[#123d27] text-[#eafff1]"
+                : dark
+                  ? "border-[#303030] bg-[#1b1b1b] text-[#d6d6d6]"
+                  : "border-[#d8d8d8] bg-white text-[#222]"
+            }`}
+            title={`${nickname || `RDV ${rdv}`} ${account.rdv || ""}`}
+          >
+            <span className="flex min-w-0 items-center gap-[6px]">
+              {loggedIn && (
+                <span className="relative h-[20px] w-[20px] shrink-0">
+                  {avatar ? (
+                    <img src={avatar} alt="" className="h-[20px] w-[20px] rounded-[4px] object-cover" />
+                  ) : (
+                    <span className="flex h-[20px] w-[20px] items-center justify-center rounded-[4px] bg-[#07c160] text-[10px] text-white">
+                      {(nickname || "微")[0]}
+                    </span>
+                  )}
+                  <span className={`absolute -bottom-[2px] -right-[2px] h-[7px] w-[7px] rounded-full bg-[#20d56b] ring-2 ${dark ? "ring-[#1b1b1b]" : "ring-white"}`} />
+                </span>
+              )}
+              <span className={`min-w-0 flex-1 truncate text-[12px] leading-[16px] ${nickname ? "" : "font-mono"}`}>
+                {nickname || `RDV ${rdv}`}
+              </span>
+            </span>
+          </button>
+        );
+      })}
+      </div>
+    </div>
+  );
+}
+
+function ProtocolLoginPanel({
+  mode,
+  theme,
+  onRefresh,
+  account,
+  onSessionStarted,
+  onEnterAccount,
+}: {
+  mode: "qr" | "old";
+  theme: PortalTheme;
+  onRefresh: () => void;
+  account?: WeChatAccount;
+  onSessionStarted?: (account: WeChatAccount, previousSessionId?: string) => void;
+  onEnterAccount?: (account: WeChatAccount) => void;
+}) {
+  const dark = theme === "dark";
+  const [form, setForm] = useState<ProtocolLoginForm>(() => {
+    const formFromSaved = (saved: ProtocolLoginStorage): ProtocolLoginForm => {
+      const accountProxy = account?.proxy && typeof account.proxy === "object" ? account.proxy : {};
+      const accountProxyEnabled = Object.values(accountProxy).some(Boolean);
+      const hasProxy = Boolean(
+        accountProxyEnabled ||
+        saved.proxyEnabled ||
+        saved.proxyType ||
+        saved.proxyIP ||
+        saved.proxyPort ||
+        saved.proxyUsr ||
+        saved.proxyPwd
+      );
+      const accountRdv = normalizeProtocolRdv(String(account?.rdv || ""));
+      const savedRdv = normalizeProtocolRdv(String(saved.rdv || ""));
+      const rdv = !validateProtocolRdv(accountRdv)
+        ? accountRdv
+        : saved.settingsSaved && !validateProtocolRdv(savedRdv)
+          ? savedRdv
+          : randomProtocolRdv();
+      const accountWxid = protocolStableWxid(account?.wxid || "", protocolSessionId(account));
+      const savedWxid = rdv === savedRdv ? protocolStableWxid(saved.wxid || "") : "";
+      return {
+        rdv,
+        proxyEnabled: hasProxy,
+        proxyType: String(accountProxy.Proxy_Type || saved.proxyType || ""),
+        proxyIP: String(accountProxy.Proxy_IP || saved.proxyIP || ""),
+        proxyPort: String(accountProxy.Proxy_Port || saved.proxyPort || ""),
+        proxyUsr: String(accountProxy.Proxy_Usr || saved.proxyUsr || ""),
+        proxyPwd: String(accountProxy.Proxy_Pwd || saved.proxyPwd || ""),
+        wxid: accountWxid || savedWxid,
+      };
+    };
+    try {
+      return formFromSaved(JSON.parse(window.localStorage.getItem(PROTOCOL_LOGIN_FORM_STORAGE) || "{}"));
+    } catch {
+      return formFromSaved({});
+    }
+  });
+  const [proxyDraft, setProxyDraft] = useState<ProtocolProxyDraft>({
+    rdv: form.rdv,
+    proxyEnabled: form.proxyEnabled,
+    proxyType: form.proxyType,
+    proxyIP: form.proxyIP,
+    proxyPort: form.proxyPort,
+    proxyUsr: form.proxyUsr,
+    proxyPwd: form.proxyPwd,
+  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mapping, setMapping] = useState<Record<string, ProtocolRdvMappingEntry>>({});
+  const [phase, setPhase] = useState<ProtocolLoginPhase>("idle");
+  const [statusText, setStatusText] = useState(mode === "qr" ? "等待启动实例" : "等待推送登录");
+  const [sessionId, setSessionId] = useState("");
+  const [uuid, setUuid] = useState("");
+  const [qrSrc, setQrSrc] = useState("");
+  const [expiresAt, setExpiresAt] = useState(0);
+  const [tick, setTick] = useState(Date.now());
+  const [scannedInfo, setScannedInfo] = useState<{ nick: string; avatar: string }>({ nick: "", avatar: "" });
+  const [successInfo, setSuccessInfo] = useState<{ wxid: string; nickname: string; avatar: string }>({ wxid: "", nickname: "", avatar: "" });
+  const [errorText, setErrorText] = useState("");
+  const formRef = useRef(form);
+  const phaseRef = useRef(phase);
+  const sessionIdRef = useRef(sessionId);
+  const fetchingQrRef = useRef(false);
+  const autoStartedRef = useRef(false);
+  formRef.current = form;
+  phaseRef.current = phase;
+  sessionIdRef.current = sessionId;
+
+  const busy = phase === "starting" || phase === "waiting" || phase === "scanned";
+  const rdvError = validateProtocolRdv(form.rdv);
+  const countdown = expiresAt ? Math.max(0, Math.ceil((expiresAt - tick) / 1000)) : 0;
+  const buildProxy = (source: ProtocolLoginForm): ProtocolProxyConfig => ({
+    Proxy_Type: source.proxyEnabled ? (source.proxyType || "socks5h") : "",
+    Proxy_IP: source.proxyEnabled ? source.proxyIP : "",
+    Proxy_Port: source.proxyEnabled ? source.proxyPort : "",
+    Proxy_Usr: source.proxyEnabled ? source.proxyUsr : "",
+    Proxy_Pwd: source.proxyEnabled ? source.proxyPwd : "",
+  });
+  const proxy = buildProxy(form);
+  const proxyEnabled = Boolean(form.proxyEnabled);
+  const proxySummary = proxyEnabled
+    ? [proxy.Proxy_IP, proxy.Proxy_Port].filter(Boolean).join(":") || "已启用代理"
+    : "未使用代理";
+  const selectedLoggedInAccount = Boolean(account && isLoggedInAccount(account));
+  const showingLoginIdentity = selectedLoggedInAccount || phase === "scanned" || phase === "success";
+  const loginIdentityAvatar = phase === "scanned"
+    ? scannedInfo.avatar
+    : successInfo.avatar || scannedInfo.avatar || String(account?.avatar || "");
+  const loginIdentityName = phase === "scanned"
+    ? scannedInfo.nick
+    : successInfo.nickname || scannedInfo.nick || (account ? accountDisplayName(account) : "");
+  const canRefreshQRCode = mode === "qr"
+    && !showingLoginIdentity
+    && Boolean(sessionId || protocolSessionId(account));
+
+  const pageClass = `pane-scroll h-full min-h-0 overflow-y-auto p-[18px] ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`;
+  const windowClass = `w-full max-w-[430px] rounded-[8px] border shadow-xl ${dark ? "bg-[#202020] border-[#3a3a3a]" : "bg-white border-[#dadada]"}`;
+  const inputClass = `w-full h-[38px] rounded-[6px] border px-[10px] outline-none text-[13px] focus:border-[#07c160] ${
+    dark ? "bg-[#2b2b2b] border-[#383838] text-[#eee] placeholder:text-[#666]" : "bg-[#f8f8f8] border-[#d8d8d8] text-[#111] placeholder:text-[#aaa]"
+  }`;
+  const labelClass = `text-[13px] ${dark ? "text-[#d0d0d0]" : "text-[#555]"}`;
+  const mutedClass = dark ? "text-[#9b9b9b]" : "text-[#777]";
+  const disabledInputClass = !proxyDraft.proxyEnabled ? "opacity-50 pointer-events-none" : "";
+  const statusClass = phase === "success"
+    ? "text-[#07c160]"
+    : phase === "error"
+      ? "text-[#ff8a8a]"
+      : dark ? "text-[#cfcfcf]" : "text-[#555]";
+
+  const saveForm = (next: ProtocolLoginForm, settingsSaved?: boolean) => {
+    let previous: ProtocolLoginStorage = {};
+    try {
+      previous = JSON.parse(window.localStorage.getItem(PROTOCOL_LOGIN_FORM_STORAGE) || "{}");
+    } catch {
+      previous = {};
+    }
+    window.localStorage.setItem(PROTOCOL_LOGIN_FORM_STORAGE, JSON.stringify({
+      ...next,
+      settingsSaved: settingsSaved ?? Boolean(previous.settingsSaved),
+    }));
+  };
+
+  const updateForm = <K extends keyof ProtocolLoginForm>(key: K, value: ProtocolLoginForm[K]) => {
+    setForm((prev) => {
+      const next = { ...prev, [key]: value };
+      saveForm(next);
+      return next;
+    });
+  };
+
+  const updateProxyDraft = <K extends keyof ProtocolProxyDraft>(key: K, value: ProtocolProxyDraft[K]) => {
+    setProxyDraft((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const openProxySettings = () => {
+    const current = formRef.current;
+    setProxyDraft({
+      rdv: current.rdv,
+      proxyEnabled: current.proxyEnabled,
+      proxyType: current.proxyType,
+      proxyIP: current.proxyIP,
+      proxyPort: current.proxyPort,
+      proxyUsr: current.proxyUsr,
+      proxyPwd: current.proxyPwd,
+    });
+    setSettingsOpen(true);
+  };
+
+  const saveProxySettings = async () => {
+    const rdv = normalizeProtocolRdv(proxyDraft.rdv);
+    const rdvValidation = validateProtocolRdv(rdv);
+    if (rdvValidation) {
+      setPhase("error");
+      setErrorText(rdvValidation);
+      return;
+    }
+    const nextForm = {
+      ...formRef.current,
+      ...proxyDraft,
+      rdv,
+      proxyType: proxyDraft.proxyEnabled ? (proxyDraft.proxyType || formRef.current.proxyType || "socks5h") : "",
+    };
+    setForm(nextForm);
+    saveForm(nextForm, true);
+    setSettingsOpen(false);
+    await runProtocolLogin(nextForm);
+  };
+
+  const loadMapping = useCallback(async () => {
+    try {
+      const data = await getProtocolRdvMapping();
+      const rows = (data?.mapping || data || {}) as Record<string, ProtocolRdvMappingEntry>;
+      setMapping(rows && typeof rows === "object" ? rows : {});
+    } catch (err) {
+      console.error("[PROTO_LOGIN] load mapping failed:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadMapping();
+  }, [loadMapping]);
+
+  useEffect(() => {
+    if (!expiresAt || phase === "idle" || phase === "success" || phase === "error") return;
+    const timer = window.setInterval(() => setTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [expiresAt, phase]);
+
+  const errorMessage = (payload: any, fallback: string) => {
+    if (typeof payload?.detail === "string") return payload.detail;
+    if (Array.isArray(payload?.detail) && payload.detail[0]?.msg) return String(payload.detail[0].msg);
+    return String(payload?.error || payload?.message || fallback);
+  };
+
+  const accountFromStartedSession = (payload: any, targetForm: ProtocolLoginForm): WeChatAccount => {
+    const nextSessionId = protocolSessionIdFromPayload(payload);
+    const startPort = protocolStartPortFromPayload(payload);
+    return {
+      id: nextSessionId,
+      account_id: nextSessionId,
+      wxid: "",
+      nickname: nextSessionId,
+      avatar: "",
+      peer: startPort ? `127.0.0.1:${startPort}` : "protocol",
+      initialized: false,
+      login_status: "2",
+      login_message: mode === "qr" ? "二维码等待确认" : "等待手机确认",
+      source: "protocol",
+      session_id: nextSessionId,
+      protocol_state: "not_started",
+      rdv: normalizeProtocolRdv(targetForm.rdv),
+      start_port: startPort,
+      qrcode_ready: mode === "qr",
+    };
+  };
+
+  const fetchQRCode = useCallback(async (
+    targetSessionId = sessionId,
+    options: { force?: boolean } = {},
+  ) => {
+    if (!targetSessionId || fetchingQrRef.current) return;
+    const cached = PROTOCOL_QRCODE_CACHE[targetSessionId];
+    if (!options.force && cached?.qrSrc && (!cached.expiresAt || cached.expiresAt > Date.now() + PROTOCOL_QRCODE_CACHE_GRACE_MS)) {
+      setQrSrc(cached.qrSrc);
+      setUuid(cached.uuid);
+      setExpiresAt(cached.expiresAt);
+      setTick(Date.now());
+      setPhase("waiting");
+      setStatusText("请使用微信扫码");
+      setErrorText("");
+      return;
+    }
+    fetchingQrRef.current = true;
+    try {
+      const data = await getProtocolLoginQRCode(targetSessionId);
+      if (data?.detail || data?.error || data?.ok === false) throw new Error(errorMessage(data, "获取二维码失败"));
+      const qrcode = data?.qrcode || data?.data || {};
+      const nextQr = pngHexToDataUrl(String(qrcode.qrcode_png_hex || ""));
+      if (!nextQr) throw new Error("未获取到二维码图片");
+      const seconds = protocolExpirySeconds(qrcode.expired_time);
+      const nextExpiresAt = seconds ? Date.now() + seconds * 1000 : 0;
+      setQrSrc(nextQr);
+      setUuid(String(qrcode.uuid || ""));
+      setExpiresAt(nextExpiresAt);
+      PROTOCOL_QRCODE_CACHE[targetSessionId] = {
+        qrSrc: nextQr,
+        uuid: String(qrcode.uuid || ""),
+        expiresAt: nextExpiresAt,
+      };
+      setTick(Date.now());
+      setPhase("waiting");
+      setStatusText("请使用微信扫码");
+      setErrorText("");
+    } finally {
+      fetchingQrRef.current = false;
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!account?.id) return;
+    const accountRdv = normalizeProtocolRdv(String(account.rdv || ""));
+    const accountWxid = protocolStableWxid(account.wxid || "", protocolSessionId(account));
+    if (validateProtocolRdv(accountRdv) && !accountWxid) return;
+    setForm((prev) => {
+      const next = {
+        ...prev,
+        rdv: validateProtocolRdv(accountRdv) ? prev.rdv : accountRdv,
+        wxid: accountWxid,
+      };
+      return next.rdv === prev.rdv && next.wxid === prev.wxid ? prev : next;
+    });
+  }, [account?.account_id, account?.id, account?.rdv, account?.wxid]);
+
+  useEffect(() => {
+    if (!account || !isLoggedInAccount(account)) return;
+    autoStartedRef.current = true;
+    setSessionId(protocolSessionId(account));
+    setQrSrc("");
+    setUuid("");
+    setExpiresAt(0);
+    setScannedInfo({ nick: "", avatar: "" });
+    setSuccessInfo({
+      wxid: protocolStableWxid(account.wxid || account.account_id || "", protocolSessionId(account)),
+      nickname: accountDisplayName(account),
+      avatar: String(account.avatar || ""),
+    });
+    setPhase("success");
+    setStatusText("账号已登录");
+    setErrorText("");
+  }, [account?.account_id, account?.avatar, account?.id, account?.login_status, account?.nickname, account?.session_id, account?.wxid]);
+
+  useEffect(() => {
+    if (mode !== "qr" || !account?.id) return;
+    if (isLoggedInAccount(account)) return;
+    const targetSessionId = protocolSessionId(account);
+    if (!targetSessionId || targetSessionId === sessionId) return;
+    autoStartedRef.current = true;
+    setSessionId(targetSessionId);
+    setQrSrc("");
+    setUuid("");
+    setExpiresAt(0);
+    setScannedInfo({ nick: "", avatar: "" });
+    setSuccessInfo({ wxid: "", nickname: "", avatar: "" });
+    setPhase("starting");
+    setStatusText("正在切换二维码");
+    fetchQRCode(targetSessionId).catch((err) => {
+      setPhase("error");
+      setStatusText("流程失败");
+      setErrorText(err instanceof Error ? err.message : "切换二维码失败");
+    });
+  }, [account?.id, account?.rdv, account?.session_id, fetchQRCode, mode, sessionId]);
+
+  const saveMappingFromProfile = useCallback(async (profilePayload: any, fallbackWxid = "") => {
+    const current = formRef.current;
+    const rdv = normalizeProtocolRdv(current.rdv);
+    const identity = protocolProfileIdentity(profilePayload);
+    const wxid = protocolStableWxid(
+      identity.wxid || fallbackWxid || (mode === "old" ? current.wxid : ""),
+      sessionIdRef.current || protocolSessionIdFromPayload(profilePayload),
+    );
+    const nickname = identity.nickname || scannedInfo.nick;
+    const avatar = identity.avatar || scannedInfo.avatar;
+    if (wxid && !validateProtocolRdv(rdv)) {
+      await saveProtocolRdvMapping(rdv, wxid, "", buildProxy(current), {
+        nickname,
+        avatar,
+        account: identity.account,
+        phone: identity.phone,
+        region: identity.region,
+        signature: identity.signature,
+        profile: identity.profile,
+      });
+      await loadMapping();
+    }
+    return { ...identity, wxid, nickname, avatar };
+  }, [loadMapping, mode, scannedInfo.avatar, scannedInfo.nick]);
+
+  const completeLogin = useCallback(async (payload: any) => {
+    const targetSessionId = sessionId || protocolSessionIdFromPayload(payload);
+    const profilePayload = payload?.profile_result || (targetSessionId ? await getProtocolProfile(targetSessionId) : payload);
+    const identity = await saveMappingFromProfile(profilePayload, protocolProfileIdentity(payload).wxid);
+    setSuccessInfo({
+      wxid: identity.wxid,
+      nickname: identity.nickname || scannedInfo.nick,
+      avatar: identity.avatar || scannedInfo.avatar,
+    });
+    setPhase("success");
+    setStatusText("登录成功，账号列表已刷新");
+    setErrorText("");
+    await onRefresh();
+  }, [onRefresh, saveMappingFromProfile, scannedInfo.avatar, scannedInfo.nick, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || phase === "idle" || phase === "success" || phase === "error") return;
+    const timer = window.setInterval(async () => {
+      try {
+        const data = await getProtocolLoginStatus(sessionId);
+        if (data?.error && data?.ok === false) return;
+        const check = data?.check_status || data?.data || {};
+        const state = protocolLoginStatusState(data);
+        const seconds = protocolExpirySeconds(check.expired_time ?? data?.expired_time ?? data?.expiredTime);
+        if (seconds > 0 && mode === "qr") {
+          setExpiresAt(Date.now() + seconds * 1000);
+          setTick(Date.now());
+        }
+        if (state === "logged_in") {
+          window.clearInterval(timer);
+          await completeLogin(data);
+          return;
+        }
+        if (state === "scanned" || state === "confirmed" || state === "authenticating" || state === "redirect_retry") {
+          const nick = String(check.nick_name || check.nickName || "");
+          const avatar = String(check.head_img_url || check.headImgUrl || "");
+          if (nick || avatar) {
+            setScannedInfo((current) => ({
+              nick: nick || current.nick,
+              avatar: avatar || current.avatar,
+            }));
+          }
+          setPhase("scanned");
+          if (state === "scanned") {
+            setStatusText(nick ? `${nick} 已扫码，请在手机确认` : "已扫码，请在手机确认");
+          } else if (state === "confirmed") {
+            setStatusText("手机端已确认，正在登录");
+          } else if (state === "authenticating") {
+            setStatusText("正在认证登录");
+          } else {
+            setStatusText("正在切换线路重试");
+          }
+          return;
+        }
+        if (state === "expired" && mode === "qr") {
+          setStatusText("二维码已过期，正在刷新");
+          await fetchQRCode(sessionId, { force: true });
+          return;
+        }
+        if (state === "canceled" || state === "expired" || state === "failed" || state === "logged_out") {
+          const fallback = state === "canceled"
+            ? "手机端已取消登录"
+            : state === "expired"
+              ? "登录确认已过期，请重新操作"
+              : state === "logged_out"
+                ? "微信已退出登录"
+                : "登录失败";
+          setPhase("error");
+          setStatusText("流程结束");
+          setErrorText(String(data?.state_text || data?.error || fallback));
+          if (state === "failed" || state === "logged_out") await onRefresh();
+          return;
+        }
+        setPhase("waiting");
+        setStatusText(mode === "old" ? "等待手机确认" : "等待扫码");
+      } catch (err) {
+        console.warn("[PROTO_LOGIN] polling failed:", err);
+      }
+    }, PROTOCOL_QRCODE_CHECK_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [completeLogin, fetchQRCode, mode, onRefresh, phase, sessionId]);
+
+  useEffect(() => {
+    if (mode !== "qr" || phase !== "waiting" || !sessionId || !expiresAt) return;
+    const waitMs = Math.max(1000, expiresAt - Date.now() + 300);
+    const timer = window.setTimeout(() => {
+      setStatusText("二维码已过期，正在刷新");
+      fetchQRCode(sessionId, { force: true }).catch((err) => {
+        setPhase("error");
+        setErrorText(err instanceof Error ? err.message : "刷新二维码失败");
+      });
+    }, waitMs);
+    return () => window.clearTimeout(timer);
+  }, [expiresAt, fetchQRCode, mode, phase, sessionId]);
+
+  useEffect(() => {
+    if (mode !== "old") return;
+    const rdv = normalizeProtocolRdv(form.rdv);
+    let targetRdv = rdv;
+    let entry = mapping[targetRdv];
+    let wxid = protocolMappingWxid(entry);
+    if (!wxid) {
+      const first = Object.entries(mapping).find(([, item]) => Boolean(protocolMappingWxid(item)));
+      if (first) {
+        targetRdv = first[0];
+        entry = first[1];
+        wxid = protocolMappingWxid(entry);
+      }
+    }
+    if (entry && wxid && form.wxid !== wxid) {
+      const proxyEntry = protocolMappingProxy(entry);
+      const hasProxy = Object.values(proxyEntry).some(Boolean);
+      setForm((prev) => {
+        const next = {
+          ...prev,
+          rdv: targetRdv,
+          wxid,
+          proxyEnabled: hasProxy,
+          proxyType: String(proxyEntry.Proxy_Type || (hasProxy ? "socks5h" : "")),
+          proxyIP: String(proxyEntry.Proxy_IP || ""),
+          proxyPort: String(proxyEntry.Proxy_Port || ""),
+          proxyUsr: String(proxyEntry.Proxy_Usr || ""),
+          proxyPwd: String(proxyEntry.Proxy_Pwd || ""),
+        };
+        return next;
+      });
+    }
+  }, [form.rdv, form.wxid, mapping, mode]);
+
+  const fillFromMapping = (rdv: string) => {
+    const entry = mapping[rdv];
+    const wxid = protocolMappingWxid(entry);
+    if (!wxid) return;
+    const proxyEntry = protocolMappingProxy(entry);
+    const hasProxy = Object.values(proxyEntry).some(Boolean);
+    setForm((prev) => {
+      const next = {
+        ...prev,
+        rdv,
+        wxid,
+        proxyEnabled: hasProxy,
+        proxyType: String(proxyEntry.Proxy_Type || (hasProxy ? "socks5h" : "")),
+        proxyIP: String(proxyEntry.Proxy_IP || ""),
+        proxyPort: String(proxyEntry.Proxy_Port || ""),
+        proxyUsr: String(proxyEntry.Proxy_Usr || ""),
+        proxyPwd: String(proxyEntry.Proxy_Pwd || ""),
+      };
+      return next;
+    });
+  };
+
+  const deleteMapping = async (rdv: string) => {
+    if (!window.confirm(`确定删除 RDV ${rdv} 的映射吗？`)) return;
+    const data = await deleteProtocolRdvMapping(rdv);
+    setMapping((data?.mapping || {}) as Record<string, ProtocolRdvMappingEntry>);
+  };
+
+  const runProtocolLogin = useCallback(async (
+    targetForm: ProtocolLoginForm = formRef.current,
+  ) => {
+    setErrorText("");
+    const rdvValidation = validateProtocolRdv(targetForm.rdv);
+    if (rdvValidation) {
+      setPhase("error");
+      setErrorText(rdvValidation);
+      return;
+    }
+    const rdv = normalizeProtocolRdv(targetForm.rdv);
+    const rawWxid = String(targetForm.wxid || "").trim();
+    const wxid = protocolStableWxid(rawWxid, sessionIdRef.current);
+    if (mode === "old" && !wxid) {
+      setPhase("error");
+      setErrorText(rawWxid ? "WXID 不能使用每次启动都会变化的 session_id" : "老号登录必须填写 WXID");
+      return;
+    }
+
+    const previousSessionId = sessionId;
+    setPhase("starting");
+    setStatusText("正在启动微信实例");
+    setQrSrc("");
+    setUuid("");
+    setSessionId("");
+    setSuccessInfo({ wxid: "", nickname: "", avatar: "" });
+    setScannedInfo({ nick: "", avatar: "" });
+    setExpiresAt(0);
+
+    try {
+      const targetProxy = buildProxy(targetForm);
+      const start = await startProtocolWechat({
+        rdv,
+        proxy_type: targetProxy.Proxy_Type,
+        proxy_ip: targetProxy.Proxy_IP,
+        proxy_port: targetProxy.Proxy_Port,
+        proxy_usr: targetProxy.Proxy_Usr,
+        proxy_pwd: targetProxy.Proxy_Pwd,
+      });
+      if (start?.detail || start?.error || start?.ok === false) throw new Error(errorMessage(start, "启动微信失败"));
+      const nextSessionId = protocolSessionIdFromPayload(start);
+      if (!nextSessionId) throw new Error("未获取到 session_id");
+      setSessionId(nextSessionId);
+      onSessionStarted?.(accountFromStartedSession(start, targetForm), previousSessionId);
+
+      if (mode === "qr") {
+        setStatusText("正在获取登录二维码");
+        await fetchQRCode(nextSessionId);
+      } else {
+        setStatusText("正在推送老号登录请求");
+        await saveProtocolRdvMapping(rdv, wxid, "", targetProxy).catch(() => null);
+        const pushed = await pushProtocolLoginUrl(nextSessionId, wxid);
+        if (pushed?.detail || pushed?.error || pushed?.ok === false) throw new Error(errorMessage(pushed, "推送登录失败"));
+        const info = pushed?.qrcode || pushed?.pushloginurl || pushed?.data || pushed;
+        const nextUuid = String(info?.uuid || pushed?.uuid || "");
+        const seconds = protocolExpirySeconds(info?.expired_time || pushed?.expired_time);
+        setUuid(nextUuid);
+        setExpiresAt(seconds ? Date.now() + seconds * 1000 : 0);
+        setTick(Date.now());
+        setPhase("scanned");
+        setStatusText("已推送登录请求，请在手机确认");
+        await loadMapping();
+      }
+    } catch (err) {
+      setPhase("error");
+      setStatusText("流程失败");
+      setErrorText(err instanceof Error ? err.message : "登录流程失败");
+    }
+  }, [fetchQRCode, loadMapping, mode, onSessionStarted, sessionId]);
+
+  const startLogin = async (event: FormEvent) => {
+    event.preventDefault();
+    if (account && isLoggedInAccount(account)) {
+      onEnterAccount?.(account);
+      return;
+    }
+    if (mode === "qr") {
+      return;
+    }
+    await runProtocolLogin(formRef.current);
+  };
+
+  useEffect(() => {
+    if (mode !== "qr" || settingsOpen || autoStartedRef.current || sessionId || phase !== "idle") return;
+    if (protocolSessionId(account)) return;
+    autoStartedRef.current = true;
+    const current = formRef.current;
+    const rdv = normalizeProtocolRdv(current.rdv);
+    const targetForm = validateProtocolRdv(rdv) ? { ...current, rdv: randomProtocolRdv() } : { ...current, rdv };
+    if (targetForm.rdv !== current.rdv) {
+      setForm(targetForm);
+      saveForm(targetForm, false);
+    }
+    runProtocolLogin(targetForm).catch((err) => {
+      setPhase("error");
+      setStatusText("流程失败");
+      setErrorText(err instanceof Error ? err.message : "自动启动微信失败");
+    });
+  }, [mode, phase, runProtocolLogin, sessionId, settingsOpen]);
+
+  const refreshCurrentQRCode = async () => {
+    if (!canRefreshQRCode) return;
+    const targetSessionId = sessionIdRef.current || protocolSessionId(account);
+    if (!targetSessionId) return;
+    setStatusText(qrSrc ? "正在刷新二维码" : "正在获取登录二维码");
+    try {
+      await fetchQRCode(targetSessionId, { force: true });
+    } catch (err) {
+      setPhase("error");
+      setStatusText("流程失败");
+      setErrorText(err instanceof Error ? err.message : "刷新二维码失败");
+    }
+  };
+
+  if (settingsOpen) {
+    return (
+      <div className={`${pageClass} flex items-center justify-center`}>
+        <div className={`${windowClass} px-[38px] py-[22px]`}>
+          <div className="h-[34px] flex items-center justify-between">
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(false)}
+              className={`w-[32px] h-[32px] flex items-center justify-center rounded-[4px] active:opacity-70 ${dark ? "text-[#bdbdbd] hover:bg-[#2b2b2b]" : "text-[#666] hover:bg-[#f2f2f2]"}`}
+              aria-label="返回"
+              title="返回"
+            >
+              <svg className="w-[19px] h-[19px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m15 18-6-6 6-6" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(false)}
+              className={`w-[32px] h-[32px] flex items-center justify-center rounded-[4px] active:opacity-70 ${dark ? "text-[#bdbdbd] hover:bg-[#2b2b2b]" : "text-[#666] hover:bg-[#f2f2f2]"}`}
+              aria-label="关闭"
+              title="关闭"
+            >
+              <svg className="w-[18px] h-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+          <div className="mt-[8px] text-center text-[22px] text-[#07c160]">Network proxy settings</div>
+
+          <label className={`mt-[26px] block ${labelClass}`}>
+            RDV
+            <input
+              value={proxyDraft.rdv}
+              onChange={(e) => updateProxyDraft("rdv", e.target.value)}
+              className={`${inputClass} mt-[8px] font-mono`}
+              placeholder="12787fac"
+            />
+            <span className={`mt-[6px] block text-[12px] ${validateProtocolRdv(proxyDraft.rdv) ? "text-[#ff8a8a]" : mutedClass}`}>
+              {validateProtocolRdv(proxyDraft.rdv) || PROTOCOL_RDV_RULE_TEXT}
+            </span>
+          </label>
+
+          <div className={`mt-[20px] rounded-[10px] border h-[64px] px-[22px] flex items-center justify-between ${dark ? "border-[#444] bg-[#292929]" : "border-[#d8d8d8] bg-[#f7f7f7]"}`}>
+            <div className="text-[18px]">Use proxy</div>
+            <button
+              type="button"
+              onClick={() => updateProxyDraft("proxyEnabled", !proxyDraft.proxyEnabled)}
+              className={`relative w-[42px] h-[24px] shrink-0 rounded-full transition-colors ${proxyDraft.proxyEnabled ? "bg-[#07c160]" : dark ? "bg-[#555]" : "bg-[#c9c9c9]"}`}
+              aria-label="Use proxy"
+            >
+              <span className={`absolute left-[3px] top-[3px] w-[18px] h-[18px] rounded-full bg-white transition-transform ${proxyDraft.proxyEnabled ? "translate-x-[18px]" : "translate-x-0"}`} />
+            </button>
+          </div>
+
+          <div className={`mt-[26px] rounded-[10px] border overflow-hidden ${dark ? "border-[#444] bg-[#292929]" : "border-[#d8d8d8] bg-[#f7f7f7]"} ${disabledInputClass}`}>
+            {[
+              ["Address", "proxyIP", ""] as const,
+              ["Port", "proxyPort", ""] as const,
+              ["Account", "proxyUsr", ""] as const,
+              ["Password", "proxyPwd", "password"] as const,
+            ].map(([label, key, type], index) => (
+              <label
+                key={key}
+                className={`h-[72px] px-[22px] flex items-center gap-[18px] ${index > 0 ? (dark ? "border-t border-[#3a3a3a]" : "border-t border-[#e1e1e1]") : ""}`}
+              >
+                <span className="w-[100px] text-[18px]">{label}</span>
+                <input
+                  type={type || "text"}
+                  value={String(proxyDraft[key] || "")}
+                  onChange={(e) => updateProxyDraft(key, e.target.value)}
+                  className={`h-[34px] min-w-0 flex-1 rounded-[6px] px-[10px] outline-none ${dark ? "bg-[#383838] text-[#eee]" : "bg-white text-[#111]"}`}
+                  disabled={!proxyDraft.proxyEnabled}
+                />
+              </label>
+            ))}
+          </div>
+
+          <button
+            type="button"
+            onClick={saveProxySettings}
+            className="mt-[34px] mx-auto w-[116px] h-[44px] rounded-[8px] bg-[#07c160] text-white text-[18px] flex items-center justify-center active:opacity-85"
+          >
+            Save
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`${pageClass} flex items-center justify-center`}>
+      <div className={`${windowClass} overflow-hidden`}>
+        <div className="h-[54px] px-[18px] flex items-center justify-between">
+          <div className="text-[18px]">{mode === "qr" ? "Weixin" : "Old login"}</div>
+          <button
+            type="button"
+            onClick={openProxySettings}
+            className={`w-[34px] h-[34px] rounded-[4px] flex items-center justify-center active:opacity-75 ${dark ? "text-[#bdbdbd] hover:bg-[#2a2a2a]" : "text-[#555] hover:bg-[#f2f2f2]"}`}
+            aria-label="代理设置"
+            title="代理设置"
+          >
+            <svg className="w-[19px] h-[19px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5Z" />
+              <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.04 1.56V21a2 2 0 1 1-4 0v-.08a1.7 1.7 0 0 0-1.04-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.04H3a2 2 0 1 1 0-4h.08A1.7 1.7 0 0 0 4.64 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06A2 2 0 1 1 7.07 4.2l.06.06A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3.04V3a2 2 0 1 1 4 0v.08a1.7 1.7 0 0 0 1.04 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.1.34.1.66 0 1h.56a2 2 0 1 1 0 4h-.56Z" />
+            </svg>
+          </button>
+        </div>
+
+        <form onSubmit={startLogin} className="px-[38px] pb-[28px]">
+          {mode === "qr" ? (
+            <div className="flex flex-col items-center">
+              <div
+                className={`w-[238px] h-[238px] mt-[8px] flex items-center justify-center overflow-hidden ${canRefreshQRCode ? "cursor-pointer active:opacity-85" : ""} ${dark ? "bg-[#181818]" : "bg-[#f8f8f8]"}`}
+                onClick={refreshCurrentQRCode}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    refreshCurrentQRCode();
+                  }
+                }}
+                role={canRefreshQRCode ? "button" : undefined}
+                tabIndex={canRefreshQRCode ? 0 : undefined}
+                title={canRefreshQRCode ? "点击刷新二维码" : undefined}
+              >
+                {showingLoginIdentity ? (
+                  loginIdentityAvatar ? (
+                    <img src={loginIdentityAvatar} alt={loginIdentityName || "微信头像"} className="w-[224px] h-[224px] rounded-[8px] object-cover" />
+                  ) : (
+                    <div className="w-[224px] h-[224px] rounded-[8px] bg-[#07c160] text-white flex items-center justify-center text-[72px]">
+                      {(loginIdentityName || successInfo.wxid || "微")[0]}
+                    </div>
+                  )
+                ) : qrSrc ? (
+                  <img src={qrSrc} alt="登录二维码" className="w-[224px] h-[224px] object-contain bg-white" />
+                ) : (
+                  <div className={`text-[13px] ${mutedClass}`}>二维码准备中</div>
+                )}
+              </div>
+              <div className={`mt-[26px] text-[22px] ${statusClass}`}>{phase === "error" ? "Login failed" : phase === "success" ? "Logged in" : phase === "scanned" ? "Confirm on phone" : "Scan to log in"}</div>
+              <div className={`mt-[10px] min-h-[22px] text-center text-[13px] ${phase === "error" ? "text-[#ff8a8a]" : mutedClass}`}>
+                {phase === "error" ? errorText || statusText : statusText}
+              </div>
+            </div>
+          ) : (
+            <div className={`mt-[12px] rounded-[8px] border px-[14px] py-[16px] ${dark ? "border-[#333] bg-[#181818]" : "border-[#e2e2e2] bg-[#fafafa]"}`}>
+              <div className="text-[18px] text-[#07c160]">老号登录</div>
+              <div className={`mt-[10px] text-[13px] leading-[20px] ${mutedClass}`}>{statusText}</div>
+              {uuid && <div className={`mt-[8px] text-[12px] font-mono break-all ${mutedClass}`}>UUID {uuid}</div>}
+            </div>
+          )}
+
+          {expiresAt > 0 && phase !== "success" && phase !== "error" && (
+            <div className={`mt-[12px] text-center text-[12px] ${mutedClass}`}>
+              {mode === "qr" ? "二维码" : "确认请求"}剩余 {countdown} 秒{mode === "qr" ? "，过期自动刷新" : ""}
+            </div>
+          )}
+
+          <div className="mt-[20px] grid grid-cols-1 gap-[10px]">
+            <div className={`rounded-[6px] px-[10px] py-[8px] text-[12px] ${dark ? "bg-[#252525] text-[#9b9b9b]" : "bg-[#f3f3f3] text-[#777]"}`}>
+              RDV <span className="font-mono">{form.rdv}</span> · {proxySummary}
+            </div>
+
+            {mode === "old" && (
+              <label className={labelClass}>
+                WXID <span className="text-[#f56c6c]">*</span>
+                <input
+                  value={form.wxid}
+                  onChange={(e) => updateForm("wxid", e.target.value)}
+                  className={`${inputClass} mt-[6px] font-mono`}
+                  placeholder="wxid_xxx"
+                  required
+                />
+              </label>
+            )}
+
+            {(selectedLoggedInAccount || mode === "old") && (
+              <button
+                type="submit"
+                disabled={!selectedLoggedInAccount && (busy || Boolean(rdvError) || (mode === "old" && !form.wxid.trim()))}
+                className={`h-[42px] rounded-[6px] bg-[#07c160] text-white text-[15px] active:opacity-85 disabled:opacity-55`}
+              >
+                {selectedLoggedInAccount ? "进入微信" : busy ? "处理中" : "启动并推送登录"}
+              </button>
+            )}
+          </div>
+
+          {Object.keys(mapping).length > 0 && (
+            <div className={`mt-[18px] pt-[14px] border-t ${dark ? "border-[#333]" : "border-[#e5e5e5]"}`}>
+              <div className="flex items-center justify-between">
+                <button type="button" onClick={loadMapping} className={`text-[13px] ${mutedClass}`}>已保存 RDV · {Object.keys(mapping).length} 个</button>
+              </div>
+              <div className="mt-[9px] max-h-[120px] overflow-y-auto grid grid-cols-1 gap-[8px]">
+                {Object.entries(mapping).map(([rdv, entry]) => {
+                  const entryWxid = protocolMappingWxid(entry);
+                  const displayIdentity = protocolMappingDisplayIdentity(entry);
+                  const hasProxy = Object.values(protocolMappingProxy(entry)).some(Boolean);
+                  return (
+                    <div key={`${rdv}:${entryWxid}`} className={`rounded-[6px] border px-[10px] py-[8px] flex items-center gap-[9px] ${dark ? "border-[#333] bg-[#252525]" : "border-[#e5e5e5] bg-[#fafafa]"}`}>
+                      <button type="button" onClick={() => fillFromMapping(rdv)} className="min-w-0 flex flex-1 items-center gap-[9px] text-left">
+                        <span className={`flex h-[34px] w-[34px] shrink-0 items-center justify-center overflow-hidden rounded-[4px] text-[13px] ${dark ? "bg-[#333] text-[#bbb]" : "bg-[#e7e7e7] text-[#666]"}`}>
+                          {displayIdentity.avatar ? (
+                            <img src={displayIdentity.avatar} alt="" className="h-full w-full object-cover" />
+                          ) : (
+                            (displayIdentity.nickname || entryWxid || rdv).slice(0, 1).toUpperCase()
+                          )}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[13px]">{displayIdentity.nickname || `RDV ${rdv}`}</span>
+                          <span className={`mt-[2px] block truncate text-[12px] ${mutedClass}`}>
+                            <span className="font-mono">{rdv} · {entryWxid}</span>{hasProxy ? " · proxy" : ""}
+                          </span>
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteMapping(rdv)}
+                        className={`h-[28px] px-[8px] rounded-[4px] border text-[12px] active:opacity-85 ${dark ? "border-[#3a2a2a] text-[#ff9a9a]" : "border-[#f0caca] text-[#c53030]"}`}
+                      >
+                        删除
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function MobileProtocolLoginPage({
+  mode,
+  theme,
+  onBack,
+  onRefresh,
+}: {
+  mode: "qr" | "old";
+  theme: PortalTheme;
+  onBack: () => void;
+  onRefresh: () => void;
+}) {
+  const dark = theme === "dark";
+  return (
+    <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
+      <MobileTopBar dark={dark} title={mode === "qr" ? "扫码上号" : "老号登录"} leftLabel="返回" onLeft={onBack} rightLabel="刷新" onRight={onRefresh} />
+      <div className="flex-1 min-h-0 overflow-hidden">
+        <ProtocolLoginPanel mode={mode} theme={theme} onRefresh={onRefresh} />
       </div>
     </div>
   );
@@ -3427,6 +5184,7 @@ function MobileAccountPortal({
   accounts,
   loading,
   theme,
+  source,
   onThemeChange,
   onRefresh,
   onSelectAccount,
@@ -3435,13 +5193,26 @@ function MobileAccountPortal({
   accounts: WeChatAccount[];
   loading: boolean;
   theme: PortalTheme;
+  source: AccountPortalSource;
   onThemeChange: (theme: PortalTheme) => void;
   onRefresh: () => void;
   onSelectAccount: (account: WeChatAccount) => void;
   onLogout: () => void;
 }) {
-  const [showBroadcast, setShowBroadcast] = useState(false);
+  const [tool, setTool] = useState<AccountPortalTool | null>(null);
   const dark = theme === "dark";
+  const preferredTool = defaultAccountPortalTool(source);
+  const toolButtons: Array<{ id: AccountPortalTool; label: string }> = source === "protocol"
+    ? [
+        { id: "qr-login", label: "扫码上号" },
+        { id: "old-login", label: "老号登录" },
+        { id: "broadcast", label: "多号群发" },
+      ]
+    : [
+        { id: "broadcast", label: "多号群发" },
+        { id: "qr-login", label: "扫码上号" },
+        { id: "old-login", label: "老号登录" },
+      ];
   const statusMeta = (account: WeChatAccount) => accountStatusMeta(account, dark);
   const displayName = (account: WeChatAccount) =>
     (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
@@ -3449,13 +5220,26 @@ function MobileAccountPortal({
     account.account_id ||
     "微信";
 
-  if (showBroadcast) {
+  if (tool === "broadcast") {
     return (
-      <MobileSwipeFrame dark={dark} onBack={() => setShowBroadcast(false)}>
+      <MobileSwipeFrame dark={dark} onBack={() => setTool(null)}>
         <MobileMultiAccountBroadcastPage
           accounts={accounts}
           theme={theme}
-          onBack={() => setShowBroadcast(false)}
+          onBack={() => setTool(null)}
+        />
+      </MobileSwipeFrame>
+    );
+  }
+
+  if (tool === "qr-login" || tool === "old-login") {
+    return (
+      <MobileSwipeFrame dark={dark} onBack={() => setTool(null)}>
+        <MobileProtocolLoginPage
+          mode={tool === "qr-login" ? "qr" : "old"}
+          theme={theme}
+          onBack={() => setTool(null)}
+          onRefresh={onRefresh}
         />
       </MobileSwipeFrame>
     );
@@ -3465,21 +5249,35 @@ function MobileAccountPortal({
     <MobileSwipeFrame dark={dark} onForward={accounts[0] ? () => onSelectAccount(accounts[0]) : undefined}>
       <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
         <MobileTopBar dark={dark} title="微信账号" rightLabel="刷新" onRight={onRefresh} leftLabel="退出" onLeft={onLogout} />
-        <div className={`px-[14px] py-[12px] border-b flex items-center justify-between ${dark ? "border-[#242424]" : "border-[#dedede]"}`}>
-          <button
-            type="button"
-            onClick={() => setShowBroadcast(true)}
-            className="h-[36px] px-[14px] rounded-full bg-[#07c160] text-white text-[14px] active:opacity-85"
-          >
-            多号群发
-          </button>
+        <div className={`px-[14px] py-[12px] border-b flex items-center justify-between gap-[10px] ${dark ? "border-[#242424]" : "border-[#dedede]"}`}>
+          <div className="flex min-w-0 flex-1 gap-[8px]">
+            {toolButtons.map((button) => {
+              const primary = button.id === preferredTool;
+              return (
+                <button
+                  key={button.id}
+                  type="button"
+                  onClick={() => setTool(button.id)}
+                  className={`h-[34px] px-[10px] rounded-[6px] text-[13px] active:opacity-85 ${
+                    primary
+                      ? "bg-[#07c160] text-white"
+                      : dark
+                        ? "border border-[#333] bg-[#1d1d1d] text-[#ddd]"
+                        : "border border-[#d8d8d8] bg-white text-[#333]"
+                  }`}
+                >
+                  {button.label}
+                </button>
+              );
+            })}
+          </div>
           <ThemeSwitch theme={theme} onChange={onThemeChange} />
         </div>
         <div className="flex-1 overflow-y-auto px-[14px] py-[14px] pb-[calc(18px+env(safe-area-inset-bottom))]">
           {loading && accounts.length === 0 && <div className="text-center text-[#888] text-[14px] mt-[40px]">正在读取微信连接...</div>}
           {!loading && accounts.length === 0 && (
             <div className="text-center text-[#888] text-[14px] leading-[24px] mt-[44px]">
-              暂无连接的微信<br />请让客户端 DLL 连接到当前后端 `/agent`
+              暂无连接的微信<br />可扫码上号或使用老号登录
             </div>
           )}
           <div className="space-y-[12px]">
@@ -3503,7 +5301,14 @@ function MobileAccountPortal({
                       {accountProfileLine(account, ["wechat_account", "phone", "region"])}
                     </div>
                   )}
-                  <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>WS {account.id}</div>
+                  <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>
+                    {account.source === "protocol" ? "Session" : "WS"} {account.id}
+                  </div>
+                  {account.rdv && (
+                    <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>
+                      RDV {account.rdv}
+                    </div>
+                  )}
                 </div>
                 <span className={`text-[12px] px-[7px] py-[3px] rounded-full ${meta.className}`}>
                   {meta.text}
@@ -5107,7 +6912,7 @@ function WorkspaceSidebar({
 
       <button
         type="button"
-        title="返回账号"
+        title="返回登录管理"
         onClick={onBackToAccounts}
         className="mt-auto mb-[12px] w-[40px] h-[40px] flex items-center justify-center text-[#9b9b9b] hover:text-[#07c160] active:opacity-75"
       >

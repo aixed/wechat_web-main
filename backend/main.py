@@ -26,6 +26,7 @@ import subprocess
 from typing import Any
 
 import config
+import protocol_api
 import wechat_api
 from agent_ws import agent_manager
 from ws_manager import manager
@@ -251,6 +252,13 @@ _CONTACT_INIT_LOCKS: dict[str, asyncio.Lock] = {}
 _CONTACT_HYDRATING_OWNERS: set[str] = set()
 _SESSION_CONTACT_HYDRATING_OWNERS: set[str] = set()
 _CONTACT_HYDRATION_PROGRESS: dict[str, dict] = {}
+_RDV_MAPPING_PATH = os.path.join(os.path.dirname(__file__), "rdv_wxid_mapping.json")
+_OLD_RDV_MAPPING_PATH = r"D:\xweixin\前端\backend\rdv_wxid_mapping.json"
+_RDV_MIN = int("10000000", 16)
+_RDV_MAX = int("7fffffff", 16)
+_RDV_RE = re.compile(r"^[0-9a-fA-F]{8}$")
+_PROTOCOL_ACCOUNT_PROFILE_CACHE: dict[str, tuple[dict, float]] = {}
+_PROTOCOL_ACCOUNT_PROFILE_TTL_SEC = 15.0
 
 
 def _new_app_state() -> dict:
@@ -318,7 +326,8 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
     if not isinstance(data, dict):
         data = {}
     nested = data.get("data") if isinstance(data.get("data"), dict) else {}
-    source = nested or data
+    protocol_profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+    source = protocol_profile or nested or data
     profile = dict(source)
     wxid = str(
         source.get("wxid")
@@ -326,6 +335,8 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
         or source.get("selfwxid")
         or source.get("selfWxid")
         or source.get("self_wxid")
+        or source.get("user_name")
+        or source.get("UserName")
         or data.get("wxid")
         or data.get("selfwxid")
         or current_wxid
@@ -334,6 +345,7 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
     nickname = str(
         source.get("nickname")
         or source.get("NickName")
+        or source.get("nick_name")
         or source.get("name")
         or data.get("nickname")
         or data.get("NickName")
@@ -345,6 +357,8 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
         source.get("head_big")
         or source.get("headimgurl")
         or source.get("head_img")
+        or source.get("big_head_url")
+        or source.get("small_head_url")
         or source.get("head_small")
         or data.get("head_big")
         or data.get("headimgurl")
@@ -355,6 +369,7 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
         source.get("account")
         or source.get("alias")
         or source.get("Alias")
+        or source.get("AliasName")
         or source.get("wechat_account")
         or source.get("userName")
         or ""
@@ -390,6 +405,485 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
         "signature": signature,
         "profile": profile,
     }
+
+
+def _validate_protocol_rdv(raw: str) -> str:
+    rdv = str(raw or "").strip().lower()
+    if rdv.startswith("0x"):
+        rdv = rdv[2:]
+    if not rdv:
+        raise HTTPException(status_code=400, detail="RDV 不能为空")
+    if not _RDV_RE.fullmatch(rdv):
+        raise HTTPException(
+            status_code=400,
+            detail="RDV 必须是 10000000 到 7fffffff 范围内的 8 位十六进制",
+        )
+    value = int(rdv, 16)
+    if value < _RDV_MIN or value > _RDV_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail="RDV 必须是 10000000 到 7fffffff 范围内的 8 位十六进制",
+        )
+    return rdv
+
+
+def _protocol_nested_payload(data: dict, key: str) -> dict:
+    value = data.get(key) if isinstance(data, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def _protocol_value_from_payload(data: dict, *keys: str) -> Any:
+    if not isinstance(data, dict):
+        return ""
+    scopes = [
+        data,
+        _protocol_nested_payload(data, "data"),
+        _protocol_nested_payload(data, "result"),
+        _protocol_nested_payload(data, "session"),
+    ]
+    for scope in scopes:
+        for key in keys:
+            value = scope.get(key)
+            if value not in (None, ""):
+                return value
+    return ""
+
+
+def _protocol_session_id_from_payload(data: dict) -> str:
+    return str(_protocol_value_from_payload(data, "session_id", "sessionId", "SessionID", "sessionID")).strip()
+
+
+def _protocol_start_port_from_payload(data: dict) -> Any:
+    return _protocol_value_from_payload(data, "start_port", "startPort", "StartPort")
+
+
+def _protocol_scope_key() -> str:
+    return f"{config.HOOK_HOST}:{config.HOOK_PORT}"
+
+
+def _empty_rdv_mapping_doc() -> dict:
+    return {"version": 2, "scopes": {}}
+
+
+def _load_rdv_mapping_doc() -> dict:
+    for path in (_RDV_MAPPING_PATH, _OLD_RDV_MAPPING_PATH):
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if not isinstance(data.get("scopes"), dict):
+                    data = {"version": 2, "scopes": {_protocol_scope_key(): data}}
+                data.setdefault("version", 2)
+                data.setdefault("scopes", {})
+                return data
+        except Exception as e:
+            _log(f"[RDV] failed to load mapping {path}: {type(e).__name__}: {e}")
+    return _empty_rdv_mapping_doc()
+
+
+def _save_rdv_mapping_doc(data: dict) -> None:
+    os.makedirs(os.path.dirname(_RDV_MAPPING_PATH), exist_ok=True)
+    with open(_RDV_MAPPING_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _stable_protocol_wxid(value: Any, session_id: str = "") -> str:
+    wxid = str(value or "").strip()
+    current_session_id = str(session_id or "").strip()
+    if not wxid:
+        return ""
+    if current_session_id and wxid.casefold() == current_session_id.casefold():
+        return ""
+    if re.fullmatch(r"[0-9a-fA-F]{32}", wxid):
+        return ""
+    return wxid
+
+
+def _normalize_rdv_mapping_entry(entry: Any) -> dict:
+    if isinstance(entry, dict):
+        proxy = entry.get("proxy") if isinstance(entry.get("proxy"), dict) else {}
+        profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
+        wxid = _stable_protocol_wxid(entry.get("wxid") or entry.get("userName"))
+        return {
+            "wxid": wxid,
+            "port": str(entry.get("port") or entry.get("StartPort") or entry.get("startPort") or ""),
+            "nickname": str(entry.get("nickname") or entry.get("NickName") or ""),
+            "avatar": str(entry.get("avatar") or entry.get("head_big") or entry.get("headimgurl") or ""),
+            "account": str(entry.get("account") or entry.get("alias") or entry.get("wechat_account") or ""),
+            "phone": str(entry.get("phone") or entry.get("tel") or ""),
+            "region": str(entry.get("region") or ""),
+            "signature": str(entry.get("signature") or entry.get("sign") or ""),
+            "profile": profile,
+            "proxy": {
+                "Proxy_Type": str(proxy.get("Proxy_Type") or proxy.get("proxy_type") or ""),
+                "Proxy_IP": str(proxy.get("Proxy_IP") or proxy.get("proxy_ip") or ""),
+                "Proxy_Port": str(proxy.get("Proxy_Port") or proxy.get("proxy_port") or ""),
+                "Proxy_Usr": str(proxy.get("Proxy_Usr") or proxy.get("proxy_usr") or ""),
+                "Proxy_Pwd": str(proxy.get("Proxy_Pwd") or proxy.get("proxy_pwd") or ""),
+            },
+        }
+    return {"wxid": _stable_protocol_wxid(entry), "port": "", "proxy": {}}
+
+
+def _current_rdv_mapping() -> dict[str, dict]:
+    data = _load_rdv_mapping_doc()
+    scopes = data.get("scopes") if isinstance(data.get("scopes"), dict) else {}
+    scoped = dict(scopes.get(_protocol_scope_key(), {}) or {})
+    if not scoped:
+        for value in scopes.values():
+            if isinstance(value, dict):
+                for rdv, entry in value.items():
+                    scoped.setdefault(str(rdv), entry)
+    mapping: dict[str, dict] = {}
+    for raw_rdv, raw_entry in scoped.items():
+        try:
+            rdv = _validate_protocol_rdv(str(raw_rdv or ""))
+        except HTTPException:
+            continue
+        entry = _normalize_rdv_mapping_entry(raw_entry)
+        if not entry.get("wxid"):
+            continue
+        mapping[rdv] = entry
+    return mapping
+
+
+def _upsert_rdv_mapping(
+    rdv: str,
+    wxid: str,
+    port: str = "",
+    proxy: dict | None = None,
+    identity: dict | None = None,
+) -> dict[str, dict]:
+    rdv = _validate_protocol_rdv(rdv)
+    raw_wxid = str(wxid or "").strip()
+    wxid = _stable_protocol_wxid(raw_wxid)
+    if not wxid:
+        detail = "wxid 不能使用每次启动都会变化的 session_id" if raw_wxid else "wxid 不能为空"
+        raise HTTPException(status_code=400, detail=detail)
+    identity = identity or {}
+    data = _load_rdv_mapping_doc()
+    scopes = data.setdefault("scopes", {})
+    scoped = scopes.setdefault(_protocol_scope_key(), {})
+    existing = _normalize_rdv_mapping_entry(scoped.get(rdv, {}))
+    same_account = existing.get("wxid") == wxid
+    previous = existing if same_account else {}
+    profile = (
+        identity.get("profile")
+        if isinstance(identity.get("profile"), dict) and identity.get("profile")
+        else previous.get("profile", {})
+    )
+    scoped[rdv] = {
+        "wxid": wxid,
+        "port": str(port or ""),
+        "nickname": str(identity.get("nickname") or previous.get("nickname") or ""),
+        "avatar": str(identity.get("avatar") or previous.get("avatar") or ""),
+        "account": str(identity.get("account") or previous.get("account") or ""),
+        "phone": str(identity.get("phone") or previous.get("phone") or ""),
+        "region": str(identity.get("region") or previous.get("region") or ""),
+        "signature": str(identity.get("signature") or previous.get("signature") or ""),
+        "profile": profile,
+        "proxy": _normalize_rdv_mapping_entry({"proxy": proxy or {}})["proxy"],
+    }
+    _save_rdv_mapping_doc(data)
+    return _current_rdv_mapping()
+
+
+def _delete_rdv_mapping(rdv: str) -> dict[str, dict]:
+    rdv = _validate_protocol_rdv(rdv)
+    data = _load_rdv_mapping_doc()
+    scopes = data.setdefault("scopes", {})
+    for scoped in scopes.values():
+        if isinstance(scoped, dict):
+            scoped.pop(rdv, None)
+    _save_rdv_mapping_doc(data)
+    return _current_rdv_mapping()
+
+
+def _parse_protocol_time(value: Any) -> float:
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _protocol_profile_logged_in(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if not data.get("ok"):
+        return False
+    if str(data.get("state") or "").strip() != "logged_in":
+        return False
+    profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+    base = profile.get("base_response") if isinstance(profile.get("base_response"), dict) else {}
+    ret = base.get("ret", base.get("ret_signed", 0))
+    try:
+        return int(ret or 0) == 0
+    except Exception:
+        return True
+
+
+async def _protocol_profile_for_session(session_id: str, *, force: bool = False) -> dict:
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return {}
+    now = time.time()
+    cached = _PROTOCOL_ACCOUNT_PROFILE_CACHE.get(session_id)
+    if cached and not force and now - cached[1] < _PROTOCOL_ACCOUNT_PROFILE_TTL_SEC:
+        return cached[0]
+    data = await protocol_api.get_profile(session_id)
+    if isinstance(data, dict) and data.get("ok"):
+        _PROTOCOL_ACCOUNT_PROFILE_CACHE[session_id] = (data, now)
+    return data if isinstance(data, dict) else {}
+
+
+def _protocol_status_from_session(item: dict) -> str:
+    state = str(item.get("state") or "").strip()
+    if item.get("online") or state == "logged_in":
+        return "3"
+    if (
+        item.get("login_started")
+        or item.get("qrcode_ready")
+        or state in {"login_starting", "qrcode_ready", "polling", "scanned", "confirmed", "authenticating"}
+    ):
+        return "2"
+    return ""
+
+
+def _protocol_message_from_session(item: dict, status: str) -> str:
+    for key in ("error", "post_login_error"):
+        text = str(item.get(key) or "").strip()
+        if text:
+            return text
+    state = str(item.get("state") or "").strip()
+    if status == "3":
+        return "已登录"
+    if item.get("qrcode_ready"):
+        return "二维码待确认"
+    if status == "2":
+        return "登录中"
+    return state or "未登录"
+
+
+_PROTOCOL_ACCOUNT_TAB_EXCLUDED_STATES = frozenset({"failed"})
+
+
+def _protocol_session_visible_in_account_tabs(item: dict) -> bool:
+    return str(item.get("state") or "").strip().lower() not in _PROTOCOL_ACCOUNT_TAB_EXCLUDED_STATES
+
+
+def _protocol_session_tab_key(item: dict) -> str:
+    rdv = str(item.get("rdv") or "").strip().lower()
+    if rdv:
+        return f"rdv:{rdv}"
+    return f"session:{str(item.get('session_id') or '').strip()}"
+
+
+def _protocol_session_tab_rank(item: dict) -> tuple[int, float, float]:
+    state = str(item.get("state") or "").strip().lower()
+    return (
+        1 if state == "logged_in" or item.get("online") else 0,
+        _parse_protocol_time(item.get("updated_at")),
+        _parse_protocol_time(item.get("created_at")),
+    )
+
+
+def _dedupe_protocol_session_tabs(items: list[dict]) -> list[dict]:
+    selected: dict[str, dict] = {}
+    for item in items:
+        key = _protocol_session_tab_key(item)
+        current = selected.get(key)
+        if current is None or _protocol_session_tab_rank(item) > _protocol_session_tab_rank(current):
+            selected[key] = item
+    return list(selected.values())
+
+
+def _protocol_account_from_identity(session_id: str, item: dict, identity: dict) -> dict:
+    wxid = str(identity.get("wxid") or "").strip()
+    nickname = str(identity.get("nickname") or "").strip()
+    avatar = str(identity.get("avatar") or "").strip()
+    status = _protocol_status_from_session(item)
+    created_at = _parse_protocol_time(item.get("created_at")) or time.time()
+    updated_at = _parse_protocol_time(item.get("updated_at")) or created_at
+    profile = identity.get("profile") if isinstance(identity.get("profile"), dict) else {}
+    return {
+        "id": session_id,
+        "account_id": wxid or session_id,
+        "wxid": wxid,
+        "nickname": nickname,
+        "avatar": avatar,
+        "phone": identity.get("phone", ""),
+        "region": identity.get("region", ""),
+        "signature": identity.get("signature", ""),
+        "wechat_account": identity.get("account", ""),
+        "profile": profile,
+        "server_port": str(item.get("start_port") or config.HOOK_PORT),
+        "peer": f"{config.HOOK_HOST}:{config.HOOK_PORT}",
+        "connected_at": created_at,
+        "last_seen_at": updated_at,
+        "pending": 0,
+        "initialized": status == "3",
+        "login_status": status,
+        "login_message": _protocol_message_from_session(item, status),
+        "login_status_updated_at": updated_at,
+        "active": session_id == _active_agent_id,
+        "source": "protocol",
+        "session_id": session_id,
+        "protocol_state": str(item.get("state") or "").strip().lower(),
+        "rdv": str(item.get("rdv") or ""),
+        "start_port": item.get("start_port") or config.HOOK_PORT,
+        "callback_url": str(item.get("callback_url") or ""),
+        "qrcode_ready": bool(item.get("qrcode_ready")),
+    }
+
+
+async def _protocol_session_to_account(item: dict, rdv_mapping: dict[str, dict] | None = None) -> dict:
+    session_id = str(item.get("session_id") or "").strip()
+    profile_raw: dict = {}
+    if session_id and _protocol_status_from_session(item) == "3":
+        try:
+            profile_raw = await _protocol_profile_for_session(session_id)
+        except Exception as e:
+            _log(f"[PROTO_ACCOUNT] getprofile failed session={session_id}: {type(e).__name__}: {e}")
+    identity = _self_identity_from_response(profile_raw, agent_id=session_id)
+    rdv = str(item.get("rdv") or "").strip().lower()
+    mapped = _normalize_rdv_mapping_entry((rdv_mapping or {}).get(rdv, {}))
+    live_wxid = _stable_protocol_wxid(identity.get("wxid"), session_id)
+    mapped_wxid = _stable_protocol_wxid(mapped.get("wxid"))
+    identity["wxid"] = live_wxid
+    if not live_wxid and mapped_wxid:
+        for key in ("wxid", "nickname", "avatar", "account", "phone", "region", "signature"):
+            if not identity.get(key) and mapped.get(key):
+                identity[key] = mapped[key]
+        if not identity.get("profile") and mapped.get("profile"):
+            identity["profile"] = mapped["profile"]
+    elif live_wxid and live_wxid == mapped_wxid:
+        for key in ("nickname", "avatar", "account", "phone", "region", "signature"):
+            if not identity.get(key) and mapped.get(key):
+                identity[key] = mapped[key]
+        if not identity.get("profile") and mapped.get("profile"):
+            identity["profile"] = mapped["profile"]
+    return _protocol_account_from_identity(session_id, item, identity)
+
+
+def _protocol_account_from_mapping(rdv: str, entry: dict) -> dict:
+    normalized = _normalize_rdv_mapping_entry(entry)
+    wxid = str(normalized.get("wxid") or "").strip()
+    nickname = str(normalized.get("nickname") or "").strip()
+    avatar = str(normalized.get("avatar") or "").strip()
+    profile = normalized.get("profile") if isinstance(normalized.get("profile"), dict) else {}
+    account_id = wxid or rdv
+    try:
+        start_port = int(normalized.get("port") or config.HOOK_PORT)
+    except Exception:
+        start_port = config.HOOK_PORT
+    return {
+        "id": f"rdv:{rdv}",
+        "account_id": account_id,
+        "wxid": wxid,
+        "nickname": nickname or wxid or f"RDV {rdv}",
+        "avatar": avatar,
+        "phone": normalized.get("phone", ""),
+        "region": normalized.get("region", ""),
+        "signature": normalized.get("signature", ""),
+        "wechat_account": normalized.get("account", ""),
+        "profile": profile,
+        "server_port": str(normalized.get("port") or config.HOOK_PORT),
+        "peer": "saved rdv",
+        "connected_at": 0,
+        "last_seen_at": 0,
+        "pending": 0,
+        "initialized": False,
+        "login_status": "",
+        "login_message": "可使用老号登录",
+        "login_status_updated_at": 0,
+        "active": False,
+        "source": "protocol",
+        "session_id": "",
+        "rdv": rdv,
+        "start_port": start_port,
+        "callback_url": "",
+        "qrcode_ready": False,
+        "saved_mapping": True,
+        "proxy": normalized.get("proxy") if isinstance(normalized.get("proxy"), dict) else {},
+    }
+
+
+async def _list_protocol_accounts() -> dict:
+    sessions_raw = await protocol_api.get_session_list()
+    items = sessions_raw.get("sessions") if isinstance(sessions_raw, dict) else []
+    if not isinstance(items, list):
+        items = []
+    visible_items = _dedupe_protocol_session_tabs([
+        item
+        for item in items
+        if isinstance(item, dict)
+        and str(item.get("session_id") or "").strip()
+        and _protocol_session_visible_in_account_tabs(item)
+    ])
+    rdv_mapping = _current_rdv_mapping()
+    accounts = await asyncio.gather(*(
+        _protocol_session_to_account(item, rdv_mapping)
+        for item in visible_items
+    )) if visible_items else []
+    accounts.sort(key=lambda row: (row.get("login_status") != "3", row.get("connected_at") or 0), reverse=False)
+    active_id = _active_agent_id if any(row.get("id") == _active_agent_id for row in accounts) else ""
+    return {
+        "active_id": active_id,
+        "accounts": accounts,
+        "source": "protocol",
+        "upstream": sessions_raw,
+    }
+
+
+async def _activate_protocol_account(session_id: str) -> dict:
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return {"ok": False, "error": "session_id 不能为空"}
+    profile_raw = await _protocol_profile_for_session(session_id, force=True)
+    if not _protocol_profile_logged_in(profile_raw):
+        return {
+            "ok": False,
+            "error": "wechat login status is not ready",
+            "login_status": {
+                "status": "",
+                "message": str(profile_raw.get("error") or profile_raw.get("state") or "等待微信登录"),
+                "wxid": "",
+                "nickname": "",
+                "avatar": "",
+            },
+            "upstream": profile_raw,
+        }
+    _activate_runtime(session_id)
+    app_state["self_info"] = profile_raw
+    identity = _self_identity_from_response(profile_raw, agent_id=session_id)
+    wxid = identity["wxid"]
+    if wxid:
+        _self_wxid_to_agent_id[wxid] = session_id
+        _put_self_info_field("wxid", wxid)
+        _put_self_info_field("selfwxid", wxid)
+    owner_wxid = _contact_owner_wxid(wxid)
+    _load_session_cache_into_state(owner_wxid)
+    app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+    app_state["initialized"] = True
+    item = {
+        "session_id": session_id,
+        "state": "logged_in",
+        "online": True,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "start_port": config.HOOK_PORT,
+    }
+    account = _protocol_account_from_identity(session_id, item, identity)
+    return {"ok": True, "active_id": session_id, "account": account}
 
 
 def _login_status_from_response(data: dict) -> dict[str, str]:
@@ -601,6 +1095,9 @@ async def _refresh_agent_account_brief(agent_id: str, wxid: str = "") -> dict:
 
 async def _refresh_account_card(agent_id: str) -> None:
     agent_id = str(agent_id or "").strip()
+    if config.IS_PROTOCOL:
+        _account_card_refreshing.discard(agent_id)
+        return
     if not agent_id or not agent_manager.is_connected(agent_id):
         return
 
@@ -615,6 +1112,8 @@ async def _refresh_account_card(agent_id: str) -> None:
 
 
 def _schedule_account_card_refresh() -> None:
+    if config.IS_PROTOCOL:
+        return
     now = time.time()
     for account in agent_manager.agents():
         agent_id = str(account.get("id") or "")
@@ -678,6 +1177,16 @@ def _get_self_wxid() -> str:
     data = self_info.get("data", {})
     if isinstance(data, dict) and data.get("wxid"):
         return data.get("wxid", "")
+    profile = self_info.get("profile", {})
+    if isinstance(profile, dict):
+        wxid = (
+            profile.get("wxid")
+            or profile.get("user_name")
+            or profile.get("UserName")
+            or profile.get("selfwxid")
+        )
+        if wxid:
+            return str(wxid)
     return self_info.get("wxid", "")
 
 
@@ -963,8 +1472,46 @@ def _sync_session_preview_from_message(wxid: str, msg: dict, *, owner_wxid: str 
 
 # ─── Startup / Shutdown ────────────────────────────────────────────
 
+async def _run_protocol_backend_initialization(session_id: str | None = None) -> bool:
+    selected = _activate_runtime(session_id or _active_agent_id or "default")
+    if not session_id:
+        _log("=" * 60)
+        _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}]")
+        _log("Protocol mode is ready; start a WeChat instance from the account page.")
+        _log(f"Protocol API: {config.HOOK_BASE_URL}")
+        _log("=" * 60)
+        return True
+
+    _log("=" * 60)
+    _log(f"WeChat Backend activating protocol session={selected}")
+    _log("=" * 60)
+    profile_raw = await _protocol_profile_for_session(selected, force=True)
+    if not _protocol_profile_logged_in(profile_raw):
+        _log(f"[PROTO_INIT] session not logged in: {profile_raw}")
+        app_state["initialized"] = False
+        return False
+
+    app_state["self_info"] = profile_raw
+    identity = _self_identity_from_response(profile_raw, agent_id=selected)
+    wxid = identity["wxid"]
+    if wxid:
+        _self_wxid_to_agent_id[wxid] = selected
+        _put_self_info_field("wxid", wxid)
+        _put_self_info_field("selfwxid", wxid)
+
+    owner_wxid = _contact_owner_wxid(wxid)
+    app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+    _load_session_cache_into_state(owner_wxid)
+    app_state["initialized"] = True
+    _log(f"[PROTO_INIT] active wxid={wxid or '-'} cached contacts/session state loaded")
+    return True
+
+
 async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     """Initialize cached state from the Hook/Protocol API."""
+    if config.IS_PROTOCOL:
+        return await _run_protocol_backend_initialization(agent_id)
+
     selected_agent = _activate_runtime(agent_id or agent_manager.active_id())
     if selected_agent:
         await agent_manager.set_active(selected_agent)
@@ -1153,7 +1700,9 @@ async def _run_initialization_after_agent():
 async def lifespan(app: FastAPI):
     """Initialize on startup, cleanup on shutdown."""
     init_task = None
-    if config.AGENT_WS_ENABLED:
+    if config.IS_PROTOCOL:
+        await _run_protocol_backend_initialization()
+    elif config.AGENT_WS_ENABLED:
         _log("=" * 60)
         _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}]")
         _log(f"Agent WS enabled: {config.CLIENT_WSS_URL}  path={config.AGENT_WS_PATH}")
@@ -1180,6 +1729,7 @@ async def lifespan(app: FastAPI):
         pass
     await agent_manager.close()
     await wechat_api.client.aclose()
+    await protocol_api.close()
     await ai_service.close()
     _log("[SHUTDOWN] Done.")
 
@@ -1230,6 +1780,10 @@ async def require_access_key(request: Request, call_next):
         from fastapi.responses import JSONResponse
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     agent_id = _request_agent_id(request)
+    if agent_id and config.IS_PROTOCOL:
+        _activate_runtime(agent_id)
+        with wechat_api.use_agent(agent_id):
+            return await call_next(request)
     if agent_id and agent_manager.is_connected(agent_id):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
@@ -1244,6 +1798,40 @@ class AuthLoginRequest(BaseModel):
 
 class ActivateAccountRequest(BaseModel):
     agent_id: str
+
+
+class ProtocolStartWechatRequest(BaseModel):
+    rdv: str
+    callback_url: str = ""
+    proxy_type: str = ""
+    proxy_ip: str = ""
+    proxy_port: str = ""
+    proxy_usr: str = ""
+    proxy_pwd: str = ""
+
+
+class ProtocolSessionRequest(BaseModel):
+    session_id: str
+    uuid: str = ""
+
+
+class ProtocolPushLoginRequest(BaseModel):
+    session_id: str
+    wxid: str
+
+
+class ProtocolRdvMappingRequest(BaseModel):
+    rdv: str
+    wxid: str = ""
+    port: str = ""
+    nickname: str = ""
+    avatar: str = ""
+    account: str = ""
+    phone: str = ""
+    region: str = ""
+    signature: str = ""
+    profile: dict[str, Any] = Field(default_factory=dict)
+    proxy: dict[str, Any] = Field(default_factory=dict)
 
 
 class SmartReplyRuleRequest(BaseModel):
@@ -1329,6 +1917,8 @@ async def auth_login(req: AuthLoginRequest):
 
 @app.get("/api/accounts")
 async def list_accounts():
+    if config.IS_PROTOCOL:
+        return await _list_protocol_accounts()
     _schedule_account_card_refresh()
     return {
         "active_id": _active_agent_id or agent_manager.active_id(),
@@ -1339,6 +1929,9 @@ async def list_accounts():
 @app.post("/api/accounts/activate")
 async def activate_account(req: ActivateAccountRequest):
     agent_id = str(req.agent_id or "").strip()
+    if config.IS_PROTOCOL:
+        async with _ACCOUNT_LOCK:
+            return await _activate_protocol_account(agent_id)
     if not agent_id or not agent_manager.is_connected(agent_id):
         return {"ok": False, "error": "agent not connected"}
     async with _ACCOUNT_LOCK:
@@ -1360,6 +1953,148 @@ async def activate_account(req: ActivateAccountRequest):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
     return {"ok": True, "active_id": agent_id, "account": agent_manager.get_agent(agent_id)}
+
+
+@app.get("/api/protocol/health")
+async def get_protocol_health():
+    return await protocol_api.health()
+
+
+@app.get("/api/protocol/rdv-mapping")
+async def get_protocol_rdv_mapping():
+    return {
+        "ok": True,
+        "scope": _protocol_scope_key(),
+        "mapping": _current_rdv_mapping(),
+        "rdv_rule": "自定义取值范围（十六进制）10000000~7fffffff",
+    }
+
+
+@app.post("/api/protocol/rdv-mapping")
+async def save_protocol_rdv_mapping(req: ProtocolRdvMappingRequest):
+    mapping = _upsert_rdv_mapping(
+        req.rdv,
+        req.wxid,
+        req.port,
+        req.proxy,
+        {
+            "nickname": req.nickname,
+            "avatar": req.avatar,
+            "account": req.account,
+            "phone": req.phone,
+            "region": req.region,
+            "signature": req.signature,
+            "profile": req.profile,
+        },
+    )
+    return {"ok": True, "scope": _protocol_scope_key(), "mapping": mapping}
+
+
+@app.delete("/api/protocol/rdv-mapping/{rdv}")
+async def delete_protocol_rdv_mapping(rdv: str):
+    mapping = _delete_rdv_mapping(rdv)
+    return {"ok": True, "scope": _protocol_scope_key(), "mapping": mapping}
+
+
+@app.post("/api/protocol/start-wechat")
+async def start_protocol_wechat(req: ProtocolStartWechatRequest):
+    rdv = _validate_protocol_rdv(req.rdv)
+    callback_url = str(req.callback_url or "").strip() or config.CALLBACK_URL
+    data = await protocol_api.start_wechat(
+        rdv=rdv,
+        callback_url=callback_url,
+        proxy_type=str(req.proxy_type or "").strip(),
+        proxy_ip=str(req.proxy_ip or "").strip(),
+        proxy_port=str(req.proxy_port or "").strip(),
+        proxy_usr=str(req.proxy_usr or "").strip(),
+        proxy_pwd=str(req.proxy_pwd or "").strip(),
+    )
+    if isinstance(data, dict):
+        session_id = _protocol_session_id_from_payload(data)
+        start_port = _protocol_start_port_from_payload(data)
+        if session_id:
+            data["session_id"] = session_id
+        if start_port not in (None, ""):
+            data["start_port"] = start_port
+        if data.get("ok") and session_id:
+            data["rdv"] = str(data.get("rdv") or rdv)
+            data["callback_url"] = str(data.get("callback_url") or callback_url)
+    return data
+
+
+@app.post("/api/protocol/get-qrcode")
+async def get_protocol_login_qrcode(req: ProtocolSessionRequest):
+    session_id = str(req.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+    return await protocol_api.get_login_qrcode(session_id)
+
+
+@app.post("/api/protocol/get-login-status")
+async def get_protocol_login_status(req: ProtocolSessionRequest):
+    session_id = str(req.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+    data = await protocol_api.get_login_status(session_id)
+    state = str(data.get("state") or data.get("raw_state") or "").strip().lower()
+    if state == "logged_in" or data.get("logged_in") is True:
+        try:
+            profile = await _protocol_profile_for_session(session_id, force=True)
+            data["profile_result"] = profile
+            if _protocol_profile_logged_in(profile):
+                identity = _self_identity_from_response(profile, agent_id=session_id)
+                data["account"] = _protocol_account_from_identity(
+                    session_id,
+                    {
+                        "session_id": session_id,
+                        "state": "logged_in",
+                        "online": True,
+                        "created_at": time.time(),
+                        "updated_at": time.time(),
+                    },
+                    identity,
+                )
+        except Exception as e:
+            data["profile_error"] = f"{type(e).__name__}: {e}"
+    return data
+
+
+@app.post("/api/protocol/push-login-url")
+async def push_protocol_login_url(req: ProtocolPushLoginRequest):
+    session_id = str(req.session_id or "").strip()
+    wxid = str(req.wxid or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+    if not wxid:
+        raise HTTPException(status_code=400, detail="wxid 不能为空")
+    return await protocol_api.push_login_url(session_id, wxid)
+
+
+@app.post("/api/protocol/get-profile")
+async def get_protocol_profile(req: ProtocolSessionRequest):
+    session_id = str(req.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+    data = await _protocol_profile_for_session(session_id, force=True)
+    if _protocol_profile_logged_in(data):
+        _activate_runtime(session_id)
+        app_state["self_info"] = data
+        identity = _self_identity_from_response(data, agent_id=session_id)
+        wxid = identity["wxid"]
+        if wxid:
+            _self_wxid_to_agent_id[wxid] = session_id
+            _put_self_info_field("wxid", wxid)
+            _put_self_info_field("selfwxid", wxid)
+    return data
+
+
+@app.post("/api/protocol/terminate")
+async def terminate_protocol_session(req: ProtocolSessionRequest):
+    session_id = str(req.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+    _PROTOCOL_ACCOUNT_PROFILE_CACHE.pop(session_id, None)
+    return await protocol_api.terminate_session(session_id)
 
 
 def _normalize_ai_task(task: SmartReplyAiTaskRequest, index: int = 0) -> dict[str, Any]:
@@ -2122,7 +2857,9 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1008, reason="unauthorized")
         return
     agent_id = str(websocket.query_params.get("agent_id") or "").strip()
-    if agent_id and agent_manager.is_connected(agent_id):
+    if agent_id and config.IS_PROTOCOL:
+        _activate_runtime(agent_id)
+    elif agent_id and agent_manager.is_connected(agent_id):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
     await manager.connect(websocket)
@@ -4064,7 +4801,10 @@ async def post_contacts_profile_batch(req: ProfileBatchRequest):
 async def get_sessions(request: Request):
     """Get current session (conversation) list from cache."""
     agent_id = _request_agent_id(request)
-    if agent_id and agent_manager.is_connected(agent_id):
+    if agent_id and config.IS_PROTOCOL:
+        _activate_runtime(agent_id)
+        _load_session_cache_into_state(_contact_owner_wxid())
+    elif agent_id and agent_manager.is_connected(agent_id):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
         _load_session_cache_into_state(_contact_owner_wxid())
@@ -4076,7 +4816,9 @@ async def refresh_sessions(request: Request):
     """Load session list once from native WeChat DB, then serve local SQLite cache."""
     t0 = time.time()
     agent_id = _request_agent_id(request)
-    if agent_id and agent_manager.is_connected(agent_id):
+    if agent_id and config.IS_PROTOCOL:
+        _activate_runtime(agent_id)
+    elif agent_id and agent_manager.is_connected(agent_id):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
     owner_wxid = _contact_owner_wxid()
@@ -5346,6 +6088,25 @@ async def _ensure_broadcast_contact_categories(contacts: dict | list, owner_wxid
 
 
 async def _ensure_account_contacts(agent_id: str):
+    if config.IS_PROTOCOL:
+        async with _ACCOUNT_LOCK:
+            _activate_runtime(agent_id)
+            login_ok = await _run_protocol_backend_initialization(agent_id)
+            if not login_ok:
+                raise RuntimeError("wechat not logged in")
+            owner_wxid = _contact_owner_wxid()
+            if app_state.get("contacts_loaded"):
+                cached_contacts = _contacts_snapshot_from_db(owner_wxid)
+                app_state["contacts"] = cached_contacts
+                cached_contacts = await _ensure_broadcast_contact_categories(cached_contacts, owner_wxid, agent_id)
+                return cached_contacts
+            with wechat_api.use_agent(agent_id):
+                await _refresh_contacts_incremental(list_type="0", init_if_empty=True, hydrate_details=False)
+            contacts = _contacts_snapshot_from_db(owner_wxid)
+            app_state["contacts"] = contacts
+            contacts = await _ensure_broadcast_contact_categories(contacts, owner_wxid, agent_id)
+            return contacts
+
     async with _ACCOUNT_LOCK:
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
@@ -5393,9 +6154,19 @@ async def _prepare_multi_account_targets(
     direct_targets: list[str],
     target_types: set[str],
 ) -> tuple[list[str], list[tuple[str, str]], dict[str, int], dict[str, dict[str, int]], list[dict]]:
-    connected_agents = [a for a in (agent_ids or []) if agent_manager.is_connected(a)]
-    if not connected_agents:
-        connected_agents = [a["id"] for a in agent_manager.agents() if a.get("id")]
+    if config.IS_PROTOCOL:
+        accounts_payload = await _list_protocol_accounts()
+        online_ids = [
+            str(a.get("id") or "")
+            for a in accounts_payload.get("accounts", [])
+            if str(a.get("id") or "") and str(a.get("login_status") or "") == "3"
+        ]
+        requested = [str(a or "").strip() for a in (agent_ids or []) if str(a or "").strip()]
+        connected_agents = [a for a in requested if a in online_ids] if requested else online_ids
+    else:
+        connected_agents = [a for a in (agent_ids or []) if agent_manager.is_connected(a)]
+        if not connected_agents:
+            connected_agents = [a["id"] for a in agent_manager.agents() if a.get("id")]
 
     total = 0
     account_targets: dict[str, int] = {}
@@ -5406,10 +6177,15 @@ async def _prepare_multi_account_targets(
     for agent_id in connected_agents:
         try:
             if direct_targets:
-                with wechat_api.use_agent(agent_id):
-                    login_status = await _refresh_agent_login_status(agent_id)
-                if str(login_status.get("status") or "") != "3":
-                    raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
+                if config.IS_PROTOCOL:
+                    profile_raw = await _protocol_profile_for_session(agent_id)
+                    if not _protocol_profile_logged_in(profile_raw):
+                        raise RuntimeError(str(profile_raw.get("error") or profile_raw.get("state") or "wechat not logged in"))
+                else:
+                    with wechat_api.use_agent(agent_id):
+                        login_status = await _refresh_agent_login_status(agent_id)
+                    if str(login_status.get("status") or "") != "3":
+                        raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
                 target_wxids = _dedupe_targets(direct_targets)
                 account_counts[agent_id] = {**_empty_contact_counts(), "targets": len(target_wxids)}
             else:
@@ -5555,7 +6331,8 @@ async def multi_account_broadcast_mixed_upload(
         if not targets:
             continue
         async with _ACCOUNT_LOCK:
-            await agent_manager.set_active(agent_id)
+            if not config.IS_PROTOCOL:
+                await agent_manager.set_active(agent_id)
             _activate_runtime(agent_id)
         attachments = await _prepare_mixed_parts_for_agent(agent_id, targets[0], image_parts, file_part, normal_mode)
         parts = _mixed_content_order(order, bool(message), attachments)
@@ -5664,7 +6441,8 @@ async def multi_account_broadcast_image_upload(
         if not agent_targets:
             continue
         async with _ACCOUNT_LOCK:
-            await agent_manager.set_active(agent_id)
+            if not config.IS_PROTOCOL:
+                await agent_manager.set_active(agent_id)
             _activate_runtime(agent_id)
             db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
         if normal_mode:
@@ -5871,7 +6649,8 @@ async def multi_account_broadcast_image_upload_stream(
             if not agent_targets:
                 continue
             async with _ACCOUNT_LOCK:
-                await agent_manager.set_active(agent_id)
+                if not config.IS_PROTOCOL:
+                    await agent_manager.set_active(agent_id)
                 _activate_runtime(agent_id)
                 db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
             if normal_mode:
@@ -6069,7 +6848,8 @@ async def multi_account_broadcast_file_upload_stream(
             if not agent_targets:
                 continue
             async with _ACCOUNT_LOCK:
-                await agent_manager.set_active(agent_id)
+                if not config.IS_PROTOCOL:
+                    await agent_manager.set_active(agent_id)
                 _activate_runtime(agent_id)
 
             sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
