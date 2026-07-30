@@ -36,8 +36,9 @@ remote_protocol_mgr_port: 29999
 server_host: "0.0.0.0"
 server_port: 5000
 # Web 前端访问密钥；浏览器需先输入该 key 才能访问聊天页和 API。
+# 默认 key 为 admin。首次运行可用 admin 进入，但请在 config.yaml 中修改 web_access_key。
 # 不要把真实密钥提交到 Git，可在 config.yaml 或 WECHAT_WEB_ACCESS_KEY 中配置。
-web_access_key: ""
+web_access_key: "admin"
 # Hook/API 并发数：本地 Hook 建议 1；远程 Hook/远程协议可设为 5-20。
 # 不配置时本地 Hook 默认 1，远程模式默认 10。
 hook_api_concurrency: 10

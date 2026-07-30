@@ -3197,6 +3197,9 @@ function AccessGate({
     <div className="h-dvh w-screen bg-[#111111] text-[#e8e8e8] flex items-center justify-center">
       <form onSubmit={submit} className="w-[360px] max-w-[calc(100vw-40px)]">
         <div className="text-[24px] font-medium mb-[22px]">访问密钥</div>
+        <div className="mb-[14px] text-[13px] leading-[20px] text-[#9a9a9a]">
+          首次启动默认 key 为 admin。建议在 config.yaml 中修改 web_access_key。
+        </div>
         <input
           value={key}
           onChange={(e) => setKey(e.target.value)}
