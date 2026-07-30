@@ -16,6 +16,7 @@ import os
 import hashlib
 import zlib
 import json as _json
+import protocol_api
 from config import (
     AGENT_WS_ENABLED,
     AGENT_WS_REQUEST_TIMEOUT,
@@ -491,11 +492,8 @@ async def send_text(wxid: str, msg: str) -> dict:
     """Send text message."""
     if IS_HOOK:
         r = await _post("/SendTextMsg", json={"toid": wxid, "msg": msg})
-    else:
-        r = await _post("/newsendmsg", json={
-            "userName": wxid, "content": msg, "msgType": 1
-        })
-    return safe_json(r)
+        return safe_json(r)
+    return await protocol_api.send_text(_CURRENT_AGENT_ID.get(), wxid, msg)
 
 
 async def send_text_no_src(wxidorgid: str, msg: str) -> dict:

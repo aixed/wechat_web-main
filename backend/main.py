@@ -2615,12 +2615,19 @@ async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
 
     sendorrecv = str(data.get("sendorrecv", "") or "")
     self_wxid = _extract_self_wxid(data) or _get_self_wxid()
+    protocol_session_id = str(
+        data.get("session_id", "")
+        or data.get("sessionId", "")
+        or data.get("SessionID", "")
+        or ""
+    ).strip()
     mapped_agent_id = (
         _agent_id_for_self_wxid(self_wxid)
         or agent_manager.agent_id_for_wxid(self_wxid)
     )
     callback_agent_id = str(
-        mapped_agent_id
+        (protocol_session_id if config.IS_PROTOCOL else "")
+        or mapped_agent_id
         or data.get("agent_id", "")
         or data.get("agentId", "")
         or ""
@@ -5038,6 +5045,8 @@ _BROADCAST_IMG_CDN_KEYS = (
 
 def _send_result_ok(result: dict) -> bool:
     if not isinstance(result, dict):
+        return False
+    if result.get("ok") is False:
         return False
     if result.get("error"):
         return False

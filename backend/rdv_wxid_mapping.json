@@ -2,6 +2,41 @@
   "version": 2,
   "scopes": {
     "bb.eixed.com:29999": {},
-    "127.0.0.1:30001": {}
+    "127.0.0.1:30001": {
+      "127f78ac": {
+        "wxid": "wxid_kqism2ws8r7s12",
+        "port": "",
+        "nickname": "Aixed",
+        "avatar": "https://wx.qlogo.cn/mmhead/ver_1/q5u5ChKOPzmbOaWv5O4QUD5YdT05TZQkaD0qbQ75epCOWek6yiaZAiaPdX5qXdH3ziaBibM8uvZtERSJhdic3g5icnInsFgGk5weIUYOia0fj9WicicvCITeIaZZ2LhECC3DObB5f8zPeUrOOS4rIyxISAnBK0Q/0",
+        "account": "theaixed",
+        "phone": "19923224257",
+        "region": "",
+        "signature": "",
+        "profile": {
+          "base_response": {
+            "ret": 0,
+            "ret_signed": 0
+          },
+          "user_name": "wxid_kqism2ws8r7s12",
+          "nick_name": "Aixed",
+          "phone": "19923224257",
+          "alias": "theaixed",
+          "country": "CN",
+          "big_head_url": "https://wx.qlogo.cn/mmhead/ver_1/q5u5ChKOPzmbOaWv5O4QUD5YdT05TZQkaD0qbQ75epCOWek6yiaZAiaPdX5qXdH3ziaBibM8uvZtERSJhdic3g5icnInsFgGk5weIUYOia0fj9WicicvCITeIaZZ2LhECC3DObB5f8zPeUrOOS4rIyxISAnBK0Q/0",
+          "small_head_url": "https://wx.qlogo.cn/mmhead/ver_1/q5u5ChKOPzmbOaWv5O4QUD5YdT05TZQkaD0qbQ75epCOWek6yiaZAiaPdX5qXdH3ziaBibM8uvZtERSJhdic3g5icnInsFgGk5weIUYOia0fj9WicicvCITeIaZZ2LhECC3DObB5f8zPeUrOOS4rIyxISAnBK0Q/132",
+          "sex": 1,
+          "status": 50458751,
+          "plain_len": 15064,
+          "updated_at": "2026-07-31T03:44:49.9210818+08:00"
+        },
+        "proxy": {
+          "Proxy_Type": "",
+          "Proxy_IP": "",
+          "Proxy_Port": "",
+          "Proxy_Usr": "",
+          "Proxy_Pwd": ""
+        }
+      }
+    }
   }
 }

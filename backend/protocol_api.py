@@ -185,6 +185,24 @@ async def get_profile(session_id: str) -> dict[str, Any]:
     )
 
 
+async def send_text(session_id: str, username: str, content: str) -> dict[str, Any]:
+    session_id = str(session_id or "").strip()
+    username = str(username or "").strip()
+    if not session_id:
+        return {"ok": False, "error": "session_id 不能为空"}
+    if not username:
+        return {"ok": False, "error": "username 不能为空"}
+    return await _post(
+        "/newsendmsg",
+        {
+            "session_id": session_id,
+            "username": username,
+            "content": str(content or ""),
+        },
+        timeout=30.0,
+    )
+
+
 async def terminate_session(session_id: str) -> dict[str, Any]:
     return await _post(
         "/TerminateThisWeChat",
