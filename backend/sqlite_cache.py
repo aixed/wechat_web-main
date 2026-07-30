@@ -146,9 +146,11 @@ class SqliteMessageCache:
                     chat_name TEXT NOT NULL DEFAULT '',
                     avatar TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    mention_only INTEGER NOT NULL DEFAULT 0,
                     message_types_json TEXT NOT NULL DEFAULT '["text"]',
                     target_senders_json TEXT NOT NULL DEFAULT '[]',
                     rules_json TEXT NOT NULL DEFAULT '[]',
+                    ai_tasks_json TEXT NOT NULL DEFAULT '[]',
                     reply_count INTEGER NOT NULL DEFAULT 0,
                     last_triggered_at INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
@@ -176,6 +178,16 @@ class SqliteMessageCache:
                     "ALTER TABLE smart_reply_configs "
                     "ADD COLUMN message_types_json TEXT NOT NULL DEFAULT '[\"text\"]'"
                 )
+            if "mention_only" not in smart_reply_columns:
+                conn.execute(
+                    "ALTER TABLE smart_reply_configs "
+                    "ADD COLUMN mention_only INTEGER NOT NULL DEFAULT 0"
+                )
+            if "ai_tasks_json" not in smart_reply_columns:
+                conn.execute(
+                    "ALTER TABLE smart_reply_configs "
+                    "ADD COLUMN ai_tasks_json TEXT NOT NULL DEFAULT '[]'"
+                )
 
     @staticmethod
     def _smart_reply_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -193,20 +205,28 @@ class SqliteMessageCache:
             message_types = json.loads(row["message_types_json"] or '["text"]')
         except Exception:
             message_types = ["text"]
+        try:
+            ai_tasks = json.loads(row["ai_tasks_json"] or "[]")
+        except Exception:
+            ai_tasks = []
         if not isinstance(target_senders, list):
             target_senders = []
         if not isinstance(rules, list):
             rules = []
         if not isinstance(message_types, list) or not message_types:
             message_types = ["text"]
+        if not isinstance(ai_tasks, list):
+            ai_tasks = []
         return {
             "chat_id": str(row["chat_id"] or ""),
             "chat_name": str(row["chat_name"] or row["chat_id"] or ""),
             "avatar": str(row["avatar"] or ""),
             "enabled": bool(int(row["enabled"] or 0)),
+            "mention_only": bool(int(row["mention_only"] or 0)),
             "message_types": [str(item) for item in message_types if str(item or "").strip()],
             "target_senders": [str(item) for item in target_senders if str(item or "").strip()],
             "rules": [item for item in rules if isinstance(item, dict)],
+            "ai_tasks": [item for item in ai_tasks if isinstance(item, dict)],
             "reply_count": int(row["reply_count"] or 0),
             "last_triggered_at": int(row["last_triggered_at"] or 0),
             "created_at": int(row["created_at"] or 0),
@@ -243,20 +263,24 @@ class SqliteMessageCache:
         target_senders = config.get("target_senders") if isinstance(config.get("target_senders"), list) else []
         message_types = config.get("message_types") if isinstance(config.get("message_types"), list) else ["text"]
         rules = config.get("rules") if isinstance(config.get("rules"), list) else []
+        ai_tasks = config.get("ai_tasks") if isinstance(config.get("ai_tasks"), list) else []
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO smart_reply_configs (
-                    owner_wxid, chat_id, chat_name, avatar, enabled,
-                    message_types_json, target_senders_json, rules_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    owner_wxid, chat_id, chat_name, avatar, enabled, mention_only,
+                    message_types_json, target_senders_json, rules_json, ai_tasks_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(owner_wxid, chat_id) DO UPDATE SET
                     chat_name=excluded.chat_name,
                     avatar=excluded.avatar,
                     enabled=excluded.enabled,
+                    mention_only=excluded.mention_only,
                     message_types_json=excluded.message_types_json,
                     target_senders_json=excluded.target_senders_json,
                     rules_json=excluded.rules_json,
+                    ai_tasks_json=excluded.ai_tasks_json,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -265,9 +289,11 @@ class SqliteMessageCache:
                     str(config.get("chat_name") or chat_id),
                     str(config.get("avatar") or ""),
                     1 if bool(config.get("enabled", True)) else 0,
+                    1 if bool(config.get("mention_only", False)) else 0,
                     json.dumps(message_types, ensure_ascii=False),
                     json.dumps(target_senders, ensure_ascii=False),
                     json.dumps(rules, ensure_ascii=False),
+                    json.dumps(ai_tasks, ensure_ascii=False),
                     now,
                     now,
                 ),

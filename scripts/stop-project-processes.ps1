@@ -73,15 +73,30 @@ function Get-ProjectProcesses {
     )
 }
 
+function Get-DescendantProcessIds {
+    param([int]$ParentId)
+
+    $children = @(
+        Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentId" -ErrorAction SilentlyContinue
+    )
+    foreach ($child in $children) {
+        $childId = [int]$child.ProcessId
+        Get-DescendantProcessIds -ParentId $childId
+        $childId
+    }
+}
+
 function Stop-ProcessTree {
     param($Process)
 
     $processId = [int]$Process.ProcessId
     Write-Host ("[STOP] pid={0} name={1}" -f $processId, $Process.Name)
-    $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
-    & $taskkill /PID $processId /T /F 2>&1 | Out-Null
-    if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
-        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    $ids = @(
+        Get-DescendantProcessIds -ParentId $processId
+        $processId
+    ) | Select-Object -Unique
+    foreach ($id in $ids) {
+        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
     }
 }
 
