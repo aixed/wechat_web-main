@@ -317,8 +317,9 @@ def save_ai_settings(
             os.remove(temp_path)
     return _apply_ai_settings(document)
 
-# Hook/API request concurrency. Local Hook keeps the conservative single-call
-# path by default; remote Hook/Protocol can handle parallel calls.
+# Hook/API request concurrency. QueryDB uses its own per-DB pool in wechat_api.
+# Local Hook keeps the conservative single-call path by default; remote
+# Hook/Protocol can handle parallel calls.
 HOOK_API_CONCURRENCY = int(_cfg.get("hook_api_concurrency", 1 if IS_LOCAL_HOOK else 10))
 if HOOK_API_CONCURRENCY < 1:
     print(f"[CONFIG] ⚠ invalid hook_api_concurrency={HOOK_API_CONCURRENCY!r}, using 1", flush=True)

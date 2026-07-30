@@ -9,7 +9,7 @@ Supports three modes via config.yaml:
 import httpx
 import asyncio
 import contextvars
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 import time
 import sys
 import os
@@ -36,65 +36,24 @@ client = httpx.AsyncClient(base_url=HOOK_BASE_URL, timeout=_DEFAULT_TIMEOUT)
 # Request counter
 _req_id = 0
 _CURRENT_AGENT_ID: contextvars.ContextVar[str] = contextvars.ContextVar("wechat_agent_id", default="")
-_query_db_locks: dict[str, asyncio.Lock] = {}
+_QUERY_DB_CONCURRENCY = 4
+_QUERY_DB_POOL_WAIT_TIMEOUT = 10.0
+_query_db_semaphores: dict[str, asyncio.Semaphore] = {}
 
 
-class _AgentHookGate:
-    """Per-agent reader/writer gate for fragile Hook routes.
-
-    Normal Hook APIs enter as shared readers. QueryDB enters as an exclusive
-    writer, so once a Session-table query is requested no new Hook calls can
-    start for that same WeChat process until QueryDB returns.
-    """
-
-    def __init__(self) -> None:
-        self._cond = asyncio.Condition()
-        self._readers = 0
-        self._writer = False
-        self._writers_waiting = 0
-
-    async def acquire_shared(self) -> None:
-        async with self._cond:
-            while self._writer or self._writers_waiting > 0:
-                await self._cond.wait()
-            self._readers += 1
-
-    async def release_shared(self) -> None:
-        async with self._cond:
-            self._readers = max(0, self._readers - 1)
-            if self._readers == 0:
-                self._cond.notify_all()
-
-    async def acquire_exclusive(self) -> None:
-        async with self._cond:
-            self._writers_waiting += 1
-            try:
-                while self._writer or self._readers > 0:
-                    await self._cond.wait()
-                self._writer = True
-            finally:
-                self._writers_waiting = max(0, self._writers_waiting - 1)
-
-    async def release_exclusive(self) -> None:
-        async with self._cond:
-            self._writer = False
-            self._cond.notify_all()
+def _query_db_pool_key(agent_id: str, dbname: str) -> str:
+    agent_key = str(agent_id or "__default__")
+    db_key = str(dbname or "").strip().lower() or "__default_db__"
+    return f"{agent_key}:{db_key}"
 
 
-_agent_hook_gates: dict[str, _AgentHookGate] = {}
-
-
-def _agent_gate_key(agent_id: str) -> str:
-    return str(agent_id or "__default__")
-
-
-def _agent_hook_gate(agent_id: str) -> _AgentHookGate:
-    key = _agent_gate_key(agent_id)
-    gate = _agent_hook_gates.get(key)
-    if gate is None:
-        gate = _AgentHookGate()
-        _agent_hook_gates[key] = gate
-    return gate
+def _query_db_semaphore(agent_id: str, dbname: str) -> asyncio.Semaphore:
+    key = _query_db_pool_key(agent_id, dbname)
+    semaphore = _query_db_semaphores.get(key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(_QUERY_DB_CONCURRENCY)
+        _query_db_semaphores[key] = semaphore
+    return semaphore
 
 
 def _is_query_db_endpoint(endpoint: str) -> bool:
@@ -116,6 +75,15 @@ if HOOK_API_CONCURRENCY <= 1:
     _hook_lock: asyncio.Lock | asyncio.Semaphore = asyncio.Lock()
 else:
     _hook_lock = asyncio.Semaphore(HOOK_API_CONCURRENCY)
+
+
+@asynccontextmanager
+async def _hook_api_slot(query_db_call: bool):
+    if query_db_call:
+        yield
+        return
+    async with _hook_lock:
+        yield
 
 # ─── Circuit breaker ───────────────────────────────────────────────
 # After consecutive failures, back off to avoid hammering a dying Hook.
@@ -252,7 +220,6 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
     use_agent_ws = AGENT_WS_ENABLED and IS_HOOK
     agent_id = _CURRENT_AGENT_ID.get() or ""
     full_url = f"agent-ws://{agent_id or 'active'}/{endpoint.lstrip('/')}" if use_agent_ws else f"{HOOK_BASE_URL}{endpoint}"
-    hook_gate = _agent_hook_gate(agent_id) if IS_HOOK else None
     query_db_call = _is_query_db_endpoint(endpoint)
 
     if not bypass_circuit_breaker and _circuit_open():
@@ -268,80 +235,64 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
         )
         raise ConnectionError(f"Circuit breaker open after {_consecutive_failures} failures")
 
-    if hook_gate:
-        if query_db_call:
-            _log(f"[API-GATE] QueryDB waiting for exclusive hook access agent={agent_id or '-'}")
-            await hook_gate.acquire_exclusive()
-            _log(f"[API-GATE] QueryDB acquired exclusive hook access agent={agent_id or '-'}")
-        else:
-            await hook_gate.acquire_shared()
-
-    try:
-        async with _hook_lock:
-            _req_id += 1
-            rid = _req_id
-            log_json = _scrub_payload_for_log(json or {})
-            transport = "AGENT" if use_agent_ws else "POST"
-            _log(f"[API #{rid}] → {transport} {full_url} agent={agent_id or '-'} body={_console_payload(log_json)}")
-            t0 = time.time()
-            try:
-                if use_agent_ws:
-                    route = endpoint.strip("/")
-                    if query_db_call:
-                        _log("[API] QueryDB via /agent with clean body (no body.agent_id injection)")
-                    agent_response = await agent_manager.request(
-                        route,
-                        json or {},
-                        timeout=timeout or AGENT_WS_REQUEST_TIMEOUT,
-                        agent_id=_CURRENT_AGENT_ID.get() or None,
-                        inject_agent_id=not query_db_call,
-                        include_method=not query_db_call,
-                    )
-                    r = httpx.Response(
-                        status_code=agent_response.status,
-                        content=agent_response.body,
-                        headers={"content-type": agent_response.content_type},
-                        request=httpx.Request("POST", f"http://agent.local/{route}"),
-                    )
-                else:
-                    r = await client.post(endpoint, json=json, timeout=timeout)
-                ms = int((time.time() - t0) * 1000)
-                body_preview = _truncate(r.text if r.text else "(empty)", 1200).replace("\n", " ")
-                _log(f"[API #{rid}] ← {transport} {full_url} status={r.status_code} time={ms}ms len={len(r.text)} body={body_preview}")
-                await _append_main_log(
-                    f"[{_ts()}]POST {full_url}\n"
-                    f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
-                    f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
-                    f"{_indent_multiline(_truncate(r.text), '          >> ')}\n"
-                    f"          time_used={ms}ms\n"
+    async with _hook_api_slot(query_db_call):
+        _req_id += 1
+        rid = _req_id
+        log_json = _scrub_payload_for_log(json or {})
+        transport = "AGENT" if use_agent_ws else "POST"
+        _log(f"[API #{rid}] → {transport} {full_url} agent={agent_id or '-'} body={_console_payload(log_json)}")
+        t0 = time.time()
+        try:
+            if use_agent_ws:
+                route = endpoint.strip("/")
+                if query_db_call:
+                    _log("[API] QueryDB via /agent with clean body (no body.agent_id injection)")
+                agent_response = await agent_manager.request(
+                    route,
+                    json or {},
+                    timeout=timeout or AGENT_WS_REQUEST_TIMEOUT,
+                    agent_id=_CURRENT_AGENT_ID.get() or None,
+                    inject_agent_id=not query_db_call,
+                    include_method=not query_db_call,
                 )
-                # Success — reset circuit breaker
-                if _consecutive_failures > 0:
-                    _log(f"[API] ✓ Circuit breaker RESET (was at {_consecutive_failures} failures)")
-                _consecutive_failures = 0
-                return r
-            except Exception as e:
-                ms = int((time.time() - t0) * 1000)
-                _log(f"[API #{rid}] ✗ {transport} {full_url} agent={agent_id or '-'} ERROR time={ms}ms {type(e).__name__}: {e}")
-                _consecutive_failures += 1
-                _last_failure_time = time.time()
-                backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
-                _log(f"[API] ⚠ Consecutive failures: {_consecutive_failures} — next backoff: {backoff}s")
-                await _append_main_log(
-                    f"[{_ts()}]POST {full_url}\n"
-                    f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
-                    f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
-                    f"{_indent_multiline(_truncate(f'{type(e).__name__}: {e}', 2000), '          >> ')}\n"
-                    f"          error={type(e).__name__} time_used={ms}ms\n"
+                r = httpx.Response(
+                    status_code=agent_response.status,
+                    content=agent_response.body,
+                    headers={"content-type": agent_response.content_type},
+                    request=httpx.Request("POST", f"http://agent.local/{route}"),
                 )
-                raise
-    finally:
-        if hook_gate:
-            if query_db_call:
-                await hook_gate.release_exclusive()
-                _log(f"[API-GATE] QueryDB released exclusive hook access agent={agent_id or '-'}")
             else:
-                await hook_gate.release_shared()
+                r = await client.post(endpoint, json=json, timeout=timeout)
+            ms = int((time.time() - t0) * 1000)
+            body_preview = _truncate(r.text if r.text else "(empty)", 1200).replace("\n", " ")
+            _log(f"[API #{rid}] ← {transport} {full_url} status={r.status_code} time={ms}ms len={len(r.text)} body={body_preview}")
+            await _append_main_log(
+                f"[{_ts()}]POST {full_url}\n"
+                f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
+                f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
+                f"{_indent_multiline(_truncate(r.text), '          >> ')}\n"
+                f"          time_used={ms}ms\n"
+            )
+            # Success — reset circuit breaker
+            if _consecutive_failures > 0:
+                _log(f"[API] ✓ Circuit breaker RESET (was at {_consecutive_failures} failures)")
+            _consecutive_failures = 0
+            return r
+        except Exception as e:
+            ms = int((time.time() - t0) * 1000)
+            _log(f"[API #{rid}] ✗ {transport} {full_url} agent={agent_id or '-'} ERROR time={ms}ms {type(e).__name__}: {e}")
+            _consecutive_failures += 1
+            _last_failure_time = time.time()
+            backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
+            _log(f"[API] ⚠ Consecutive failures: {_consecutive_failures} — next backoff: {backoff}s")
+            await _append_main_log(
+                f"[{_ts()}]POST {full_url}\n"
+                f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
+                f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
+                f"{_indent_multiline(_truncate(f'{type(e).__name__}: {e}', 2000), '          >> ')}\n"
+                f"          error={type(e).__name__} time_used={ms}ms\n"
+            )
+            raise
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -892,18 +843,28 @@ async def turn_off_do_not_disturb(gid_or_wxid: str) -> dict:
 async def query_db(dbname: str, sql: str, timeout: float | None = None) -> dict:
     """Query WeChat local SQLite database.
 
-    The Hook QueryDB route is not safe for concurrent calls on the same
-    WeChat process. Serialize per agent to avoid crashing the client when
-    history, session, and sticker queries overlap.
+    QueryDB supports concurrent calls. Mirror the Hook-side pool by allowing up
+    to 4 in-flight queries per agent and DB file. The 5th waiter gets up to
+    10 seconds for a slot, then returns {}.
     """
     if IS_HOOK:
         # Keep QueryDB bounded; remote servers sometimes stall.
         if timeout is None:
-            timeout = 10.0 if IS_LOCAL_HOOK else 15.0
-        agent_key = _CURRENT_AGENT_ID.get() or "__default__"
-        lock = _query_db_locks.setdefault(agent_key, asyncio.Lock())
-        async with lock:
+            timeout = 20.0 if IS_LOCAL_HOOK else 25.0
+        agent_id = _CURRENT_AGENT_ID.get() or ""
+        semaphore = _query_db_semaphore(agent_id, dbname)
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=_QUERY_DB_POOL_WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            _log(
+                f"[API-GATE] QueryDB pooled connection unavailable "
+                f"agent={agent_id or '-'} db={dbname} limit={_QUERY_DB_CONCURRENCY}"
+            )
+            return {}
+        try:
             r = await _post("/QueryDB", json={"dbname": dbname, "sql": sql}, timeout=timeout)
+        finally:
+            semaphore.release()
         return safe_json(r)
     else:
         _log(f"[API] Remote mode: QueryDB not available (db={dbname})")
@@ -1098,19 +1059,20 @@ def _extract_sender_from_bytes_extra(hex_str: str) -> str:
 
 
 async def _query_db_parallel(dbs: list[str], sql: str) -> list:
-    """Query multiple DB files sequentially.
-
-    Hook QueryDB is not concurrency-safe on the same WeChat process. Keep this
-    helper sequential even in remote-hook mode.
-    """
+    """Query multiple DB files concurrently, capped by the QueryDB semaphore."""
     all_rows: list = []
-    for db in dbs:
+
+    async def _query_one(db: str) -> list:
         try:
             data = await query_db(db, sql)
             if data and isinstance(data.get("data"), list):
-                all_rows.extend(data["data"])
+                return data["data"]
         except Exception:
-            continue
+            pass
+        return []
+
+    for rows in await asyncio.gather(*(_query_one(db) for db in dbs)):
+        all_rows.extend(rows)
     return all_rows
 
 
@@ -1274,10 +1236,9 @@ def _parse_bulk_row(row) -> tuple[str, dict] | tuple[None, None]:
 
 async def get_last_messages_bulk(wxids: list[str]) -> dict:
     """Get the last message for each session from DB (across all DB files).
-    Uses lightweight queries (no BytesExtra, no nested subquery) to avoid
-    overloading the Hook DLL which can crash WeChat.
-    Local: sequential with bail-on-error. Remote: limited parallelism to avoid
-    hammering freshly logged-in Hook clients during startup."""
+    Uses lightweight queries (no BytesExtra, no nested subquery) to keep the
+    QueryDB connection pool responsive.
+    QueryDB calls run concurrently and are capped per DB by query_db()."""
     if IS_PROTOCOL:
         _log("[API] Remote mode: get_last_messages_bulk via QueryDB not available")
         return {}
@@ -1311,34 +1272,20 @@ async def get_last_messages_bulk(wxids: list[str]) -> dict:
             if not existing or parsed["time"] > existing.get("time", 0):
                 results[talker] = parsed
 
-    if not IS_LOCAL_HOOK:
-        # ─── Remote: sequential QueryDB ─────────────────────────────
-        # QueryDB is not safe for concurrent calls on one Hook client.
-        for batch in batches:
-            sql = _build_sql(batch)
-            for db in _ALL_DBS:
-                try:
-                    data = await asyncio.wait_for(query_db(db, sql), timeout=18.0)
-                    _merge_rows(data)
-                except Exception:
-                    continue
-    else:
-        # ─── Local: sequential with bail-on-error ──────────────────
-        bail = False
-        for batch in batches:
-            if bail:
-                break
-            sql = _build_sql(batch)
-            for db in _ALL_DBS:
-                if bail:
-                    break
-                try:
-                    data = await query_db(db, sql)
-                    _merge_rows(data)
-                except Exception as e:
-                    _log(f"[BULK_MSG] Error querying {db}: {e} — bailing out")
-                    bail = True
-                    break
+    async def _query_batch_db(batch: list[str], db: str) -> dict:
+        try:
+            return await query_db(db, _build_sql(batch))
+        except Exception as e:
+            _log(f"[BULK_MSG] Error querying {db}: {e}")
+            return {}
+
+    tasks = [
+        _query_batch_db(batch, db)
+        for batch in batches
+        for db in _ALL_DBS
+    ]
+    for data in await asyncio.gather(*tasks):
+        _merge_rows(data)
 
     _log(f"[BULK_MSG] Got last messages for {len(results)} sessions")
     return results

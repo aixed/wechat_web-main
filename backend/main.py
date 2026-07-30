@@ -2017,8 +2017,8 @@ async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
         pre_messages.append((chat_id, normalized))
 
     # Callback payloads already contain either decoded content (RecvType=1)
-    # or PB data (RecvType=2). Do not query WeChat DB from the callback path:
-    # Hook QueryDB is not concurrency-safe and can crash the client.
+    # or PB data (RecvType=2). Avoid extra QueryDB work in the callback path so
+    # chat-history requests can use the DB connection pool.
 
     # ── Lazy profile hydration for new incoming senders ───────────
     profile_updates: dict[str, dict] = {}
