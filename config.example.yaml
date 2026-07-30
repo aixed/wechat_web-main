@@ -46,7 +46,7 @@ hook_api_concurrency: 10
 # Vite 会直接读取 frontend_host/frontend_port。
 # Windows 启动脚本发现端口被占用时，会向后尝试最多 10 个端口并回写 frontend_port。
 frontend_host: "0.0.0.0"
-frontend_port: 3001
+frontend_port: 80
 
 # --- 远程客户端 DLL 主动连接到本后端的 WS/WSS 长连接 ---
 # 无证书测试：client_wss_scheme="ws"，client_wss_port=5000，
