@@ -23,6 +23,7 @@ import shutil
 import re
 import html
 import subprocess
+import importlib
 from typing import Any
 
 import config
@@ -259,6 +260,7 @@ _RDV_MAX = int("7fffffff", 16)
 _RDV_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 _PROTOCOL_ACCOUNT_PROFILE_CACHE: dict[str, tuple[dict, float]] = {}
 _PROTOCOL_ACCOUNT_PROFILE_TTL_SEC = 15.0
+_runtime_init_task: asyncio.Task | None = None
 
 
 def _new_app_state() -> dict:
@@ -1696,11 +1698,78 @@ async def _run_initialization_after_agent():
         await asyncio.sleep(5)
 
 
+async def _cancel_runtime_init_task() -> None:
+    global _runtime_init_task
+    if not _runtime_init_task:
+        return
+    _runtime_init_task.cancel()
+    try:
+        await _runtime_init_task
+    except asyncio.CancelledError:
+        pass
+    _runtime_init_task = None
+
+
+async def _reload_runtime_config() -> None:
+    global config, wechat_api, protocol_api
+    old_wechat_client = getattr(wechat_api, "client", None)
+    old_protocol_client = getattr(protocol_api, "client", None)
+    config = importlib.reload(config)
+    wechat_api = importlib.reload(wechat_api)
+    protocol_api = importlib.reload(protocol_api)
+    ai_service.configure(
+        base_url=config.AI_BASE_URL,
+        api_key=config.AI_API_KEY,
+        model=config.AI_MODEL,
+    )
+    for client in (old_wechat_client, old_protocol_client):
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+
+
+async def _start_runtime_after_config() -> dict[str, Any]:
+    global _runtime_init_task
+    await _cancel_runtime_init_task()
+    reset_payload = _new_app_state()
+    app_state.update(reset_payload)
+    _account_runtimes.clear()
+    _self_wxid_to_agent_id.clear()
+    _agent_login_status_seen.clear()
+    _agent_self_profile_refreshed.clear()
+    _account_card_refresh_at.clear()
+    _account_card_refreshing.clear()
+    _initializing_agents.clear()
+    _agent_polling_paused_until.clear()
+
+    if config.IS_PROTOCOL:
+        ready = await _run_protocol_backend_initialization()
+        return {"runtime": "protocol", "ready": ready}
+
+    if config.AGENT_WS_ENABLED:
+        _log("=" * 60)
+        _log(f"WeChat Backend configured.  [mode={config.LOGIN_MODE}]")
+        _log(f"Agent WS enabled: {config.CLIENT_WSS_URL}  path={config.AGENT_WS_PATH}")
+        _log("=" * 60)
+        _runtime_init_task = asyncio.create_task(_run_initialization_after_agent())
+        return {"runtime": "agent_ws", "ready": True}
+
+    _runtime_init_task = asyncio.create_task(_run_backend_initialization())
+    return {"runtime": "hook", "ready": True}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize on startup, cleanup on shutdown."""
     init_task = None
-    if config.IS_PROTOCOL:
+    if not config.config_file_exists():
+        _log("=" * 60)
+        _log("config.yaml not found. Web setup is waiting for initial configuration.")
+        _log("Open the frontend, enter the access key, then complete the setup form.")
+        _log("=" * 60)
+    elif config.IS_PROTOCOL:
         await _run_protocol_backend_initialization()
     elif config.AGENT_WS_ENABLED:
         _log("=" * 60)
@@ -1714,6 +1783,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await _cancel_runtime_init_task()
     if init_task:
         init_task.cancel()
         try:
@@ -1765,7 +1835,13 @@ def _request_agent_id(request: Request) -> str:
 
 def _is_public_http_path(path: str) -> bool:
     return (
-        path in {"/api/auth/login", "/api/callback", config.CALLBACK_PATH}
+        path in {
+            "/api/auth/login",
+            "/api/setup/status",
+            "/api/setup/initial-config",
+            "/api/callback",
+            config.CALLBACK_PATH,
+        }
         or path == config.AGENT_WS_PATH
         or path.startswith("/uploads/")
     )
@@ -1776,9 +1852,13 @@ async def require_access_key(request: Request, call_next):
     if request.method.upper() == "OPTIONS":
         return await call_next(request)
     path = request.url.path
-    if path.startswith("/api/") and not _is_public_http_path(path) and not _request_access_ok(request):
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if path.startswith("/api/") and not _is_public_http_path(path):
+        if not _request_access_ok(request):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not config.config_file_exists():
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": "setup_required"}, status_code=428)
     agent_id = _request_agent_id(request)
     if agent_id and config.IS_PROTOCOL:
         _activate_runtime(agent_id)
@@ -1794,6 +1874,16 @@ async def require_access_key(request: Request, call_next):
 
 class AuthLoginRequest(BaseModel):
     key: str
+
+
+class InitialSetupRequest(BaseModel):
+    key: str = ""
+    web_access_key: str = "admin"
+    wechat_mode: int = Field(default=1, ge=1, le=3)
+    host: str = ""
+    api_port: int = Field(default=30001, ge=1, le=65535)
+    mgr_port: int = Field(default=29999, ge=1, le=65535)
+    public_host: str = ""
 
 
 class ActivateAccountRequest(BaseModel):
@@ -1912,7 +2002,53 @@ async def auth_login(req: AuthLoginRequest):
         return {"ok": False, "error": "access key is not configured"}
     if str(req.key or "") != config.WEB_ACCESS_KEY:
         return {"ok": False}
-    return {"ok": True}
+    setup_required = not config.config_file_exists()
+    return {"ok": True, "setup_required": setup_required, "config_exists": not setup_required}
+
+
+@app.get("/api/setup/status")
+async def setup_status():
+    defaults = config.initial_setup_defaults()
+    return {
+        "ok": True,
+        "config_exists": defaults["config_exists"],
+        "setup_required": not defaults["config_exists"],
+        "default_web_access_key": defaults["default_web_access_key"],
+        "defaults": defaults["defaults"],
+        "modes": defaults["modes"],
+    }
+
+
+@app.post("/api/setup/initial-config")
+async def setup_initial_config(req: InitialSetupRequest):
+    if str(req.key or "") != config.WEB_ACCESS_KEY:
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if config.config_file_exists():
+        return {"ok": False, "error": "already_configured"}
+    try:
+        saved = config.save_initial_setup_config(
+            wechat_mode=req.wechat_mode,
+            web_access_key=req.web_access_key,
+            host=req.host,
+            api_port=req.api_port,
+            mgr_port=req.mgr_port,
+            public_host=req.public_host,
+        )
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except FileExistsError:
+        return {"ok": False, "error": "already_configured"}
+
+    await _reload_runtime_config()
+    runtime = await _start_runtime_after_config()
+    return {
+        "ok": True,
+        "setup_required": False,
+        "config_exists": True,
+        "config": saved,
+        "runtime": runtime,
+        "web_access_key": saved["web_access_key"],
+    }
 
 
 @app.get("/api/accounts")

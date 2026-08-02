@@ -9,12 +9,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-    throw "Config file not found: $ConfigPath"
-}
-
 $utf8 = New-Object System.Text.UTF8Encoding($false)
-$configText = [System.IO.File]::ReadAllText($ConfigPath, [System.Text.Encoding]::UTF8)
+$configExists = Test-Path -LiteralPath $ConfigPath -PathType Leaf
+$configText = if ($configExists) {
+    [System.IO.File]::ReadAllText($ConfigPath, [System.Text.Encoding]::UTF8)
+} else {
+    ""
+}
 $portValuePattern = New-Object System.Text.RegularExpressions.Regex(
     '(?m)^\s*frontend_port\s*:\s*["'']?([0-9]+)["'']?\s*(?:#.*)?$'
 )
@@ -70,16 +71,18 @@ if ($selectedPort -eq 0) {
     throw "No available frontend port was found from $startPort to $lastPort."
 }
 
-$portLinePattern = New-Object System.Text.RegularExpressions.Regex(
-    '(?m)^\s*frontend_port\s*:.*$'
-)
-$portLine = "frontend_port: $selectedPort"
-if ($portLinePattern.IsMatch($configText)) {
-    $updatedConfig = $portLinePattern.Replace($configText, $portLine, 1)
-} else {
-    $separator = if ($configText.EndsWith("`n")) { "" } else { [Environment]::NewLine }
-    $updatedConfig = $configText + $separator + $portLine + [Environment]::NewLine
-}
+if ($configExists) {
+    $portLinePattern = New-Object System.Text.RegularExpressions.Regex(
+        '(?m)^\s*frontend_port\s*:.*$'
+    )
+    $portLine = "frontend_port: $selectedPort"
+    if ($portLinePattern.IsMatch($configText)) {
+        $updatedConfig = $portLinePattern.Replace($configText, $portLine, 1)
+    } else {
+        $separator = if ($configText.EndsWith("`n")) { "" } else { [Environment]::NewLine }
+        $updatedConfig = $configText + $separator + $portLine + [Environment]::NewLine
+    }
 
-[System.IO.File]::WriteAllText($ConfigPath, $updatedConfig, $utf8)
+    [System.IO.File]::WriteAllText($ConfigPath, $updatedConfig, $utf8)
+}
 Write-Output $selectedPort
