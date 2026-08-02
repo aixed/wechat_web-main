@@ -14,6 +14,7 @@ import {
   getAccessKey,
   getAccounts,
   getContacts,
+  getSetupStatus,
   getLocalContacts,
   getContactProfiles,
   getProtocolLoginQRCode,
@@ -34,6 +35,7 @@ import {
   pushProtocolLoginUrl,
   refreshContacts,
   refreshSessions,
+  saveInitialSetup,
   saveProtocolRdvMapping,
   setActiveAgentId,
   setAccessKey,
@@ -43,7 +45,7 @@ import {
   unmuteSession,
   unpinChat,
 } from "./api";
-import type { BroadcastContentOrder, ProtocolProxyConfig, ProtocolRdvMappingEntry } from "./api";
+import type { BroadcastContentOrder, InitialSetupMode, ProtocolProxyConfig, ProtocolRdvMappingEntry } from "./api";
 import type { ContactProfile, Session, ChatMessage, SmartReplyTarget, WSMessage, WeChatAccount } from "./types";
 import { replaceWechatEmojis } from "./utils/wechatEmoji";
 
@@ -67,6 +69,14 @@ type ProtocolLoginStorage = Partial<ProtocolLoginForm> & {
   settingsSaved?: boolean;
 };
 type ProtocolProxyDraft = Pick<ProtocolLoginForm, "rdv" | "proxyEnabled" | "proxyType" | "proxyIP" | "proxyPort" | "proxyUsr" | "proxyPwd">;
+type InitialSetupForm = {
+  webAccessKey: string;
+  wechatMode: InitialSetupMode;
+  host: string;
+  apiPort: string;
+  mgrPort: string;
+  publicHost: string;
+};
 type ProtocolCachedQr = {
   qrSrc: string;
   uuid: string;
@@ -1507,6 +1517,11 @@ export default function App() {
   const [localProtocolAccounts, setLocalProtocolAccounts] = useState<WeChatAccount[]>([]);
   const [hiddenProtocolSessionIds, setHiddenProtocolSessionIds] = useState<Set<string>>(new Set());
   const [authError, setAuthError] = useState("");
+  const [setupChecking, setSetupChecking] = useState(true);
+  const [setupRequired, setSetupRequired] = useState(false);
+  const [setupAccessKey, setSetupAccessKey] = useState("");
+  const [setupError, setSetupError] = useState("");
+  const [setupDefaults, setSetupDefaults] = useState<any>(null);
   const [selfWxid, setSelfWxid] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [rawContacts, setRawContacts] = useState<any>(null);
@@ -1622,6 +1637,33 @@ export default function App() {
     groupNamesFetched.current.clear();
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    getSetupStatus()
+      .then((data) => {
+        if (cancelled) return;
+        if (data?.setup_required) {
+          setSetupRequired(true);
+          setSetupDefaults(data?.defaults || null);
+          setAuthenticated(false);
+          setSelectedAccountId("");
+          setAccounts([]);
+          resetChatState();
+          return;
+        }
+        setSetupRequired(false);
+      })
+      .catch((err) => {
+        console.warn("[SETUP] status check failed:", err);
+      })
+      .finally(() => {
+        if (!cancelled) setSetupChecking(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [resetChatState]);
+
   const loadAccounts = useCallback(async () => {
     setAccountsLoading(true);
     try {
@@ -1634,6 +1676,14 @@ export default function App() {
         setAccounts([]);
         setAccountPortalSource("hook");
         setAccountManagerOpen(false);
+        resetChatState();
+        return [];
+      }
+      if (data?.error === "setup_required") {
+        setSetupRequired(true);
+        setAuthenticated(false);
+        setSelectedAccountId("");
+        setAccounts([]);
         resetChatState();
         return [];
       }
@@ -1678,6 +1728,14 @@ export default function App() {
         setAuthError("密钥不正确");
         return false;
       }
+      if (data?.setup_required) {
+        setSetupRequired(true);
+        setSetupAccessKey(key);
+        setSetupError("");
+        setSetupDefaults((await getSetupStatus())?.defaults || null);
+        setAuthenticated(false);
+        return true;
+      }
       setAuthenticated(true);
       await loadAccounts();
       return true;
@@ -1687,6 +1745,54 @@ export default function App() {
       return false;
     }
   }, [loadAccounts]);
+
+  const handleInitialSetup = useCallback(async (form: InitialSetupForm) => {
+    setSetupError("");
+    const apiPort = Number(form.apiPort);
+    const mgrPort = Number(form.mgrPort);
+    if (!Number.isInteger(apiPort) || apiPort < 1 || apiPort > 65535) {
+      setSetupError("API 端口必须是 1-65535 之间的整数");
+      return false;
+    }
+    if (!Number.isInteger(mgrPort) || mgrPort < 1 || mgrPort > 65535) {
+      setSetupError("管理端口必须是 1-65535 之间的整数");
+      return false;
+    }
+    try {
+      const data = await saveInitialSetup({
+        key: setupAccessKey,
+        web_access_key: form.webAccessKey.trim() || "admin",
+        wechat_mode: form.wechatMode,
+        host: form.wechatMode === 1 ? "127.0.0.1" : form.host.trim(),
+        api_port: apiPort,
+        mgr_port: mgrPort,
+        public_host: form.publicHost.trim(),
+      });
+      const unavailableMessage = backendUnavailableText(data);
+      if (unavailableMessage) {
+        setSetupError(unavailableMessage);
+        return false;
+      }
+      if (!data?.ok) {
+        setSetupError(String(data?.error || "初始化配置失败"));
+        return false;
+      }
+      const nextKey = String(data?.web_access_key || data?.config?.web_access_key || form.webAccessKey || "admin").trim();
+      setAccessKey(nextKey || "admin");
+      setSetupAccessKey("");
+      setSetupRequired(false);
+      setSetupError("");
+      setAuthenticated(true);
+      setSelectedAccountId("");
+      resetChatState();
+      await loadAccounts();
+      return true;
+    } catch (err) {
+      console.error("[SETUP] initial config failed:", err);
+      setSetupError("初始化配置失败");
+      return false;
+    }
+  }, [loadAccounts, resetChatState, setupAccessKey]);
 
   const handleSelectAccount = useCallback(async (
     account: WeChatAccount,
@@ -1802,8 +1908,22 @@ export default function App() {
     setHiddenProtocolSessionIds((prev) => new Set(prev).add(sessionId));
     setLocalProtocolAccounts((prev) => prev.filter((item) => protocolSessionId(item) !== sessionId));
     setProtocolLoginAccount((prev) => (protocolSessionId(prev) === sessionId ? null : prev));
-    await terminateProtocolSession(sessionId).catch((err) => console.error("[PROTO_LOGIN] terminate failed:", err));
-    await loadAccounts();
+    try {
+      const data = await terminateProtocolSession(sessionId);
+      const statusCode = Number(data?.status_code || 0);
+      if (data?.ok === false || statusCode >= 400) {
+        throw new Error(String(data?.error || data?.message || data?.msg || "结束微信实例失败"));
+      }
+    } catch (err) {
+      setHiddenProtocolSessionIds((prev) => {
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
+      throw err;
+    } finally {
+      await loadAccounts();
+    }
   }, [loadAccounts]);
 
   useEffect(() => {
@@ -3138,6 +3258,24 @@ export default function App() {
   const activeMsgs = activeChat ? (chatMessages[activeChat] || []) : [];
   const managedAccounts = mergeProtocolAccounts(accounts, localProtocolAccounts, hiddenProtocolSessionIds);
 
+  if (setupChecking) {
+    return <AccessLoading message="正在检查配置" />;
+  }
+
+  if (setupRequired) {
+    if (!setupAccessKey) {
+      return <AccessGate onLogin={handleLogin} error={authError} />;
+    }
+    return (
+      <InitialSetupGate
+        accessKey={setupAccessKey}
+        defaults={setupDefaults}
+        error={setupError}
+        onSubmit={handleInitialSetup}
+      />
+    );
+  }
+
   if (!authenticated) {
     return <AccessGate onLogin={handleLogin} error={authError} />;
   }
@@ -3514,6 +3652,223 @@ export default function App() {
   );
 }
 
+const INITIAL_SETUP_MODES: Array<{ value: InitialSetupMode; label: string; subtitle: string }> = [
+  { value: 1, label: "本地 Hook", subtitle: "本机微信" },
+  { value: 2, label: "远程 Hook", subtitle: "DLL 回连" },
+  { value: 3, label: "远程协议", subtitle: "协议服务" },
+];
+
+function initialSetupModeKey(mode: InitialSetupMode): "local_hook" | "remote_hook" | "remote_protocol" {
+  if (mode === 2) return "remote_hook";
+  if (mode === 3) return "remote_protocol";
+  return "local_hook";
+}
+
+function setupDefaultsFor(defaults: any, mode: InitialSetupMode): any {
+  const key = initialSetupModeKey(mode);
+  return defaults?.[key] && typeof defaults[key] === "object" ? defaults[key] : {};
+}
+
+function setupFormFromDefaults(defaults: any, mode: InitialSetupMode): InitialSetupForm {
+  const modeDefaults = setupDefaultsFor(defaults, mode);
+  const browserHost = window.location.hostname || "127.0.0.1";
+  const host = mode === 1 ? "127.0.0.1" : String(modeDefaults.host || "127.0.0.1");
+  return {
+    webAccessKey: "admin",
+    wechatMode: mode,
+    host,
+    apiPort: String(modeDefaults.api_port || 30001),
+    mgrPort: String(modeDefaults.mgr_port || 29999),
+    publicHost: String(modeDefaults.public_host || browserHost || "127.0.0.1"),
+  };
+}
+
+function AccessLoading({ message }: { message: string }) {
+  return (
+    <div className="h-dvh w-screen bg-[#111111] text-[#e8e8e8] flex items-center justify-center">
+      <div className="text-[15px] text-[#9a9a9a]">{message}</div>
+    </div>
+  );
+}
+
+function SetupInput({
+  label,
+  value,
+  onChange,
+  readOnly = false,
+  type = "text",
+  placeholder = "",
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  readOnly?: boolean;
+  type?: string;
+  placeholder?: string;
+}) {
+  return (
+    <label className="block">
+      <span className="block mb-[7px] text-[13px] text-[#b8b8b8]">{label}</span>
+      <input
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        readOnly={readOnly}
+        type={type}
+        placeholder={placeholder}
+        className={`w-full h-[42px] rounded-[4px] border px-[12px] outline-none focus:border-[#07c160] ${
+          readOnly
+            ? "bg-[#181818] border-[#2d2d2d] text-[#8d8d8d]"
+            : "bg-[#222] border-[#3a3a3a] text-[#e8e8e8]"
+        }`}
+      />
+    </label>
+  );
+}
+
+function InitialSetupGate({
+  accessKey,
+  defaults,
+  error,
+  onSubmit,
+}: {
+  accessKey: string;
+  defaults: any;
+  error: string;
+  onSubmit: (form: InitialSetupForm) => Promise<boolean>;
+}) {
+  const [form, setForm] = useState<InitialSetupForm>(() => setupFormFromDefaults(defaults, 1));
+  const [submitting, setSubmitting] = useState(false);
+  const accessKeyVerified = Boolean(accessKey);
+  const modeDefaults = setupDefaultsFor(defaults, form.wechatMode);
+  const isLocalHook = form.wechatMode === 1;
+  const isRemoteHook = form.wechatMode === 2;
+  const hostLabel = isLocalHook ? "Hook IP" : form.wechatMode === 2 ? "远程 Hook API IP/域名" : "协议服务 IP/域名";
+
+  useEffect(() => {
+    setForm((current) => ({
+      ...setupFormFromDefaults(defaults, current.wechatMode),
+      webAccessKey: current.webAccessKey || "admin",
+    }));
+  }, [defaults]);
+
+  const chooseMode = (mode: InitialSetupMode) => {
+    setForm((current) => ({
+      ...setupFormFromDefaults(defaults, mode),
+      webAccessKey: current.webAccessKey || "admin",
+    }));
+  };
+
+  const updateField = <K extends keyof InitialSetupForm>(field: K, value: InitialSetupForm[K]) => {
+    setForm((current) => ({ ...current, [field]: value }));
+  };
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await onSubmit(form);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="h-dvh w-screen bg-[#111111] text-[#e8e8e8] flex items-center justify-center px-[20px]">
+      <form onSubmit={submit} className="w-[520px] max-w-full">
+        <div className="flex items-start justify-between gap-[16px] mb-[22px]">
+          <div>
+            <div className="text-[24px] font-medium">初始配置</div>
+            <div className="mt-[8px] text-[13px] text-[#8f8f8f]">生成 config.yaml 后进入控制台</div>
+          </div>
+          {accessKeyVerified && (
+            <div className="shrink-0 h-[28px] px-[10px] rounded-[4px] bg-[#123d27] text-[#49d17d] text-[12px] flex items-center">
+              key 已验证
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-[16px]">
+          <SetupInput
+            label="web_access_key"
+            value={form.webAccessKey}
+            onChange={(value) => updateField("webAccessKey", value)}
+            placeholder="admin"
+          />
+
+          <div>
+            <div className="mb-[8px] text-[13px] text-[#b8b8b8]">微信使用模式</div>
+            <div className="grid grid-cols-3 gap-[8px]">
+              {INITIAL_SETUP_MODES.map((mode) => {
+                const selected = form.wechatMode === mode.value;
+                return (
+                  <button
+                    key={mode.value}
+                    type="button"
+                    onClick={() => chooseMode(mode.value)}
+                    className={`h-[58px] rounded-[4px] border px-[10px] text-left active:opacity-85 ${
+                      selected
+                        ? "bg-[#123d27] border-[#07c160] text-white"
+                        : "bg-[#1d1d1d] border-[#333] text-[#cfcfcf]"
+                    }`}
+                  >
+                    <div className="text-[14px] leading-[20px]">{mode.label}</div>
+                    <div className="text-[12px] leading-[18px] text-[#888]">{mode.subtitle}</div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {isRemoteHook && (
+            <SetupInput
+              label="DLL 回连 IP/域名"
+              value={form.publicHost}
+              onChange={(value) => updateField("publicHost", value)}
+              placeholder={String(modeDefaults.public_host || "127.0.0.1")}
+            />
+          )}
+
+          <SetupInput
+            label={hostLabel}
+            value={isLocalHook ? "127.0.0.1" : form.host}
+            onChange={(value) => updateField("host", value)}
+            readOnly={isLocalHook}
+            placeholder="127.0.0.1"
+          />
+
+          <div className="grid grid-cols-2 gap-[12px]">
+            <SetupInput
+              label="API 端口"
+              value={form.apiPort}
+              onChange={(value) => updateField("apiPort", value)}
+              type="number"
+              placeholder="30001"
+            />
+            <SetupInput
+              label="管理端口"
+              value={form.mgrPort}
+              onChange={(value) => updateField("mgrPort", value)}
+              type="number"
+              placeholder="29999"
+            />
+          </div>
+        </div>
+
+        {error && <div className="mt-[12px] text-[13px] text-[#f56c6c]">{error}</div>}
+
+        <button
+          type="submit"
+          disabled={submitting}
+          className="mt-[18px] w-full h-[42px] rounded-[4px] bg-[#07c160] text-white disabled:bg-[#315541] active:opacity-85"
+        >
+          {submitting ? "正在写入" : "确定进入"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 function AccessGate({
   onLogin,
   error,
@@ -3539,7 +3894,7 @@ function AccessGate({
       <form onSubmit={submit} className="w-[360px] max-w-[calc(100vw-40px)]">
         <div className="text-[24px] font-medium mb-[22px]">访问密钥</div>
         <div className="mb-[14px] text-[13px] leading-[20px] text-[#9a9a9a]">
-          首次启动默认 key 为 admin。建议在 config.yaml 中修改 web_access_key。
+          默认 key 为 admin。首次配置时可修改 web_access_key。
         </div>
         <input
           value={key}
@@ -3799,13 +4154,14 @@ function AccountPortal({
   onSelectAccount: (account: WeChatAccount) => void;
   onLogout: () => void;
   onSessionStarted: (account: WeChatAccount, previousSessionId?: string) => void;
-  onTerminateProtocolAccount: (account: WeChatAccount) => void;
+  onTerminateProtocolAccount: (account: WeChatAccount) => Promise<void>;
 }) {
   const dark = theme === "dark";
   const [tool, setTool] = useState<AccountPortalTool>(() => defaultAccountPortalTool(source));
   const [loginAccount, setLoginAccount] = useState<WeChatAccount | null>(account || null);
   const [loginPanelNonce, setLoginPanelNonce] = useState(0);
   const [contextMenu, setContextMenu] = useState<{ account: WeChatAccount; x: number; y: number } | null>(null);
+  const [terminatingSessionIds, setTerminatingSessionIds] = useState<Set<string>>(new Set());
   useEffect(() => {
     setTool(defaultAccountPortalTool(source));
   }, [source]);
@@ -3817,11 +4173,16 @@ function AccountPortal({
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
     window.addEventListener("click", close);
     window.addEventListener("blur", close);
+    window.addEventListener("keydown", closeOnEscape);
     return () => {
       window.removeEventListener("click", close);
       window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", closeOnEscape);
     };
   }, [contextMenu]);
   const portalAccounts = accounts;
@@ -3843,14 +4204,39 @@ function AccountPortal({
     setLoginAccount(account);
     onSessionStarted(account, previousSessionId);
   };
+  const openProtocolContextMenu = (account: WeChatAccount, event: MouseEvent<HTMLButtonElement>) => {
+    if (!hasProtocolSession(account)) return;
+    event.preventDefault();
+    const menuWidth = 210;
+    const menuHeight = 92;
+    setContextMenu({
+      account,
+      x: Math.min(event.clientX, Math.max(8, window.innerWidth - menuWidth - 8)),
+      y: Math.min(event.clientY, Math.max(8, window.innerHeight - menuHeight - 8)),
+    });
+  };
   const handleTerminateAccount = async (account: WeChatAccount) => {
     const sessionId = protocolSessionId(account);
     if (!sessionId) return;
     setContextMenu(null);
+    const label = account.rdv ? `RDV ${account.rdv}` : `Session ${sessionId.slice(0, 8)}`;
+    if (!window.confirm(`确定结束微信实例 ${label} 吗？`)) return;
+    setTerminatingSessionIds((prev) => new Set(prev).add(sessionId));
     if (loginAccount && protocolSessionId(loginAccount) === sessionId) {
       setLoginAccount(null);
     }
-    await onTerminateProtocolAccount(account);
+    try {
+      await onTerminateProtocolAccount(account);
+    } catch (err) {
+      console.error("[PROTO_LOGIN] terminate failed:", err);
+      window.alert(err instanceof Error ? err.message : "结束微信实例失败");
+    } finally {
+      setTerminatingSessionIds((prev) => {
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
+    }
   };
   const renderToolButton = (tab: { id: AccountPortalTool; label: string }) => {
     const selected = tool === tab.id;
@@ -3902,18 +4288,25 @@ function AccountPortal({
       )}
     </div>
   );
+  const contextSessionId = protocolSessionId(contextMenu?.account);
+  const contextTerminating = Boolean(contextSessionId && terminatingSessionIds.has(contextSessionId));
   const contextMenuNode = contextMenu && (
     <div
-      className={`fixed z-[200] min-w-[138px] rounded-[6px] border py-[6px] shadow-xl ${dark ? "bg-[#202020] border-[#3a3a3a] text-[#e8e8e8]" : "bg-white border-[#d8d8d8] text-[#222]"}`}
+      className={`fixed z-[200] w-[210px] rounded-[6px] border py-[6px] shadow-xl ${dark ? "bg-[#202020] border-[#3a3a3a] text-[#e8e8e8]" : "bg-white border-[#d8d8d8] text-[#222]"}`}
       style={{ left: contextMenu.x, top: contextMenu.y }}
       onClick={(event) => event.stopPropagation()}
     >
+      <div className={`px-[12px] pb-[6px] text-[11px] leading-[16px] border-b ${dark ? "border-[#333] text-[#8f8f8f]" : "border-[#eee] text-[#777]"}`}>
+        <div className="truncate">{contextMenu.account.rdv ? `RDV ${contextMenu.account.rdv}` : "微信实例"}</div>
+        <div className="font-mono truncate" title={contextSessionId}>Session {contextSessionId.slice(0, 12)}</div>
+      </div>
       <button
         type="button"
+        disabled={contextTerminating}
         onClick={() => handleTerminateAccount(contextMenu.account)}
-        className={`w-full h-[34px] px-[12px] text-left text-[13px] ${dark ? "hover:bg-[#2c2c2c] text-[#ff9a9a]" : "hover:bg-[#f6f6f6] text-[#c53030]"}`}
+        className={`w-full h-[34px] px-[12px] text-left text-[13px] disabled:opacity-60 disabled:cursor-not-allowed ${dark ? "hover:bg-[#2c2c2c] text-[#ff9a9a]" : "hover:bg-[#f6f6f6] text-[#c53030]"}`}
       >
-        结束实例
+        {contextTerminating ? "正在结束..." : "结束微信实例"}
       </button>
     </div>
   );
@@ -3961,9 +4354,7 @@ function AccountPortal({
               handleAccountForLogin(account);
             }}
             onContextMenu={(account, event) => {
-              if (!hasProtocolSession(account)) return;
-              event.preventDefault();
-              setContextMenu({ account, x: event.clientX, y: event.clientY });
+              openProtocolContextMenu(account, event);
             }}
           />
         )}
@@ -4030,8 +4421,7 @@ function AccountPortal({
                 onClick={handleClick}
                 onContextMenu={(event) => {
                   if (account.source !== "protocol" || !hasProtocolSession(account)) return;
-                  event.preventDefault();
-                  setContextMenu({ account, x: event.clientX, y: event.clientY });
+                  openProtocolContextMenu(account, event);
                 }}
                 className={`w-full min-h-[100px] rounded-[6px] border p-[14px] flex items-center gap-[14px] text-left active:opacity-90 ${
                   dark ? "bg-[#1b1b1b] hover:bg-[#242424] border-[#2b2b2b]" : "bg-white hover:bg-[#f7f7f7] border-[#e3e3e3]"
@@ -4100,21 +4490,7 @@ function AccountPortal({
           </div>
         </div>
       </div>
-      {contextMenu && (
-        <div
-          className={`fixed z-[200] min-w-[138px] rounded-[6px] border py-[6px] shadow-xl ${dark ? "bg-[#202020] border-[#3a3a3a] text-[#e8e8e8]" : "bg-white border-[#d8d8d8] text-[#222]"}`}
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-          onClick={(event) => event.stopPropagation()}
-        >
-          <button
-            type="button"
-            onClick={() => handleTerminateAccount(contextMenu.account)}
-            className={`w-full h-[34px] px-[12px] text-left text-[13px] ${dark ? "hover:bg-[#2c2c2c] text-[#ff9a9a]" : "hover:bg-[#f6f6f6] text-[#c53030]"}`}
-          >
-            结束实例
-          </button>
-        </div>
-      )}
+      {contextMenuNode}
     </div>
   );
 }

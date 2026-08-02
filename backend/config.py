@@ -23,6 +23,8 @@ for _stream in (sys.stdout, sys.stderr):
 # ─── Load config.yaml ─────────────────────────────────────────────
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.yaml")
+_CONFIG_EXAMPLE_PATH = os.path.join(os.path.dirname(__file__), "..", "config.example.yaml")
+CONFIG_EXISTS = os.path.exists(_CONFIG_PATH)
 
 def _to_bool(v, default: bool = False) -> bool:
     if v is None:
@@ -108,7 +110,7 @@ MGR_BASE_URL = f"http://{HOOK_HOST}:{MGR_PORT}"
 # Backend server. Keep this on 127.0.0.1 when the frontend runs on the same
 # machine and proxies /api + /agent; set to 0.0.0.0 only when exposing backend
 # ports directly is intentional.
-SERVER_HOST = str(_cfg.get("server_host", "127.0.0.1") or "127.0.0.1")
+SERVER_HOST = str(_cfg.get("server_host", "0.0.0.0") or "0.0.0.0")
 SERVER_PORT = int(_cfg.get("server_port", 5000))
 DEFAULT_WEB_ACCESS_KEY = "admin"
 
@@ -350,6 +352,193 @@ RECV_TYPE = int(_cfg.get("recvtype", _cfg.get("recv_type", 2)))
 if RECV_TYPE not in (1, 2):
     print(f"[CONFIG] ⚠ invalid recv_type={RECV_TYPE!r}, using 2", flush=True)
     RECV_TYPE = 2
+
+
+def config_file_exists() -> bool:
+    return os.path.exists(_CONFIG_PATH)
+
+
+def _mode_defaults(mode_number: int) -> dict[str, Any]:
+    mode_name = _MODE_BY_NUMBER.get(mode_number, "local_hook")
+    host_key = f"{mode_name}_host"
+    api_key = f"{mode_name}_api_port"
+    mgr_key = f"{mode_name}_mgr_port"
+    host = "127.0.0.1"
+    return {
+        "wechat_mode": mode_number,
+        "mode": mode_name,
+        "host_key": host_key,
+        "api_port_key": api_key,
+        "mgr_port_key": mgr_key,
+        "host": host,
+        "api_port": int(_cfg.get(api_key, 30001)),
+        "mgr_port": int(_cfg.get(mgr_key, 29999)),
+    }
+
+
+def initial_setup_defaults() -> dict[str, Any]:
+    return {
+        "config_exists": config_file_exists(),
+        "default_web_access_key": DEFAULT_WEB_ACCESS_KEY,
+        "web_access_key": WEB_ACCESS_KEY if config_file_exists() else DEFAULT_WEB_ACCESS_KEY,
+        "server_port": SERVER_PORT,
+        "frontend_port": 80,
+        "modes": [
+            {"value": 1, "label": "本地 Hook", "mode": "local_hook"},
+            {"value": 2, "label": "远程 Hook", "mode": "remote_hook"},
+            {"value": 3, "label": "远程协议", "mode": "remote_protocol"},
+        ],
+        "defaults": {
+            "local_hook": _mode_defaults(1),
+            "remote_hook": {
+                **_mode_defaults(2),
+                "public_host": str(_cfg.get("client_wss_host", _cfg.get("ip", "127.0.0.1")) or "127.0.0.1"),
+            },
+            "remote_protocol": _mode_defaults(3),
+        },
+    }
+
+
+def _clean_host(value: Any, *, default: str = "127.0.0.1") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    if any(ch.isspace() for ch in text):
+        raise ValueError("IP/域名不能包含空白字符")
+    return text
+
+
+def _clean_port(value: Any, *, default: int, field: str) -> int:
+    raw = str(value if value not in (None, "") else default).strip()
+    try:
+        port = int(raw)
+    except Exception as exc:
+        raise ValueError(f"{field} 必须是 1-65535 之间的整数") from exc
+    if port < 1 or port > 65535:
+        raise ValueError(f"{field} 必须是 1-65535 之间的整数")
+    return port
+
+
+def _load_initial_config_template() -> Any:
+    from ruamel.yaml import YAML
+
+    parser = YAML()
+    parser.preserve_quotes = True
+    if os.path.exists(_CONFIG_EXAMPLE_PATH):
+        with open(_CONFIG_EXAMPLE_PATH, "r", encoding="utf-8") as stream:
+            return parser, parser.load(stream) or {}
+    return parser, {
+        "ip": "127.0.0.1",
+        "wechat_mode": 1,
+        "local_hook_host": "127.0.0.1",
+        "local_hook_api_port": 30001,
+        "local_hook_mgr_port": 29999,
+        "remote_hook_host": "127.0.0.1",
+        "remote_hook_api_port": 30001,
+        "remote_hook_mgr_port": 29999,
+        "remote_protocol_host": "127.0.0.1",
+        "remote_protocol_api_port": 30001,
+        "remote_protocol_mgr_port": 29999,
+        "server_host": "0.0.0.0",
+        "server_port": 5000,
+        "web_access_key": DEFAULT_WEB_ACCESS_KEY,
+        "hook_api_concurrency": 10,
+        "frontend_host": "0.0.0.0",
+        "frontend_port": 80,
+        "agent_ws_enabled": True,
+        "agent_ws_path": "/agent",
+        "client_wss_scheme": "ws",
+        "client_wss_host": "127.0.0.1",
+        "client_wss_port": 5000,
+        "agent_ws_request_timeout": 30,
+        "recvtype": 1,
+        "restart_on_button_login_fail": True,
+        "max_restarts_after_button_login_fail": 1,
+        "ai_base_url": "",
+        "ai_api_key": "",
+        "ai_model": "",
+        "ai_active_profile_id": "",
+        "ai_profiles": [],
+        "ai_timeout_seconds": 60,
+        "ai_max_concurrency": 3,
+    }
+
+
+def save_initial_setup_config(
+    *,
+    wechat_mode: Any,
+    web_access_key: Any = DEFAULT_WEB_ACCESS_KEY,
+    host: Any = "",
+    api_port: Any = 30001,
+    mgr_port: Any = 29999,
+    public_host: Any = "",
+) -> dict[str, Any]:
+    if config_file_exists():
+        raise FileExistsError("config.yaml 已存在")
+
+    try:
+        mode_number = int(str(wechat_mode).strip())
+    except Exception as exc:
+        raise ValueError("微信使用模式必须选择 1、2 或 3") from exc
+    if mode_number not in _MODE_BY_NUMBER:
+        raise ValueError("微信使用模式必须选择 1、2 或 3")
+
+    access_key = str(web_access_key or "").strip() or DEFAULT_WEB_ACCESS_KEY
+    mode_name = _MODE_BY_NUMBER[mode_number]
+    selected_host = "127.0.0.1" if mode_number == 1 else _clean_host(host)
+    selected_api_port = _clean_port(api_port, default=30001, field="API 端口")
+    selected_mgr_port = _clean_port(mgr_port, default=29999, field="管理端口")
+    selected_public_host = _clean_host(public_host or selected_host)
+
+    parser, document = _load_initial_config_template()
+    document["wechat_mode"] = mode_number
+    document["web_access_key"] = access_key
+    document["server_host"] = str(document.get("server_host") or "0.0.0.0")
+    document["server_port"] = _clean_port(document.get("server_port"), default=5000, field="server_port")
+    document["frontend_host"] = str(document.get("frontend_host") or "0.0.0.0")
+    document["frontend_port"] = _clean_port(document.get("frontend_port"), default=80, field="frontend_port")
+    document["hook_api_concurrency"] = 1 if mode_number == 1 else 10
+    document["recvtype"] = _clean_port(document.get("recvtype"), default=1, field="recvtype")
+
+    document[f"{mode_name}_host"] = selected_host
+    document[f"{mode_name}_api_port"] = selected_api_port
+    document[f"{mode_name}_mgr_port"] = selected_mgr_port
+
+    if mode_number == 1:
+        document["ip"] = "127.0.0.1"
+        document["agent_ws_enabled"] = False
+        document["client_wss_host"] = "127.0.0.1"
+    elif mode_number == 2:
+        document["ip"] = selected_public_host
+        document["agent_ws_enabled"] = True
+        document["client_wss_scheme"] = str(document.get("client_wss_scheme") or "ws")
+        document["client_wss_host"] = selected_public_host
+        document["client_wss_port"] = _clean_port(document.get("client_wss_port"), default=5000, field="client_wss_port")
+    else:
+        document["ip"] = selected_host
+        document["agent_ws_enabled"] = False
+        document["client_wss_host"] = selected_host
+
+    temp_path = _CONFIG_PATH + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as stream:
+            parser.dump(document, stream)
+        os.replace(temp_path, _CONFIG_PATH)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    return {
+        "wechat_mode": mode_number,
+        "mode": mode_name,
+        "web_access_key": access_key,
+        "host": selected_host,
+        "api_port": selected_api_port,
+        "mgr_port": selected_mgr_port,
+        "public_host": selected_public_host,
+        "config_path": os.path.abspath(_CONFIG_PATH),
+    }
+
 
 # Login flow behavior flags (used by backend/login_remote_hook.py)
 RESTART_ON_BUTTON_LOGIN_FAIL = _to_bool(_cfg.get("restart_on_button_login_fail", True), True)

@@ -16,21 +16,16 @@ set "RUN_DIR=%ROOT%.run"
 set "START_ROOT=%ROOT%"
 if not exist "%RUN_DIR%" mkdir "%RUN_DIR%"
 
-if not exist "%ROOT%config.yaml" (
-  if exist "%ROOT%config.example.yaml" (
-    echo [SETUP] config.yaml not found. Creating it from config.example.yaml.
-    copy /y "%ROOT%config.example.yaml" "%ROOT%config.yaml" >nul
-  ) else (
-    echo [ERROR] config.yaml and config.example.yaml were not found.
+set "CONFIG_EXISTS=0"
+if exist "%ROOT%config.yaml" set "CONFIG_EXISTS=1"
+if "%CONFIG_EXISTS%"=="0" (
+  echo [SETUP] config.yaml not found. Web setup will create it after access-key login.
+) else (
+  call :ensure_web_access_key
+  if errorlevel 1 (
     pause
     exit /b 1
   )
-)
-
-call :ensure_web_access_key
-if errorlevel 1 (
-  pause
-  exit /b 1
 )
 
 call :cleanup_stale_processes
@@ -115,7 +110,11 @@ if errorlevel 1 (
 
 echo.
 echo Backend and frontend startup commands were launched.
-echo Frontend port %FRONTEND_PORT% was written to config.yaml.
+if "%CONFIG_EXISTS%"=="1" (
+  echo Frontend port %FRONTEND_PORT% was written to config.yaml.
+) else (
+  echo Frontend port %FRONTEND_PORT% is using startup defaults until config.yaml is created.
+)
 
 set "START_ALL_CLOSE_CMD=0"
 set "START_ALL_CMDLINE=%CMDCMDLINE%"
@@ -143,7 +142,7 @@ exit /b 0
 set "FRONTEND_PORT="
 set "FRONTEND_PORT_FILE=%RUN_DIR%\frontend.port.tmp"
 del /f /q "%FRONTEND_PORT_FILE%" >nul 2>nul
-echo [SETUP] Checking up to 10 frontend ports from config.yaml...
+echo [SETUP] Checking up to 10 frontend ports from config/defaults...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\select-frontend-port.ps1" -ConfigPath "%ROOT%config.yaml" -MaxAttempts 10 > "%FRONTEND_PORT_FILE%"
 if errorlevel 1 (
   echo [ERROR] Could not find an available frontend port in 10 attempts.

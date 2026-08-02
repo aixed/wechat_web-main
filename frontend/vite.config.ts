@@ -32,8 +32,13 @@ function readConfigNumber(key: string, fallback: number): number {
   return Number.isFinite(value) ? value : fallback
 }
 
+function readEnvNumber(key: string, fallback: number): number {
+  const value = Number(process.env[key])
+  return Number.isFinite(value) ? value : fallback
+}
+
 const frontendHost = readConfigValue('frontend_host') || '0.0.0.0'
-const frontendPort = readConfigNumber('frontend_port', 3001)
+const frontendPort = readEnvNumber('FRONTEND_PORT', readConfigNumber('frontend_port', 80))
 const configuredBackendHost = readConfigValue('server_host') || '127.0.0.1'
 const backendHost = normalizeProxyHost(configuredBackendHost)
 const backendPort = readConfigNumber('server_port', 5000)

@@ -66,6 +66,26 @@ export const loginWithKey = (key: string) =>
     headers: { "Content-Type": "application/json" },
   });
 
+export type InitialSetupMode = 1 | 2 | 3;
+
+export type InitialSetupPayload = {
+  key: string;
+  web_access_key: string;
+  wechat_mode: InitialSetupMode;
+  host: string;
+  api_port: number;
+  mgr_port: number;
+  public_host?: string;
+};
+
+export const getSetupStatus = () => fetchJSON("/api/setup/status");
+
+export const saveInitialSetup = (payload: InitialSetupPayload) =>
+  fetchJSON("/api/setup/initial-config", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
 export const getAccounts = () => fetchJSON("/api/accounts");
 export const activateAccount = (agentId: string) =>
   fetchJSON("/api/accounts/activate", {
