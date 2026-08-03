@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Session } from "../types";
+import { DEFAULT_AVATAR_URL } from "../avatar";
 
 export type SessionMenuAction = "pin" | "unpin" | "mark_unread" | "mute" | "unmute" | "smart_reply" | "delete";
 
@@ -25,31 +26,40 @@ function PinBadge() {
 
 /**
  * Session avatar — keyed by wxid to prevent React state reuse across items.
- * If no URL or load error → letter fallback (never inherits previous avatar).
+ * If no URL or load error, use the shared neutral avatar.
  */
 function Avatar({ session }: { session: Session }) {
-  const [imgError, setImgError] = useState(false);
+  const [failedUrl, setFailedUrl] = useState("");
   const avatarUrl = session.avatar || "";
-  const initial = session.nickname?.[0] || session.wxid?.[0] || "?";
+  const aggregateAvatars = (session.aggregateAvatars || []).slice(0, 4);
+  const aggregateTiles = Array.from({ length: 4 }, (_, index) => aggregateAvatars[index] || DEFAULT_AVATAR_URL);
 
   return (
     <div className="relative w-[42px] h-[42px] shrink-0">
-      {avatarUrl && !imgError ? (
+      {session.aggregateCategory ? (
+        <div className={`grid h-full w-full grid-cols-2 gap-px overflow-hidden rounded-[5px] p-[2px] ${session.aggregateCategory === "official" ? "bg-[#1688f0]" : "bg-[#21a8f4]"}`}>
+          {aggregateTiles.map((url, index) => (
+            <img
+              key={`${url}:${index}`}
+              src={url || DEFAULT_AVATAR_URL}
+              alt=""
+              className="h-full min-h-0 w-full min-w-0 rounded-[1px] bg-white object-cover"
+              onError={(event) => {
+                event.currentTarget.onerror = null;
+                event.currentTarget.src = DEFAULT_AVATAR_URL;
+              }}
+              loading="lazy"
+            />
+          ))}
+        </div>
+      ) : (
         <img
-          src={avatarUrl}
+          src={avatarUrl && failedUrl !== avatarUrl ? avatarUrl : DEFAULT_AVATAR_URL}
           alt=""
           className="w-full h-full rounded-[5px] object-cover"
-          onError={() => setImgError(true)}
+          onError={() => setFailedUrl(avatarUrl)}
           loading="lazy"
         />
-      ) : (
-        <div
-          className={`w-full h-full rounded-[5px] flex items-center justify-center text-white text-[16px] font-medium ${
-            session.is_group ? "bg-[#576b95]" : "bg-[#60b044]"
-          }`}
-        >
-          {initial}
-        </div>
       )}
       {session.pinned ? <PinBadge /> : null}
     </div>
@@ -91,6 +101,7 @@ export default function SessionList({
   const openContextMenu = (e: React.MouseEvent, session: Session) => {
     e.preventDefault();
     e.stopPropagation();
+    if (session.aggregateCategory) return;
     setMenu({
       x: Math.max(8, Math.min(e.clientX, window.innerWidth - 188)),
       y: Math.max(8, Math.min(e.clientY, window.innerHeight - 256)),

@@ -9,7 +9,6 @@ import {
   broadcastMixedUpload,
   clearActiveAgentId,
   clearAccessKey,
-  deleteProtocolRdvMapping,
   getActiveAgentId,
   getAccessKey,
   getAccounts,
@@ -48,6 +47,7 @@ import {
 import type { BroadcastContentOrder, InitialSetupMode, ProtocolProxyConfig, ProtocolRdvMappingEntry } from "./api";
 import type { ContactProfile, Session, ChatMessage, SmartReplyTarget, WSMessage, WeChatAccount } from "./types";
 import { replaceWechatEmojis } from "./utils/wechatEmoji";
+import { DEFAULT_AVATAR_URL } from "./avatar";
 
 type ViewMode = "chats" | "contacts" | "broadcast" | "smart-reply";
 type MobileTab = "chats" | "contacts" | "me" | "broadcast" | "smart-reply";
@@ -79,7 +79,6 @@ type InitialSetupForm = {
 };
 type ProtocolCachedQr = {
   qrSrc: string;
-  uuid: string;
   expiresAt: number;
 };
 type ContactCategoryKey = "groups" | "official" | "service" | "openim";
@@ -95,6 +94,8 @@ const PROTOCOL_QRCODE_CACHE_GRACE_MS = 2_000;
 const PROTOCOL_ACCOUNT_TAB_EXCLUDED_STATES = new Set(["failed"]);
 const PROTOCOL_QRCODE_CACHE: Record<string, ProtocolCachedQr> = {};
 const PINNED_ORDER_THRESHOLD = 1_000_000_000_000;
+const OFFICIAL_AGGREGATE_ID = "__official_accounts__";
+const SERVICE_AGGREGATE_ID = "__service_accounts__";
 const MOBILE_SWIPE_DIRECTION_EPSILON = 0.25;
 const MOBILE_BROWSER_SWIPE_EDGE_PX = 44;
 const MOBILE_SWIPE_MAX_DRAG_PX = 120;
@@ -1106,6 +1107,7 @@ function profileDisplayName(profile: ContactProfile | undefined, fallback: strin
     raw.markname ||
     raw.Remark ||
     raw.remark ||
+    raw.nick_name ||
     raw.nickname ||
     raw.NickName ||
     fallback
@@ -1117,8 +1119,12 @@ function profileAvatar(profile: ContactProfile | undefined, fallback = ""): stri
   return (
     profile?.avatar ||
     raw.SmallHeadImgUrl ||
+    raw.small_head_img_url ||
+    raw.small_head_url ||
     raw.smallhead ||
     raw.BigHeadImgUrl ||
+    raw.big_head_img_url ||
+    raw.big_head_url ||
     raw.bighead ||
     raw.headimgurl ||
     raw.head_img ||
@@ -1244,35 +1250,18 @@ function numericContactField(raw: any, ...keys: string[]): number | null {
   return null;
 }
 
-function rawContactCategory(raw: any, wxid: string): ContactCategoryKey | "personal" {
+function rawContactCategory(raw: any, wxid: string): ContactCategoryKey | "personal" | null {
   const id = String(wxid || "").trim();
   if (id.endsWith("@chatroom")) return "groups";
   if (id.endsWith("@openim") || Boolean(raw?.OpenIM || raw?.OpenIMDetail || raw?.openim_detail)) return "openim";
   if (id.startsWith("gh_")) {
-    const bitVal = numericContactField(raw, "BitVal", "bitval", "status", "Status");
-    if (bitVal === 513 || bitVal === 515) return "service";
-
-    const verifyFlag = numericContactField(raw, "VerifyFlag", "verifyflag");
-    if (verifyFlag === 24) return "service";
-    if (verifyFlag === 8) return "official";
-
-    const marker = String(
-      raw?.ServiceType ??
-      raw?.service_type ??
-      raw?.ServiceFlag ??
-      raw?.serviceFlag ??
-      raw?.AccountType ??
-      raw?.account_type ??
-      raw?.TypeName ??
-      raw?.typeName ??
-      raw?.SourceText ??
-      raw?.type ??
-      raw?.Type ??
-      "",
-    ).toLowerCase();
-    if (marker.includes("service") || marker.includes("\u670d\u52a1")) return "service";
-    if (marker.includes("official") || marker.includes("public") || marker.includes("\u516c\u4f17\u53f7")) return "official";
-    return "official";
+    const serviceType = numericContactField(raw, "ServiceType", "serviceType", "service_type");
+    if (serviceType !== null) {
+      if (serviceType === 0) return "official";
+      if (serviceType === 1) return "service";
+      return null;
+    }
+    return null;
   }
   return "personal";
 }
@@ -1324,6 +1313,15 @@ function formatMsgTypePreview(msgType: string, content: string): string {
     case "9994": return "";
     default: return content?.substring(0, 30) || "[消息]";
   }
+}
+
+function isProtocolInternalMessage(msg: ChatMessage): boolean {
+  const msgType = String(msg.msgtype || "");
+  const content = String(msg.msg || "").trim().toLowerCase();
+  if (msgType === "9999" && content === "chatroom member changed") return true;
+  return msgType === "10002"
+    && String(msg.fromid || "").trim().toLowerCase() === "weixin"
+    && content.startsWith("<sysmsg");
 }
 
 function extractQuoteTitle(xml: string): string {
@@ -1562,6 +1560,7 @@ export default function App() {
   const briefTimer = useRef<number | null>(null);
   const briefInFlight = useRef(false);
   const briefRequestedWxids = useRef<Set<string>>(new Set());
+  const contactProfileRequests = useRef<Set<string>>(new Set());
   const groupProfileRequestedWxids = useRef<Set<string>>(new Set());
   const groupNamesFetched = useRef<Set<string>>(new Set());
   // Keep a live ref to avatarMap so flushBriefQueue always sees the latest
@@ -1581,6 +1580,7 @@ export default function App() {
     accounts.find((account) => account.id === selectedAccountId) ||
     (routeAccountWxid ? accounts.find((account) => accountMatchesRoute(account, routeAccountWxid)) : undefined);
   const selectedAccountWxid = String(selectedAccount?.wxid || "").trim();
+  const protocolAccountSelected = selectedAccount?.source === "protocol";
   const routeSelfWxid = /^wxid_/i.test(routeAccountWxid) || routeAccountWxid.includes("@") ? routeAccountWxid : "";
   const effectiveSelfWxid = selfWxid || selectedAccountWxid || routeSelfWxid;
   const selfDisplayId = effectiveSelfWxid || accountRouteKey(selectedAccount) || routeAccountWxid;
@@ -1633,6 +1633,7 @@ export default function App() {
     localContactsLoadingRef.current = false;
     pendingBriefWxids.current.clear();
     briefRequestedWxids.current.clear();
+    contactProfileRequests.current.clear();
     groupProfileRequestedWxids.current.clear();
     groupNamesFetched.current.clear();
   }, []);
@@ -2015,15 +2016,21 @@ export default function App() {
         missing.push(wxid);
       }
     }
-    if (missing.length === 0) return cached;
+    const requested = missing.filter((wxid) => !contactProfileRequests.current.has(wxid));
+    if (requested.length === 0) return cached;
+    requested.forEach((wxid) => contactProfileRequests.current.add(wxid));
 
-    const data = await getContactProfiles(missing, gid, force);
-    const members = data?.members || {};
-    if (selectedAccountIdRef.current !== requestAccountId) {
+    try {
+      const data = await getContactProfiles(requested, gid, force);
+      const members = data?.members || {};
+      if (selectedAccountIdRef.current !== requestAccountId) {
+        return { ...cached, ...members };
+      }
+      applyContactProfileUpdates(members);
       return { ...cached, ...members };
+    } finally {
+      requested.forEach((wxid) => contactProfileRequests.current.delete(wxid));
     }
-    applyContactProfileUpdates(members);
-    return { ...cached, ...members };
   }, [applyContactProfileUpdates]);
 
   const ensureGroupProfiles = useCallback((wxids: string[]) => {
@@ -2116,39 +2123,69 @@ export default function App() {
     else hydrateDirectoryContacts();
   }, [hydrateDirectoryContacts, loadLocalDirectoryContacts]);
 
-  const openSelfProfileCard = useCallback(async () => {
-    setSelfCardOpen(true);
+  const loadSelfProfile = useCallback(async () => {
+    const requestAccountId = selectedAccountIdRef.current;
     const wxid = effectiveSelfWxid;
-    if (!wxid) {
-      setSelfProfileLoading(false);
+    if (selectedAccount?.source !== "protocol") {
+      if (wxid) await ensureContactProfiles([wxid], "", { force: true });
       return;
     }
+
+    const sessionId = protocolSessionId(selectedAccount) || requestAccountId;
+    if (!sessionId) return;
+    const data = await getProtocolProfile(sessionId);
+    if (data?.ok === false) {
+      throw new Error(String(data?.error || data?.message || "getprofile failed"));
+    }
+    const identity = protocolProfileIdentity(data);
+    const profileWxid = identity.wxid || wxid;
+    if (!profileWxid || selectedAccountIdRef.current !== requestAccountId) return;
+    const rawProfile = { ...(identity.profile || {}), wxid: profileWxid };
+    const update: ContactProfile = {
+      wxid: profileWxid,
+      name: identity.nickname || profileWxid,
+      avatar: identity.avatar,
+      profile: rawProfile,
+    };
+    setSelfWxid(profileWxid);
+    applyContactProfileUpdates({ [profileWxid]: update });
+    setAccounts((prev) => prev.map((account) => account.id === requestAccountId ? {
+      ...account,
+      wxid: profileWxid,
+      account_id: profileWxid,
+      nickname: identity.nickname || account.nickname,
+      avatar: identity.avatar || account.avatar,
+      phone: identity.phone || account.phone,
+      region: identity.region || account.region,
+      signature: identity.signature || account.signature,
+      wechat_account: identity.account || account.wechat_account,
+      profile: rawProfile,
+    } : account));
+  }, [applyContactProfileUpdates, effectiveSelfWxid, ensureContactProfiles, selectedAccount]);
+
+  const openSelfProfileCard = useCallback(async () => {
+    setSelfCardOpen(true);
     setSelfProfileLoading(true);
     try {
-      await ensureContactProfiles([wxid], "", { force: true });
+      await loadSelfProfile();
     } catch (err) {
       console.error("[SELF_PROFILE]", err);
     } finally {
       setSelfProfileLoading(false);
     }
-  }, [effectiveSelfWxid, ensureContactProfiles]);
+  }, [loadSelfProfile]);
 
   const openMobileSelfProfileDetail = useCallback(async () => {
     setMobileProfileDetailOpen(true);
-    const wxid = effectiveSelfWxid;
-    if (!wxid) {
-      setSelfProfileLoading(false);
-      return;
-    }
     setSelfProfileLoading(true);
     try {
-      await ensureContactProfiles([wxid], "", { force: true });
+      await loadSelfProfile();
     } catch (err) {
       console.error("[SELF_PROFILE]", err);
     } finally {
       setSelfProfileLoading(false);
     }
-  }, [effectiveSelfWxid, ensureContactProfiles]);
+  }, [loadSelfProfile]);
 
   const switchMode = useCallback((mode: ViewMode, options: { skipRoute?: boolean } = {}) => {
     setViewMode(mode);
@@ -2349,9 +2386,11 @@ export default function App() {
         for (const session of enriched) {
           merged.set(session.wxid, session);
         }
-        for (const existing of prev) {
-          if (!merged.has(existing.wxid)) {
-            merged.set(existing.wxid, existing);
+        if (data?.source !== "protocol_statusnotify") {
+          for (const existing of prev) {
+            if (!merged.has(existing.wxid)) {
+              merged.set(existing.wxid, existing);
+            }
           }
         }
         return sortSessionsForDisplay(Array.from(merged.values()));
@@ -2458,7 +2497,7 @@ export default function App() {
             pinned: Boolean(current.pinned || snap?.pinned),
             order: normalizeSessionOrder(current.order || snap?.order),
           });
-        } else {
+        } else if (!protocolAccountSelected) {
           enrichedMap.set(sessionWxid, {
             wxid: sessionWxid,
             nickname: nameMap[sessionWxid] || sessionWxid,
@@ -2545,6 +2584,7 @@ export default function App() {
         const chatId = extractChatId(chatMsg, myWxid || selfWxid);
         if (!chatId) continue;
         if (isHookStatusEchoMessage(chatMsg)) continue;
+        if (protocolAccountSelected && isProtocolInternalMessage(chatMsg)) continue;
 
         const isIncoming = String(chatMsg.sendorrecv) === "2";
         const isCurrentlyViewing = activeChat === chatId;
@@ -2647,18 +2687,31 @@ export default function App() {
       }
 
       for (const [chatId, senderWxids] of groupSenderWxidsByChat.entries()) {
-        hydrateGroupSenders(chatId, Array.from(senderWxids), myWxid || selfWxid);
+        if (protocolAccountSelected) {
+          const profileWxids = Array.from(senderWxids);
+          const currentSelfWxid = myWxid || selfWxid || effectiveSelfWxid;
+          if (currentSelfWxid) profileWxids.push(currentSelfWxid);
+          ensureContactProfiles(profileWxids, chatId).catch((err) => console.error("[PROTOCOL_PROFILE]", err));
+        } else {
+          hydrateGroupSenders(chatId, Array.from(senderWxids), myWxid || selfWxid);
+        }
       }
       if (groupChatWxidsNeedingProfile.size > 0) {
         ensureGroupProfiles(Array.from(groupChatWxidsNeedingProfile));
       }
       if (directChatWxids.size > 0) {
         const directWxids = Array.from(directChatWxids);
-        const directOpenimWxids = directWxids.filter((wxid) => wxid.endsWith("@openim"));
-        const directRegularWxids = directWxids.filter((wxid) => !wxid.endsWith("@openim"));
-        queueBriefLookup(directRegularWxids, myWxid || selfWxid);
-        if (directOpenimWxids.length > 0) {
-          ensureContactProfiles(directOpenimWxids).catch((err) => console.error("[OPENIM_PROFILE]", err));
+        if (protocolAccountSelected) {
+          const currentSelfWxid = myWxid || selfWxid || effectiveSelfWxid;
+          if (currentSelfWxid) directWxids.push(currentSelfWxid);
+          ensureContactProfiles(directWxids).catch((err) => console.error("[PROTOCOL_PROFILE]", err));
+        } else {
+          const directOpenimWxids = directWxids.filter((wxid) => wxid.endsWith("@openim"));
+          const directRegularWxids = directWxids.filter((wxid) => !wxid.endsWith("@openim"));
+          queueBriefLookup(directRegularWxids, myWxid || selfWxid);
+          if (directOpenimWxids.length > 0) {
+            ensureContactProfiles(directOpenimWxids).catch((err) => console.error("[OPENIM_PROFILE]", err));
+          }
         }
       }
     }
@@ -2721,7 +2774,7 @@ export default function App() {
         );
       }
     }
-  }, [selfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, hydrateGroupSenders, ensureContactProfiles, ensureGroupProfiles, applyContactProfileUpdates, selectedAccountId]);
+  }, [selfWxid, effectiveSelfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, hydrateGroupSenders, ensureContactProfiles, ensureGroupProfiles, applyContactProfileUpdates, selectedAccountId, protocolAccountSelected]);
 
   const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId), selectedAccountId);
 
@@ -2825,6 +2878,19 @@ export default function App() {
       prev.map((s) => (s.wxid === wxid ? { ...s, unread: 0 } : s))
     );
     markAsRead(wxid).catch((err) => console.error("[MARK_READ]", err));
+    if (protocolAccountSelected) {
+      const profileWxids = new Set<string>();
+      if (effectiveSelfWxid) profileWxids.add(effectiveSelfWxid);
+      if (!wxid.includes("@chatroom")) profileWxids.add(wxid);
+      for (const message of chatMessages[wxid] || []) {
+        const senderWxid = String(message.fromid || "").trim();
+        if (senderWxid && !senderWxid.includes("@chatroom")) profileWxids.add(senderWxid);
+      }
+      if (profileWxids.size > 0) {
+        ensureContactProfiles(Array.from(profileWxids), wxid.includes("@chatroom") ? wxid : "")
+          .catch((err) => console.error("[PROTOCOL_PROFILE]", err));
+      }
+    }
     // If it's a group, fetch member names (fast) + resolve avatars for loaded messages
     if (wxid.includes("@chatroom")) {
       fetchGroupMemberNames(wxid);
@@ -2838,7 +2904,7 @@ export default function App() {
             senderWxids.push(from);
           }
         }
-        if (senderWxids.length > 0) {
+        if (senderWxids.length > 0 && !protocolAccountSelected) {
           hydrateGroupSenders(wxid, senderWxids, selfWxid);
         }
       }
@@ -2846,6 +2912,7 @@ export default function App() {
   };
 
   const handleSessionMenuAction = async (action: SessionMenuAction, session: Session) => {
+    if (session.aggregateCategory) return;
     const wxid = session.wxid;
     try {
       if (action === "smart_reply") {
@@ -3051,8 +3118,20 @@ export default function App() {
       });
     }
 
-    // For group chats, resolve brief info only for senders that appear in loaded messages.
-    if (wxid.includes("@chatroom")) {
+    // Protocol mode resolves full profiles from its SQLite cache, then /getcontact on misses.
+    if (protocolAccountSelected) {
+      const profileWxids = new Set<string>();
+      if (effectiveSelfWxid) profileWxids.add(effectiveSelfWxid);
+      if (!wxid.includes("@chatroom")) profileWxids.add(wxid);
+      for (const message of displayMsgs) {
+        const senderWxid = String(message.fromid || "").trim();
+        if (senderWxid && !senderWxid.includes("@chatroom")) profileWxids.add(senderWxid);
+      }
+      if (profileWxids.size > 0) {
+        ensureContactProfiles(Array.from(profileWxids), wxid.includes("@chatroom") ? wxid : "")
+          .catch((err) => console.error("[PROTOCOL_PROFILE]", err));
+      }
+    } else if (wxid.includes("@chatroom")) {
       const senderWxids = new Set<string>();
       for (const m of displayMsgs) {
         const from = m.fromid || "";
@@ -3090,6 +3169,7 @@ export default function App() {
         c.avatar ||
         "";
       const category = rawContactCategory(c, wxid);
+      if (!category) return null;
       return {
         wxid,
         name: profileDisplayName(profile, fallbackName),
@@ -3244,6 +3324,42 @@ export default function App() {
     profileAvatar(selfProfile, (effectiveSelfWxid ? avatarMap[effectiveSelfWxid] : "") || selectedAccountAvatar || "") ||
     (selfProfile?.profile?.BigHeadImgUrl || selfProfile?.profile?.SmallHeadImgUrl || "");
   const darkTheme = portalTheme === "dark";
+  const accountAggregateSessions = [
+    buildAccountAggregateSession("official", officialEntries, sessions),
+    buildAccountAggregateSession("service", serviceEntries, sessions),
+  ].filter((session): session is Session => Boolean(session));
+  const chatListSessions = sortSessionsForDisplay([
+    ...sessions.filter((session) => !session.wxid.startsWith("gh_")),
+    ...accountAggregateSessions,
+  ]);
+  const openAccountCategory = (category: "official" | "service") => {
+    setContactSource("network");
+    setActiveChat(null);
+    setDirectoryProfileWxid(null);
+    setMobileProfileDetailOpen(false);
+    if (isMobile) {
+      setMobileTab("contacts");
+      setMobileContactCategory(category);
+      setDesktopContactCategory(null);
+    } else {
+      setViewMode("contacts");
+      setDesktopContactCategory(category);
+      setMobileContactCategory(null);
+    }
+    hydrateDirectoryContacts();
+    setRoute("contact");
+  };
+  const handleSelectSession = (wxid: string) => {
+    if (wxid === OFFICIAL_AGGREGATE_ID) {
+      openAccountCategory("official");
+      return;
+    }
+    if (wxid === SERVICE_AGGREGATE_ID) {
+      openAccountCategory("service");
+      return;
+    }
+    handleSelectChat(wxid);
+  };
   const activeSession = sessions.find((s) => s.wxid === activeChat) || (activeChat ? {
     wxid: activeChat,
     nickname: contactMap[activeChat] || activeChat,
@@ -3293,6 +3409,7 @@ export default function App() {
           onOpenAccountManager={handleOpenAccountManager}
           onSelectAccount={handleSelectAccount}
           onSessionStarted={handleProtocolSessionStarted}
+          onTerminateProtocolAccount={handleTerminateProtocolAccount}
         />
       );
     }
@@ -3328,7 +3445,7 @@ export default function App() {
   }
 
   if (isMobile) {
-    const firstMobileSession = sessions[0];
+    const firstMobileSession = chatListSessions[0];
     const firstMobileContact = mobileTab === "contacts" ? (friendEntries[0] || groupEntries[0] || officialEntries[0] || serviceEntries[0] || openimEntries[0]) : null;
     const canMobileForward = Boolean(
       (mobileTab === "chats" && firstMobileSession) ||
@@ -3337,7 +3454,7 @@ export default function App() {
     );
     const handleMobileForward = () => {
       if (mobileTab === "chats" && firstMobileSession) {
-        handleSelectChat(firstMobileSession.wxid, firstMobileSession);
+        handleSelectSession(firstMobileSession.wxid);
         return;
       }
       if (mobileTab === "contacts" && firstMobileContact) {
@@ -3454,7 +3571,7 @@ export default function App() {
       >
         <MobileMainShell
           tab={mobileTab}
-          sessions={sessions}
+          sessions={chatListSessions}
           friends={friendEntries}
           groups={groupEntries}
           localFriends={localFriendEntries}
@@ -3473,7 +3590,7 @@ export default function App() {
           contactsLoading={contactsHydrating}
           dark={darkTheme}
           onSwitchTab={switchMobileTab}
-          onSelectChat={handleSelectChat}
+          onSelectChat={handleSelectSession}
           onSelectContact={openDirectoryProfile}
           onSelectContactCategory={setMobileContactCategory}
           onHydrateContacts={hydrateDirectoryContacts}
@@ -3522,9 +3639,9 @@ export default function App() {
       >
         {viewMode === "chats" && (
           <SessionList
-            sessions={sessions}
+            sessions={chatListSessions}
             activeWxid={activeChat}
-            onSelectChat={handleSelectChat}
+            onSelectChat={handleSelectSession}
             onSessionAction={handleSessionMenuAction}
             onRefreshSessions={handleRefreshSessions}
             loading={sessionsHydrating}
@@ -4039,6 +4156,7 @@ function ProtocolLoginOnlyPortal({
   onOpenAccountManager,
   onSelectAccount,
   onSessionStarted,
+  onTerminateProtocolAccount,
 }: {
   accounts: WeChatAccount[];
   account?: WeChatAccount;
@@ -4049,13 +4167,25 @@ function ProtocolLoginOnlyPortal({
   onOpenAccountManager: () => void;
   onSelectAccount: (account: WeChatAccount) => void;
   onSessionStarted: (account: WeChatAccount, previousSessionId?: string) => void;
+  onTerminateProtocolAccount: (account: WeChatAccount) => void | Promise<void>;
 }) {
   const dark = theme === "dark";
-  const [mode, setMode] = useState<"qr" | "old">("qr");
+  const [mode, setMode] = useState<"qr" | "old">("old");
   const [selectedAccount, setSelectedAccount] = useState<WeChatAccount | null>(account || null);
+  const [contextMenu, setContextMenu] = useState<{ account: WeChatAccount; x: number; y: number } | null>(null);
   useEffect(() => {
     if (account) setSelectedAccount(account);
   }, [account]);
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("blur", close);
+    };
+  }, [contextMenu]);
   const protocolAccounts = accounts.filter(isProtocolAccountTabVisible);
   const activeTabKey = protocolAccountTabKey(selectedAccount);
   const handleAccountTab = (target: WeChatAccount) => {
@@ -4065,6 +4195,20 @@ function ProtocolLoginOnlyPortal({
     }
     setSelectedAccount(target);
     setMode(hasProtocolSession(target) ? "qr" : "old");
+  };
+  const handleSessionStarted = (target: WeChatAccount, previousSessionId = "") => {
+    setSelectedAccount(target);
+    onSessionStarted(target, previousSessionId);
+  };
+  const handleTerminateAccount = async (target: WeChatAccount) => {
+    const sessionId = protocolSessionId(target);
+    if (!sessionId) return;
+    setContextMenu(null);
+    if (protocolSessionId(selectedAccount) === sessionId) {
+      setSelectedAccount(null);
+      setMode("old");
+    }
+    await onTerminateProtocolAccount(target);
   };
   return (
     <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
@@ -4083,13 +4227,6 @@ function ProtocolLoginOnlyPortal({
             aria-label="新增微信 / 多账号管理"
           >
             +
-          </button>
-          <button
-            type="button"
-            onClick={() => setMode(mode === "qr" ? "old" : "qr")}
-            className={`h-[32px] px-[12px] rounded-[6px] border text-[13px] active:opacity-85 ${dark ? "border-[#333] bg-[#1d1d1d] text-[#ddd]" : "border-[#d8d8d8] bg-white text-[#333]"}`}
-          >
-            {mode === "qr" ? "老号登录" : "扫码上号"}
           </button>
           <button
             type="button"
@@ -4114,6 +4251,11 @@ function ProtocolLoginOnlyPortal({
           activeKey={activeTabKey}
           dark={dark}
           onSelect={handleAccountTab}
+          onContextMenu={(target, event) => {
+            if (!hasProtocolSession(target)) return;
+            event.preventDefault();
+            setContextMenu({ account: target, x: event.clientX, y: event.clientY });
+          }}
         />
       )}
       <div className="flex-1 min-h-0 overflow-hidden">
@@ -4123,12 +4265,71 @@ function ProtocolLoginOnlyPortal({
           theme={theme}
           onRefresh={onRefresh}
           account={selectedAccount || undefined}
-          onSessionStarted={onSessionStarted}
+          onSessionStarted={handleSessionStarted}
           onEnterAccount={onSelectAccount}
+          onModeChange={setMode}
         />
       </div>
+      {contextMenu && (
+        <div
+          role="menu"
+          className={`fixed z-[200] min-w-[138px] rounded-[6px] border py-[6px] shadow-xl ${dark ? "bg-[#202020] border-[#3a3a3a] text-[#e8e8e8]" : "bg-white border-[#d8d8d8] text-[#222]"}`}
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => handleTerminateAccount(contextMenu.account)}
+            className={`w-full h-[34px] px-[12px] text-left text-[13px] ${dark ? "hover:bg-[#2c2c2c] text-[#ff9a9a]" : "hover:bg-[#f6f6f6] text-[#c53030]"}`}
+          >
+            关闭实例
+          </button>
+        </div>
+      )}
     </div>
   );
+}
+
+function buildAccountAggregateSession(
+  category: "official" | "service",
+  entries: DirectoryEntry[],
+  sessions: Session[],
+): Session | null {
+  if (entries.length === 0) return null;
+
+  const childIds = new Set(entries.map((entry) => entry.wxid));
+  const childSessions = sessions.filter((session) => childIds.has(session.wxid));
+  const latest = childSessions.slice().sort((a, b) => {
+    const timestampDelta = (b.lastTimestamp || 0) - (a.lastTimestamp || 0);
+    if (timestampDelta !== 0) return timestampDelta;
+    return normalizeSessionOrder(b.order) - normalizeSessionOrder(a.order);
+  })[0];
+  const aggregateAvatars = Array.from(new Set([
+    latest?.avatar || "",
+    ...childSessions.map((session) => session.avatar || ""),
+    ...entries.map((entry) => entry.avatar || ""),
+  ].filter(Boolean))).slice(0, 4);
+  const childName = latest?.nickname || (latest ? entries.find((entry) => entry.wxid === latest.wxid)?.name : "") || "";
+  const childPreview = latest?.lastMsg || "";
+
+  return {
+    wxid: category === "official" ? OFFICIAL_AGGREGATE_ID : SERVICE_AGGREGATE_ID,
+    nickname: category === "official" ? "公众号" : "服务号",
+    avatar: aggregateAvatars[0] || "",
+    aggregateCategory: category,
+    aggregateAvatars,
+    is_group: false,
+    lastMsg: latest
+      ? `${childName || latest.wxid}${childPreview ? `: ${childPreview}` : ""}`
+      : `${entries.length} 个账号`,
+    lastTime: latest?.lastTime || "",
+    lastTimestamp: latest?.lastTimestamp || 0,
+    unread: childSessions.reduce((total, session) => total + Math.max(0, Number(session.unread) || 0), 0),
+    muted: childSessions.length > 0 && childSessions.every((session) => Boolean(session.muted)),
+    pinned: childSessions.some((session) => Boolean(session.pinned)),
+    order: childSessions.reduce((highest, session) => Math.max(highest, normalizeSessionOrder(session.order)), 0),
+  };
 }
 
 function AccountPortal({
@@ -4274,6 +4475,7 @@ function AccountPortal({
           account={loginAccount || undefined}
           onSessionStarted={handleProtocolSessionStarted}
           onEnterAccount={onSelectAccount}
+          onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
         />
       )}
       {tool === "old-login" && (
@@ -4284,6 +4486,7 @@ function AccountPortal({
           onRefresh={onRefresh}
           account={loginAccount || undefined}
           onSessionStarted={handleProtocolSessionStarted}
+          onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
         />
       )}
     </div>
@@ -4474,6 +4677,7 @@ function AccountPortal({
                 account={loginAccount || undefined}
                 onSessionStarted={handleProtocolSessionStarted}
                 onEnterAccount={onSelectAccount}
+                onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
               />
             )}
             {tool === "old-login" && (
@@ -4485,6 +4689,7 @@ function AccountPortal({
                 account={loginAccount || undefined}
                 onSessionStarted={handleProtocolSessionStarted}
                 onEnterAccount={onSelectAccount}
+                onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
               />
             )}
           </div>
@@ -4602,13 +4807,7 @@ function ProtocolAccountTabStrip({
             <span className="flex min-w-0 items-center gap-[6px]">
               {loggedIn && (
                 <span className="relative h-[20px] w-[20px] shrink-0">
-                  {avatar ? (
-                    <img src={avatar} alt="" className="h-[20px] w-[20px] rounded-[4px] object-cover" />
-                  ) : (
-                    <span className="flex h-[20px] w-[20px] items-center justify-center rounded-[4px] bg-[#07c160] text-[10px] text-white">
-                      {(nickname || "微")[0]}
-                    </span>
-                  )}
+                  <img src={avatar || DEFAULT_AVATAR_URL} alt="" className="h-[20px] w-[20px] rounded-[4px] object-cover" />
                   <span className={`absolute -bottom-[2px] -right-[2px] h-[7px] w-[7px] rounded-full bg-[#20d56b] ring-2 ${dark ? "ring-[#1b1b1b]" : "ring-white"}`} />
                 </span>
               )}
@@ -4631,6 +4830,7 @@ function ProtocolLoginPanel({
   account,
   onSessionStarted,
   onEnterAccount,
+  onModeChange,
 }: {
   mode: "qr" | "old";
   theme: PortalTheme;
@@ -4638,6 +4838,7 @@ function ProtocolLoginPanel({
   account?: WeChatAccount;
   onSessionStarted?: (account: WeChatAccount, previousSessionId?: string) => void;
   onEnterAccount?: (account: WeChatAccount) => void;
+  onModeChange: (mode: "qr" | "old") => void;
 }) {
   const dark = theme === "dark";
   const [form, setForm] = useState<ProtocolLoginForm>(() => {
@@ -4693,7 +4894,6 @@ function ProtocolLoginPanel({
   const [phase, setPhase] = useState<ProtocolLoginPhase>("idle");
   const [statusText, setStatusText] = useState(mode === "qr" ? "等待启动实例" : "等待推送登录");
   const [sessionId, setSessionId] = useState("");
-  const [uuid, setUuid] = useState("");
   const [qrSrc, setQrSrc] = useState("");
   const [expiresAt, setExpiresAt] = useState(0);
   const [tick, setTick] = useState(Date.now());
@@ -4725,6 +4925,11 @@ function ProtocolLoginPanel({
     ? [proxy.Proxy_IP, proxy.Proxy_Port].filter(Boolean).join(":") || "已启用代理"
     : "未使用代理";
   const selectedLoggedInAccount = Boolean(account && isLoggedInAccount(account));
+  const oldAccountEntry = mapping[normalizeProtocolRdv(form.rdv)];
+  const oldAccountDisplayIdentity = protocolMappingDisplayIdentity(oldAccountEntry);
+  const oldAccountWxid = protocolMappingWxid(oldAccountEntry) || protocolStableWxid(form.wxid);
+  const oldAccountName = oldAccountDisplayIdentity.nickname || oldAccountWxid || "老号登录";
+  const oldAccountAvatar = oldAccountDisplayIdentity.avatar;
   const showingLoginIdentity = selectedLoggedInAccount || phase === "scanned" || phase === "success";
   const loginIdentityAvatar = phase === "scanned"
     ? scannedInfo.avatar
@@ -4865,7 +5070,6 @@ function ProtocolLoginPanel({
     const cached = PROTOCOL_QRCODE_CACHE[targetSessionId];
     if (!options.force && cached?.qrSrc && (!cached.expiresAt || cached.expiresAt > Date.now() + PROTOCOL_QRCODE_CACHE_GRACE_MS)) {
       setQrSrc(cached.qrSrc);
-      setUuid(cached.uuid);
       setExpiresAt(cached.expiresAt);
       setTick(Date.now());
       setPhase("waiting");
@@ -4883,11 +5087,9 @@ function ProtocolLoginPanel({
       const seconds = protocolExpirySeconds(qrcode.expired_time);
       const nextExpiresAt = seconds ? Date.now() + seconds * 1000 : 0;
       setQrSrc(nextQr);
-      setUuid(String(qrcode.uuid || ""));
       setExpiresAt(nextExpiresAt);
       PROTOCOL_QRCODE_CACHE[targetSessionId] = {
         qrSrc: nextQr,
-        uuid: String(qrcode.uuid || ""),
         expiresAt: nextExpiresAt,
       };
       setTick(Date.now());
@@ -4919,7 +5121,6 @@ function ProtocolLoginPanel({
     autoStartedRef.current = true;
     setSessionId(protocolSessionId(account));
     setQrSrc("");
-    setUuid("");
     setExpiresAt(0);
     setScannedInfo({ nick: "", avatar: "" });
     setSuccessInfo({
@@ -4940,7 +5141,6 @@ function ProtocolLoginPanel({
     autoStartedRef.current = true;
     setSessionId(targetSessionId);
     setQrSrc("");
-    setUuid("");
     setExpiresAt(0);
     setScannedInfo({ nick: "", avatar: "" });
     setSuccessInfo({ wxid: "", nickname: "", avatar: "" });
@@ -4993,12 +5193,25 @@ function ProtocolLoginPanel({
     await onRefresh();
   }, [onRefresh, saveMappingFromProfile, scannedInfo.avatar, scannedInfo.nick, sessionId]);
 
+  const fallbackToQRCode = useCallback(() => {
+    setPhase("starting");
+    setStatusText("老号登录失败，正在获取二维码");
+    setErrorText("");
+    onModeChange("qr");
+  }, [onModeChange]);
+
   useEffect(() => {
     if (!sessionId || phase === "idle" || phase === "success" || phase === "error") return;
     const timer = window.setInterval(async () => {
       try {
         const data = await getProtocolLoginStatus(sessionId);
-        if (data?.error && data?.ok === false) return;
+        if (data?.error && data?.ok === false) {
+          if (mode === "old") {
+            window.clearInterval(timer);
+            fallbackToQRCode();
+          }
+          return;
+        }
         const check = data?.check_status || data?.data || {};
         const state = protocolLoginStatusState(data);
         const seconds = protocolExpirySeconds(check.expired_time ?? data?.expired_time ?? data?.expiredTime);
@@ -5038,6 +5251,11 @@ function ProtocolLoginPanel({
           return;
         }
         if (state === "canceled" || state === "expired" || state === "failed" || state === "logged_out") {
+          if (mode === "old") {
+            window.clearInterval(timer);
+            fallbackToQRCode();
+            return;
+          }
           const fallback = state === "canceled"
             ? "手机端已取消登录"
             : state === "expired"
@@ -5058,7 +5276,7 @@ function ProtocolLoginPanel({
       }
     }, PROTOCOL_QRCODE_CHECK_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [completeLogin, fetchQRCode, mode, onRefresh, phase, sessionId]);
+  }, [completeLogin, fallbackToQRCode, fetchQRCode, mode, onRefresh, phase, sessionId]);
 
   useEffect(() => {
     if (mode !== "qr" || phase !== "waiting" || !sessionId || !expiresAt) return;
@@ -5107,34 +5325,6 @@ function ProtocolLoginPanel({
     }
   }, [form.rdv, form.wxid, mapping, mode]);
 
-  const fillFromMapping = (rdv: string) => {
-    const entry = mapping[rdv];
-    const wxid = protocolMappingWxid(entry);
-    if (!wxid) return;
-    const proxyEntry = protocolMappingProxy(entry);
-    const hasProxy = Object.values(proxyEntry).some(Boolean);
-    setForm((prev) => {
-      const next = {
-        ...prev,
-        rdv,
-        wxid,
-        proxyEnabled: hasProxy,
-        proxyType: String(proxyEntry.Proxy_Type || (hasProxy ? "socks5h" : "")),
-        proxyIP: String(proxyEntry.Proxy_IP || ""),
-        proxyPort: String(proxyEntry.Proxy_Port || ""),
-        proxyUsr: String(proxyEntry.Proxy_Usr || ""),
-        proxyPwd: String(proxyEntry.Proxy_Pwd || ""),
-      };
-      return next;
-    });
-  };
-
-  const deleteMapping = async (rdv: string) => {
-    if (!window.confirm(`确定删除 RDV ${rdv} 的映射吗？`)) return;
-    const data = await deleteProtocolRdvMapping(rdv);
-    setMapping((data?.mapping || {}) as Record<string, ProtocolRdvMappingEntry>);
-  };
-
   const runProtocolLogin = useCallback(async (
     targetForm: ProtocolLoginForm = formRef.current,
   ) => {
@@ -5158,12 +5348,12 @@ function ProtocolLoginPanel({
     setPhase("starting");
     setStatusText("正在启动微信实例");
     setQrSrc("");
-    setUuid("");
     setSessionId("");
     setSuccessInfo({ wxid: "", nickname: "", avatar: "" });
     setScannedInfo({ nick: "", avatar: "" });
     setExpiresAt(0);
 
+    let startedSessionId = "";
     try {
       const targetProxy = buildProxy(targetForm);
       const start = await startProtocolWechat({
@@ -5177,6 +5367,7 @@ function ProtocolLoginPanel({
       if (start?.detail || start?.error || start?.ok === false) throw new Error(errorMessage(start, "启动微信失败"));
       const nextSessionId = protocolSessionIdFromPayload(start);
       if (!nextSessionId) throw new Error("未获取到 session_id");
+      startedSessionId = nextSessionId;
       setSessionId(nextSessionId);
       onSessionStarted?.(accountFromStartedSession(start, targetForm), previousSessionId);
 
@@ -5189,9 +5380,7 @@ function ProtocolLoginPanel({
         const pushed = await pushProtocolLoginUrl(nextSessionId, wxid);
         if (pushed?.detail || pushed?.error || pushed?.ok === false) throw new Error(errorMessage(pushed, "推送登录失败"));
         const info = pushed?.qrcode || pushed?.pushloginurl || pushed?.data || pushed;
-        const nextUuid = String(info?.uuid || pushed?.uuid || "");
         const seconds = protocolExpirySeconds(info?.expired_time || pushed?.expired_time);
-        setUuid(nextUuid);
         setExpiresAt(seconds ? Date.now() + seconds * 1000 : 0);
         setTick(Date.now());
         setPhase("scanned");
@@ -5199,11 +5388,16 @@ function ProtocolLoginPanel({
         await loadMapping();
       }
     } catch (err) {
+      if (mode === "old" && startedSessionId) {
+        console.warn("[PROTO_LOGIN] old login failed, falling back to QR code:", err);
+        fallbackToQRCode();
+        return;
+      }
       setPhase("error");
       setStatusText("流程失败");
       setErrorText(err instanceof Error ? err.message : "登录流程失败");
     }
-  }, [fetchQRCode, loadMapping, mode, onSessionStarted, sessionId]);
+  }, [fallbackToQRCode, fetchQRCode, loadMapping, mode, onSessionStarted, sessionId]);
 
   const startLogin = async (event: FormEvent) => {
     event.preventDefault();
@@ -5375,13 +5569,7 @@ function ProtocolLoginPanel({
                 title={canRefreshQRCode ? "点击刷新二维码" : undefined}
               >
                 {showingLoginIdentity ? (
-                  loginIdentityAvatar ? (
-                    <img src={loginIdentityAvatar} alt={loginIdentityName || "微信头像"} className="w-[224px] h-[224px] rounded-[8px] object-cover" />
-                  ) : (
-                    <div className="w-[224px] h-[224px] rounded-[8px] bg-[#07c160] text-white flex items-center justify-center text-[72px]">
-                      {(loginIdentityName || successInfo.wxid || "微")[0]}
-                    </div>
-                  )
+                  <img src={loginIdentityAvatar || DEFAULT_AVATAR_URL} alt={loginIdentityName || "微信头像"} className="w-[224px] h-[224px] rounded-[8px] object-cover" />
                 ) : qrSrc ? (
                   <img src={qrSrc} alt="登录二维码" className="w-[224px] h-[224px] object-contain bg-white" />
                 ) : (
@@ -5394,10 +5582,15 @@ function ProtocolLoginPanel({
               </div>
             </div>
           ) : (
-            <div className={`mt-[12px] rounded-[8px] border px-[14px] py-[16px] ${dark ? "border-[#333] bg-[#181818]" : "border-[#e2e2e2] bg-[#fafafa]"}`}>
-              <div className="text-[18px] text-[#07c160]">老号登录</div>
-              <div className={`mt-[10px] text-[13px] leading-[20px] ${mutedClass}`}>{statusText}</div>
-              {uuid && <div className={`mt-[8px] text-[12px] font-mono break-all ${mutedClass}`}>UUID {uuid}</div>}
+            <div className="mt-[12px] flex flex-col items-center text-center">
+              <div className={`flex h-[104px] w-[104px] items-center justify-center overflow-hidden rounded-[8px] text-[36px] ${dark ? "bg-[#303030] text-[#cfcfcf]" : "bg-[#e9e9e9] text-[#666]"}`}>
+                <img src={oldAccountAvatar || DEFAULT_AVATAR_URL} alt={oldAccountName} className="h-full w-full object-cover" />
+              </div>
+              <div className="mt-[16px] max-w-full truncate text-[20px]">{oldAccountName}</div>
+              {oldAccountWxid && <div className={`mt-[6px] max-w-full truncate font-mono text-[12px] ${mutedClass}`}>{oldAccountWxid}</div>}
+              <div className={`mt-[12px] min-h-[20px] text-[13px] ${phase === "error" ? "text-[#ff8a8a]" : mutedClass}`}>
+                {phase === "error" ? errorText || statusText : statusText}
+              </div>
             </div>
           )}
 
@@ -5412,7 +5605,7 @@ function ProtocolLoginPanel({
               RDV <span className="font-mono">{form.rdv}</span> · {proxySummary}
             </div>
 
-            {mode === "old" && (
+            {mode === "old" && !oldAccountWxid && (
               <label className={labelClass}>
                 WXID <span className="text-[#f56c6c]">*</span>
                 <input
@@ -5431,51 +5624,10 @@ function ProtocolLoginPanel({
                 disabled={!selectedLoggedInAccount && (busy || Boolean(rdvError) || (mode === "old" && !form.wxid.trim()))}
                 className={`h-[42px] rounded-[6px] bg-[#07c160] text-white text-[15px] active:opacity-85 disabled:opacity-55`}
               >
-                {selectedLoggedInAccount ? "进入微信" : busy ? "处理中" : "启动并推送登录"}
+                {selectedLoggedInAccount ? "进入微信" : busy ? "登录中" : "登录"}
               </button>
             )}
           </div>
-
-          {Object.keys(mapping).length > 0 && (
-            <div className={`mt-[18px] pt-[14px] border-t ${dark ? "border-[#333]" : "border-[#e5e5e5]"}`}>
-              <div className="flex items-center justify-between">
-                <button type="button" onClick={loadMapping} className={`text-[13px] ${mutedClass}`}>已保存 RDV · {Object.keys(mapping).length} 个</button>
-              </div>
-              <div className="mt-[9px] max-h-[120px] overflow-y-auto grid grid-cols-1 gap-[8px]">
-                {Object.entries(mapping).map(([rdv, entry]) => {
-                  const entryWxid = protocolMappingWxid(entry);
-                  const displayIdentity = protocolMappingDisplayIdentity(entry);
-                  const hasProxy = Object.values(protocolMappingProxy(entry)).some(Boolean);
-                  return (
-                    <div key={`${rdv}:${entryWxid}`} className={`rounded-[6px] border px-[10px] py-[8px] flex items-center gap-[9px] ${dark ? "border-[#333] bg-[#252525]" : "border-[#e5e5e5] bg-[#fafafa]"}`}>
-                      <button type="button" onClick={() => fillFromMapping(rdv)} className="min-w-0 flex flex-1 items-center gap-[9px] text-left">
-                        <span className={`flex h-[34px] w-[34px] shrink-0 items-center justify-center overflow-hidden rounded-[4px] text-[13px] ${dark ? "bg-[#333] text-[#bbb]" : "bg-[#e7e7e7] text-[#666]"}`}>
-                          {displayIdentity.avatar ? (
-                            <img src={displayIdentity.avatar} alt="" className="h-full w-full object-cover" />
-                          ) : (
-                            (displayIdentity.nickname || entryWxid || rdv).slice(0, 1).toUpperCase()
-                          )}
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate text-[13px]">{displayIdentity.nickname || `RDV ${rdv}`}</span>
-                          <span className={`mt-[2px] block truncate text-[12px] ${mutedClass}`}>
-                            <span className="font-mono">{rdv} · {entryWxid}</span>{hasProxy ? " · proxy" : ""}
-                          </span>
-                        </span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => deleteMapping(rdv)}
-                        className={`h-[28px] px-[8px] rounded-[4px] border text-[12px] active:opacity-85 ${dark ? "border-[#3a2a2a] text-[#ff9a9a]" : "border-[#f0caca] text-[#c53030]"}`}
-                      >
-                        删除
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
         </form>
       </div>
     </div>
@@ -5487,18 +5639,29 @@ function MobileProtocolLoginPage({
   theme,
   onBack,
   onRefresh,
+  onModeChange,
 }: {
   mode: "qr" | "old";
   theme: PortalTheme;
   onBack: () => void;
   onRefresh: () => void;
+  onModeChange: (mode: "qr" | "old") => void;
 }) {
   const dark = theme === "dark";
+  const [account, setAccount] = useState<WeChatAccount | null>(null);
   return (
     <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
       <MobileTopBar dark={dark} title={mode === "qr" ? "扫码上号" : "老号登录"} leftLabel="返回" onLeft={onBack} rightLabel="刷新" onRight={onRefresh} />
       <div className="flex-1 min-h-0 overflow-hidden">
-        <ProtocolLoginPanel mode={mode} theme={theme} onRefresh={onRefresh} />
+        <ProtocolLoginPanel
+          key={`${mode}:${accountStableKey(account) || "new"}`}
+          mode={mode}
+          theme={theme}
+          onRefresh={onRefresh}
+          account={account || undefined}
+          onSessionStarted={setAccount}
+          onModeChange={onModeChange}
+        />
       </div>
     </div>
   );
@@ -5544,15 +5707,15 @@ function ThemeSwitch({ theme, onChange }: { theme: PortalTheme; onChange: (theme
 }
 
 function AccountAvatar({ account }: { account: WeChatAccount }) {
-  const [failed, setFailed] = useState(false);
-  const name = (account.nickname && account.nickname !== account.id ? account.nickname : "") || account.wxid || account.account_id || "?";
-  if (account.avatar && !failed) {
-    return <img src={account.avatar} alt="" className="w-[54px] h-[54px] rounded-[5px] object-cover bg-[#333]" onError={() => setFailed(true)} />;
-  }
+  const [failedUrl, setFailedUrl] = useState("");
+  const avatarUrl = account.avatar || "";
   return (
-    <div className="w-[54px] h-[54px] rounded-[5px] bg-[#07c160] text-white flex items-center justify-center text-[22px] shrink-0">
-      {name[0]}
-    </div>
+    <img
+      src={avatarUrl && failedUrl !== avatarUrl ? avatarUrl : DEFAULT_AVATAR_URL}
+      alt={account.nickname || account.wxid || ""}
+      className="w-[54px] h-[54px] rounded-[5px] object-cover bg-[#333] shrink-0"
+      onError={() => setFailedUrl(avatarUrl)}
+    />
   );
 }
 
@@ -5616,6 +5779,7 @@ function MobileAccountPortal({
           theme={theme}
           onBack={() => setTool(null)}
           onRefresh={onRefresh}
+          onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
         />
       </MobileSwipeFrame>
     );
@@ -6308,7 +6472,15 @@ function MobileSessionRow({ session, onClick, dark }: { session: Session; onClic
           : (session.pinned ? "bg-[#e2e2e2] active:bg-[#d6d6d6]" : "active:bg-[#f4f4f4]")
       }`}
     >
-      <MobileAvatar name={session.nickname || session.wxid} avatar={session.avatar} group={session.is_group} size={44} pinned={session.pinned} />
+      <MobileAvatar
+        name={session.nickname || session.wxid}
+        avatar={session.avatar}
+        group={session.is_group}
+        size={44}
+        pinned={session.pinned}
+        aggregateCategory={session.aggregateCategory}
+        aggregateAvatars={session.aggregateAvatars}
+      />
       <div className={`min-w-0 flex-1 h-full border-b flex flex-col justify-center ${dark ? "border-[#242424]" : "border-[#ededed]"}`}>
         <div className="flex items-baseline gap-[7px]">
           <div className="text-[16px] leading-[21px] truncate flex-1">{session.nickname || session.wxid}</div>
@@ -6608,7 +6780,7 @@ function MobileProfileDetailPage({
     <div className={`h-dvh w-screen overflow-hidden flex flex-col ${dark ? "bg-[#111111] text-[#e8e8e8]" : "bg-[#ededed] text-[#111]"}`}>
       <MobileTopBar dark={dark} title="Profile" leftLabel="‹" onLeft={onBack} />
       <div className="flex-1 overflow-y-auto">
-        <MobileProfileRow dark={dark} label="Profile Photo" value="" onClick={onAvatarClick} image={avatar} />
+        <MobileProfileRow dark={dark} label="Profile Photo" value="" onClick={onAvatarClick} image={avatar || DEFAULT_AVATAR_URL} />
         <MobileProfileRow dark={dark} label="Name" value={name} />
         {gender && <MobileProfileRow dark={dark} label="Gender" value={gender} />}
         <MobileProfileRow dark={dark} label="Region" value={area || ""} />
@@ -6665,16 +6837,51 @@ function MobileTabButton({ active, label, icon, onClick, dark }: { active: boole
   );
 }
 
-function MobileAvatar({ name, avatar, group, size = 42, pinned = false }: { name: string; avatar?: string; group?: boolean; size?: number; pinned?: boolean }) {
-  const [failed, setFailed] = useState(false);
+function MobileAvatar({
+  name,
+  avatar,
+  size = 42,
+  pinned = false,
+  aggregateCategory,
+  aggregateAvatars = [],
+}: {
+  name: string;
+  avatar?: string;
+  group?: boolean;
+  size?: number;
+  pinned?: boolean;
+  aggregateCategory?: "official" | "service";
+  aggregateAvatars?: string[];
+}) {
+  const [failedUrl, setFailedUrl] = useState("");
+  const avatarUrl = avatar || "";
+  const aggregateTiles = Array.from({ length: 4 }, (_, index) => aggregateAvatars[index] || DEFAULT_AVATAR_URL);
   return (
     <div className="relative shrink-0" style={{ width: size, height: size }}>
-      {avatar && !failed ? (
-        <img src={avatar} alt="" className="w-full h-full rounded-[6px] object-cover" onError={() => setFailed(true)} loading="lazy" />
-      ) : (
-        <div className={`w-full h-full rounded-[6px] text-white flex items-center justify-center ${group ? "bg-[#576b95]" : "bg-[#07c160]"}`} style={{ fontSize: Math.max(15, size * 0.38) }}>
-          {(name || "?")[0]}
+      {aggregateCategory ? (
+        <div className={`grid h-full w-full grid-cols-2 gap-px overflow-hidden rounded-[6px] p-[2px] ${aggregateCategory === "official" ? "bg-[#1688f0]" : "bg-[#21a8f4]"}`}>
+          {aggregateTiles.map((url, index) => (
+            <img
+              key={`${url}:${index}`}
+              src={url}
+              alt=""
+              className="h-full min-h-0 w-full min-w-0 rounded-[1px] bg-white object-cover"
+              onError={(event) => {
+                event.currentTarget.onerror = null;
+                event.currentTarget.src = DEFAULT_AVATAR_URL;
+              }}
+              loading="lazy"
+            />
+          ))}
         </div>
+      ) : (
+        <img
+          src={avatarUrl && failedUrl !== avatarUrl ? avatarUrl : DEFAULT_AVATAR_URL}
+          alt={name}
+          className="w-full h-full rounded-[6px] object-cover"
+          onError={() => setFailedUrl(avatarUrl)}
+          loading="lazy"
+        />
       )}
       {pinned ? (
         <span className="absolute -left-[3px] -top-[3px] w-[16px] h-[16px] rounded-full bg-[#07c160] text-white shadow-sm flex items-center justify-center">
@@ -7250,13 +7457,7 @@ function WorkspaceSidebar({
         onClick={onSelfClick}
         title={selfName}
       >
-        {selfAvatar ? (
-          <img src={selfAvatar} alt="" className="w-full h-full object-cover" />
-        ) : (
-          <div className="w-full h-full bg-[#576b95] text-white flex items-center justify-center text-[22px]">
-            {(selfName || "我")[0]}
-          </div>
-        )}
+        <img src={selfAvatar || DEFAULT_AVATAR_URL} alt={selfName} className="w-full h-full object-cover" />
       </button>
 
       <div className="mt-[30px] flex flex-col items-center gap-[24px]">
@@ -7329,27 +7530,16 @@ function SidebarIconButton({
 }
 
 function EntryAvatar({ entry }: { entry: DirectoryEntry }) {
-  const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    setFailed(false);
-  }, [entry.wxid, entry.avatar]);
-  if (entry.avatar && !failed) {
-    return (
-      <img
-        src={entry.avatar}
-        alt=""
-        className="w-[42px] h-[42px] rounded-[4px] object-cover bg-[#ddd] shrink-0"
-        onError={() => setFailed(true)}
-        loading="lazy"
-      />
-    );
-  }
+  const [failedUrl, setFailedUrl] = useState("");
+  const avatarUrl = entry.avatar || "";
   return (
-    <div className={`w-[42px] h-[42px] rounded-[4px] flex items-center justify-center text-white text-[16px] shrink-0 ${
-      entry.is_group ? "bg-[#4f8dd8]" : "bg-[#07c160]"
-    }`}>
-      {(entry.name || entry.wxid || "?")[0]}
-    </div>
+    <img
+      src={avatarUrl && failedUrl !== avatarUrl ? avatarUrl : DEFAULT_AVATAR_URL}
+      alt={entry.name || entry.wxid}
+      className="w-[42px] h-[42px] rounded-[4px] object-cover bg-[#ddd] shrink-0"
+      onError={() => setFailedUrl(avatarUrl)}
+      loading="lazy"
+    />
   );
 }
 
@@ -8509,13 +8699,7 @@ function SelfProfileCard({
               onClick={onAvatarClick}
               title="查看大图"
             >
-              {avatar ? (
-                <img src={avatar} alt="" className="w-full h-full object-cover" />
-              ) : (
-                <div className="w-full h-full bg-[#576b95] text-white flex items-center justify-center text-[30px]">
-                  {(name || "我")[0]}
-                </div>
-              )}
+              <img src={avatar || DEFAULT_AVATAR_URL} alt={name} className="w-full h-full object-cover" />
             </button>
             <div className="min-w-0 flex-1 pt-[2px]">
               <div className="flex items-center gap-[8px]">
@@ -8556,11 +8740,7 @@ function LargeAvatarOverlay({ src, onClose, dark = true }: { src: string; onClos
         </button>
       </div>
       <div className="flex-1 min-h-0 flex items-center justify-center p-[28px]">
-        {src ? (
-          <img src={src} alt="" className="max-w-full max-h-full object-contain" />
-        ) : (
-          <div className={dark ? "text-[#777]" : "text-[#999]"}>暂无头像</div>
-        )}
+        <img src={src || DEFAULT_AVATAR_URL} alt="" className="max-w-full max-h-full object-contain" />
       </div>
     </div>
   );

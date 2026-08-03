@@ -24,8 +24,16 @@ class SqliteMessageCache:
         cache_dir = os.path.join(base_dir, ".sqlite_cache")
         os.makedirs(cache_dir, exist_ok=True)
         self.db_path = db_path or os.path.join(cache_dir, "wechat_cache.sqlite3")
+        self.existed_before_init = os.path.isfile(self.db_path)
         self._lock = RLock()
+        self._history_owners: set[str] = set()
         self._init_db()
+        if self.existed_before_init:
+            with self._lock, self._connect() as conn:
+                self._history_owners = {
+                    str(row["owner_wxid"] or "").strip()
+                    for row in conn.execute("SELECT DISTINCT owner_wxid FROM messages").fetchall()
+                }
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -409,7 +417,15 @@ class SqliteMessageCache:
             if newest:
                 self._upsert_last_message_locked(conn, wxid, self._last_from_message(newest), now, owner_wxid=owner_wxid)
             self._refresh_state_locked(conn, wxid, mark_initialized=mark_initialized, now=now, owner_wxid=owner_wxid)
+        with self._lock:
+            self._history_owners.add(owner_wxid)
         return len(rows)
+
+    def has_message_history(self, *, owner_wxid: str = "") -> bool:
+        """Return whether this account has ever persisted a message row."""
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock:
+            return owner_wxid in self._history_owners
 
     def mark_initialized(self, wxid: str, *, owner_wxid: str = "") -> None:
         now = int(time.time())
@@ -449,6 +465,36 @@ class SqliteMessageCache:
         messages = [json.loads(row["message_json"]) for row in rows]
         messages.reverse()
         return messages
+
+    def search_messages(
+        self,
+        wxid: str,
+        keyword: str,
+        limit: int = 50,
+        *,
+        owner_wxid: str = "",
+    ) -> list[dict[str, Any]]:
+        wxid = str(wxid or "").strip()
+        keyword = str(keyword or "").strip()
+        if not wxid or not keyword:
+            return []
+        owner_wxid = str(owner_wxid or "").strip()
+        limit = max(1, min(int(limit or 50), 100))
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_json
+                FROM messages
+                WHERE owner_wxid = ? AND wxid = ? AND message_json LIKE ? ESCAPE '\\'
+                ORDER BY timestamp DESC, msg_id DESC
+                LIMIT ?
+                """,
+                (owner_wxid, wxid, f"%{escaped}%", limit),
+            ).fetchall()
+        folded = keyword.casefold()
+        messages = [json.loads(row["message_json"]) for row in rows]
+        return [message for message in messages if folded in str(message.get("msg", "")).casefold()]
 
     def update_image_path_by_msg_id(self, msg_id: str, img_path: str, *, owner_wxid: str = "") -> int:
         if not msg_id or not img_path:
@@ -546,6 +592,7 @@ class SqliteMessageCache:
                 or profile.get("markname")
                 or profile.get("Remark")
                 or profile.get("remark")
+                or profile.get("nick_name")
                 or profile.get("nickname")
                 or profile.get("NickName")
                 or ""
@@ -554,6 +601,10 @@ class SqliteMessageCache:
                 contact.get("avatar")
                 or profile.get("SmallHeadImgUrl")
                 or profile.get("BigHeadImgUrl")
+                or profile.get("small_head_url")
+                or profile.get("big_head_url")
+                or profile.get("small_head_img_url")
+                or profile.get("big_head_img_url")
                 or profile.get("smallhead")
                 or profile.get("bighead")
                 or profile.get("headimgurl")
@@ -596,7 +647,7 @@ class SqliteMessageCache:
                         WHEN instr(excluded.profile_json, 'SmallHeadImgUrl') > 0 OR instr(excluded.profile_json, 'smallhead') > 0 THEN excluded.profile_json
                         WHEN instr(excluded.profile_json, 'BigHeadImgUrl') > 0 OR instr(excluded.profile_json, 'bighead') > 0 THEN excluded.profile_json
                         WHEN instr(excluded.profile_json, 'VerifyFlag') > 0 OR instr(excluded.profile_json, 'verifyflag') > 0 THEN excluded.profile_json
-                        WHEN instr(excluded.profile_json, 'BitVal') > 0 OR instr(excluded.profile_json, 'bitval') > 0 THEN excluded.profile_json
+                        WHEN instr(excluded.profile_json, 'BitVal') > 0 OR instr(excluded.profile_json, 'bitval') > 0 OR instr(excluded.profile_json, 'bit_val') > 0 THEN excluded.profile_json
                         WHEN instr(excluded.profile_json, 'ServiceType') > 0 OR instr(excluded.profile_json, 'service_type') > 0 THEN excluded.profile_json
                         WHEN instr(excluded.profile_json, 'ServiceFlag') > 0 OR instr(excluded.profile_json, 'serviceFlag') > 0 THEN excluded.profile_json
                         WHEN instr(excluded.profile_json, 'AccountType') > 0 OR instr(excluded.profile_json, 'account_type') > 0 THEN excluded.profile_json

@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, type ReactNode, type WheelEvent, 
 import type { ChatMessage } from "../types";
 import { getImageUrl, getDbImageUrl, downloadImage, authQuery } from "../api";
 import { replaceWechatEmojis } from "../utils/wechatEmoji";
+import { DEFAULT_AVATAR_URL } from "../avatar";
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -218,36 +219,22 @@ function formatMessageTime(timeStr: string | undefined, timestamp?: number): str
 }
 
 /**
- * Avatar component: shows image if URL available, letter fallback otherwise.
+ * Avatar component: shows the shared neutral avatar until a URL is available.
  * Uses unique key per wxid to prevent state leakage between different contacts.
  */
 function ChatAvatar({ wxid, isSelf, name, avatarUrl }: {
   wxid: string; isSelf: boolean; name: string; avatarUrl?: string;
 }) {
-  const [imgError, setImgError] = useState(false);
+  const [failedUrl, setFailedUrl] = useState("");
 
-  if (avatarUrl && !imgError) {
-    return (
-      <img
-        src={avatarUrl}
-        alt=""
-        className="w-[40px] h-[40px] rounded-[4px] object-cover"
-        onError={() => setImgError(true)}
-        loading="lazy"
-      />
-    );
-  }
-
-  // Letter fallback
-  const initial = name?.[0] || wxid?.slice(-2)?.[0] || "?";
   return (
-    <div
-      className={`w-[40px] h-[40px] rounded-[4px] flex items-center justify-center text-white text-[14px] font-medium ${
-        isSelf ? "bg-[#60b044]" : "bg-[#576b95]"
-      }`}
-    >
-      {initial}
-    </div>
+    <img
+      src={avatarUrl && failedUrl !== avatarUrl ? avatarUrl : DEFAULT_AVATAR_URL}
+      alt={name || wxid || (isSelf ? "Me" : "")}
+      className="w-[40px] h-[40px] rounded-[4px] object-cover"
+      onError={() => setFailedUrl(avatarUrl || "")}
+      loading="lazy"
+    />
   );
 }
 
@@ -584,13 +571,7 @@ export default function MessageBubble({
           return (
             <div className="w-[220px]">
               <div className="flex items-center gap-2 pb-2 border-b border-[#333]">
-                {smallimg ? (
-                  <img src={smallimg} className="w-10 h-10 rounded-[4px]" alt="" />
-                ) : (
-                  <div className="w-10 h-10 rounded-[4px] bg-[#60b044] flex items-center justify-center text-white text-sm">
-                    {nickname[0]}
-                  </div>
-                )}
+                <img src={smallimg || DEFAULT_AVATAR_URL} className="w-10 h-10 rounded-[4px] object-cover" alt="" />
                 <span className="text-[17px]">{nickname}</span>
               </div>
               <div className="text-[11px] text-[#888] mt-1.5">个人名片</div>

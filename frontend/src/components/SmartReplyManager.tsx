@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { analyzeAiMessage, deleteSmartReply, getAiSettings, getGroupMemberDetails, getSmartReplies, saveAiSettings, saveSmartReply, validateAiSettings } from "../api";
 import type { AiAnalysisResult, AiProfile, AiSettings, SmartReplyAiOutputMode, SmartReplyAiTask, SmartReplyConfig, SmartReplyMessageType, SmartReplyRule, SmartReplyTarget } from "../types";
+import { DEFAULT_AVATAR_URL } from "../avatar";
 
 interface GroupMember {
   wxid: string;
@@ -1317,12 +1318,14 @@ export default function SmartReplyManager({
 function TargetAvatar({ target, size }: { target: SmartReplyTarget; size: number }) {
   const [failedSrc, setFailedSrc] = useState("");
   const avatar = target.avatar || "";
-  return avatar && failedSrc !== avatar ? (
-    <img src={avatar} alt="" onError={() => setFailedSrc(avatar)} className="rounded-[5px] object-cover shrink-0" style={{ width: size, height: size }} />
-  ) : (
-    <div className="rounded-[5px] bg-[#576b95] text-white flex items-center justify-center shrink-0" style={{ width: size, height: size, fontSize: Math.max(13, size * 0.38) }}>
-      {(target.name || target.wxid || "?")[0]}
-    </div>
+  return (
+    <img
+      src={avatar && failedSrc !== avatar ? avatar : DEFAULT_AVATAR_URL}
+      alt={target.name || target.wxid}
+      onError={() => setFailedSrc(avatar)}
+      className="rounded-[5px] object-cover shrink-0"
+      style={{ width: size, height: size }}
+    />
   );
 }
 
