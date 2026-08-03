@@ -17,6 +17,7 @@ def config(**overrides):
         "chat_name": "Test group",
         "enabled": True,
         "mention_only": False,
+        "use_no_src": False,
         "message_types": ["text"],
         "target_senders": [SENDER],
         "rules": [{
@@ -441,11 +442,12 @@ class SmartReplyStorageTests(unittest.TestCase):
             "max_parallel": 3,
         }]
         saved = self.cache.upsert_smart_reply_config(
-            config(ai_tasks=ai_tasks, mention_only=True),
+            config(ai_tasks=ai_tasks, mention_only=True, use_no_src=True),
             owner_wxid=OWNER,
         )
         self.assertTrue(saved["enabled"])
         self.assertTrue(saved["mention_only"])
+        self.assertTrue(saved["use_no_src"])
         self.assertEqual(["text"], saved["message_types"])
         self.assertEqual([SENDER], saved["target_senders"])
         self.assertEqual(ai_tasks, saved["ai_tasks"])
@@ -474,6 +476,59 @@ class SmartReplyStorageTests(unittest.TestCase):
 
 
 class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_low_level_text_reply_uses_no_src_sender(self):
+        import main
+
+        temp_dir = tempfile.TemporaryDirectory()
+        cache = SqliteMessageCache(os.path.join(temp_dir.name, "cache.sqlite3"))
+        normal_sent: list[tuple[str, str]] = []
+        no_src_sent: list[tuple[str, str]] = []
+
+        async def fake_send_text(wxid, text):
+            normal_sent.append((wxid, text))
+            return {"SendTextMsg": "1"}
+
+        async def fake_send_text_no_src(wxid, text):
+            no_src_sent.append((wxid, text))
+            return {"SendTextMsg_NoSrc": "1"}
+
+        async def noop(*_args, **_kwargs):
+            return None
+
+        old_cache = main.sqlite_cache
+        old_engine = main.smart_reply_engine
+        old_send_text = main.wechat_api.send_text
+        old_send_text_no_src = main.wechat_api.send_text_no_src
+        old_broadcast = main.manager.broadcast
+        old_local_sent = main._broadcast_local_sent_for_agent
+        try:
+            main.sqlite_cache = cache
+            main.smart_reply_engine = SmartReplyEngine(cooldown=0)
+            main.wechat_api.send_text = fake_send_text
+            main.wechat_api.send_text_no_src = fake_send_text_no_src
+            main.manager.broadcast = noop
+            main._broadcast_local_sent_for_agent = noop
+            cache.upsert_smart_reply_config(config(use_no_src=True), owner_wxid=OWNER)
+
+            await main._process_smart_reply_message(
+                owner_wxid=OWNER,
+                agent_id="agent_1",
+                self_wxid=OWNER,
+                chat_id=CHAT_ID,
+                message=message("urgent"),
+            )
+        finally:
+            main.sqlite_cache = old_cache
+            main.smart_reply_engine = old_engine
+            main.wechat_api.send_text = old_send_text
+            main.wechat_api.send_text_no_src = old_send_text_no_src
+            main.manager.broadcast = old_broadcast
+            main._broadcast_local_sent_for_agent = old_local_sent
+            temp_dir.cleanup()
+
+        self.assertEqual([], normal_sent)
+        self.assertEqual([(CHAT_ID, "received")], no_src_sent)
+
     async def test_private_ai_reply_reaches_send_stage(self):
         import main
 

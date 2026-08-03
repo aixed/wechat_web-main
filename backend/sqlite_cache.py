@@ -155,6 +155,7 @@ class SqliteMessageCache:
                     avatar TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     mention_only INTEGER NOT NULL DEFAULT 0,
+                    use_no_src INTEGER NOT NULL DEFAULT 0,
                     message_types_json TEXT NOT NULL DEFAULT '["text"]',
                     target_senders_json TEXT NOT NULL DEFAULT '[]',
                     rules_json TEXT NOT NULL DEFAULT '[]',
@@ -190,6 +191,11 @@ class SqliteMessageCache:
                 conn.execute(
                     "ALTER TABLE smart_reply_configs "
                     "ADD COLUMN mention_only INTEGER NOT NULL DEFAULT 0"
+                )
+            if "use_no_src" not in smart_reply_columns:
+                conn.execute(
+                    "ALTER TABLE smart_reply_configs "
+                    "ADD COLUMN use_no_src INTEGER NOT NULL DEFAULT 0"
                 )
             if "ai_tasks_json" not in smart_reply_columns:
                 conn.execute(
@@ -231,6 +237,7 @@ class SqliteMessageCache:
             "avatar": str(row["avatar"] or ""),
             "enabled": bool(int(row["enabled"] or 0)),
             "mention_only": bool(int(row["mention_only"] or 0)),
+            "use_no_src": bool(int(row["use_no_src"] or 0)),
             "message_types": [str(item) for item in message_types if str(item or "").strip()],
             "target_senders": [str(item) for item in target_senders if str(item or "").strip()],
             "rules": [item for item in rules if isinstance(item, dict)],
@@ -276,15 +283,16 @@ class SqliteMessageCache:
             conn.execute(
                 """
                 INSERT INTO smart_reply_configs (
-                    owner_wxid, chat_id, chat_name, avatar, enabled, mention_only,
+                    owner_wxid, chat_id, chat_name, avatar, enabled, mention_only, use_no_src,
                     message_types_json, target_senders_json, rules_json, ai_tasks_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(owner_wxid, chat_id) DO UPDATE SET
                     chat_name=excluded.chat_name,
                     avatar=excluded.avatar,
                     enabled=excluded.enabled,
                     mention_only=excluded.mention_only,
+                    use_no_src=excluded.use_no_src,
                     message_types_json=excluded.message_types_json,
                     target_senders_json=excluded.target_senders_json,
                     rules_json=excluded.rules_json,
@@ -298,6 +306,7 @@ class SqliteMessageCache:
                     str(config.get("avatar") or ""),
                     1 if bool(config.get("enabled", True)) else 0,
                     1 if bool(config.get("mention_only", False)) else 0,
+                    1 if bool(config.get("use_no_src", False)) else 0,
                     json.dumps(message_types, ensure_ascii=False),
                     json.dumps(target_senders, ensure_ascii=False),
                     json.dumps(rules, ensure_ascii=False),
