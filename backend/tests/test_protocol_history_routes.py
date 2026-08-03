@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import tempfile
 import unittest
@@ -64,6 +65,29 @@ class ProtocolHistoryRouteTests(unittest.IsolatedAsyncioTestCase):
         status_notify.assert_awaited_once_with(code=3, function_name="", function_arg="")
         query_sessions.assert_not_awaited()
 
+    async def test_protocol_session_cache_loads_without_message_history(self):
+        main.sqlite_cache.upsert_sessions([{
+            "strUsrName": "wxid_cached_session",
+            "strNickName": "Cached Session",
+            "strContent": "cached preview",
+            "nTime": 123,
+            "nOrder": 123,
+        }], owner_wxid="wxid_owner")
+        request = SimpleNamespace(headers={}, query_params={})
+
+        with (
+            patch.object(main.config, "IS_PROTOCOL", True),
+            patch.object(main, "_contact_owner_wxid", return_value="wxid_owner"),
+        ):
+            result = await main.get_sessions(request)
+
+        self.assertEqual("protocol_sqlite", result["source"])
+        self.assertEqual(
+            ["wxid_cached_session"],
+            [row["strUsrName"] for row in result["sessions"]["data"]],
+        )
+        self.assertEqual("cached preview", result["last_messages"]["wxid_cached_session"]["content"])
+
     async def test_protocol_session_refresh_hydrates_names_avatars_and_pins(self):
         status_notify = AsyncMock(return_value={
             "ok": True,
@@ -73,6 +97,7 @@ class ProtocolHistoryRouteTests(unittest.IsolatedAsyncioTestCase):
                 "chat_contact_list": [
                     "wxid_normal",
                     "45996531138@chatroom",
+                    "48248334674@chatroom",
                     "filehelper",
                 ],
             },
@@ -99,8 +124,19 @@ class ProtocolHistoryRouteTests(unittest.IsolatedAsyncioTestCase):
                         "contact": {
                             "user_name": "45996531138@chatroom",
                             "nick_name": "Pinned Group",
+                            "remark": "Pinned Group Remark",
                             "small_head_img_url": "https://example.test/group.jpg",
                             "bit_val": 2050,
+                        },
+                    },
+                    {
+                        "user_name": "48248334674@chatroom",
+                        "ret": 0,
+                        "contact": {
+                            "user_name": "48248334674@chatroom",
+                            "nick_name": "Fallback Group Nick",
+                            "small_head_img_url": "https://example.test/fallback-group.jpg",
+                            "bit_val": 2,
                         },
                     },
                     {
@@ -127,19 +163,121 @@ class ProtocolHistoryRouteTests(unittest.IsolatedAsyncioTestCase):
 
         rows = result["sessions"]["data"]
         self.assertEqual(
-            ["wxid_normal", "45996531138@chatroom", "filehelper"],
+            ["45996531138@chatroom", "filehelper", "wxid_normal", "48248334674@chatroom"],
             [row["strUsrName"] for row in rows],
         )
-        self.assertEqual("Normal Remark", rows[0]["strNickName"])
-        self.assertFalse(rows[0]["pinned"])
-        self.assertTrue(rows[1]["pinned"])
-        self.assertTrue(rows[2]["pinned"])
+        rows_by_wxid = {row["strUsrName"]: row for row in rows}
+        self.assertEqual("Normal Remark", rows_by_wxid["wxid_normal"]["strNickName"])
+        self.assertEqual("Pinned Group Remark", rows_by_wxid["45996531138@chatroom"]["strNickName"])
+        self.assertEqual("Fallback Group Nick", rows_by_wxid["48248334674@chatroom"]["strNickName"])
+        self.assertFalse(rows_by_wxid["wxid_normal"]["pinned"])
+        self.assertTrue(rows_by_wxid["45996531138@chatroom"]["pinned"])
+        self.assertTrue(rows_by_wxid["filehelper"]["pinned"])
         self.assertEqual("Normal Remark", result["contact_profiles"]["wxid_normal"]["name"])
         self.assertEqual(
             "https://example.test/normal.jpg",
             result["contact_profiles"]["wxid_normal"]["avatar"],
         )
         batch_brief.assert_awaited_once()
+
+    async def test_protocol_session_refresh_merges_server_and_local_sessions(self):
+        main.sqlite_cache.upsert_contacts({
+            "server_new": {
+                "wxid": "server_new",
+                "name": "server_new",
+                "profile": {"remark": "Server Remark", "nick_name": "Server Nick", "bit_val": 3},
+            },
+            "server_shared": {"wxid": "server_shared", "name": "Server Shared", "profile": {"bit_val": 3}},
+            "local_old": {
+                "wxid": "local_old",
+                "name": "local_old",
+                "profile": {"nick_name": "Local Nick", "bit_val": 3},
+            },
+            "local_pinned": {"wxid": "local_pinned", "name": "Local Pinned", "profile": {"bit_val": 2050}},
+            "previous_server": {"wxid": "previous_server", "name": "Previous Server", "profile": {"bit_val": 3}},
+        }, owner_wxid="wxid_owner")
+        main.sqlite_cache.upsert_sessions([
+            {"strUsrName": "server_shared", "strContent": "shared preview", "nTime": 300, "nOrder": 300},
+            {"strUsrName": "local_old", "strContent": "local preview", "nTime": 500, "nOrder": 500},
+            {"strUsrName": "local_pinned", "strContent": "pinned preview", "nTime": 100, "nOrder": 100},
+            {
+                "strUsrName": "previous_server",
+                "strContent": "previous preview",
+                "nTime": 200,
+                "nOrder": main._PROTOCOL_STATUSNOTIFY_ORDER_BASE + 99,
+                "statusnotify_recent": True,
+            },
+        ], owner_wxid="wxid_owner")
+        status_notify = AsyncMock(return_value={
+            "ok": True,
+            "statusnotify": {
+                "base_response": {"ret": 0, "ret_signed": 0},
+                "chat_contact_count": 2,
+                "chat_contact_list": ["server_new", "server_shared"],
+            },
+        })
+        request = SimpleNamespace(headers={}, query_params={})
+
+        with (
+            patch.object(main.config, "IS_PROTOCOL", True),
+            patch.object(main, "_contact_owner_wxid", return_value="wxid_owner"),
+            patch.object(main.wechat_api, "status_notify", status_notify),
+            patch.object(main, "_fetch_and_cache_contact_details", AsyncMock(return_value={})),
+        ):
+            result = await main.refresh_sessions(request)
+
+        rows = result["sessions"]["data"]
+        self.assertEqual(
+            ["local_pinned", "server_new", "server_shared", "local_old", "previous_server"],
+            [row["strUsrName"] for row in rows],
+        )
+        rows_by_wxid = {row["strUsrName"]: row for row in rows}
+        self.assertEqual("Server Remark", rows_by_wxid["server_new"]["strNickName"])
+        self.assertEqual("Local Nick", rows_by_wxid["local_old"]["strNickName"])
+        self.assertEqual("shared preview", rows_by_wxid["server_shared"]["strContent"])
+        self.assertTrue(rows_by_wxid["local_pinned"]["pinned"])
+        self.assertTrue(rows_by_wxid["server_new"]["statusnotify_recent"])
+        self.assertFalse(rows_by_wxid["previous_server"]["statusnotify_recent"])
+        self.assertEqual(200, rows_by_wxid["previous_server"]["nOrder"])
+        self.assertEqual(
+            [row["strUsrName"] for row in rows],
+            [row["strUsrName"] for row in main.sqlite_cache.get_sessions(owner_wxid="wxid_owner")],
+        )
+
+    async def test_protocol_image_download_uses_synchronous_cdn_response(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"protocol-image-test"
+        cdn_download = AsyncMock(return_value={
+            "ok": True,
+            "data": {
+                "status": 0,
+                "data": {
+                    "imageBase64": base64.b64encode(png).decode("ascii"),
+                    "imageMimeType": "image/png",
+                },
+            },
+        })
+        request = SimpleNamespace(
+            headers={"X-Agent-Id": "SESSION_1"},
+            query_params={},
+            json=AsyncMock(return_value={
+                "msg_xml": '<msg><img aeskey="001122" cdnmidimgurl="file-id" /></msg>',
+                "msg_id": "123456",
+                "bytes_extra_hex": "",
+            }),
+        )
+        image_cache = os.path.join(self.temp_dir.name, "images")
+
+        with (
+            patch.object(main.config, "IS_PROTOCOL", True),
+            patch.object(main, "_IMG_CACHE_DIR", image_cache),
+            patch.object(main, "_contact_owner_wxid", return_value="wxid_owner"),
+            patch.object(main.protocol_api, "download_cdn_image", cdn_download),
+        ):
+            response = await main.download_image(request)
+
+        with open(response.path, "rb") as image_file:
+            self.assertEqual(png, image_file.read())
+        cdn_download.assert_awaited_once_with("SESSION_1", "001122", "file-id")
 
     async def test_protocol_initcontact_matrix_is_loaded_once_and_all_ids_are_cached(self):
         init_contact = AsyncMock(return_value={

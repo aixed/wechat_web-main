@@ -875,9 +875,8 @@ async def _activate_protocol_account(session_id: str) -> dict:
         _put_self_info_field("wxid", wxid)
         _put_self_info_field("selfwxid", wxid)
     owner_wxid = _contact_owner_wxid(wxid)
-    if not _skip_empty_protocol_history_preload(owner_wxid):
-        _load_session_cache_into_state(owner_wxid)
-        app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+    _load_session_cache_into_state(owner_wxid)
+    app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
     app_state["initialized"] = True
     item = {
         "session_id": session_id,
@@ -1196,16 +1195,6 @@ def _protocol_history_available(owner_wxid: str = "") -> bool:
     return sqlite_cache.has_message_history(owner_wxid=_contact_owner_wxid(owner_wxid))
 
 
-def _skip_empty_protocol_history_preload(owner_wxid: str) -> bool:
-    if _protocol_history_available(owner_wxid):
-        return False
-    app_state["contacts"] = None
-    app_state["sessions"] = {"data": []}
-    app_state["last_messages"] = {}
-    _log(f"[PROTO_HISTORY] no local history for owner={owner_wxid}; preload skipped")
-    return True
-
-
 def _format_preview(msg_type: str, content: str) -> str:
     t = str(msg_type)
     if t == "1":
@@ -1514,9 +1503,8 @@ async def _run_protocol_backend_initialization(session_id: str | None = None) ->
         _put_self_info_field("selfwxid", wxid)
 
     owner_wxid = _contact_owner_wxid(wxid)
-    if not _skip_empty_protocol_history_preload(owner_wxid):
-        app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
-        _load_session_cache_into_state(owner_wxid)
+    app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+    _load_session_cache_into_state(owner_wxid)
     app_state["initialized"] = True
     _log(f"[PROTO_INIT] active wxid={wxid or '-'} protocol cache ready")
     return True
@@ -3318,6 +3306,8 @@ def _to_int(value) -> int:
 
 
 _PROTOCOL_CONTACT_PIN_BIT = 0x800
+_PROTOCOL_STATUSNOTIFY_ORDER_BASE = 100_000_000_000
+_PROTOCOL_PINNED_ORDER_BASE = 1_000_000_000_000
 
 
 def _statusnotify_payload(data) -> dict:
@@ -3377,6 +3367,62 @@ def _contact_summary_is_pinned(summary: dict | None) -> bool:
     return bool(bit_val & _PROTOCOL_CONTACT_PIN_BIT)
 
 
+def _protocol_contact_display_name(wxid: str, summary: dict | None) -> str:
+    profile = _contact_summary_profile(summary)
+    explicit_name = _contact_profile_explicit_name(profile).strip()
+    if explicit_name and explicit_name != wxid:
+        return explicit_name
+    cached_name = str((summary or {}).get("name") or "").strip() if isinstance(summary, dict) else ""
+    if cached_name and cached_name != wxid:
+        return cached_name
+    return explicit_name or cached_name or wxid
+
+
+def _protocol_session_is_pinned(row: dict | None, summary: dict | None = None) -> bool:
+    if _contact_summary_is_pinned(summary):
+        return True
+    if not isinstance(row, dict):
+        return False
+    flag = row.get("pinned")
+    if isinstance(flag, str):
+        flag = flag.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(flag) or _to_int(_row_value(row, "nOrder", "NOrder", "order")) >= _PROTOCOL_PINNED_ORDER_BASE
+
+
+def _protocol_local_session_row(row: dict, summary: dict | None = None) -> dict:
+    merged = dict(row)
+    wxid = str(_row_value(merged, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
+    contact_name = _protocol_contact_display_name(wxid, summary)
+    if contact_name and contact_name != wxid:
+        merged["strNickName"] = contact_name
+    order_value = _to_int(_row_value(merged, "nOrder", "NOrder", "order"))
+    timestamp = _to_int(_row_value(
+        merged,
+        "nTime",
+        "NTime",
+        "nUpdateTime",
+        "nCreateTime",
+        "CreateTime",
+        "timestamp",
+        "lastTimestamp",
+    ))
+    pinned = _protocol_session_is_pinned(merged, summary)
+    if pinned:
+        if order_value < _PROTOCOL_PINNED_ORDER_BASE:
+            local_rank = order_value if 0 < order_value < _PROTOCOL_STATUSNOTIFY_ORDER_BASE else timestamp
+            order_value = _PROTOCOL_PINNED_ORDER_BASE + max(local_rank, timestamp, 1)
+    elif order_value >= _PROTOCOL_STATUSNOTIFY_ORDER_BASE:
+        order_value = timestamp
+    merged.update({
+        "nOrder": order_value,
+        "order": order_value,
+        "pinned": pinned,
+        "statusnotify_recent": False,
+    })
+    merged.pop("statusnotify_index", None)
+    return merged
+
+
 def _protocol_session_rows(
     wxids: list[str],
     contact_profiles: dict[str, dict],
@@ -3392,13 +3438,19 @@ def _protocol_session_rows(
     for index, wxid in enumerate(wxids):
         summary = contact_profiles.get(wxid) if isinstance(contact_profiles, dict) else {}
         profile = _contact_summary_profile(summary)
-        name = str(
-            (summary or {}).get("name")
-            or _contact_profile_explicit_name(profile)
-            or wxid
-        )
+        name = _protocol_contact_display_name(wxid, summary)
         bit_val = _contact_profile_int(profile, "bit_val", "BitVal", "bitval") or 0
         row = dict(cached_by_wxid.get(wxid) or {})
+        rank = count - index
+        pinned = _protocol_session_is_pinned(row, summary)
+        existing_order = _to_int(_row_value(row, "nOrder", "NOrder", "order"))
+        if pinned:
+            order_value = max(
+                existing_order if existing_order >= _PROTOCOL_PINNED_ORDER_BASE else 0,
+                _PROTOCOL_PINNED_ORDER_BASE + _PROTOCOL_STATUSNOTIFY_ORDER_BASE + rank,
+            )
+        else:
+            order_value = _PROTOCOL_STATUSNOTIFY_ORDER_BASE + rank
         row.update({
             "strUsrName": wxid,
             "strNickName": name,
@@ -3416,14 +3468,43 @@ def _protocol_session_rows(
                 "timestamp",
                 "lastTimestamp",
             )),
-            "nOrder": count - index,
-            "order": count - index,
-            "pinned": _contact_summary_is_pinned(summary),
+            "nOrder": order_value,
+            "order": order_value,
+            "pinned": pinned,
             "bit_val": bit_val,
             "statusnotify_index": index,
+            "statusnotify_recent": True,
         })
         rows.append(row)
     return rows
+
+
+def _merge_protocol_session_rows(
+    status_rows: list[dict],
+    cached_rows: list[dict],
+    contact_profiles: dict[str, dict],
+) -> list[dict]:
+    recent_wxids = {
+        str(_row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
+        for row in status_rows
+        if isinstance(row, dict)
+    }
+    merged = [dict(row) for row in status_rows if isinstance(row, dict)]
+    for cached in cached_rows:
+        if not isinstance(cached, dict):
+            continue
+        wxid = str(_row_value(cached, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
+        if not wxid or wxid in recent_wxids:
+            continue
+        merged.append(_protocol_local_session_row(cached, contact_profiles.get(wxid)))
+
+    merged.sort(key=lambda row: (
+        1 if _protocol_session_is_pinned(row, contact_profiles.get(str(row.get("strUsrName") or ""))) else 0,
+        1 if row.get("statusnotify_recent") else 0,
+        _to_int(_row_value(row, "nOrder", "NOrder", "order")),
+        _to_int(_row_value(row, "nTime", "NTime", "timestamp", "lastTimestamp")),
+    ), reverse=True)
+    return merged
 
 
 async def _refresh_protocol_session_list(owner_wxid: str, account_id: str) -> dict:
@@ -3450,9 +3531,16 @@ async def _refresh_protocol_session_list(owner_wxid: str, account_id: str) -> di
                 account_id=account_id,
             )
 
-    contact_profiles = sqlite_cache.get_contacts(wxids, owner_wxid=owner_wxid) if wxids else {}
     cached_rows = _session_rows_from_cache(owner_wxid)
-    session_rows = _protocol_session_rows(wxids, contact_profiles, cached_rows)
+    cached_wxids = [
+        str(_row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
+        for row in cached_rows
+        if isinstance(row, dict)
+    ]
+    merged_wxids = _normalize_wxids([*wxids, *cached_wxids])
+    contact_profiles = sqlite_cache.get_contacts(merged_wxids, owner_wxid=owner_wxid) if merged_wxids else {}
+    status_rows = _protocol_session_rows(wxids, contact_profiles, cached_rows)
+    session_rows = _merge_protocol_session_rows(status_rows, cached_rows, contact_profiles)
     if session_rows:
         sqlite_cache.upsert_sessions(session_rows, owner_wxid=owner_wxid)
 
@@ -3462,7 +3550,7 @@ async def _refresh_protocol_session_list(owner_wxid: str, account_id: str) -> di
     app_state["last_messages"] = last_messages
     app_state["session_list_loaded"] = True
     _log(
-        f"[REFRESH] protocol statusnotify sessions={len(session_rows)} "
+        f"[REFRESH] protocol statusnotify recent={len(status_rows)} merged={len(session_rows)} "
         f"pinned={sum(1 for row in session_rows if row.get('pinned'))}"
     )
     return {
@@ -5210,11 +5298,24 @@ async def post_contacts_profile_batch(req: ProfileBatchRequest):
 async def get_sessions(request: Request):
     """Get current session (conversation) list from cache."""
     agent_id = _request_agent_id(request)
-    if agent_id and config.IS_PROTOCOL:
-        _activate_runtime(agent_id)
+    if config.IS_PROTOCOL:
+        if agent_id:
+            _activate_runtime(agent_id)
         owner_wxid = _contact_owner_wxid()
-        if not _skip_empty_protocol_history_preload(owner_wxid):
-            _load_session_cache_into_state(owner_wxid)
+        raw_sessions, last_messages = _load_session_cache_into_state(owner_wxid)
+        session_list = raw_sessions.get("data", []) if isinstance(raw_sessions, dict) else []
+        profile_wxids = [
+            str(_row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
+            for row in session_list
+            if isinstance(row, dict)
+        ]
+        contact_profiles = sqlite_cache.get_contacts(profile_wxids, owner_wxid=owner_wxid) if profile_wxids else {}
+        return {
+            "sessions": raw_sessions,
+            "last_messages": last_messages,
+            "contact_profiles": contact_profiles,
+            "source": "protocol_sqlite",
+        }
     elif agent_id and agent_manager.is_connected(agent_id):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
@@ -5239,14 +5340,6 @@ async def refresh_sessions(request: Request):
             return await _refresh_protocol_session_list(owner_wxid, target_agent_id)
         except Exception as e:
             _log(f"[REFRESH] protocol statusnotify failed; using local session cache: {type(e).__name__}: {e}")
-            if _skip_empty_protocol_history_preload(owner_wxid):
-                return {
-                    "sessions": {"data": []},
-                    "last_messages": {},
-                    "contact_profiles": {},
-                    "source": "protocol_statusnotify_error",
-                    "warning": str(e),
-                }
             raw_sessions, last_messages = _load_session_cache_into_state(owner_wxid)
             session_list = raw_sessions.get("data", []) if isinstance(raw_sessions, dict) else []
             profile_wxids = [
@@ -7755,6 +7848,23 @@ def _extract_download_save_path(result: Any) -> str:
     return ""
 
 
+def _extract_protocol_cdn_base64(result: Any) -> str:
+    """Find the decrypted file payload returned by the Go /cdndownload API."""
+    stack: list[Any] = [result]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                lowered = str(key).replace("_", "").lower()
+                if lowered in {"imagebase64", "filedata"} and isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(current)
+    return ""
+
+
 def _cache_downloaded_image_file(source_path: str, cache_path: str) -> str:
     """Copy a locally accessible Hook download into the backend image cache."""
     if not _nonempty_file(source_path):
@@ -7877,9 +7987,14 @@ async def download_image(request: Request):
       2. Decode local .dat files via /DecodePic (Image then Thumb)
       3. Call /DownPic to trigger WeChat CDN download, then re-check local paths
 
+    Protocol strategy:
+      1. Parse aeskey and fileid from the image message XML
+      2. Call the Go protocol /cdndownload endpoint
+      3. Save the synchronous imageBase64/fileData response locally
+
     Remote hook strategy:
       1. Check callback cache (base64 images saved from callbacks)
-      2. Call /download → image arrives via callback as base64
+      2. Call /download; the image arrives later through an img_base64 callback
       3. Wait for the callback to deliver the image
     """
     import hashlib
@@ -7895,7 +8010,17 @@ async def download_image(request: Request):
         except Exception:
             pass
 
-    # ─── Check callback cache first (works for both local & remote) ──
+    cdn_params = _parse_img_xml_cdn_params(msg_xml)
+    has_cdn_params = bool(cdn_params["decode_key"] and cdn_params["file_id"])
+    xml_hash = hashlib.md5((msg_xml or msg_id or "").encode("utf-8", errors="replace")).hexdigest()
+    file_id_hash = hashlib.md5(cdn_params["file_id"].encode("utf-8", errors="replace")).hexdigest()[:12]
+    msg_part = _safe_media_filename_part(str(msg_id or ""), "nomsg", 64)
+    download_filename = f"wximg_{msg_part}_{xml_hash[:12]}_{file_id_hash}.jpg"
+    cache_path = os.path.join(_IMG_CACHE_DIR, "cdn", download_filename)
+    legacy_cache_path = os.path.join(_IMG_CACHE_DIR, f"{xml_hash}.jpg")
+    cache_candidates = (cache_path, legacy_cache_path)
+
+    # Check the callback cache first. This is shared by Hook modes.
     if msg_id:
         cb_dir = os.path.join(_IMG_CACHE_DIR, "callback")
         safe_id = "".join(c for c in str(msg_id) if c.isalnum() or c in ("_", "-", "."))[:80]
@@ -7904,20 +8029,50 @@ async def download_image(request: Request):
             if os.path.exists(cached) and os.path.getsize(cached) > 0:
                 return _image_file_response(cached, msg_id)
 
-    # ═══ Remote Hook: CDN protocol download ════════════════════════
+    # Protocol mode: download and decrypt CDN data synchronously through the Go service.
+    if config.IS_PROTOCOL:
+        for cached_path in cache_candidates:
+            if _nonempty_file(cached_path):
+                return _image_file_response(cached_path, msg_id)
+        if not has_cdn_params:
+            return {"error": "No CDN params in image XML for protocol download"}
+
+        account_id = _request_agent_id(request) or _active_agent_id or agent_manager.active_id() or ""
+        if not account_id:
+            return {"error": "No active protocol session for image download"}
+
+        async with _cdn_download_sem:
+            for cached_path in cache_candidates:
+                if _nonempty_file(cached_path):
+                    return _image_file_response(cached_path, msg_id)
+            _log(
+                f"[IMG_DL] protocol /cdndownload: aeskey={cdn_params['decode_key'][:16]}... "
+                f"file_id={cdn_params['file_id'][:32]}... msg_id={msg_id}"
+            )
+            cdn_result = await protocol_api.download_cdn_image(
+                account_id,
+                cdn_params["decode_key"],
+                cdn_params["file_id"],
+            )
+            if not isinstance(cdn_result, dict) or cdn_result.get("ok") is False:
+                error = str((cdn_result or {}).get("error") or (cdn_result or {}).get("retmsg") or "CDN download failed")
+                _log(f"[IMG_DL] protocol /cdndownload failed: {error}")
+                return {"error": error}
+            image_base64 = _extract_protocol_cdn_base64(cdn_result)
+            if not image_base64:
+                _log(f"[IMG_DL] protocol /cdndownload returned no image data: {_scrub_callback_payload(cdn_result)}")
+                return {"error": "Protocol CDN response did not contain image data"}
+            saved_path, byte_len = _save_img_base64_to_cache(image_base64, str(msg_id or xml_hash))
+            ready_path = _cache_downloaded_image_file(saved_path or "", cache_path)
+            if not ready_path:
+                return {"error": "Protocol CDN image could not be saved"}
+            _log(f"[IMG_DL] protocol image ready: {ready_path} ({byte_len} bytes)")
+            return _image_file_response(ready_path, msg_id)
+
+    # Remote Hook mode: /download triggers an asynchronous img_base64 callback.
     if not config.IS_LOCAL_HOOK:
-        cdn_params = _parse_img_xml_cdn_params(msg_xml)
-        has_cdn_params = bool(cdn_params["decode_key"] and cdn_params["file_id"])
 
         if has_cdn_params:
-            xml_hash = hashlib.md5((msg_xml or msg_id or "").encode("utf-8", errors="replace")).hexdigest()
-            file_id_hash = hashlib.md5(cdn_params["file_id"].encode("utf-8", errors="replace")).hexdigest()[:12]
-            msg_part = _safe_media_filename_part(str(msg_id or ""), "nomsg", 64)
-            download_filename = f"wximg_{msg_part}_{xml_hash[:12]}_{file_id_hash}.jpg"
-            cache_path = os.path.join(_IMG_CACHE_DIR, "cdn", download_filename)
-            legacy_cache_path = os.path.join(_IMG_CACHE_DIR, f"{xml_hash}.jpg")
-            cache_candidates = (cache_path, legacy_cache_path)
-
             # Already downloaded before?
             for cached_path in cache_candidates:
                 if _nonempty_file(cached_path):
@@ -7932,7 +8087,7 @@ async def download_image(request: Request):
                     if os.path.exists(cached) and os.path.getsize(cached) > 0:
                         return _image_file_response(cached, msg_id)
 
-            # ── De-dup: if another request is already downloading this image, just wait ──
+            # Reuse an in-flight remote Hook download for the same image.
             async with _inflight_cdn_lock:
                 existing = _inflight_cdn_downloads.get(xml_hash)
                 if existing and not existing.done():
@@ -7952,7 +8107,7 @@ async def download_image(request: Request):
                     if _nonempty_file(cached_path):
                         return _image_file_response(cached_path, msg_id)
 
-            # ── Start new download (serialized: one CDN download at a time) ──
+            # Start a serialized remote Hook CDN download.
             loop = asyncio.get_event_loop()
             inflight_fut: asyncio.Future = loop.create_future()
             async with _inflight_cdn_lock:
@@ -8032,17 +8187,17 @@ async def download_image(request: Request):
         if not raw:
             return {"error": "No CDN params in image XML for remote download"}
 
-    # ═══ Local Hook: original strategy ═══════════════════════════════
+    # Local Hook fallback: inspect and decode files from the WeChat data directory.
     img_dat_paths: list[bytes] = []
     thumb_dat_paths: list[bytes] = []
 
-    # ─── Phase 1: Check local decoded .jpg ────────────────────────
+    # Phase 1: check local decoded .jpg files.
     if raw:
         img_dat_paths, thumb_dat_paths, found = _find_local_image(raw)
         if found:
             return _image_file_response(found, msg_id)
 
-    # ─── Phase 2: Decode local .dat files ─────────────────────────
+    # Phase 2: decode local .dat files.
     if img_dat_paths:
         result = await _try_decode_dat(img_dat_paths, "Image")
         if result:
@@ -8052,7 +8207,7 @@ async def download_image(request: Request):
         if result:
             return _image_file_response(result, msg_id)
 
-    # ─── Phase 3: /DownPic → trigger download → re-check local ───
+    # Phase 3: trigger /DownPic, then re-check local files.
     if msg_xml and ("<img" in msg_xml or "<msg>" in msg_xml):
         xml_hash = hashlib.md5(msg_xml.encode("utf-8", errors="replace")).hexdigest()
         cache_path = os.path.join(_IMG_CACHE_DIR, f"{xml_hash}.jpg")

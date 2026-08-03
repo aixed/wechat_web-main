@@ -203,6 +203,28 @@ async def send_text(session_id: str, username: str, content: str) -> dict[str, A
     )
 
 
+async def download_cdn_image(session_id: str, aeskey: str, file_id: str) -> dict[str, Any]:
+    session_id = str(session_id or "").strip()
+    aeskey = str(aeskey or "").strip()
+    file_id = str(file_id or "").strip()
+    if not session_id:
+        return {"ok": False, "error": "session_id cannot be empty"}
+    if not aeskey or not file_id:
+        return {"ok": False, "error": "aeskey and file_id cannot be empty"}
+    return await _post(
+        "/cdndownload",
+        {
+            "session_id": session_id,
+            "aeskey": aeskey,
+            "fileid": file_id,
+            "fileType": 1,
+            "chatType": 0,
+            "largesVideo": 0,
+        },
+        timeout=55.0,
+    )
+
+
 async def terminate_session(session_id: str) -> dict[str, Any]:
     return await _post(
         "/TerminateThisWeChat",

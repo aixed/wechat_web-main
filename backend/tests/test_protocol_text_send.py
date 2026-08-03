@@ -46,6 +46,26 @@ class ProtocolTextSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("session_id", result["error"])
         post.assert_not_awaited()
 
+    async def test_protocol_client_downloads_cdn_image(self):
+        post = AsyncMock(return_value={"ok": True, "data": {"data": {"imageBase64": "abc"}}})
+
+        with patch.object(protocol_api, "_post", post):
+            result = await protocol_api.download_cdn_image("SESSION_123", "001122", "file-id")
+
+        self.assertTrue(result["ok"])
+        post.assert_awaited_once_with(
+            "/cdndownload",
+            {
+                "session_id": "SESSION_123",
+                "aeskey": "001122",
+                "fileid": "file-id",
+                "fileType": 1,
+                "chatType": 0,
+                "largesVideo": 0,
+            },
+            timeout=55.0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
