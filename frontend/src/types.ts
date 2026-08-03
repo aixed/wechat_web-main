@@ -21,6 +21,8 @@ export interface Session {
   pinned?: boolean;
   order?: number;
   is_group: boolean;
+  aggregateCategory?: "official" | "service";
+  aggregateAvatars?: string[];
 }
 
 export interface SmartReplyRule {

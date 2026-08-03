@@ -228,7 +228,9 @@ app_state = {
 }
 
 message_store = MessageStore()
-sqlite_cache = SqliteMessageCache()
+_SQLITE_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".sqlite_cache")
+_SQLITE_CACHE_FILENAME = "wechat_protocol_cache.sqlite3" if config.IS_PROTOCOL else "wechat_cache.sqlite3"
+sqlite_cache = SqliteMessageCache(os.path.join(_SQLITE_CACHE_DIR, _SQLITE_CACHE_FILENAME))
 smart_reply_engine = SmartReplyEngine()
 ai_service = AiService(
     base_url=config.AI_BASE_URL,
@@ -873,8 +875,9 @@ async def _activate_protocol_account(session_id: str) -> dict:
         _put_self_info_field("wxid", wxid)
         _put_self_info_field("selfwxid", wxid)
     owner_wxid = _contact_owner_wxid(wxid)
-    _load_session_cache_into_state(owner_wxid)
-    app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+    if not _skip_empty_protocol_history_preload(owner_wxid):
+        _load_session_cache_into_state(owner_wxid)
+        app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
     app_state["initialized"] = True
     item = {
         "session_id": session_id,
@@ -1029,36 +1032,15 @@ def _brief_entry_from_response(data: dict, wxid: str) -> dict:
                 "avatar": str(entry.get("avatar") or ""),
             }
 
-    info_list = data.get("info") or data.get("data") or data.get("list") or []
-    if isinstance(info_list, dict):
-        info_list = info_list.get("info") or info_list.get("list") or []
-    if not isinstance(info_list, list):
-        return {}
-
-    for info in info_list:
+    for info in _contacts_from_batch_brief_response(data):
         if not isinstance(info, dict):
             continue
-        item_wxid = str(info.get("wxid") or info.get("UserName") or info.get("userName") or "").strip()
+        item_wxid = _contact_profile_wxid(info)
         if item_wxid != wxid:
             continue
         return {
-            "name": str(
-                info.get("markname")
-                or info.get("nickname")
-                or info.get("NickName")
-                or info.get("nick")
-                or info.get("Remark")
-                or ""
-            ),
-            "avatar": str(
-                info.get("smallhead")
-                or info.get("bighead")
-                or info.get("SmallHeadImgUrl")
-                or info.get("BigHeadImgUrl")
-                or info.get("headimgurl")
-                or info.get("avatar")
-                or ""
-            ),
+            "name": _contact_profile_explicit_name(info),
+            "avatar": _contact_profile_avatar(info),
         }
     return {}
 
@@ -1208,6 +1190,22 @@ def _contact_cache_key(wxid: str, owner_wxid: str = "") -> str:
     return f"{_contact_owner_wxid(owner_wxid)}::{str(wxid or '').strip()}"
 
 
+def _protocol_history_available(owner_wxid: str = "") -> bool:
+    if not config.IS_PROTOCOL:
+        return True
+    return sqlite_cache.has_message_history(owner_wxid=_contact_owner_wxid(owner_wxid))
+
+
+def _skip_empty_protocol_history_preload(owner_wxid: str) -> bool:
+    if _protocol_history_available(owner_wxid):
+        return False
+    app_state["contacts"] = None
+    app_state["sessions"] = {"data": []}
+    app_state["last_messages"] = {}
+    _log(f"[PROTO_HISTORY] no local history for owner={owner_wxid}; preload skipped")
+    return True
+
+
 def _format_preview(msg_type: str, content: str) -> str:
     t = str(msg_type)
     if t == "1":
@@ -1334,6 +1332,20 @@ def _is_callback_status_echo(msg: dict, sendorrecv: str, self_wxid: str) -> bool
     if msgtype == "3" and content in {"PC发图片消息成功", "发图片消息成功"}:
         return True
     return False
+
+
+def _is_protocol_internal_callback_message(msg: dict) -> bool:
+    """Filter protocol sync events that must not become chat sessions."""
+    if not config.IS_PROTOCOL or not isinstance(msg, dict):
+        return False
+
+    msgtype = str(msg.get("msgtype", "") or "")
+    content = str(msg.get("msg", "") or "").strip()
+    if msgtype == "9999" and content.casefold() == "chatroom member changed":
+        return True
+
+    from_id = str(msg.get("fromid", "") or "").strip().casefold()
+    return msgtype == "10002" and from_id == "weixin" and content.casefold().startswith("<sysmsg")
 
 
 def _store_message_and_session(chat_id: str, msg: dict) -> dict:
@@ -1502,10 +1514,11 @@ async def _run_protocol_backend_initialization(session_id: str | None = None) ->
         _put_self_info_field("selfwxid", wxid)
 
     owner_wxid = _contact_owner_wxid(wxid)
-    app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
-    _load_session_cache_into_state(owner_wxid)
+    if not _skip_empty_protocol_history_preload(owner_wxid):
+        app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+        _load_session_cache_into_state(owner_wxid)
     app_state["initialized"] = True
-    _log(f"[PROTO_INIT] active wxid={wxid or '-'} cached contacts/session state loaded")
+    _log(f"[PROTO_INIT] active wxid={wxid or '-'} protocol cache ready")
     return True
 
 
@@ -2221,6 +2234,9 @@ async def get_protocol_profile(req: ProtocolSessionRequest):
             _self_wxid_to_agent_id[wxid] = session_id
             _put_self_info_field("wxid", wxid)
             _put_self_info_field("selfwxid", wxid)
+            profile = identity.get("profile") if isinstance(identity.get("profile"), dict) else {}
+            if profile:
+                await _cache_contact_profiles([profile], owner_wxid=wxid)
     return data
 
 
@@ -2886,6 +2902,9 @@ async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
 
         if msgtype == "9994":
             continue
+        if _is_protocol_internal_callback_message(msg):
+            _log(f"[CALLBACK] Skip protocol internal event type={msgtype} from={source} content={content!r}")
+            continue
         if _is_callback_status_echo(msg, sendorrecv, self_wxid):
             _log(f"[CALLBACK] Skip status echo type={msgtype} content={content!r}")
             continue
@@ -3168,7 +3187,8 @@ async def get_local_contacts():
         cached_entry = cached.get(wxid) if wxid else None
         cached_profile = cached_entry.get("profile") if isinstance(cached_entry, dict) and isinstance(cached_entry.get("profile"), dict) else {}
         category = _contact_directory_category({**raw, **cached_profile}, wxid)
-        add_entry(raw, "service" if category == "service" else "official")
+        if category in {"official", "service"}:
+            add_entry(raw, category)
 
     counts = {key: len(value) for key, value in categories.items()}
     return {
@@ -3297,6 +3317,167 @@ def _to_int(value) -> int:
         return 0
 
 
+_PROTOCOL_CONTACT_PIN_BIT = 0x800
+
+
+def _statusnotify_payload(data) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    payload = data.get("statusnotify")
+    if isinstance(payload, dict):
+        return payload
+    nested = data.get("data")
+    if isinstance(nested, dict):
+        payload = nested.get("statusnotify")
+        if isinstance(payload, dict):
+            return payload
+    return data if "chat_contact_list" in data else {}
+
+
+def _statusnotify_response_ok(data) -> bool:
+    if not isinstance(data, dict) or data.get("ok") is False or data.get("error"):
+        return False
+    payload = _statusnotify_payload(data)
+    if not payload:
+        return False
+    base = payload.get("base_response")
+    if isinstance(base, dict):
+        ret = base.get("ret_signed", base.get("ret"))
+        if ret not in (None, "") and _to_int(ret) != 0:
+            return False
+    return True
+
+
+def _statusnotify_contact_ids(data) -> list[str]:
+    payload = _statusnotify_payload(data)
+    raw_ids = payload.get("chat_contact_list") if isinstance(payload, dict) else []
+    if not isinstance(raw_ids, list):
+        return []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for raw_wxid in raw_ids:
+        wxid = str(raw_wxid or "").strip()
+        if not wxid or wxid in seen:
+            continue
+        seen.add(wxid)
+        ids.append(wxid)
+    return ids
+
+
+def _contact_summary_profile(summary: dict | None) -> dict:
+    if not isinstance(summary, dict):
+        return {}
+    profile = summary.get("profile")
+    return profile if isinstance(profile, dict) else summary
+
+
+def _contact_summary_is_pinned(summary: dict | None) -> bool:
+    profile = _contact_summary_profile(summary)
+    bit_val = _contact_profile_int(profile, "bit_val", "BitVal", "bitval") or 0
+    return bool(bit_val & _PROTOCOL_CONTACT_PIN_BIT)
+
+
+def _protocol_session_rows(
+    wxids: list[str],
+    contact_profiles: dict[str, dict],
+    cached_rows: list[dict],
+) -> list[dict]:
+    cached_by_wxid = {
+        str(_row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip(): row
+        for row in cached_rows
+        if isinstance(row, dict)
+    }
+    count = len(wxids)
+    rows: list[dict] = []
+    for index, wxid in enumerate(wxids):
+        summary = contact_profiles.get(wxid) if isinstance(contact_profiles, dict) else {}
+        profile = _contact_summary_profile(summary)
+        name = str(
+            (summary or {}).get("name")
+            or _contact_profile_explicit_name(profile)
+            or wxid
+        )
+        bit_val = _contact_profile_int(profile, "bit_val", "BitVal", "bitval") or 0
+        row = dict(cached_by_wxid.get(wxid) or {})
+        row.update({
+            "strUsrName": wxid,
+            "strNickName": name,
+            "strContent": _row_value(row, "strContent", "StrContent", "content", "lastMsg"),
+            "nMsgType": str(_row_value(row, "nMsgType", "NMsgType", "msgType", "type") or "1"),
+            "nUnReadCount": _to_int(_row_value(row, "nUnReadCount", "UnReadCount", "unread")),
+            "othersAtMe": _to_int(_row_value(row, "othersAtMe", "OthersAtMe", "atMe")),
+            "nTime": _to_int(_row_value(
+                row,
+                "nTime",
+                "NTime",
+                "nUpdateTime",
+                "nCreateTime",
+                "CreateTime",
+                "timestamp",
+                "lastTimestamp",
+            )),
+            "nOrder": count - index,
+            "order": count - index,
+            "pinned": _contact_summary_is_pinned(summary),
+            "bit_val": bit_val,
+            "statusnotify_index": index,
+        })
+        rows.append(row)
+    return rows
+
+
+async def _refresh_protocol_session_list(owner_wxid: str, account_id: str) -> dict:
+    with wechat_api.use_agent(account_id):
+        status_data = await wechat_api.status_notify(
+            code=3,
+            function_name="",
+            function_arg="",
+        )
+    if not _statusnotify_response_ok(status_data):
+        raise RuntimeError(str(
+            (status_data or {}).get("error")
+            or (status_data or {}).get("message")
+            or "statusnotify returned a non-success response"
+        ))
+
+    wxids = _statusnotify_contact_ids(status_data)
+    if wxids:
+        with wechat_api.use_agent(account_id):
+            await _fetch_and_cache_contact_details(
+                wxids,
+                broadcast_updates=False,
+                owner_wxid=owner_wxid,
+                account_id=account_id,
+            )
+
+    contact_profiles = sqlite_cache.get_contacts(wxids, owner_wxid=owner_wxid) if wxids else {}
+    cached_rows = _session_rows_from_cache(owner_wxid)
+    session_rows = _protocol_session_rows(wxids, contact_profiles, cached_rows)
+    if session_rows:
+        sqlite_cache.upsert_sessions(session_rows, owner_wxid=owner_wxid)
+
+    snapshot = {"data": session_rows}
+    last_messages = _last_messages_from_session_rows(session_rows)
+    app_state["sessions"] = snapshot
+    app_state["last_messages"] = last_messages
+    app_state["session_list_loaded"] = True
+    _log(
+        f"[REFRESH] protocol statusnotify sessions={len(session_rows)} "
+        f"pinned={sum(1 for row in session_rows if row.get('pinned'))}"
+    )
+    return {
+        "sessions": snapshot,
+        "last_messages": last_messages,
+        "contact_profiles": contact_profiles,
+        "source": "protocol_statusnotify",
+        "upstream": {
+            "chat_contact_count": len(wxids),
+            "msg_id": _statusnotify_payload(status_data).get("msg_id"),
+            "new_msg_id": _statusnotify_payload(status_data).get("new_msg_id"),
+        },
+    }
+
+
 def _session_rows_from_cache(owner_wxid: str = "") -> list[dict]:
     owner_wxid = owner_wxid or _contact_owner_wxid()
     return sqlite_cache.get_sessions(owner_wxid=owner_wxid)
@@ -3355,6 +3536,7 @@ def _contact_profile_wxid(profile: dict) -> str:
     return str(
         profile.get("wxid")
         or profile.get("id")
+        or profile.get("user_name")
         or profile.get("UserName")
         or profile.get("userName")
         or profile.get("strUsrName")
@@ -3373,6 +3555,7 @@ def _contact_profile_name(profile: dict) -> str:
         profile.get("markname")
         or profile.get("Remark")
         or profile.get("remark")
+        or profile.get("nick_name")
         or profile.get("nickname")
         or profile.get("NickName")
         or profile.get("nick")
@@ -3387,6 +3570,7 @@ def _contact_profile_explicit_name(profile: dict) -> str:
         profile.get("markname")
         or profile.get("Remark")
         or profile.get("remark")
+        or profile.get("nick_name")
         or profile.get("nickname")
         or profile.get("NickName")
         or profile.get("nick")
@@ -3399,6 +3583,10 @@ def _contact_profile_avatar(profile: dict) -> str:
     return str(
         profile.get("SmallHeadImgUrl")
         or profile.get("BigHeadImgUrl")
+        or profile.get("small_head_url")
+        or profile.get("big_head_url")
+        or profile.get("small_head_img_url")
+        or profile.get("big_head_img_url")
         or profile.get("smallhead")
         or profile.get("bighead")
         or profile.get("headimgurl")
@@ -3438,42 +3626,20 @@ def _contact_profile_account_category(profile: dict, wxid: str = "") -> str:
     if not wxid.startswith("gh_"):
         return ""
 
-    bit_val = _contact_profile_int(profile, "BitVal", "bitval", "status", "Status")
-    if bit_val in (513, 515):
-        return "service"
-
-    verify_flag = _contact_profile_int(profile, "VerifyFlag", "verifyflag")
-    if verify_flag == 24:
-        return "service"
-    if verify_flag == 8:
-        return "official"
-
-    marker = str(
-        profile.get("ServiceType")
-        or profile.get("service_type")
-        or profile.get("ServiceFlag")
-        or profile.get("serviceFlag")
-        or profile.get("AccountType")
-        or profile.get("account_type")
-        or profile.get("TypeName")
-        or profile.get("typeName")
-        or profile.get("SourceText")
-        or profile.get("type")
-        or profile.get("Type")
-        or ""
-    ).lower()
-    if marker:
-        if "service" in marker or "\u670d\u52a1" in marker:
-            return "service"
-        if "official" in marker or "public" in marker or "\u516c\u4f17\u53f7" in marker:
+    service_type = _contact_profile_int(profile, "ServiceType", "serviceType", "service_type")
+    if service_type is not None:
+        if service_type == 0:
             return "official"
-
+        if service_type == 1:
+            return "service"
     return ""
 
 
 def _contact_profile_needs_account_type(profile: dict, wxid: str = "") -> bool:
     wxid = str(wxid or _contact_profile_wxid(profile) or "").strip()
     if not wxid.startswith("gh_"):
+        return False
+    if _contact_profile_int(profile, "ServiceType", "serviceType", "service_type") is not None:
         return False
     return not _contact_profile_account_category(profile, wxid)
 
@@ -3493,7 +3659,7 @@ def _contact_directory_category(profile: dict, wxid: str = "") -> str:
     ):
         return "openim"
     if wxid.startswith("gh_"):
-        return _contact_profile_account_category(profile, wxid) or "official"
+        return _contact_profile_account_category(profile, wxid)
     return "personal"
 
 
@@ -3588,6 +3754,82 @@ def _extract_batch_contact_entries(payload: dict | list) -> list[dict]:
     return out
 
 
+def _protocol_initcontact_entries(payload: dict | list) -> list[dict]:
+    """Flatten the protocol /initcontact paged wxid matrix into contact rows."""
+    payload = _contact_payload(payload)
+    if not isinstance(payload, dict):
+        return []
+
+    raw_groups = payload.get("initcontact")
+    if not isinstance(raw_groups, list):
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    stack = list(reversed(raw_groups))
+    while stack:
+        value = stack.pop()
+        if isinstance(value, (list, tuple)):
+            stack.extend(reversed(value))
+            continue
+        if isinstance(value, dict):
+            wxid = _contact_profile_wxid(value)
+            entry = dict(value)
+        else:
+            wxid = str(value or "").strip()
+            entry = {"user_name": wxid}
+        if not wxid or wxid in seen:
+            continue
+        seen.add(wxid)
+        entry.setdefault("wxid", wxid)
+        entry.setdefault("gid", wxid if wxid.endswith("@chatroom") else "")
+        entry.setdefault("type", "chatroom" if wxid.endswith("@chatroom") else "friend")
+        out.append(entry)
+    return out
+
+
+def _contacts_from_batch_brief_response(data) -> list[dict]:
+    """Normalize Hook and protocol BatchGetContactBriefInfo response envelopes."""
+    if isinstance(data, list):
+        source = data
+    elif isinstance(data, dict):
+        current = data
+        for _ in range(4):
+            nested = current.get("batchgetcontactbriefinfo")
+            if isinstance(nested, dict):
+                current = nested
+                continue
+            nested = current.get("data")
+            if isinstance(nested, dict) and not any(
+                isinstance(current.get(key), list) for key in ("info", "contacts", "list")
+            ):
+                current = nested
+                continue
+            break
+        source = current.get("info") or current.get("contacts") or current.get("list") or []
+    else:
+        source = []
+
+    if not isinstance(source, list):
+        return []
+
+    contacts: list[dict] = []
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        nested_contact = item.get("contact")
+        profile = dict(nested_contact) if isinstance(nested_contact, dict) else dict(item)
+        wxid = _contact_profile_wxid(profile) or str(
+            item.get("user_name") or item.get("userName") or item.get("UserName") or ""
+        ).strip()
+        if not wxid:
+            continue
+        if not _contact_profile_wxid(profile):
+            profile["user_name"] = wxid
+        contacts.append(profile)
+    return contacts
+
+
 def _contacts_from_getcontact_response(data) -> list[dict]:
     """Normalize GetContact envelopes from local/remote Hook into contact rows."""
     if isinstance(data, list):
@@ -3597,6 +3839,10 @@ def _contacts_from_getcontact_response(data) -> list[dict]:
 
     current = data
     for _ in range(4):
+        nested_getcontact = current.get("getcontact")
+        if isinstance(nested_getcontact, dict):
+            current = nested_getcontact
+            continue
         rows = _extract_contact_list(
             current,
             "contacts", "contact", "info", "infos", "member", "members", "data",
@@ -3654,6 +3900,7 @@ def _all_raw_contact_entries(contacts: dict | list) -> list[dict]:
             *_extract_contact_list(contacts, "chatroom", "chatrooms", "chat_room", "chat_rooms", "group", "groups", "group_chat", "group_chats"),
             *_extract_contact_list(contacts, "data"),
             *_extract_batch_contact_entries(contacts),
+            *_protocol_initcontact_entries(contacts),
         ]
     else:
         source = []
@@ -3992,7 +4239,7 @@ def _contact_account_category_missing_ids(owner_wxid: str = "", candidates: list
             continue
         entry = cached.get(wxid) or {}
         profile = entry.get("profile") if isinstance(entry.get("profile"), dict) else {}
-        if not _contact_profile_account_category(profile, wxid):
+        if _contact_profile_needs_account_type(profile, wxid):
             missing.append(wxid)
     return missing
 
@@ -4017,6 +4264,7 @@ def _cache_raw_contacts(contacts: dict, *, owner_wxid: str = "") -> tuple[int, i
     data_list = [
         *_extract_contact_list(contacts, "data"),
         *_extract_batch_contact_entries(contacts),
+        *_protocol_initcontact_entries(contacts),
     ]
     if data_list:
         friend_wxids = {_contact_profile_wxid(c) for c in friend_list if isinstance(c, dict)}
@@ -4222,22 +4470,39 @@ async def _fetch_and_cache_contact_details(
         }
         await _broadcast_contact_hydration_progress(owner_wxid, account_id)
 
-    for i in range(0, len(targets), 100):
-        batch = targets[i:i + 100]
-        batch_index = i // 100 + 1
+    batches = [targets[i:i + 100] for i in range(0, len(targets), 100)]
+    max_concurrency = max(1, min(int(getattr(config, "HOOK_API_CONCURRENCY", 1)), len(batches)))
+    fetch_semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def _fetch_batch(batch_index: int, batch: list[str]) -> tuple[int, list[str], dict | None, Exception | None]:
+        async with fetch_semaphore:
+            try:
+                wxid_str = ",".join(batch)
+                data = await wechat_api.batch_get_contact_brief_info(wxid_str)
+                return batch_index, batch, data, None
+            except Exception as exc:
+                return batch_index, batch, None, exc
+
+    _log(
+        f"[CONTACTS] BatchGetContactBriefInfo fetching {len(batches)} batches concurrently: "
+        f"owner={owner_wxid} concurrency={max_concurrency} batch_size=100"
+    )
+    fetched_batches = await asyncio.gather(*(
+        _fetch_batch(index, batch)
+        for index, batch in enumerate(batches, start=1)
+    ))
+
+    for batch_index, batch, data, fetch_error in fetched_batches:
         batch_update_count = 0
         try:
-            wxid_str = ",".join(batch)
-            data = await wechat_api.batch_get_contact_brief_info(wxid_str)
+            if fetch_error is not None:
+                raise fetch_error
             if not _getcontact_response_ok(data):
-                failed += len(batch)
-                _log(
-                    f"[CONTACTS] BatchGetContactBriefInfo batch returned non-success "
-                    f"({len(batch)}): {str(data)[:300]}"
+                raise RuntimeError(
+                    f"batch returned non-success ({len(batch)}): {str(data)[:300]}"
                 )
-                continue
 
-            info_list = data.get("info", []) if isinstance(data, dict) else []
+            info_list = _contacts_from_batch_brief_response(data)
             found: set[str] = set()
             updates: dict[str, dict] = {}
             for info in info_list:
@@ -4325,7 +4590,6 @@ async def _fetch_and_cache_contact_details(
                 app_state["contacts"] = snapshot
             await _broadcast_contacts_snapshot(snapshot, account_id=account_id, owner_wxid=owner_wxid)
             await _broadcast_contact_hydration_progress(owner_wxid, account_id)
-        await asyncio.sleep(0.05)
     if broadcast_progress:
         _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
             "active": False,
@@ -4360,7 +4624,6 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
     }
 
     async def _hydrate_details() -> None:
-        _CONTACT_HYDRATING_OWNERS.add(owner_wxid)
         try:
             with wechat_api.use_agent(account_id):
                 await _fetch_and_cache_contact_details(
@@ -4383,6 +4646,7 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
             _CONTACT_HYDRATING_OWNERS.discard(owner_wxid)
 
     _log(f"[CONTACTS] scheduling BatchGetContactBriefInfo hydration: owner={owner_wxid} ids={len(ids)}, batch=100")
+    _CONTACT_HYDRATING_OWNERS.add(owner_wxid)
     task = asyncio.create_task(_hydrate_details())
     _track_background_send(task, "contacts_briefinfo")
 
@@ -4517,6 +4781,14 @@ async def _refresh_contacts_incremental(
     """
     owner_wxid = _contact_owner_wxid()
     account_id = _active_agent_id or agent_manager.active_id() or ""
+    if not app_state.get("contacts_loaded"):
+        cached_contacts = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+        if cached_contacts and sqlite_cache.has_contact_init_done_v2(owner_wxid=owner_wxid):
+            app_state["contacts_loaded"] = True
+            _log(
+                f"[CONTACTS] restored completed InitContact state from SQLite: "
+                f"owner={owner_wxid} cached={len(cached_contacts)}"
+            )
     if app_state.get("contacts_loaded"):
         snapshot = _contacts_snapshot_from_db(owner_wxid)
         app_state["contacts"] = snapshot
@@ -4860,22 +5132,16 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
             wxid_str = ",".join(batch)
             try:
                 data = await wechat_api.batch_get_contact_brief_info(wxid_str)
-                info_list = data.get("info", []) if isinstance(data, dict) else []
+                info_list = _contacts_from_batch_brief_response(data)
                 found_in_batch: dict[str, dict] = {}
                 for info in info_list:
                     if not isinstance(info, dict):
                         continue
-                    wxid = info.get("wxid", "") or ""
+                    wxid = _contact_profile_wxid(info)
                     if not wxid:
                         continue
-                    name = (
-                        info.get("markname", "") or
-                        info.get("nickname", "") or
-                        info.get("nick", "") or
-                        info.get("WXAccount", "") or
-                        ""
-                    )
-                    avatar = info.get("smallhead", "") or info.get("bighead", "") or ""
+                    name = _contact_profile_explicit_name(info)
+                    avatar = _contact_profile_avatar(info)
                     found_in_batch[wxid] = {"name": name, "avatar": avatar}
 
                 if found_in_batch:
@@ -4934,7 +5200,7 @@ async def post_contacts_profile_batch(req: ProfileBatchRequest):
         require_full=True,
         gid=req.gid,
         broadcast_updates=True,
-        fetch_missing=req.force,
+        fetch_missing=config.IS_PROTOCOL or req.force,
         force_refresh=req.force,
     )
     return {"members": members}
@@ -4946,7 +5212,9 @@ async def get_sessions(request: Request):
     agent_id = _request_agent_id(request)
     if agent_id and config.IS_PROTOCOL:
         _activate_runtime(agent_id)
-        _load_session_cache_into_state(_contact_owner_wxid())
+        owner_wxid = _contact_owner_wxid()
+        if not _skip_empty_protocol_history_preload(owner_wxid):
+            _load_session_cache_into_state(owner_wxid)
     elif agent_id and agent_manager.is_connected(agent_id):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
@@ -4965,6 +5233,35 @@ async def refresh_sessions(request: Request):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
     owner_wxid = _contact_owner_wxid()
+    if config.IS_PROTOCOL:
+        target_agent_id = agent_id or _active_agent_id or agent_manager.active_id() or ""
+        try:
+            return await _refresh_protocol_session_list(owner_wxid, target_agent_id)
+        except Exception as e:
+            _log(f"[REFRESH] protocol statusnotify failed; using local session cache: {type(e).__name__}: {e}")
+            if _skip_empty_protocol_history_preload(owner_wxid):
+                return {
+                    "sessions": {"data": []},
+                    "last_messages": {},
+                    "contact_profiles": {},
+                    "source": "protocol_statusnotify_error",
+                    "warning": str(e),
+                }
+            raw_sessions, last_messages = _load_session_cache_into_state(owner_wxid)
+            session_list = raw_sessions.get("data", []) if isinstance(raw_sessions, dict) else []
+            profile_wxids = [
+                str(_row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
+                for row in session_list
+                if isinstance(row, dict)
+            ]
+            contact_profiles = sqlite_cache.get_contacts(profile_wxids, owner_wxid=owner_wxid) if profile_wxids else {}
+            return {
+                "sessions": raw_sessions,
+                "last_messages": last_messages,
+                "contact_profiles": contact_profiles,
+                "source": "protocol_sqlite_fallback",
+                "warning": str(e),
+            }
     target_agent_id = agent_id or _active_agent_id or agent_manager.active_id()
     if target_agent_id:
         _agent_polling_paused_until[target_agent_id] = time.time() + 20.0
@@ -5022,6 +5319,23 @@ async def get_messages(wxid: str, limit: int = 20, db: str = "MSG0.db"):
     """
     limit = max(1, min(int(limit or 20), 100))
     owner_wxid = _contact_owner_wxid()
+    if config.IS_PROTOCOL:
+        if not _protocol_history_available(owner_wxid):
+            existing = message_store.get_messages(wxid, limit)
+            return {
+                "data": existing,
+                "source": "protocol_memory" if existing else "protocol_empty",
+            }
+        cached = sqlite_cache.get_messages(wxid, limit, owner_wxid=owner_wxid)
+        if cached:
+            message_store.add_history_no_flag(wxid, cached)
+            return {"data": cached, "source": "protocol_sqlite"}
+        existing = message_store.get_messages(wxid, limit)
+        return {
+            "data": existing,
+            "source": "protocol_memory" if existing else "protocol_sqlite",
+        }
+
     normalized: list[dict] = []
     try:
         history = await wechat_api.get_chat_history(wxid, limit, dbs=[db])
@@ -5063,6 +5377,14 @@ async def get_older_messages(wxid: str, before: int = 0, limit: int = 100, db: s
         return {"data": []}
     limit = max(1, min(int(limit or 100), 100))
     owner_wxid = _contact_owner_wxid()
+    if config.IS_PROTOCOL:
+        if not _protocol_history_available(owner_wxid):
+            return {"data": [], "source": "protocol_empty"}
+        cached = sqlite_cache.get_messages(wxid, limit, before=before, owner_wxid=owner_wxid)
+        if cached:
+            message_store.add_history_no_flag(wxid, cached)
+        return {"data": cached, "source": "protocol_sqlite"}
+
     cached = sqlite_cache.get_messages(wxid, limit, before=before, owner_wxid=owner_wxid)
     # Older caches written before sender extraction was fixed may identify the
     # chatroom itself as the sender.  Do not serve those rows forever: re-query
@@ -5092,6 +5414,14 @@ async def get_older_messages(wxid: str, before: int = 0, limit: int = 100, db: s
 @app.get("/api/messages/{wxid}/query")
 async def query_messages(wxid: str, keyword: str, limit: int = 50, db: str = "MSG0.db"):
     """Search messages by keyword."""
+    if config.IS_PROTOCOL:
+        owner_wxid = _contact_owner_wxid()
+        if not _protocol_history_available(owner_wxid):
+            return {"data": [], "source": "protocol_empty"}
+        return {
+            "data": sqlite_cache.search_messages(wxid, keyword, limit, owner_wxid=owner_wxid),
+            "source": "protocol_sqlite",
+        }
     sql = (
         f"SELECT TalkerId, CreateTime, StrTalker, StrContent, MsgSvrID, Type "
         f"FROM MSG WHERE StrTalker = '{wxid}' AND StrContent LIKE '%{keyword}%' "
@@ -8135,12 +8465,12 @@ async def _fallback_group_member_details(gid: str) -> dict[str, dict]:
         batch = member_wxids[i:i + batch_size]
         try:
             data = await wechat_api.batch_get_contact_brief_info(",".join(batch))
-            for info in data.get("info", []):
-                wxid = info.get("wxid", "")
+            for info in _contacts_from_batch_brief_response(data):
+                wxid = _contact_profile_wxid(info)
                 if not wxid or wxid not in result:
                     continue
-                avatar = info.get("smallhead", "") or info.get("bighead", "")
-                name = info.get("markname", "") or info.get("nickname", "") or info.get("nick", "")
+                avatar = _contact_profile_avatar(info)
+                name = _contact_profile_explicit_name(info)
                 if avatar:
                     result[wxid]["avatar"] = avatar
                 if name and result[wxid]["name"] == wxid:

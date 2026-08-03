@@ -370,6 +370,24 @@ async def is_login_status() -> dict:
     }
 
 
+async def status_notify(
+    code: int = 3,
+    function_name: str = "",
+    function_arg: str = "",
+) -> dict:
+    """Fetch the server-maintained recent conversation ids in protocol mode."""
+    r = await _post(
+        "/statusnotify",
+        json={
+            "code": int(code),
+            "function_name": str(function_name or ""),
+            "function_arg": str(function_arg or ""),
+        },
+        timeout=30.0,
+    )
+    return safe_json(r)
+
+
 async def init_contact() -> dict:
     """Initialize contact list (must call before GetFriendAndChatRoomList).
 
@@ -398,9 +416,9 @@ async def batch_get_contact_brief_info(wxid_list: str) -> dict:
     if IS_HOOK:
         r = await _post("/BatchGetContactBriefInfo", json={"wxidlist": wxid_list})
     else:
-        # Remote expects array of userNames
+        # Protocol service accepts up to 100 wxids/gids in one request.
         names = [w.strip() for w in wxid_list.split(",") if w.strip()]
-        r = await _post("/batchgetcontactbriefinfo", json={"userNames": names})
+        r = await _post("/batchgetcontactbriefinfo", json={"wxidorgid": names})
     return safe_json(r)
 
 
@@ -430,7 +448,7 @@ async def get_contact(wxids: list[str]) -> dict:
     if IS_HOOK:
         r = await _post("/GetContact", json={"wxids": names})
     else:
-        r = await _post("/getcontact", json={"userNames": names, "chatRoomUserName": ""})
+        r = await _post("/getcontact", json={"wxidorgid": names})
     return safe_json(r)
 
 

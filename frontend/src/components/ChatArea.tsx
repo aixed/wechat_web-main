@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, ContactProfile, Session } from "../types";
 import { sendText, getMessages, getOlderMessages, sendImageUpload, sendFileUpload } from "../api";
 import MessageBubble from "./MessageBubble";
+import { DEFAULT_AVATAR_URL } from "../avatar";
 
 interface ChatAreaProps {
   session: Session;
@@ -26,6 +27,22 @@ interface ChatAreaProps {
 
 const TEXTAREA_BASE_HEIGHT = 86;
 const TEXTAREA_MAX_HEIGHT = 124;
+
+function contactProfileAvatar(profile: ContactProfile | undefined, fallback = ""): string {
+  const raw = profile?.profile || {};
+  return String(
+    profile?.avatar
+    || raw.SmallHeadImgUrl
+    || raw.small_head_img_url
+    || raw.small_head_url
+    || raw.BigHeadImgUrl
+    || raw.big_head_img_url
+    || raw.big_head_url
+    || raw.avatar
+    || fallback
+    || ""
+  );
+}
 const INITIAL_HISTORY_LIMIT = 20;
 const OLDER_HISTORY_LIMIT = 100;
 
@@ -622,7 +639,10 @@ export default function ChatArea({
               // Determine sender wxid for avatar / name lookup
               const senderWxid = isSelf ? selfWxid : (msg.fromid || "");
               const senderName = contactMap[senderWxid] || senderWxid;
-              const senderAvatarUrl = avatarMap[senderWxid] || "";
+              const senderAvatarUrl = contactProfileAvatar(
+                contactProfiles[senderWxid],
+                avatarMap[senderWxid] || "",
+              );
 
               return (
                 <MessageBubble
@@ -632,7 +652,7 @@ export default function ChatArea({
                   selfWxid={selfWxid}
                   isGroup={isGroup}
                   senderName={senderName}
-                  avatarUrl={isSelf ? (avatarMap[selfWxid] || "") : senderAvatarUrl}
+                  avatarUrl={senderAvatarUrl}
                   onAvatarClick={handleAvatarClick}
                   mobile={mobile}
                   dark={dark}
@@ -1069,7 +1089,7 @@ function ContactProfileCard({
   const remark = profileField(raw, ["Remark", "remark", "markname"]);
   const nickName = profileField(raw, ["NickName", "nickname", "nick"]);
   const name = remark || profile?.name || nickName || fallbackName || wxid;
-  const avatar = profile?.avatar || raw.SmallHeadImgUrl || raw.BigHeadImgUrl || fallbackAvatar || "";
+  const avatar = profile?.avatar || raw.SmallHeadImgUrl || raw.small_head_img_url || raw.small_head_url || raw.BigHeadImgUrl || raw.big_head_img_url || raw.big_head_url || fallbackAvatar || "";
   const alias = profileField(raw, ["Alias", "alias"]);
   const phone = profileField(raw, ["tel", "Tel", "phone", "Phone", "mobile", "Mobile", "MobileFullHash"]);
   const labelText = profileField(raw, ["LabelText", "LabelName", "LabelNames", "labelText", "labelname"]);
@@ -1091,17 +1111,12 @@ function ContactProfileCard({
       >
         <div className="px-[36px] pt-[34px] pb-[20px]">
           <div className="flex items-start gap-[22px]">
-            {avatar ? (
-              <img
-                src={avatar}
-                alt=""
-                className="w-[88px] h-[88px] rounded-[8px] object-cover bg-[#ddd] shrink-0"
-              />
-            ) : (
-              <div className="w-[88px] h-[88px] rounded-[8px] bg-[#576b95] flex items-center justify-center text-white text-[28px] shrink-0">
-                {(name || wxid)[0] || "?"}
-              </div>
-            )}
+            <img
+              src={avatar || DEFAULT_AVATAR_URL}
+              alt=""
+              className="w-[88px] h-[88px] rounded-[8px] object-cover bg-[#ddd] shrink-0"
+              onError={(event) => { event.currentTarget.src = DEFAULT_AVATAR_URL; }}
+            />
             <div className="min-w-0 flex-1 pt-[2px]">
               <div className="flex items-center gap-[7px] min-w-0">
                 <h3 className="text-[24px] leading-[30px] font-medium truncate">{name}</h3>
@@ -1207,7 +1222,7 @@ function OpenIMContactProfileCard({
   const remark = profileField(raw, ["Remark", "remark", "markname"]);
   const nickName = profileField(raw, ["NickName", "nickname", "nick"]);
   const name = remark || profile?.name || nickName || fallbackName || wxid;
-  const avatar = profile?.avatar || raw.SmallHeadImgUrl || raw.BigHeadImgUrl || raw.avatar || fallbackAvatar || "";
+  const avatar = profile?.avatar || raw.SmallHeadImgUrl || raw.small_head_img_url || raw.small_head_url || raw.BigHeadImgUrl || raw.big_head_img_url || raw.big_head_url || raw.avatar || fallbackAvatar || "";
   const sex = Number(raw.Sex || 0);
   const rows = openimInfoRows(raw);
   const sourceRow = rows.find((row) => row.title === "来自") || {
@@ -1250,17 +1265,12 @@ function OpenIMContactProfileCard({
       >
         <div className="px-[36px] pt-[34px] pb-[24px]">
           <div className="flex items-start gap-[22px]">
-            {avatar ? (
-              <img
-                src={avatar}
-                alt=""
-                className="w-[88px] h-[88px] rounded-[8px] object-cover bg-[#ddd] shrink-0"
-              />
-            ) : (
-              <div className="w-[88px] h-[88px] rounded-[8px] bg-[#576b95] flex items-center justify-center text-white text-[28px] shrink-0">
-                {(name || wxid)[0] || "?"}
-              </div>
-            )}
+            <img
+              src={avatar || DEFAULT_AVATAR_URL}
+              alt=""
+              className="w-[88px] h-[88px] rounded-[8px] object-cover bg-[#ddd] shrink-0"
+              onError={(event) => { event.currentTarget.src = DEFAULT_AVATAR_URL; }}
+            />
             <div className="min-w-0 flex-1 pt-[2px]">
               <div className="flex items-center gap-[7px] min-w-0">
                 <h3 className="text-[24px] leading-[30px] font-medium break-words">{name}</h3>
