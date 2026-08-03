@@ -20,6 +20,7 @@ import {
   getProtocolLoginStatus,
   getProtocolProfile,
   getProtocolRdvMapping,
+  getSessions,
   getGroupMemberDetails,
   getGroupMemberNames,
   getMultiAccountBroadcastTargets,
@@ -1102,6 +1103,23 @@ function mergeRawContactsWithProfiles(raw: any, members: Record<string, ContactP
 
 function profileDisplayName(profile: ContactProfile | undefined, fallback: string): string {
   const raw = profile?.profile || {};
+  const wxid = pickFirstString(profile?.wxid, raw.wxid, raw.user_name, raw.UserName, raw.strUsrName);
+  if (wxid.endsWith("@chatroom")) {
+    const cachedName = profile?.name && profile.name !== wxid ? profile.name : "";
+    return pickFirstString(
+      raw.markname,
+      raw.Remark,
+      raw.remark,
+      raw.nick_name,
+      raw.nickname,
+      raw.NickName,
+      raw.nick,
+      raw.strNickName,
+      cachedName,
+      fallback,
+      wxid,
+    );
+  }
   return (
     profile?.name ||
     raw.markname ||
@@ -1702,6 +1720,10 @@ export default function App() {
         });
         return next.length === current.length ? current : next;
       });
+      setProtocolLoginAccount((current) => {
+        if (!current || current.source !== "protocol") return current;
+        return refreshedProtocolAccount(current, rows) || current;
+      });
       setAccounts(rows);
       setAccountPortalSource(accountPortalSourceFromPayload(data, rows));
       return rows;
@@ -1970,8 +1992,7 @@ export default function App() {
     const nextAvatars: Record<string, string> = {};
 
     for (const [wxid, entry] of Object.entries(updates)) {
-      const raw = entry?.profile || {};
-      const name = entry?.name || raw.markname || raw.Remark || raw.remark || raw.nickname || raw.NickName || raw.strNickName || "";
+      const name = profileDisplayName(entry, "");
       const avatar = profileAvatar(entry, "");
       if (name && name !== wxid) nextNames[wxid] = name;
       if (avatar) nextAvatars[wxid] = avatar;
@@ -2354,55 +2375,76 @@ export default function App() {
     if (sessionsHydrating || (!force && sessionsHydrated)) return;
     const requestAccountId = selectedAccountIdRef.current;
     setSessionsHydrating(true);
+    let loadedAny = false;
     try {
-      const data = await refreshSessions(requestAccountId);
-      if (selectedAccountIdRef.current !== requestAccountId) return;
-      const rawSessions = data?.sessions || data;
-      const lastMessages = data?.last_messages || {};
-      const cachedProfiles = (data?.contact_profiles && typeof data.contact_profiles === "object")
-        ? data.contact_profiles
-        : {};
-      if (Object.keys(cachedProfiles).length > 0) {
-        applyContactProfileUpdates(cachedProfiles);
-      }
-
-      const sessionNames = { ...contactMapRef.current };
-      const sessionAvatars = { ...avatarMapRef.current };
-      for (const [profileWxid, entry] of Object.entries<ContactProfile>(cachedProfiles)) {
-        const name = profileDisplayName(entry, "");
-        const avatar = profileAvatar(entry, "");
-        if (name && name !== profileWxid) sessionNames[profileWxid] = name;
-        if (avatar) sessionAvatars[profileWxid] = avatar;
-      }
-
-      const parsed = parseSessions(rawSessions, sessionNames, lastMessages);
-      const enriched: Session[] = parsed.map((s) => ({
-        ...s,
-        avatar: sessionAvatars[s.wxid] || s.avatar || "",
-      }));
-
-      setSessions((prev) => {
-        const merged = new Map<string, Session>();
-        for (const session of enriched) {
-          merged.set(session.wxid, session);
+      const applySessionPayload = (data: any, preserveExisting: boolean) => {
+        if (selectedAccountIdRef.current !== requestAccountId) return false;
+        const rawSessions = data?.sessions || data;
+        const lastMessages = data?.last_messages || {};
+        const cachedProfiles = (data?.contact_profiles && typeof data.contact_profiles === "object")
+          ? data.contact_profiles
+          : {};
+        if (Object.keys(cachedProfiles).length > 0) {
+          applyContactProfileUpdates(cachedProfiles);
         }
-        if (data?.source !== "protocol_statusnotify") {
-          for (const existing of prev) {
-            if (!merged.has(existing.wxid)) {
-              merged.set(existing.wxid, existing);
+
+        const sessionNames = { ...contactMapRef.current };
+        const sessionAvatars = { ...avatarMapRef.current };
+        for (const [profileWxid, entry] of Object.entries<ContactProfile>(cachedProfiles)) {
+          const name = profileDisplayName(entry, "");
+          const avatar = profileAvatar(entry, "");
+          if (name && name !== profileWxid) sessionNames[profileWxid] = name;
+          if (avatar) sessionAvatars[profileWxid] = avatar;
+        }
+
+        const parsed = parseSessions(rawSessions, sessionNames, lastMessages);
+        const enriched: Session[] = parsed.map((s) => ({
+          ...s,
+          avatar: sessionAvatars[s.wxid] || s.avatar || "",
+        }));
+
+        setSessions((prev) => {
+          const merged = new Map<string, Session>();
+          for (const session of enriched) {
+            merged.set(session.wxid, session);
+          }
+          if (preserveExisting) {
+            for (const existing of prev) {
+              if (!merged.has(existing.wxid)) {
+                merged.set(existing.wxid, existing);
+              }
             }
           }
-        }
-        return sortSessionsForDisplay(Array.from(merged.values()));
-      });
+          return sortSessionsForDisplay(Array.from(merged.values()));
+        });
+        return true;
+      };
 
-      // Account entry is intentionally narrow: exactly one Session-table refresh
-      // to populate the recent conversation list. Contacts/profiles/history stay lazy.
-      setSessionsHydrated(true);
+      if (!force) {
+        try {
+          const cached = await getSessions(requestAccountId);
+          loadedAny = applySessionPayload(cached, true) || loadedAny;
+        } catch (err) {
+          console.warn("[SESSIONS] local hydrate failed:", err);
+        }
+      }
+
+      const refreshed = await refreshSessions(requestAccountId);
+      loadedAny = applySessionPayload(
+        refreshed,
+        refreshed?.source !== "protocol_statusnotify",
+      ) || loadedAny;
+
+      // Account entry first paints SQLite, then replaces it with the merged
+      // statusnotify + SQLite snapshot. Contacts/profiles/history stay lazy.
+      if (selectedAccountIdRef.current === requestAccountId) {
+        setSessionsHydrated(true);
+      }
     } catch (err) {
       console.error("[SESSIONS] hydrate failed:", err);
     } finally {
       if (selectedAccountIdRef.current === requestAccountId) {
+        if (loadedAny) setSessionsHydrated(true);
         setSessionsHydrating(false);
       }
     }
@@ -2460,8 +2502,7 @@ export default function App() {
       const avatars = buildAvatarMap(contacts, avatar_urls);
       const cachedProfiles = (contact_profiles && typeof contact_profiles === "object") ? contact_profiles : {};
       for (const [profileWxid, entry] of Object.entries<ContactProfile>(cachedProfiles)) {
-        const raw = entry?.profile || {};
-        const name = entry?.name || raw.markname || raw.Remark || raw.remark || raw.nickname || raw.NickName || raw.strNickName || "";
+        const name = profileDisplayName(entry, "");
         const avatar = profileAvatar(entry, "");
         if (name && name !== profileWxid) nameMap[profileWxid] = name;
         if (avatar) avatars[profileWxid] = avatar;
@@ -2567,7 +2608,7 @@ export default function App() {
       const liveContactMap = { ...contactMap };
       const liveAvatarMap = { ...avatarMap };
       for (const [wxid, entry] of Object.entries<any>(contactUpdates)) {
-        const name = entry?.name || entry?.profile?.markname || entry?.profile?.Remark || entry?.profile?.remark || entry?.profile?.nickname || entry?.profile?.NickName || "";
+        const name = profileDisplayName(entry, "");
         const avatar = profileAvatar(entry, "");
         if (name && name !== wxid) liveContactMap[wxid] = name;
         if (avatar) liveAvatarMap[wxid] = avatar;
@@ -4106,6 +4147,16 @@ function dedupeProtocolAccountTabs(accounts: WeChatAccount[]): WeChatAccount[] {
   return Array.from(selected.values());
 }
 
+function refreshedProtocolAccount(
+  current: WeChatAccount | null | undefined,
+  accounts: WeChatAccount[],
+): WeChatAccount | undefined {
+  const currentKey = protocolAccountTabKey(current);
+  if (!currentKey) return undefined;
+  return dedupeProtocolAccountTabs(accounts.filter(isProtocolAccountTabVisible))
+    .find((account) => protocolAccountTabKey(account) === currentKey);
+}
+
 function accountDisplayName(account: WeChatAccount): string {
   return (
     (account.nickname && account.nickname !== account.id ? account.nickname : "") ||
@@ -4187,7 +4238,8 @@ function ProtocolLoginOnlyPortal({
     };
   }, [contextMenu]);
   const protocolAccounts = accounts.filter(isProtocolAccountTabVisible);
-  const activeTabKey = protocolAccountTabKey(selectedAccount);
+  const displayedSelectedAccount = refreshedProtocolAccount(selectedAccount, protocolAccounts) || selectedAccount;
+  const activeTabKey = protocolAccountTabKey(displayedSelectedAccount);
   const handleAccountTab = (target: WeChatAccount) => {
     if (isLoggedInAccount(target)) {
       onSelectAccount(target);
@@ -4204,7 +4256,7 @@ function ProtocolLoginOnlyPortal({
     const sessionId = protocolSessionId(target);
     if (!sessionId) return;
     setContextMenu(null);
-    if (protocolSessionId(selectedAccount) === sessionId) {
+    if (protocolAccountTabKey(selectedAccount) === protocolAccountTabKey(target)) {
       setSelectedAccount(null);
       setMode("old");
     }
@@ -4264,7 +4316,7 @@ function ProtocolLoginOnlyPortal({
           mode={mode}
           theme={theme}
           onRefresh={onRefresh}
-          account={selectedAccount || undefined}
+          account={displayedSelectedAccount || undefined}
           onSessionStarted={handleSessionStarted}
           onEnterAccount={onSelectAccount}
           onModeChange={setMode}
@@ -4388,6 +4440,7 @@ function AccountPortal({
   }, [contextMenu]);
   const portalAccounts = accounts;
   const protocolAccounts = portalAccounts.filter(isProtocolAccountTabVisible);
+  const displayedLoginAccount = refreshedProtocolAccount(loginAccount, protocolAccounts) || loginAccount;
   const handleAddProtocolLogin = () => {
     setLoginAccount(null);
     setTool("qr-login");
@@ -4423,7 +4476,7 @@ function AccountPortal({
     const label = account.rdv ? `RDV ${account.rdv}` : `Session ${sessionId.slice(0, 8)}`;
     if (!window.confirm(`确定结束微信实例 ${label} 吗？`)) return;
     setTerminatingSessionIds((prev) => new Set(prev).add(sessionId));
-    if (loginAccount && protocolSessionId(loginAccount) === sessionId) {
+    if (loginAccount && protocolAccountTabKey(loginAccount) === protocolAccountTabKey(account)) {
       setLoginAccount(null);
     }
     try {
@@ -4468,11 +4521,11 @@ function AccountPortal({
       {tool === "broadcast" && <MultiAccountBroadcastPanel accounts={portalAccounts} theme={theme} />}
       {tool === "qr-login" && (
         <ProtocolLoginPanel
-          key={`qr:${accountStableKey(loginAccount) || loginPanelNonce}`}
+          key={`qr:${accountStableKey(displayedLoginAccount) || loginPanelNonce}`}
           mode="qr"
           theme={theme}
           onRefresh={onRefresh}
-          account={loginAccount || undefined}
+          account={displayedLoginAccount || undefined}
           onSessionStarted={handleProtocolSessionStarted}
           onEnterAccount={onSelectAccount}
           onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
@@ -4480,11 +4533,11 @@ function AccountPortal({
       )}
       {tool === "old-login" && (
         <ProtocolLoginPanel
-          key={`old:${accountStableKey(loginAccount) || loginPanelNonce}`}
+          key={`old:${accountStableKey(displayedLoginAccount) || loginPanelNonce}`}
           mode="old"
           theme={theme}
           onRefresh={onRefresh}
-          account={loginAccount || undefined}
+          account={displayedLoginAccount || undefined}
           onSessionStarted={handleProtocolSessionStarted}
           onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
         />
@@ -4551,7 +4604,7 @@ function AccountPortal({
         {protocolAccounts.length > 0 && (
           <ProtocolAccountTabStrip
             accounts={protocolAccounts}
-            activeKey={protocolAccountTabKey(loginAccount)}
+            activeKey={protocolAccountTabKey(displayedLoginAccount)}
             dark={dark}
             onSelect={(account) => {
               handleAccountForLogin(account);
@@ -4670,11 +4723,11 @@ function AccountPortal({
             {tool === "broadcast" && <MultiAccountBroadcastPanel accounts={portalAccounts} theme={theme} />}
             {tool === "qr-login" && (
               <ProtocolLoginPanel
-                key={`qr:${accountStableKey(loginAccount) || loginPanelNonce}`}
+                key={`qr:${accountStableKey(displayedLoginAccount) || loginPanelNonce}`}
                 mode="qr"
                 theme={theme}
                 onRefresh={onRefresh}
-                account={loginAccount || undefined}
+                account={displayedLoginAccount || undefined}
                 onSessionStarted={handleProtocolSessionStarted}
                 onEnterAccount={onSelectAccount}
                 onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
@@ -4682,11 +4735,11 @@ function AccountPortal({
             )}
             {tool === "old-login" && (
               <ProtocolLoginPanel
-                key={`old:${accountStableKey(loginAccount) || loginPanelNonce}`}
+                key={`old:${accountStableKey(displayedLoginAccount) || loginPanelNonce}`}
                 mode="old"
                 theme={theme}
                 onRefresh={onRefresh}
-                account={loginAccount || undefined}
+                account={displayedLoginAccount || undefined}
                 onSessionStarted={handleProtocolSessionStarted}
                 onEnterAccount={onSelectAccount}
                 onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
