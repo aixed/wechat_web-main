@@ -104,6 +104,7 @@ function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
     avatar: target.avatar || "",
     enabled: true,
     mention_only: false,
+    use_no_src: false,
     message_types: ["text"],
     target_senders: isGroup ? [] : [target.wxid],
     rules: [makeRule()],
@@ -118,6 +119,7 @@ function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
   return {
     ...config,
     mention_only: isGroup && Boolean(config.mention_only),
+    use_no_src: Boolean(config.use_no_src),
     message_types: config.message_types?.length ? [...config.message_types] : ["text"],
     target_senders: isGroup ? [...(config.target_senders || [])] : [config.chat_id],
     rules: (config.rules || []).map((rule) => ({
@@ -408,6 +410,7 @@ export default function SmartReplyManager({
         avatar: draft.avatar,
         enabled: draft.enabled,
         mention_only: draft.mention_only,
+        use_no_src: draft.use_no_src,
         message_types: draft.message_types,
         target_senders: draft.target_senders,
         rules,
@@ -836,7 +839,19 @@ export default function SmartReplyManager({
                 <h2 className="text-[15px] font-medium">消息类别</h2>
                 <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>已启用 {draft.message_types.length} 类</div>
               </div>
-              {draft.chat_id.endsWith("@chatroom") && (
+              <div className="flex flex-wrap items-center justify-end gap-x-[18px] gap-y-[8px]">
+                <div
+                  className="flex items-center gap-[8px] text-[13px]"
+                  title="开启后文本智能回复通过 /SendTextMsg_NoSrc 发送"
+                >
+                  <span>底层发送</span>
+                  <CompactToggle
+                    checked={draft.use_no_src}
+                    onChange={(use_no_src) => updateDraft({ use_no_src })}
+                    label="底层发送"
+                  />
+                </div>
+                {draft.chat_id.endsWith("@chatroom") && (
                 <div
                   className="flex items-center gap-[8px] text-[13px]"
                   title="开启后只处理目标发送人 @ 当前账号的消息"
@@ -848,7 +863,8 @@ export default function SmartReplyManager({
                     label="只处理 @本人 消息"
                   />
                 </div>
-              )}
+                )}
+              </div>
             </div>
             <div role="tablist" className={`mt-[14px] flex flex-wrap items-center gap-x-[12px] gap-y-[4px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
               {MESSAGE_TYPE_OPTIONS.map((option) => {

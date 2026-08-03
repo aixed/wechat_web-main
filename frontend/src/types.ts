@@ -96,6 +96,7 @@ export interface SmartReplyConfig {
   avatar?: string;
   enabled: boolean;
   mention_only: boolean;
+  use_no_src: boolean;
   message_types: SmartReplyMessageType[];
   target_senders: string[];
   rules: SmartReplyRule[];

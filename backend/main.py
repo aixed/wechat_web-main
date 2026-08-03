@@ -1953,6 +1953,7 @@ class SmartReplyConfigRequest(BaseModel):
     avatar: str = ""
     enabled: bool = True
     mention_only: bool = False
+    use_no_src: bool = False
     message_types: list[str] = Field(default_factory=lambda: ["text"])
     target_senders: list[str] = Field(default_factory=list)
     rules: list[SmartReplyRuleRequest] = Field(default_factory=list)
@@ -2508,6 +2509,7 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
         "avatar": str(req.avatar or cached_contact.get("avatar") or "").strip()[:2000],
         "enabled": bool(req.enabled),
         "mention_only": is_group and bool(req.mention_only),
+        "use_no_src": bool(req.use_no_src),
         "message_types": message_types,
         "target_senders": target_senders,
         "rules": rules,
@@ -2669,8 +2671,12 @@ async def _process_smart_reply_message(
             f"count={len(decision.replies)}"
         )
     try:
+        use_no_src = bool(config_row.get("use_no_src"))
+
         async def _send_one(reply: str):
             with wechat_api.use_agent(agent_id):
+                if use_no_src:
+                    return await wechat_api.send_text_no_src(chat_id, reply)
                 return await wechat_api.send_text(chat_id, reply)
 
         results = await asyncio.gather(
@@ -2699,7 +2705,8 @@ async def _process_smart_reply_message(
         await manager.broadcast({"type": "smart_reply_updated", "data": {"config": updated}})
         _log(
             f"[SMART_REPLY] sent chat={chat_id} sender={message.get('fromid', '')} "
-            f"reason={decision.reason} count={len(sent_replies)} disabled={decision.disable_after_send}"
+            f"reason={decision.reason} count={len(sent_replies)} mode={'no_src' if use_no_src else 'normal'} "
+            f"disabled={decision.disable_after_send}"
         )
     except Exception as exc:
         _log(f"[SMART_REPLY] error chat={chat_id}: {type(exc).__name__}: {exc}")
