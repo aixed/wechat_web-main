@@ -2625,7 +2625,11 @@ async def _process_smart_reply_message(
     self_wxid: str,
     chat_id: str,
     message: dict[str, Any],
+    received_at: float | None = None,
 ) -> None:
+    process_started_at = time.perf_counter()
+    message_received_at = process_started_at if received_at is None else received_at
+    queue_ms = max(0.0, (process_started_at - message_received_at) * 1000)
     config_row = sqlite_cache.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
     if not config_row:
         return
@@ -2670,6 +2674,8 @@ async def _process_smart_reply_message(
             f"[SMART_REPLY] AI reserved chat={chat_id} sender={message.get('fromid', '')} "
             f"count={len(decision.replies)}"
         )
+    evaluation_finished_at = time.perf_counter()
+    evaluate_ms = (evaluation_finished_at - process_started_at) * 1000
     try:
         use_no_src = bool(config_row.get("use_no_src"))
 
@@ -2679,10 +2685,14 @@ async def _process_smart_reply_message(
                     return await wechat_api.send_text_no_src(chat_id, reply)
                 return await wechat_api.send_text(chat_id, reply)
 
+        send_started_at = time.perf_counter()
         results = await asyncio.gather(
             *(_send_one(reply) for reply in decision.replies),
             return_exceptions=True,
         )
+        send_finished_at = time.perf_counter()
+        send_ms = (send_finished_at - send_started_at) * 1000
+        total_ms = max(0.0, (send_finished_at - message_received_at) * 1000)
         sent_replies: list[str] = []
         for reply, result in zip(decision.replies, results):
             if isinstance(result, BaseException) or not _send_result_ok(result):
@@ -2693,7 +2703,20 @@ async def _process_smart_reply_message(
                 continue
             sent_replies.append(reply)
         if not sent_replies:
+            _log(
+                f"[SMART_REPLY] send completed chat={chat_id} sender={message.get('fromid', '')} "
+                f"reason={decision.reason} count=0 mode={'no_src' if use_no_src else 'normal'} "
+                f"queue_ms={queue_ms:.1f} evaluate_ms={evaluate_ms:.1f} "
+                f"send_ms={send_ms:.1f} total_ms={total_ms:.1f}"
+            )
             return
+        _log(
+            f"[SMART_REPLY] sent chat={chat_id} sender={message.get('fromid', '')} "
+            f"reason={decision.reason} count={len(sent_replies)} mode={'no_src' if use_no_src else 'normal'} "
+            f"disabled={decision.disable_after_send} "
+            f"queue_ms={queue_ms:.1f} evaluate_ms={evaluate_ms:.1f} "
+            f"send_ms={send_ms:.1f} total_ms={total_ms:.1f}"
+        )
         updated = sqlite_cache.record_smart_reply_trigger(
             chat_id,
             owner_wxid=owner_wxid,
@@ -2703,11 +2726,6 @@ async def _process_smart_reply_message(
         for reply in sent_replies:
             await _broadcast_local_sent_for_agent(agent_id, chat_id, "1", reply)
         await manager.broadcast({"type": "smart_reply_updated", "data": {"config": updated}})
-        _log(
-            f"[SMART_REPLY] sent chat={chat_id} sender={message.get('fromid', '')} "
-            f"reason={decision.reason} count={len(sent_replies)} mode={'no_src' if use_no_src else 'normal'} "
-            f"disabled={decision.disable_after_send}"
-        )
     except Exception as exc:
         _log(f"[SMART_REPLY] error chat={chat_id}: {type(exc).__name__}: {exc}")
 
@@ -2719,6 +2737,7 @@ def _schedule_smart_reply_message(
     self_wxid: str,
     chat_id: str,
     message: dict[str, Any],
+    received_at: float | None = None,
 ) -> None:
     task = asyncio.create_task(_process_smart_reply_message(
         owner_wxid=owner_wxid,
@@ -2726,6 +2745,7 @@ def _schedule_smart_reply_message(
         self_wxid=self_wxid,
         chat_id=chat_id,
         message=dict(message),
+        received_at=received_at,
     ))
     _track_background_send(task, "smart_reply")
 
@@ -2754,6 +2774,7 @@ async def wechat_callback(request: Request):
 
 async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
     """Process a callback received through HTTP or the agent WebSocket."""
+    callback_received_at = time.perf_counter()
     _log_callback_sample(data)
 
     # Log top-level callback keys for debugging CDN download callbacks
@@ -2908,6 +2929,22 @@ async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
             continue
         pre_messages.append((chat_id, normalized))
 
+    # Smart replies only depend on normalized message data and their saved
+    # configuration. Start them before contact hydration, storage, and frontend
+    # broadcasts so those secondary tasks cannot delay the outbound reply.
+    callback_owner_wxid = _contact_owner_wxid(self_wxid)
+    for chat_id, normalized in pre_messages:
+        _schedule_smart_reply_message(
+            owner_wxid=callback_owner_wxid,
+            agent_id=callback_agent_id,
+            self_wxid=self_wxid,
+            chat_id=chat_id,
+            message=normalized,
+            received_at=callback_received_at,
+        )
+    if pre_messages:
+        await asyncio.sleep(0)
+
     # Callback payloads already contain either decoded content (RecvType=1)
     # or PB data (RecvType=2). Avoid extra QueryDB work in the callback path so
     # chat-history requests can use the DB connection pool.
@@ -2952,16 +2989,6 @@ async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
             "contact_updates": profile_updates,
         },
     })
-
-    callback_owner_wxid = _contact_owner_wxid(self_wxid)
-    for chat_id, normalized in pre_messages:
-        _schedule_smart_reply_message(
-            owner_wxid=callback_owner_wxid,
-            agent_id=callback_agent_id,
-            self_wxid=self_wxid,
-            chat_id=chat_id,
-            message=normalized,
-        )
 
     return {"status": "success"}
 
