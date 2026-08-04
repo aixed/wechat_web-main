@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 
 from smart_reply import SmartReplyEngine
@@ -501,6 +502,8 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
         old_send_text_no_src = main.wechat_api.send_text_no_src
         old_broadcast = main.manager.broadcast
         old_local_sent = main._broadcast_local_sent_for_agent
+        old_log = main._log
+        logs: list[str] = []
         try:
             main.sqlite_cache = cache
             main.smart_reply_engine = SmartReplyEngine(cooldown=0)
@@ -508,6 +511,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
             main.wechat_api.send_text_no_src = fake_send_text_no_src
             main.manager.broadcast = noop
             main._broadcast_local_sent_for_agent = noop
+            main._log = logs.append
             cache.upsert_smart_reply_config(config(use_no_src=True), owner_wxid=OWNER)
 
             await main._process_smart_reply_message(
@@ -516,6 +520,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
                 self_wxid=OWNER,
                 chat_id=CHAT_ID,
                 message=message("urgent"),
+                received_at=time.perf_counter() - 0.02,
             )
         finally:
             main.sqlite_cache = old_cache
@@ -524,10 +529,77 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
             main.wechat_api.send_text_no_src = old_send_text_no_src
             main.manager.broadcast = old_broadcast
             main._broadcast_local_sent_for_agent = old_local_sent
+            main._log = old_log
             temp_dir.cleanup()
 
         self.assertEqual([], normal_sent)
         self.assertEqual([(CHAT_ID, "received")], no_src_sent)
+        timing_log = next(line for line in logs if line.startswith("[SMART_REPLY] sent"))
+        self.assertIn("mode=no_src", timing_log)
+        self.assertRegex(timing_log, r"queue_ms=\d+\.\d")
+        self.assertRegex(timing_log, r"evaluate_ms=\d+\.\d")
+        self.assertRegex(timing_log, r"send_ms=\d+\.\d")
+        self.assertRegex(timing_log, r"total_ms=\d+\.\d")
+
+    async def test_callback_schedules_reply_before_profile_hydration(self):
+        import main
+
+        events: list[str] = []
+        scheduled: list[dict] = []
+
+        def fake_normalize(_msg, _sendorrecv, _self_wxid):
+            return CHAT_ID, message("urgent")
+
+        def fake_schedule(**kwargs):
+            events.append("scheduled")
+            scheduled.append(kwargs)
+
+        async def fake_profiles(*_args, **_kwargs):
+            events.append("profiles")
+            return {}
+
+        async def fake_broadcast(*_args, **_kwargs):
+            events.append("broadcast")
+
+        old_normalize = main._normalize_callback_message
+        old_schedule = main._schedule_smart_reply_message
+        old_profiles = main._ensure_contact_profiles
+        old_store = main._store_message_and_session
+        old_load_sessions = main._load_session_cache_into_state
+        old_broadcast = main.manager.broadcast
+        old_activate = main._activate_runtime
+        old_put_self = main._put_self_info_field
+        try:
+            main._normalize_callback_message = fake_normalize
+            main._schedule_smart_reply_message = fake_schedule
+            main._ensure_contact_profiles = fake_profiles
+            main._store_message_and_session = lambda *_args, **_kwargs: {}
+            main._load_session_cache_into_state = lambda *_args, **_kwargs: None
+            main.manager.broadcast = fake_broadcast
+            main._activate_runtime = lambda *_args, **_kwargs: None
+            main._put_self_info_field = lambda *_args, **_kwargs: None
+
+            result = await main._process_wechat_callback({
+                "agent_id": "agent_1",
+                "selfwxid": OWNER,
+                "sendorrecv": "2",
+                "msglist": [message("urgent")],
+            })
+        finally:
+            main._normalize_callback_message = old_normalize
+            main._schedule_smart_reply_message = old_schedule
+            main._ensure_contact_profiles = old_profiles
+            main._store_message_and_session = old_store
+            main._load_session_cache_into_state = old_load_sessions
+            main.manager.broadcast = old_broadcast
+            main._activate_runtime = old_activate
+            main._put_self_info_field = old_put_self
+
+        self.assertEqual({"status": "success"}, result)
+        self.assertLess(events.index("scheduled"), events.index("profiles"))
+        self.assertLess(events.index("scheduled"), events.index("broadcast"))
+        self.assertEqual(1, len(scheduled))
+        self.assertIsInstance(scheduled[0]["received_at"], float)
 
     async def test_private_ai_reply_reaches_send_stage(self):
         import main
