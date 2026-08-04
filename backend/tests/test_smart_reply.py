@@ -547,8 +547,9 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
         events: list[str] = []
         scheduled: list[dict] = []
 
-        def fake_normalize(_msg, _sendorrecv, _self_wxid):
-            return CHAT_ID, message("urgent")
+        def fake_normalize(raw_message, _sendorrecv, _self_wxid):
+            events.append(f"normalized:{raw_message['msg']}")
+            return CHAT_ID, message(raw_message["msg"])
 
         def fake_schedule(**kwargs):
             events.append("scheduled")
@@ -583,7 +584,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
                 "agent_id": "agent_1",
                 "selfwxid": OWNER,
                 "sendorrecv": "2",
-                "msglist": [message("urgent")],
+                "msglist": [message("urgent"), message("second")],
             })
         finally:
             main._normalize_callback_message = old_normalize
@@ -598,7 +599,8 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"status": "success"}, result)
         self.assertLess(events.index("scheduled"), events.index("profiles"))
         self.assertLess(events.index("scheduled"), events.index("broadcast"))
-        self.assertEqual(1, len(scheduled))
+        self.assertLess(events.index("scheduled"), events.index("normalized:second"))
+        self.assertEqual(2, len(scheduled))
         self.assertIsInstance(scheduled[0]["received_at"], float)
 
     async def test_private_ai_reply_reaches_send_stage(self):
