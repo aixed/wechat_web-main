@@ -2755,6 +2755,7 @@ def _schedule_smart_reply_message(
 @app.post("/api/callback")
 async def wechat_callback(request: Request):
     """Receive messages from WeChat Hook and broadcast to frontend via WebSocket."""
+    callback_received_at = time.perf_counter()
     raw_body = await request.body()
     try:
         data = json.loads(raw_body.decode("utf-8-sig"))
@@ -2769,12 +2770,16 @@ async def wechat_callback(request: Request):
     original_path = request.headers.get("x-original-callback-path", "")
     if original_path:
         data.setdefault("_callback_path", original_path)
-    return await _process_wechat_callback(data)
+    return await _process_wechat_callback(data, received_at=callback_received_at)
 
 
-async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
+async def _process_wechat_callback(
+    data: dict[str, Any],
+    *,
+    received_at: float | None = None,
+) -> dict[str, str]:
     """Process a callback received through HTTP or the agent WebSocket."""
-    callback_received_at = time.perf_counter()
+    callback_received_at = time.perf_counter() if received_at is None else received_at
     _log_callback_sample(data)
 
     # Log top-level callback keys for debugging CDN download callbacks
@@ -2827,11 +2832,21 @@ async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
     normalized_messages: list[dict] = []
     session_updates: list[dict] = []
     pre_messages: list[tuple[str, dict]] = []  # (chat_id, normalized) — stored after callback normalization
+    callback_owner_wxid = _contact_owner_wxid(self_wxid)
 
-    # Check if there are pending CDN downloads (for smarter callback matching)
-    async with _pending_cdn_lock:
-        has_pending_cdn = len(_pending_cdn_images) > 0
-        pending_keys_dbg = list(_pending_cdn_images.keys())
+    # Pending CDN state is irrelevant to ordinary text callbacks. Avoid even
+    # briefly queuing those callbacks behind an in-progress media operation.
+    has_embedded_media = any(
+        isinstance(msg, dict)
+        and any(msg.get(key) for key in ("img_base64", "video_base64", "file_base64", "gif_base64"))
+        for msg in msglist
+    )
+    has_pending_cdn = False
+    pending_keys_dbg: list[str] = []
+    if has_embedded_media:
+        async with _pending_cdn_lock:
+            has_pending_cdn = len(_pending_cdn_images) > 0
+            pending_keys_dbg = list(_pending_cdn_images.keys())
     if has_pending_cdn:
         _log(f"[CALLBACK] {len(pending_keys_dbg)} pending CDN downloads: {pending_keys_dbg}")
 
@@ -2928,12 +2943,6 @@ async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
         if not chat_id or not normalized:
             continue
         pre_messages.append((chat_id, normalized))
-
-    # Smart replies only depend on normalized message data and their saved
-    # configuration. Start them before contact hydration, storage, and frontend
-    # broadcasts so those secondary tasks cannot delay the outbound reply.
-    callback_owner_wxid = _contact_owner_wxid(self_wxid)
-    for chat_id, normalized in pre_messages:
         _schedule_smart_reply_message(
             owner_wxid=callback_owner_wxid,
             agent_id=callback_agent_id,
@@ -2942,7 +2951,8 @@ async def _process_wechat_callback(data: dict[str, Any]) -> dict[str, str]:
             message=normalized,
             received_at=callback_received_at,
         )
-    if pre_messages:
+        # Let this individual reply reach its first I/O wait before parsing the
+        # next message in the same callback batch.
         await asyncio.sleep(0)
 
     # Callback payloads already contain either decoded content (RecvType=1)
