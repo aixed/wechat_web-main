@@ -36,17 +36,23 @@ from sqlite_cache import SqliteMessageCache
 from pb_parser import parse_raw_pb
 from smart_reply import SmartReplyEngine
 from ai_service import AiService, AiServiceError
+from daily_log import append_daily_log
 
 
-def _log(msg: str):
-    """Flush-safe print."""
+def _write_log(category: str, msg: str) -> None:
     print(msg, flush=True)
-    try:
-        os.makedirs(_RUN_DIR, exist_ok=True)
-        with open(os.path.join(os.path.dirname(__file__), "main.log"), "a", encoding="utf-8") as f:
-            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}]{msg}\n")
-    except Exception:
-        pass
+    now = datetime.now()
+    append_daily_log(category, f"[{now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}]{msg}\n", when=now)
+
+
+def _log(msg: str) -> None:
+    """Write a general backend log entry."""
+    _write_log("main", msg)
+
+
+def _smart_reply_log(msg: str) -> None:
+    """Write only to the dedicated smart-reply daily log."""
+    _write_log("smart_reply", msg)
 
 
 _RUN_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".run")
@@ -2592,13 +2598,18 @@ def _preview_text(value: Any, limit: int = 80) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
-async def _evaluate_ai_tasks(content: str, tasks: list[dict[str, Any]]) -> tuple[str, ...]:
+async def _evaluate_ai_tasks(
+    content: str,
+    tasks: list[dict[str, Any]],
+    *,
+    message_id: str = "-",
+) -> tuple[str, ...]:
     enabled_tasks = [task for task in tasks if isinstance(task, dict) and bool(task.get("enabled"))]
     if not enabled_tasks:
-        _log("[AI_REPLY] skipped: no enabled AI tasks")
+        _smart_reply_log(f"[AI_REPLY] skipped message_id={message_id}: no enabled AI tasks")
         return ()
     if not ai_service.configured:
-        _log("[AI_REPLY] skipped: AI service is not configured")
+        _smart_reply_log(f"[AI_REPLY] skipped message_id={message_id}: AI service is not configured")
         return ()
     results = await asyncio.gather(
         *(ai_service.analyze(content, task) for task in enabled_tasks),
@@ -2607,11 +2618,15 @@ async def _evaluate_ai_tasks(content: str, tasks: list[dict[str, Any]]) -> tuple
     replies: list[str] = []
     for task, result in zip(enabled_tasks, results):
         if isinstance(result, BaseException):
-            _log(f"[AI_REPLY] task failed id={task.get('id', '')}: {type(result).__name__}: {result}")
+            _smart_reply_log(
+                f"[AI_REPLY] task failed message_id={message_id} id={task.get('id', '')}: "
+                f"{type(result).__name__}: {result}"
+            )
             continue
         task_replies = _ai_result_replies(task, result)
-        _log(
-            f"[AI_REPLY] task result id={task.get('id', '')} matched={result.get('matched')} "
+        _smart_reply_log(
+            f"[AI_REPLY] task result message_id={message_id} id={task.get('id', '')} "
+            f"matched={result.get('matched')} "
             f"confidence={result.get('confidence')} replies={len(task_replies)}"
         )
         replies.extend(task_replies)
@@ -2633,6 +2648,12 @@ async def _process_smart_reply_message(
     config_row = sqlite_cache.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
     if not config_row:
         return
+    message_id = str(message.get("id") or "-")
+    _smart_reply_log(
+        f"[SMART_REPLY] received message_id={message_id} chat={chat_id} "
+        f"sender={message.get('fromid', '')} msgtype={message.get('msgtype', '')} "
+        f"queue_ms={queue_ms:.1f} text={_preview_text(message.get('msg'))!r}"
+    )
     decision = smart_reply_engine.evaluate(
         owner_wxid=owner_wxid,
         chat_id=chat_id,
@@ -2647,17 +2668,19 @@ async def _process_smart_reply_message(
             or decision.reason not in {"keyword_not_matched", "too_few_lines", "pure_single_line"}
             or not ai_tasks
         ):
-            _log(
-                f"[SMART_REPLY] skipped chat={chat_id} sender={message.get('fromid', '')} "
+            _smart_reply_log(
+                f"[SMART_REPLY] skipped message_id={message_id} chat={chat_id} "
+                f"sender={message.get('fromid', '')} "
                 f"reason={decision.reason} msgtype={message.get('msgtype', '')} ai_tasks={len(ai_tasks or [])}"
             )
             return
         raw_content = str(message.get("msg") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-        _log(
-            f"[SMART_REPLY] evaluating AI chat={chat_id} sender={message.get('fromid', '')} "
+        _smart_reply_log(
+            f"[SMART_REPLY] evaluating AI message_id={message_id} chat={chat_id} "
+            f"sender={message.get('fromid', '')} "
             f"reason={decision.reason} text={_preview_text(raw_content)!r}"
         )
-        ai_replies = await _evaluate_ai_tasks(raw_content, ai_tasks)
+        ai_replies = await _evaluate_ai_tasks(raw_content, ai_tasks, message_id=message_id)
         decision = smart_reply_engine.reserve_ai_replies(
             owner_wxid=owner_wxid,
             chat_id=chat_id,
@@ -2665,13 +2688,15 @@ async def _process_smart_reply_message(
             replies=ai_replies,
         )
         if not decision.should_send:
-            _log(
-                f"[SMART_REPLY] AI produced no send chat={chat_id} sender={message.get('fromid', '')} "
+            _smart_reply_log(
+                f"[SMART_REPLY] AI produced no send message_id={message_id} chat={chat_id} "
+                f"sender={message.get('fromid', '')} "
                 f"reason={decision.reason} replies={len(ai_replies)}"
             )
             return
-        _log(
-            f"[SMART_REPLY] AI reserved chat={chat_id} sender={message.get('fromid', '')} "
+        _smart_reply_log(
+            f"[SMART_REPLY] AI reserved message_id={message_id} chat={chat_id} "
+            f"sender={message.get('fromid', '')} "
             f"count={len(decision.replies)}"
         )
     evaluation_finished_at = time.perf_counter()
@@ -2680,7 +2705,7 @@ async def _process_smart_reply_message(
         use_no_src = bool(config_row.get("use_no_src"))
 
         async def _send_one(reply: str):
-            with wechat_api.use_agent(agent_id):
+            with wechat_api.use_agent(agent_id), wechat_api.use_log_category("smart_reply"):
                 if use_no_src:
                     return await wechat_api.send_text_no_src(chat_id, reply)
                 return await wechat_api.send_text(chat_id, reply)
@@ -2696,22 +2721,25 @@ async def _process_smart_reply_message(
         sent_replies: list[str] = []
         for reply, result in zip(decision.replies, results):
             if isinstance(result, BaseException) or not _send_result_ok(result):
-                _log(
-                    f"[SMART_REPLY] send failed chat={chat_id} reason={decision.reason} "
+                _smart_reply_log(
+                    f"[SMART_REPLY] send failed message_id={message_id} chat={chat_id} "
+                    f"reason={decision.reason} "
                     f"reply={reply!r} result={result}"
                 )
                 continue
             sent_replies.append(reply)
         if not sent_replies:
-            _log(
-                f"[SMART_REPLY] send completed chat={chat_id} sender={message.get('fromid', '')} "
+            _smart_reply_log(
+                f"[SMART_REPLY] send completed message_id={message_id} chat={chat_id} "
+                f"sender={message.get('fromid', '')} "
                 f"reason={decision.reason} count=0 mode={'no_src' if use_no_src else 'normal'} "
                 f"queue_ms={queue_ms:.1f} evaluate_ms={evaluate_ms:.1f} "
                 f"send_ms={send_ms:.1f} total_ms={total_ms:.1f}"
             )
             return
-        _log(
-            f"[SMART_REPLY] sent chat={chat_id} sender={message.get('fromid', '')} "
+        _smart_reply_log(
+            f"[SMART_REPLY] sent message_id={message_id} chat={chat_id} "
+            f"sender={message.get('fromid', '')} "
             f"reason={decision.reason} count={len(sent_replies)} mode={'no_src' if use_no_src else 'normal'} "
             f"disabled={decision.disable_after_send} "
             f"queue_ms={queue_ms:.1f} evaluate_ms={evaluate_ms:.1f} "
@@ -2727,7 +2755,10 @@ async def _process_smart_reply_message(
             await _broadcast_local_sent_for_agent(agent_id, chat_id, "1", reply)
         await manager.broadcast({"type": "smart_reply_updated", "data": {"config": updated}})
     except Exception as exc:
-        _log(f"[SMART_REPLY] error chat={chat_id}: {type(exc).__name__}: {exc}")
+        _smart_reply_log(
+            f"[SMART_REPLY] error message_id={message_id} chat={chat_id}: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _schedule_smart_reply_message(
@@ -8851,7 +8882,7 @@ if __name__ == "__main__":
 
     # NOTE:
     # - In dev, uvicorn reload can be useful.
-    # - But writing logs (e.g. backend/main.log) will trigger reload loops unless excluded.
+    # - But writing logs will trigger reload loops unless excluded.
     # Default: reload OFF. Enable by setting WECHAT_RELOAD=1.
     reload_enabled = os.environ.get("WECHAT_RELOAD", "0") == "1"
     uvicorn.run(
@@ -8864,7 +8895,8 @@ if __name__ == "__main__":
             "*.log",
             "**/*.log",
             "backend/*.log",
-            "backend/main.log",
+            "backend/logs/*",
+            "backend/logs/**/*",
             "backend/_uploads/*",
             ".img_cache/*",
             ".avatar_cache/*",

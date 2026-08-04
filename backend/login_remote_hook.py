@@ -19,6 +19,7 @@ import tempfile
 import threading
 import base64
 import requests
+from daily_log import append_daily_log
 
 # ─── 加载 config ───────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
@@ -26,6 +27,7 @@ from config import (
     HOOK_HOST, HOOK_PORT, MGR_PORT,
     RDV, CLIENT_WSS_URL,
     RECV_TYPE,
+    AGENT_WS_ENABLED, IS_REMOTE_HOOK,
     RESTART_ON_BUTTON_LOGIN_FAIL, MAX_RESTARTS_AFTER_BUTTON_LOGIN_FAIL,
 )
 
@@ -39,27 +41,27 @@ POST_START_DELAY = 5  # StartWechat 后等几秒让 Hook DLL 注入初始化
 POST_CLEANUP_DELAY = 5  # 清理进程后额外等几秒确保端口释放
 
 # ─── 日志文件 ──────────────────────────────────────────────────────
-LOG_FILE = os.path.join(os.path.dirname(__file__), "..", "login.log")
-_log_fp = None
+_log_opened = False
 
 
 def _open_log():
-    global _log_fp
-    if _log_fp is None:
-        _log_fp = open(LOG_FILE, "a", encoding="utf-8")
-        _log_fp.write(f"\n{'=' * 60}\n")
-        _log_fp.write(f"  Login session started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        _log_fp.write(f"{'=' * 60}\n\n")
-        _log_fp.flush()
+    global _log_opened
+    if not _log_opened:
+        _log_opened = True
+        append_daily_log(
+            "login",
+            f"\n{'=' * 60}\n"
+            f"  Login session started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"{'=' * 60}\n\n",
+        )
 
 
 def log(msg: str):
     ts = time.strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
-    if _log_fp:
-        _log_fp.write(line + "\n")
-        _log_fp.flush()
+    if _log_opened:
+        append_daily_log("login", line + "\n")
 
 
 def _post(url: str, body: dict = None, *, timeout: float = TIMEOUT,
@@ -365,19 +367,25 @@ def precheck() -> str:
 # Step 1: StartWechat
 # ═══════════════════════════════════════════════════════════════════
 
+def _start_wechat_body() -> dict:
+    body = {
+        "StartPort": str(HOOK_PORT),
+        "RDV": RDV,
+        "RecvType": str(RECV_TYPE),
+        "ConnectType": "http",
+    }
+    if AGENT_WS_ENABLED:
+        body["RemoteWS"] = CLIENT_WSS_URL
+    return body
+
+
 def start_wechat() -> dict | None:
     """调用管理端口启动微信实例，返回响应JSON。
 
     使用 JSON body (application/json)，与 Postman 行为一致。
     """
     url = f"{MGR_URL}/StartWechat"
-    body = {
-        "StartPort": str(HOOK_PORT),
-        "RDV": RDV,
-        "RecvType": str(RECV_TYPE),
-        "ConnectType": "http",
-        "RemoteWS": CLIENT_WSS_URL,
-    }
+    body = _start_wechat_body()
     try:
         r = _post(url, body, timeout=TIMEOUT)
     except requests.ConnectionError as e:
@@ -861,10 +869,13 @@ def _post_login_verify():
 def main():
     _open_log()
     log("=" * 50)
-    log("Remote Hook 登录 (自动选择免扫码 / 扫码)")
+    log(f"{'Remote Hook' if IS_REMOTE_HOOK else 'Local Hook'} 登录 (自动选择免扫码 / 扫码)")
     log(f"  管理端口: {MGR_URL}")
     log(f"  API 端口: {API_URL}")
-    log(f"  远程 WebSocket: {CLIENT_WSS_URL}")
+    if AGENT_WS_ENABLED:
+        log(f"  远程 WebSocket: {CLIENT_WSS_URL}")
+    else:
+        log("  远程 WebSocket: 未启用（本地 HTTP 直连）")
     log(f"  RDV: {RDV}")
     log("=" * 50)
 

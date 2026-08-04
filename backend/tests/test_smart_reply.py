@@ -502,7 +502,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
         old_send_text_no_src = main.wechat_api.send_text_no_src
         old_broadcast = main.manager.broadcast
         old_local_sent = main._broadcast_local_sent_for_agent
-        old_log = main._log
+        old_log = main._smart_reply_log
         logs: list[str] = []
         try:
             main.sqlite_cache = cache
@@ -511,7 +511,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
             main.wechat_api.send_text_no_src = fake_send_text_no_src
             main.manager.broadcast = noop
             main._broadcast_local_sent_for_agent = noop
-            main._log = logs.append
+            main._smart_reply_log = logs.append
             cache.upsert_smart_reply_config(config(use_no_src=True), owner_wxid=OWNER)
 
             await main._process_smart_reply_message(
@@ -529,11 +529,13 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
             main.wechat_api.send_text_no_src = old_send_text_no_src
             main.manager.broadcast = old_broadcast
             main._broadcast_local_sent_for_agent = old_local_sent
-            main._log = old_log
+            main._smart_reply_log = old_log
             temp_dir.cleanup()
 
         self.assertEqual([], normal_sent)
         self.assertEqual([(CHAT_ID, "received")], no_src_sent)
+        received_log = next(line for line in logs if line.startswith("[SMART_REPLY] received"))
+        self.assertIn("text='urgent'", received_log)
         timing_log = next(line for line in logs if line.startswith("[SMART_REPLY] sent"))
         self.assertIn("mode=no_src", timing_log)
         self.assertRegex(timing_log, r"queue_ms=\d+\.\d")

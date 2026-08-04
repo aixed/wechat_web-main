@@ -50,6 +50,7 @@ frontend_host: "0.0.0.0"
 frontend_port: 80
 
 # --- 远程客户端 DLL 主动连接到本后端的 WS/WSS 长连接 ---
+# 仅 wechat_mode=2 时生效；本地 Hook 和远程协议模式会强制忽略此开关。
 # 无证书测试：client_wss_scheme="ws"，client_wss_port=5000，
 #   DLL 使用 RemoteWS="ws://1.14.149.2:5000/agent"，直连 server_port。
 # 正式部署：client_wss_scheme="wss"，client_wss_port=443，

@@ -329,7 +329,13 @@ if HOOK_API_CONCURRENCY < 1:
 
 # DLL agent WebSocket. The DLL connects outward to this backend, usually through
 # TLS termination as wss://<public-ip>:<client_wss_port><agent_ws_path>.
-AGENT_WS_ENABLED = _to_bool(_cfg.get("agent_ws_enabled", False), False)
+def _resolve_agent_ws_enabled(login_mode: str, raw_value: Any) -> bool:
+    return login_mode == "remote_hook" and _to_bool(raw_value, False)
+
+
+# RemoteWS is a transport for remote Hook clients only.  Ignore stale or
+# copied agent_ws_enabled=true values in local Hook and protocol modes.
+AGENT_WS_ENABLED = _resolve_agent_ws_enabled(LOGIN_MODE, _cfg.get("agent_ws_enabled", False))
 AGENT_WS_PATH = str(_cfg.get("agent_ws_path", "/agent") or "/agent")
 if not AGENT_WS_PATH.startswith("/"):
     AGENT_WS_PATH = "/" + AGENT_WS_PATH
