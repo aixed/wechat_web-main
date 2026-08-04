@@ -143,12 +143,22 @@ npm run lint
 - `hook_api_concurrency`：Hook/API 并发数；本地 Hook 默认 `1`，远程 Hook/远程协议默认 `10`，用于避免慢查询阻塞 `GetContact`、头像、发送消息等交互接口。
 - `QueryDB` 历史查询：不再使用旧的全局查询锁；同一账号的同一个数据库文件最多并发 `4` 路，第 5 个请求最多等待 `10` 秒，超时返回空结果并在日志中记录 `pooled connection unavailable`。
 - `frontend_host` / `frontend_port`：前端开发服务器监听地址和端口，由 Vite 直接读取 `config.yaml`。Windows 的 `start-all.bat` 会从 `frontend_port` 开始检查最多 10 个连续端口，将首个空闲端口回写到 `config.yaml`，并在页面可访问后自动打开 `http://127.0.0.1:<frontend_port>`。
-- `agent_ws_enabled`：是否启用远程客户端 DLL 主动连接本后端的 `/agent` WebSocket 通道；启用后 Hook API 调用会通过这条长连接发给 DLL。
+- `agent_ws_enabled`：仅远程 Hook（`wechat_mode: 2`）使用。启用后，远程客户端 DLL 主动连接本后端的 `/agent` WebSocket，Hook API 调用通过该长连接发送；本地 Hook（`wechat_mode: 1`）始终直连本机 HTTP 接口，不使用 RemoteWS。
 - `agent_ws_path`：DLL 连接路径，默认 `/agent`。
 - `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；无证书直连后端可用 `client_wss_scheme: "ws"`、`client_wss_port: 5000`，DLL 配置 `RemoteWS="ws://1.14.149.2:5000/agent"`；正式 TLS 部署用 `client_wss_scheme: "wss"`、`client_wss_port: 443`，DLL 配置 `RemoteWS="wss://1.14.149.2/agent"`。
 - 使用前端端口代理 `/agent` 时，后端 `server_port` 不需要暴露公网；直连 `server_port` 时，需要云服务器安全组放行该端口。若使用 Nginx/Caddy，也需要保留 WebSocket Upgrade 头。
 - `recvtype`：Hook 消息接收类型，默认 `1`；`1` 为 Hook 直接返回 `msglist`，`2` 为 protobuf/raw `pb_msg`。旧配置 `recv_type` 仍兼容。
 - `WECHAT_FILES_BASE`：可选环境变量，用于指定本机微信文件目录；不设置时会按默认微信文件目录推导。
+
+### 日志目录
+
+日志按类型和日期分别存放，每天自动创建一个文件：
+
+- 通用后端和 Hook API 日志：`backend/logs/main/YYYY-MM-DD.log`
+- 智能回复收件、匹配、发送和耗时日志：`backend/logs/smart_reply/YYYY-MM-DD.log`
+- 登录脚本日志：`backend/logs/login/YYYY-MM-DD.log`
+
+智能回复触发的发送接口请求也写入 `smart_reply` 日志，不会混入 `main` 日志。日志通过后台线程写盘，不阻塞消息回复链路。
 
 ### 消息类型参考
 

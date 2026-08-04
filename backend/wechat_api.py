@@ -17,6 +17,7 @@ import hashlib
 import zlib
 import json as _json
 import protocol_api
+from daily_log import append_daily_log
 from config import (
     AGENT_WS_ENABLED,
     AGENT_WS_REQUEST_TIMEOUT,
@@ -37,9 +38,18 @@ client = httpx.AsyncClient(base_url=HOOK_BASE_URL, timeout=_DEFAULT_TIMEOUT)
 # Request counter
 _req_id = 0
 _CURRENT_AGENT_ID: contextvars.ContextVar[str] = contextvars.ContextVar("wechat_agent_id", default="")
+_CURRENT_LOG_CATEGORY: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "wechat_api_log_category",
+    default="main",
+)
 _QUERY_DB_CONCURRENCY = 4
 _QUERY_DB_POOL_WAIT_TIMEOUT = 10.0
 _query_db_semaphores: dict[str, asyncio.Semaphore] = {}
+
+
+def _use_agent_ws_transport() -> bool:
+    """Only remote Hook clients need the /agent WebSocket transport."""
+    return bool(AGENT_WS_ENABLED and IS_HOOK and not IS_LOCAL_HOOK)
 
 
 def _query_db_pool_key(agent_id: str, dbname: str) -> str:
@@ -69,6 +79,15 @@ def use_agent(agent_id: str | None):
     finally:
         _CURRENT_AGENT_ID.reset(token)
 
+
+@contextmanager
+def use_log_category(category: str):
+    token = _CURRENT_LOG_CATEGORY.set(str(category or "main"))
+    try:
+        yield
+    finally:
+        _CURRENT_LOG_CATEGORY.reset(token)
+
 # Concurrency control:
 #  - Local Hook defaults to 1 (serialize everything — DLL injection can be fragile)
 #  - Remote Hook/Protocol defaults to 10 so slow calls don't block profile/avatar/send APIs
@@ -91,10 +110,6 @@ async def _hook_api_slot(query_db_call: bool):
 _consecutive_failures = 0
 _last_failure_time = 0.0
 _BACKOFF_SECONDS = [0, 2, 5, 10, 30]  # indexed by min(failures, len-1)
-
-_MAIN_LOG_PATH = os.path.join(os.path.dirname(__file__), "main.log")
-_MAIN_LOG_LOCK = asyncio.Lock()
-
 
 def _ts() -> str:
     """Timestamp with milliseconds."""
@@ -133,17 +148,9 @@ def _indent_multiline(text: str, prefix: str) -> str:
     return prefix + ("\n" + pad).join(lines)
 
 
-async def _append_main_log(block: str) -> None:
-    """Append a log block to backend/main.log (best-effort)."""
-    try:
-        async with _MAIN_LOG_LOCK:
-            with open(_MAIN_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(block)
-                if not block.endswith("\n"):
-                    f.write("\n")
-    except Exception:
-        # Never break API calls because of logging.
-        pass
+async def _append_api_log(block: str) -> None:
+    """Route API details to the active daily log without blocking the request."""
+    append_daily_log(_CURRENT_LOG_CATEGORY.get(), block)
 
 
 def _log(msg: str):
@@ -242,7 +249,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
     """Logged POST wrapper with mode-aware concurrency control."""
     global _req_id, _consecutive_failures, _last_failure_time
 
-    use_agent_ws = AGENT_WS_ENABLED and IS_HOOK
+    use_agent_ws = _use_agent_ws_transport()
     agent_id = _CURRENT_AGENT_ID.get() or ""
     request_json = _protocol_payload(endpoint, json, agent_id)
     full_url = f"agent-ws://{agent_id or 'active'}/{endpoint.lstrip('/')}" if use_agent_ws else f"{HOOK_BASE_URL}{endpoint}"
@@ -252,7 +259,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
         backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
         log_json = _scrub_payload_for_log(request_json or {})
         _log(f"[API] ⏸ Circuit breaker OPEN — skipping {full_url} (failures={_consecutive_failures}, backoff={backoff}s)")
-        await _append_main_log(
+        await _append_api_log(
             f"[{_ts()}]POST {full_url}\n"
             f"          agent_id={agent_id or '-'} endpoint={endpoint}\n"
             f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
@@ -292,7 +299,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
             ms = int((time.time() - t0) * 1000)
             body_preview = _truncate(r.text if r.text else "(empty)", 1200).replace("\n", " ")
             _log(f"[API #{rid}] ← {transport} {full_url} status={r.status_code} time={ms}ms len={len(r.text)} body={body_preview}")
-            await _append_main_log(
+            await _append_api_log(
                 f"[{_ts()}]POST {full_url}\n"
                 f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
                 f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"
@@ -311,7 +318,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
             _last_failure_time = time.time()
             backoff = _BACKOFF_SECONDS[min(_consecutive_failures, len(_BACKOFF_SECONDS) - 1)]
             _log(f"[API] ⚠ Consecutive failures: {_consecutive_failures} — next backoff: {backoff}s")
-            await _append_main_log(
+            await _append_api_log(
                 f"[{_ts()}]POST {full_url}\n"
                 f"          request_id={rid} agent_id={agent_id or '-'} endpoint={endpoint}\n"
                 f"{_indent_multiline(_truncate(_pretty_json(log_json)), '          << ')}\n"

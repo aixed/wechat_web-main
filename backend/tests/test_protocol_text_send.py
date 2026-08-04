@@ -1,11 +1,93 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
+import config as app_config
+import login_remote_hook
 import protocol_api
 import wechat_api
 
 
 class ProtocolTextSendTests(unittest.IsolatedAsyncioTestCase):
+    def test_remote_ws_setting_only_applies_to_remote_hook(self):
+        self.assertFalse(app_config._resolve_agent_ws_enabled("local_hook", True))
+        self.assertTrue(app_config._resolve_agent_ws_enabled("remote_hook", True))
+        self.assertFalse(app_config._resolve_agent_ws_enabled("remote_hook", False))
+        self.assertFalse(app_config._resolve_agent_ws_enabled("remote_protocol", True))
+
+    def test_local_start_wechat_body_omits_remote_ws(self):
+        with patch.object(login_remote_hook, "AGENT_WS_ENABLED", False):
+            body = login_remote_hook._start_wechat_body()
+        self.assertNotIn("RemoteWS", body)
+
+    def test_remote_hook_start_wechat_body_includes_remote_ws(self):
+        with (
+            patch.object(login_remote_hook, "AGENT_WS_ENABLED", True),
+            patch.object(login_remote_hook, "CLIENT_WSS_URL", "wss://example.com/agent"),
+        ):
+            body = login_remote_hook._start_wechat_body()
+        self.assertEqual("wss://example.com/agent", body["RemoteWS"])
+
+    def test_local_hook_never_uses_remote_agent_transport(self):
+        with (
+            patch.object(wechat_api, "AGENT_WS_ENABLED", True),
+            patch.object(wechat_api, "IS_HOOK", True),
+            patch.object(wechat_api, "IS_LOCAL_HOOK", True),
+        ):
+            self.assertFalse(wechat_api._use_agent_ws_transport())
+
+    def test_remote_hook_uses_agent_transport_when_enabled(self):
+        with (
+            patch.object(wechat_api, "AGENT_WS_ENABLED", True),
+            patch.object(wechat_api, "IS_HOOK", True),
+            patch.object(wechat_api, "IS_LOCAL_HOOK", False),
+        ):
+            self.assertTrue(wechat_api._use_agent_ws_transport())
+
+    def test_remote_hook_can_disable_agent_transport(self):
+        with (
+            patch.object(wechat_api, "AGENT_WS_ENABLED", False),
+            patch.object(wechat_api, "IS_HOOK", True),
+            patch.object(wechat_api, "IS_LOCAL_HOOK", False),
+        ):
+            self.assertFalse(wechat_api._use_agent_ws_transport())
+
+    def test_api_log_category_is_scoped(self):
+        self.assertEqual("main", wechat_api._CURRENT_LOG_CATEGORY.get())
+        with wechat_api.use_log_category("smart_reply"):
+            self.assertEqual("smart_reply", wechat_api._CURRENT_LOG_CATEGORY.get())
+        self.assertEqual("main", wechat_api._CURRENT_LOG_CATEGORY.get())
+
+    async def test_api_log_uses_active_category(self):
+        with (
+            patch.object(wechat_api, "append_daily_log") as append_log,
+            wechat_api.use_log_category("smart_reply"),
+        ):
+            await wechat_api._append_api_log("send details")
+
+        append_log.assert_called_once_with("smart_reply", "send details")
+
+    async def test_local_hook_text_uses_http_hook_contract(self):
+        response = httpx.Response(200, json={"SendTextMsg": "1"})
+        post = AsyncMock(return_value=response)
+
+        with patch.object(wechat_api, "IS_HOOK", True), patch.object(wechat_api, "_post", post):
+            result = await wechat_api.send_text("filehelper", "hello")
+
+        self.assertEqual({"SendTextMsg": "1"}, result)
+        post.assert_awaited_once_with("/SendTextMsg", json={"toid": "filehelper", "msg": "hello"})
+
+    async def test_local_hook_no_src_text_uses_http_hook_contract(self):
+        response = httpx.Response(200, json={"SendTextMsg_NoSrc": "1"})
+        post = AsyncMock(return_value=response)
+
+        with patch.object(wechat_api, "IS_HOOK", True), patch.object(wechat_api, "_post", post):
+            result = await wechat_api.send_text_no_src("filehelper", "hello")
+
+        self.assertEqual({"SendTextMsg_NoSrc": "1"}, result)
+        post.assert_awaited_once_with("/SendTextMsg_NoSrc", json={"toid": "filehelper", "msg": "hello"})
+
     async def test_protocol_client_uses_newsendmsg_contract(self):
         post = AsyncMock(return_value={"ok": True})
 
@@ -17,8 +99,10 @@ class ProtocolTextSendTests(unittest.IsolatedAsyncioTestCase):
             "/newsendmsg",
             {
                 "session_id": "SESSION_123",
-                "username": "filehelper",
+                "userName": "filehelper",
                 "content": "hello",
+                "msgType": 1,
+                "async": 0,
             },
             timeout=30.0,
         )

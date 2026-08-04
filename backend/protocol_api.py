@@ -196,8 +196,10 @@ async def send_text(session_id: str, username: str, content: str) -> dict[str, A
         "/newsendmsg",
         {
             "session_id": session_id,
-            "username": username,
+            "userName": username,
             "content": str(content or ""),
+            "msgType": 1,
+            "async": 0,
         },
         timeout=30.0,
     )
