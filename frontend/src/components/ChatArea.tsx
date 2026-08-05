@@ -30,6 +30,42 @@ interface ChatAreaProps {
 const DESKTOP_COMPOSER_DEFAULT_HEIGHT = 176;
 const DESKTOP_COMPOSER_MIN_HEIGHT = 140;
 const CHAT_BACKGROUND_MAX_SIZE = 20 * 1024 * 1024;
+const DEFAULT_BUBBLE_OPACITY = 78;
+const MIN_BUBBLE_OPACITY = 0;
+const GLOBAL_BUBBLE_OPACITY_KEY = "wechat-web:wallpaper-bubble-opacity:global";
+const CHAT_BUBBLE_OPACITY_KEY_PREFIX = "wechat-web:wallpaper-bubble-opacity:chat:";
+const LOW_OPACITY_TEXT_CONTRAST_KEY = "wechat-web:wallpaper-bubble-low-opacity-text-contrast";
+
+function readBubbleOpacity(key: string): number | null {
+  try {
+    const value = Number.parseInt(window.localStorage.getItem(key) || "", 10);
+    if (!Number.isFinite(value)) return null;
+    return Math.min(100, Math.max(MIN_BUBBLE_OPACITY, value));
+  } catch {
+    return null;
+  }
+}
+
+function saveBubbleOpacity(key: string, value: number | null) {
+  try {
+    if (value === null) {
+      window.localStorage.removeItem(key);
+    } else {
+      window.localStorage.setItem(key, String(value));
+    }
+  } catch {
+    // The current value still applies when browser storage is unavailable.
+  }
+}
+
+function readStoredBoolean(key: string, fallback: boolean): boolean {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value === null ? fallback : value === "true";
+  } catch {
+    return fallback;
+  }
+}
 
 function contactProfileAvatar(profile: ContactProfile | undefined, fallback = ""): string {
   const raw = profile?.profile || {};
@@ -84,6 +120,14 @@ export default function ChatArea({
   const [chatBackgroundUrl, setChatBackgroundUrl] = useState("");
   const [backgroundSaving, setBackgroundSaving] = useState(false);
   const [backgroundError, setBackgroundError] = useState("");
+  const [bubbleOpacityScope, setBubbleOpacityScope] = useState<"global" | "chat">("global");
+  const [globalBubbleOpacity, setGlobalBubbleOpacity] = useState(
+    () => readBubbleOpacity(GLOBAL_BUBBLE_OPACITY_KEY) ?? DEFAULT_BUBBLE_OPACITY,
+  );
+  const [chatBubbleOpacityOverride, setChatBubbleOpacityOverride] = useState<number | null>(null);
+  const [enhanceLowOpacityText, setEnhanceLowOpacityText] = useState(
+    () => readStoredBoolean(LOW_OPACITY_TEXT_CONTRAST_KEY, true),
+  );
   const [desktopComposerHeight, setDesktopComposerHeight] = useState(DESKTOP_COMPOSER_DEFAULT_HEIGHT);
 
   const chatAreaRef = useRef<HTMLDivElement>(null);
@@ -113,6 +157,11 @@ export default function ChatArea({
   const isGroup = session.is_group;
   const canSend = input.trim().length > 0 || pendingImages.length > 0;
   const backgroundStorageKey = `${selfWxid || "unknown-account"}:${session.wxid}`;
+  const chatBubbleOpacityKey = `${CHAT_BUBBLE_OPACITY_KEY_PREFIX}${backgroundStorageKey}`;
+  const effectiveBubbleOpacity = chatBubbleOpacityOverride ?? globalBubbleOpacity;
+  const selectedBubbleOpacity = bubbleOpacityScope === "global"
+    ? globalBubbleOpacity
+    : effectiveBubbleOpacity;
 
   const replaceChatBackgroundUrl = useCallback((nextUrl: string) => {
     const previousUrl = chatBackgroundUrlRef.current;
@@ -142,6 +191,10 @@ export default function ChatArea({
   useEffect(() => {
     pendingImagesRef.current = pendingImages;
   }, [pendingImages]);
+
+  useEffect(() => {
+    setChatBubbleOpacityOverride(readBubbleOpacity(chatBubbleOpacityKey));
+  }, [chatBubbleOpacityKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -668,6 +721,34 @@ export default function ChatArea({
     }
   };
 
+  const handleBubbleOpacityChange = (value: number) => {
+    const nextValue = Math.min(100, Math.max(MIN_BUBBLE_OPACITY, value));
+    if (bubbleOpacityScope === "global") {
+      setGlobalBubbleOpacity(nextValue);
+      saveBubbleOpacity(GLOBAL_BUBBLE_OPACITY_KEY, nextValue);
+      return;
+    }
+    setChatBubbleOpacityOverride(nextValue);
+    saveBubbleOpacity(chatBubbleOpacityKey, nextValue);
+  };
+
+  const resetChatBubbleOpacity = () => {
+    setChatBubbleOpacityOverride(null);
+    saveBubbleOpacity(chatBubbleOpacityKey, null);
+  };
+
+  const toggleLowOpacityTextContrast = () => {
+    setEnhanceLowOpacityText((current) => {
+      const nextValue = !current;
+      try {
+        window.localStorage.setItem(LOW_OPACITY_TEXT_CONTRAST_KEY, String(nextValue));
+      } catch {
+        // The current value still applies when browser storage is unavailable.
+      }
+      return nextValue;
+    });
+  };
+
   const composerMaxHeight = useCallback(() => {
     const chatHeight = chatAreaRef.current?.clientHeight || window.innerHeight;
     return Math.max(
@@ -728,15 +809,16 @@ export default function ChatArea({
   const pageBg = dark ? "bg-[#111111]" : "bg-[#ededed]";
   const titleText = dark ? "text-[#e5e5e5]" : "text-[#111]";
   const mutedText = dark ? "text-[#5c5c5c]" : "text-[#999]";
-  const messageAreaStyle: React.CSSProperties | undefined = chatBackgroundUrl ? {
+  const messageAreaStyle = chatBackgroundUrl ? {
     backgroundImage: `url("${chatBackgroundUrl}")`,
     backgroundPosition: "center",
     backgroundRepeat: "no-repeat",
     backgroundSize: "cover",
     boxShadow: dark
       ? "inset 0 0 0 9999px rgba(0, 0, 0, 0.34)"
-      : "inset 0 0 0 9999px rgba(255, 255, 255, 0.32)",
-  } : undefined;
+      : "inset 0 0 0 9999px rgba(0, 0, 0, 0.08)",
+    "--chat-bubble-opacity": String(effectiveBubbleOpacity / 100),
+  } as React.CSSProperties : undefined;
 
   return (
     <div ref={chatAreaRef} className={`h-full w-full flex flex-col ${dark ? "bg-[#191919]" : "bg-[#ededed]"}`}>
@@ -824,6 +906,75 @@ export default function ChatArea({
 
               <div className={`mx-[12px] h-px ${dark ? "bg-[#383838]" : "bg-[#e6e6e6]"}`} />
 
+              <div className="px-[13px] py-[11px]">
+                <div className="flex items-center justify-between text-[13px]">
+                  <span>气泡不透明度</span>
+                  <span className={`tabular-nums ${dark ? "text-[#aaa]" : "text-[#666]"}`}>{selectedBubbleOpacity}%</span>
+                </div>
+                <div className={`mt-[9px] grid grid-cols-2 h-[28px] rounded-[4px] p-[2px] ${dark ? "bg-[#191919]" : "bg-[#ededed]"}`}>
+                  {(["global", "chat"] as const).map((scope) => {
+                    const active = bubbleOpacityScope === scope;
+                    return (
+                      <button
+                        key={scope}
+                        type="button"
+                        onClick={() => setBubbleOpacityScope(scope)}
+                        className={`rounded-[3px] text-[12px] ${active
+                          ? dark ? "bg-[#3a3a3a] text-white" : "bg-white text-[#222] shadow-sm"
+                          : dark ? "text-[#888]" : "text-[#777]"
+                        }`}
+                      >
+                        {scope === "global" ? "全局" : "本聊天"}
+                      </button>
+                    );
+                  })}
+                </div>
+                <input
+                  type="range"
+                  min={MIN_BUBBLE_OPACITY}
+                  max={100}
+                  step={1}
+                  value={selectedBubbleOpacity}
+                  onChange={(event) => handleBubbleOpacityChange(Number(event.target.value))}
+                  className="mt-[10px] block h-[18px] w-full cursor-pointer accent-[#07c160]"
+                  aria-label={`${bubbleOpacityScope === "global" ? "全局" : "本聊天"}气泡不透明度`}
+                />
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={enhanceLowOpacityText}
+                  onClick={toggleLowOpacityTextContrast}
+                  className="mt-[7px] flex h-[24px] w-full items-center justify-between text-[11px]"
+                >
+                  <span className={dark ? "text-[#aaa]" : "text-[#555]"}>低于 50% 文字增强</span>
+                  <span className={`relative h-[18px] w-[32px] shrink-0 rounded-full transition-colors ${
+                    enhanceLowOpacityText ? "bg-[#07c160]" : dark ? "bg-[#555]" : "bg-[#c8c8c8]"
+                  }`}>
+                    <span className={`absolute left-0 top-[2px] h-[14px] w-[14px] rounded-full bg-white shadow-sm transition-transform ${
+                      enhanceLowOpacityText ? "translate-x-[16px]" : "translate-x-[2px]"
+                    }`} />
+                  </span>
+                </button>
+                {bubbleOpacityScope === "chat" && (
+                  <div className="mt-[6px] flex h-[22px] items-center justify-between text-[11px]">
+                    <span className={dark ? "text-[#888]" : "text-[#777]"}>
+                      {chatBubbleOpacityOverride === null ? "跟随全局" : "独立设置"}
+                    </span>
+                    {chatBubbleOpacityOverride !== null && (
+                      <button
+                        type="button"
+                        onClick={resetChatBubbleOpacity}
+                        className={dark ? "text-[#9fb9dc] hover:text-[#c4d7f0]" : "text-[#576b95] hover:text-[#334b7d]"}
+                      >
+                        恢复跟随
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className={`mx-[12px] h-px ${dark ? "bg-[#383838]" : "bg-[#e6e6e6]"}`} />
+
               <button
                 type="button"
                 onClick={() => {
@@ -905,6 +1056,9 @@ export default function ChatArea({
                   onAvatarClick={handleAvatarClick}
                   mobile={mobile}
                   dark={dark}
+                  hasChatBackground={Boolean(chatBackgroundUrl)}
+                  wallpaperBubbleOpacity={effectiveBubbleOpacity}
+                  enhanceLowOpacityText={enhanceLowOpacityText}
                 />
               );
             })}
