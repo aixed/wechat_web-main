@@ -1707,6 +1707,18 @@ export default function App() {
         return [];
       }
       const rows: WeChatAccount[] = Array.isArray(data?.accounts) ? data.accounts : [];
+      const savedActiveAgentId = getActiveAgentId();
+      const localHttpAccount = data?.transport === "http"
+        ? rows.find((account) => account.transport === "http")
+        : undefined;
+      if (localHttpAccount && savedActiveAgentId && savedActiveAgentId !== localHttpAccount.id) {
+        clearActiveAgentId();
+        setSelectedAccountId("");
+        setRouteAccount("");
+        setAccountManagerOpen(true);
+        resetChatState();
+        window.history.replaceState({ route: "root" }, "", "/");
+      }
       const upstreamSessions = Array.isArray(data?.upstream?.sessions) ? data.upstream.sessions : [];
       const upstreamStateBySessionId = new Map<string, string>();
       upstreamSessions.forEach((session: any) => {
@@ -1733,7 +1745,7 @@ export default function App() {
     } finally {
       setAccountsLoading(false);
     }
-  }, [resetChatState]);
+  }, [resetChatState, setRouteAccount]);
 
   const handleLogin = useCallback(async (key: string) => {
     setAuthError("");
@@ -4699,7 +4711,11 @@ function AccountPortal({
                   )}
                   <div className={`text-[12px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{account.peer || "connected"}</div>
                   <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#555]" : "text-[#aaa]"}`} title={account.id}>
-                    {account.source === "protocol" ? "Session" : "WS"} {account.id}
+                    {account.source === "protocol"
+                      ? `Session ${account.id}`
+                      : account.transport === "http"
+                        ? `HTTP · Port ${account.api_port || account.start_port || account.server_port || "-"}`
+                        : `WS ${account.id}`}
                   </div>
                   {account.rdv && (
                     <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#555]" : "text-[#aaa]"}`}>
@@ -5895,7 +5911,11 @@ function MobileAccountPortal({
                     </div>
                   )}
                   <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>
-                    {account.source === "protocol" ? "Session" : "WS"} {account.id}
+                    {account.source === "protocol"
+                      ? `Session ${account.id}`
+                      : account.transport === "http"
+                        ? `HTTP · Port ${account.api_port || account.start_port || account.server_port || "-"}`
+                        : `WS ${account.id}`}
                   </div>
                   {account.rdv && (
                     <div className={`text-[11px] truncate mt-[3px] ${dark ? "text-[#666]" : "text-[#aaa]"}`}>
