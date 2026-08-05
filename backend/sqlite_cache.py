@@ -398,20 +398,34 @@ class SqliteMessageCache:
             return 0
         now = int(time.time())
         owner_wxid = str(owner_wxid or "").strip()
-        rows = []
+        pending: list[tuple[str, int, dict[str, Any]]] = []
         newest: dict[str, Any] | None = None
         for msg in msgs:
             if not isinstance(msg, dict):
                 continue
             msg_id = self._message_id(msg)
             ts = self._timestamp(msg)
-            rows.append((owner_wxid, wxid, msg_id, ts, json.dumps(msg, ensure_ascii=False), now, now))
+            pending.append((msg_id, ts, dict(msg)))
             if newest is None or ts >= self._timestamp(newest):
                 newest = msg
-        if not rows:
+        if not pending:
             return 0
 
         with self._lock, self._connect() as conn:
+            rows = []
+            for msg_id, ts, msg in pending:
+                existing_row = conn.execute(
+                    "SELECT message_json FROM messages WHERE owner_wxid = ? AND wxid = ? AND msg_id = ?",
+                    (owner_wxid, wxid, msg_id),
+                ).fetchone()
+                if existing_row:
+                    try:
+                        existing = json.loads(existing_row["message_json"])
+                    except Exception:
+                        existing = {}
+                    if isinstance(existing, dict):
+                        msg = self._preserve_media_fields(msg, existing)
+                rows.append((owner_wxid, wxid, msg_id, ts, json.dumps(msg, ensure_ascii=False), now, now))
             conn.executemany(
                 """
                 INSERT INTO messages (owner_wxid, wxid, msg_id, timestamp, message_json, created_at, updated_at)
@@ -429,6 +443,20 @@ class SqliteMessageCache:
         with self._lock:
             self._history_owners.add(owner_wxid)
         return len(rows)
+
+    @staticmethod
+    def _preserve_media_fields(message: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(message)
+        for key in (
+            "img_path", "img_len", "db_image_id",
+            "video_path", "video_len",
+            "file_path", "file_len",
+            "gif_path", "gif_len",
+            "voice_hex", "voice_data", "voice_len",
+        ):
+            if not merged.get(key) and fallback.get(key):
+                merged[key] = fallback[key]
+        return merged
 
     def has_message_history(self, *, owner_wxid: str = "") -> bool:
         """Return whether this account has ever persisted a message row."""

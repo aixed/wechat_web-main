@@ -79,6 +79,7 @@ class MessageStore:
         callback / DB message with a proper ``msgsvrid`` arrives."""
         if not wxid or not isinstance(msg, dict):
             return False
+        msg = dict(msg)
         msg_id = str(msg.get("id", "")).strip()
         with self._lock:
             if wxid not in self.messages:
@@ -89,14 +90,16 @@ class MessageStore:
             # matching synthetic "send_..." placeholder that was created for
             # instant local display in _broadcast_local_sent_message().
             if msg_id and not msg_id.startswith("send_"):
-                self._remove_synthetic_match(wxid, msg)
+                synthetic = self._remove_synthetic_match(wxid, msg)
+                if synthetic:
+                    msg = self._preserve_media_fields(msg, synthetic)
 
             if msg_id and msg_id in self._message_ids[wxid]:
                 if replace:
                     # Replace the existing message with the new (DB) version
                     for i, existing in enumerate(self.messages[wxid]):
                         if str(existing.get("id", "")).strip() == msg_id:
-                            self.messages[wxid][i] = msg
+                            self.messages[wxid][i] = self._preserve_media_fields(msg, existing)
                             break
                     self._sort_messages_in_place(wxid)
                     return True
@@ -107,7 +110,21 @@ class MessageStore:
             self._sort_messages_in_place(wxid)
             return True
 
-    def _remove_synthetic_match(self, wxid: str, real_msg: dict[str, Any]) -> None:
+    @staticmethod
+    def _preserve_media_fields(message: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(message)
+        for key in (
+            "img_path", "img_len", "db_image_id",
+            "video_path", "video_len",
+            "file_path", "file_len",
+            "gif_path", "gif_len",
+            "voice_hex", "voice_data", "voice_len",
+        ):
+            if not merged.get(key) and fallback.get(key):
+                merged[key] = fallback[key]
+        return merged
+
+    def _remove_synthetic_match(self, wxid: str, real_msg: dict[str, Any]) -> dict[str, Any] | None:
         """Remove a synthetic ``send_...`` placeholder that matches *real_msg*.
 
         Match criteria:
@@ -123,7 +140,7 @@ class MessageStore:
             or real_msg.get("IsSender") == 1
         )
         if not is_self:
-            return
+            return None
 
         msg_type = str(real_msg.get("msgtype", "") or "")
         msg_content = str(real_msg.get("msg", "") or "")
@@ -154,8 +171,8 @@ class MessageStore:
                     continue
             # Found a match — remove the synthetic placeholder
             self._message_ids[wxid].discard(eid)
-            self.messages[wxid].pop(i)
-            return
+            return self.messages[wxid].pop(i)
+        return None
 
     def get_messages(self, wxid: str, limit: int = 0) -> list[dict[str, Any]]:
         with self._lock:

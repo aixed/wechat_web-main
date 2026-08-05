@@ -3,6 +3,7 @@ import type { ChatMessage, ContactProfile, Session } from "../types";
 import { sendText, getMessages, getOlderMessages, sendImageUpload, sendFileUpload } from "../api";
 import MessageBubble from "./MessageBubble";
 import { DEFAULT_AVATAR_URL } from "../avatar";
+import { deleteChatBackground, getChatBackground, saveChatBackground } from "../chatBackgroundStore";
 
 interface ChatAreaProps {
   session: Session;
@@ -19,14 +20,16 @@ interface ChatAreaProps {
     options?: { force?: boolean },
   ) => Promise<Record<string, ContactProfile>>;
   onInputChange?: (hasText: boolean) => void;
+  onOpenSmartReply?: (session: Session) => void;
   mobile?: boolean;
   dark?: boolean;
 }
 
 /* Group sender parsing removed — WeChat 4.x stores sender in BytesExtra, backend extracts it */
 
-const TEXTAREA_BASE_HEIGHT = 86;
-const TEXTAREA_MAX_HEIGHT = 124;
+const DESKTOP_COMPOSER_DEFAULT_HEIGHT = 176;
+const DESKTOP_COMPOSER_MIN_HEIGHT = 140;
+const CHAT_BACKGROUND_MAX_SIZE = 20 * 1024 * 1024;
 
 function contactProfileAvatar(profile: ContactProfile | undefined, fallback = ""): string {
   const raw = profile?.profile || {};
@@ -64,7 +67,7 @@ function imageFilesFromClipboardData(data: DataTransfer | null): File[] {
 
 export default function ChatArea({
   session, messages, selfWxid, onBack, onNewMessages, avatarMap, contactMap,
-  contactProfiles, onRequestContactProfile, onInputChange, mobile = false, dark = true,
+  contactProfiles, onRequestContactProfile, onInputChange, onOpenSmartReply, mobile = false, dark = true,
 }: ChatAreaProps) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -77,7 +80,13 @@ export default function ChatArea({
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileError, setProfileError] = useState("");
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [chatBackgroundUrl, setChatBackgroundUrl] = useState("");
+  const [backgroundSaving, setBackgroundSaving] = useState(false);
+  const [backgroundError, setBackgroundError] = useState("");
+  const [desktopComposerHeight, setDesktopComposerHeight] = useState(DESKTOP_COMPOSER_DEFAULT_HEIGHT);
 
+  const chatAreaRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -85,6 +94,10 @@ export default function ChatArea({
   const albumInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const backgroundInputRef = useRef<HTMLInputElement>(null);
+  const settingsMenuRef = useRef<HTMLDivElement>(null);
+  const chatBackgroundUrlRef = useRef("");
+  const activeBackgroundKeyRef = useRef("");
   const isInitialScroll = useRef(true);
   const loadingOlderRef = useRef(false);
   const pendingImagesRef = useRef<PendingImage[]>([]);
@@ -99,6 +112,14 @@ export default function ChatArea({
 
   const isGroup = session.is_group;
   const canSend = input.trim().length > 0 || pendingImages.length > 0;
+  const backgroundStorageKey = `${selfWxid || "unknown-account"}:${session.wxid}`;
+
+  const replaceChatBackgroundUrl = useCallback((nextUrl: string) => {
+    const previousUrl = chatBackgroundUrlRef.current;
+    if (previousUrl && previousUrl !== nextUrl) URL.revokeObjectURL(previousUrl);
+    chatBackgroundUrlRef.current = nextUrl;
+    setChatBackgroundUrl(nextUrl);
+  }, []);
 
   const runSendJobs = useCallback((label: string, jobs: Promise<unknown>[], cleanup?: () => void) => {
     if (jobs.length === 0) {
@@ -123,6 +144,52 @@ export default function ChatArea({
   }, [pendingImages]);
 
   useEffect(() => {
+    let cancelled = false;
+    activeBackgroundKeyRef.current = backgroundStorageKey;
+    replaceChatBackgroundUrl("");
+    setBackgroundError("");
+    void getChatBackground(backgroundStorageKey)
+      .then((image) => {
+        if (!image || cancelled) return;
+        const nextUrl = URL.createObjectURL(image);
+        if (cancelled) {
+          URL.revokeObjectURL(nextUrl);
+          return;
+        }
+        replaceChatBackgroundUrl(nextUrl);
+      })
+      .catch((error) => {
+        if (!cancelled) console.error("[CHAT_BACKGROUND_LOAD]", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [backgroundStorageKey, replaceChatBackgroundUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (chatBackgroundUrlRef.current) URL.revokeObjectURL(chatBackgroundUrlRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!(event.target instanceof Node) || settingsMenuRef.current?.contains(event.target)) return;
+      setSettingsOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSettingsOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [settingsOpen]);
+
+  useEffect(() => {
     return () => {
       pendingImagesRef.current.forEach((image) => URL.revokeObjectURL(image.url));
     };
@@ -133,6 +200,7 @@ export default function ChatArea({
       prev.forEach((image) => URL.revokeObjectURL(image.url));
       return [];
     });
+    setSettingsOpen(false);
     onInputChange?.(input.trim().length > 0);
   }, [session.wxid]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -431,10 +499,6 @@ export default function ChatArea({
     onInputChange?.(false);
     setSending(true);
 
-    if (textareaRef.current) {
-      textareaRef.current.style.height = `${TEXTAREA_BASE_HEIGHT}px`;
-    }
-
     const jobs: Promise<unknown>[] = [];
     if (msg) {
       jobs.push(sendText(session.wxid, msg));
@@ -463,9 +527,6 @@ export default function ChatArea({
     const val = e.target.value;
     setInput(val);
     onInputChange?.(val.trim().length > 0 || pendingImages.length > 0);
-    const el = e.target;
-    el.style.height = `${TEXTAREA_BASE_HEIGHT}px`;
-    el.style.height = Math.min(Math.max(el.scrollHeight, TEXTAREA_BASE_HEIGHT), TEXTAREA_MAX_HEIGHT) + "px";
   };
 
   const handleMobileInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -563,6 +624,103 @@ export default function ChatArea({
     setSending(false);
   };
 
+  const handleBackgroundPick = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setBackgroundError("请选择图片文件");
+      return;
+    }
+    if (file.size > CHAT_BACKGROUND_MAX_SIZE) {
+      setBackgroundError("图片不能超过 20 MB");
+      return;
+    }
+
+    const targetKey = backgroundStorageKey;
+    setBackgroundSaving(true);
+    setBackgroundError("");
+    try {
+      await saveChatBackground(targetKey, file);
+      if (activeBackgroundKeyRef.current === targetKey) {
+        replaceChatBackgroundUrl(URL.createObjectURL(file));
+      }
+    } catch (error) {
+      console.error("[CHAT_BACKGROUND_SAVE]", error);
+      setBackgroundError("聊天背景保存失败");
+    } finally {
+      setBackgroundSaving(false);
+    }
+  };
+
+  const handleClearBackground = async () => {
+    const targetKey = backgroundStorageKey;
+    setBackgroundSaving(true);
+    setBackgroundError("");
+    try {
+      await deleteChatBackground(targetKey);
+      if (activeBackgroundKeyRef.current === targetKey) replaceChatBackgroundUrl("");
+    } catch (error) {
+      console.error("[CHAT_BACKGROUND_DELETE]", error);
+      setBackgroundError("聊天背景清除失败");
+    } finally {
+      setBackgroundSaving(false);
+    }
+  };
+
+  const composerMaxHeight = useCallback(() => {
+    const chatHeight = chatAreaRef.current?.clientHeight || window.innerHeight;
+    return Math.max(
+      DESKTOP_COMPOSER_MIN_HEIGHT,
+      Math.min(Math.floor(chatHeight * 0.55), chatHeight - 160),
+    );
+  }, []);
+
+  const clampComposerHeight = useCallback((height: number) => (
+    Math.min(Math.max(height, DESKTOP_COMPOSER_MIN_HEIGHT), composerMaxHeight())
+  ), [composerMaxHeight]);
+
+  const handleComposerResizeStart = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (mobile) return;
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = desktopComposerHeight;
+
+    const handleMove = (moveEvent: PointerEvent) => {
+      setDesktopComposerHeight(clampComposerHeight(startHeight + startY - moveEvent.clientY));
+    };
+
+    const handleUp = () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp, { once: true });
+    window.addEventListener("pointercancel", handleUp, { once: true });
+  };
+
+  const handleComposerResizeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    const delta = event.key === "ArrowUp" ? 12 : -12;
+    setDesktopComposerHeight((height) => clampComposerHeight(height + delta));
+  };
+
+  useEffect(() => {
+    if (mobile || !chatAreaRef.current) return;
+    const observer = new ResizeObserver(() => {
+      setDesktopComposerHeight((height) => clampComposerHeight(height));
+    });
+    observer.observe(chatAreaRef.current);
+    return () => observer.disconnect();
+  }, [clampComposerHeight, mobile]);
+
   // ─── Render ─────────────────────────────────────────────────────
   const topBarClass = mobile
     ? (dark ? "h-[56px] pt-[env(safe-area-inset-top)] border-b border-[#242424] bg-[#111111]" : "h-[56px] pt-[env(safe-area-inset-top)] border-b border-[#dedede] bg-[#ededed]")
@@ -570,9 +728,18 @@ export default function ChatArea({
   const pageBg = dark ? "bg-[#111111]" : "bg-[#ededed]";
   const titleText = dark ? "text-[#e5e5e5]" : "text-[#111]";
   const mutedText = dark ? "text-[#5c5c5c]" : "text-[#999]";
+  const messageAreaStyle: React.CSSProperties | undefined = chatBackgroundUrl ? {
+    backgroundImage: `url("${chatBackgroundUrl}")`,
+    backgroundPosition: "center",
+    backgroundRepeat: "no-repeat",
+    backgroundSize: "cover",
+    boxShadow: dark
+      ? "inset 0 0 0 9999px rgba(0, 0, 0, 0.34)"
+      : "inset 0 0 0 9999px rgba(255, 255, 255, 0.32)",
+  } : undefined;
 
   return (
-    <div className={`h-full w-full flex flex-col ${dark ? "bg-[#191919]" : "bg-[#ededed]"}`}>
+    <div ref={chatAreaRef} className={`h-full w-full flex flex-col ${dark ? "bg-[#191919]" : "bg-[#ededed]"}`}>
       {/* ─── Top bar ─── */}
       <div className={`px-[10px] flex items-center shrink-0 z-10 ${topBarClass}`}>
         <button
@@ -591,31 +758,113 @@ export default function ChatArea({
         >
           <span className="block truncate">{session.nickname || session.wxid}</span>
         </button>
-        <button
-          type="button"
-          onClick={() => handleAvatarClick(session.wxid)}
-          className={`w-[36px] h-[36px] flex items-center justify-center active:opacity-70 ${titleText}`}
-          aria-label="查看资料"
-        >
-          <svg className="w-[20px] h-[20px]" fill="currentColor" viewBox="0 0 24 24">
-            <circle cx="5" cy="12" r="1.5" />
-            <circle cx="12" cy="12" r="1.5" />
-            <circle cx="19" cy="12" r="1.5" />
-          </svg>
-        </button>
+        <div ref={settingsMenuRef} className="relative">
+          <button
+            type="button"
+            onClick={() => {
+              setBackgroundError("");
+              setSettingsOpen((open) => !open);
+            }}
+            className={`w-[36px] h-[36px] flex items-center justify-center rounded-[4px] outline-none focus-visible:ring-1 focus-visible:ring-[#777] active:opacity-70 ${
+              settingsOpen ? (dark ? "bg-[#2a2a2a]" : "bg-[#dedede]") : ""
+            } ${titleText}`}
+            aria-label="聊天设置"
+            aria-expanded={settingsOpen}
+            title="聊天设置"
+          >
+            <svg className="w-[20px] h-[20px]" fill="none" stroke="currentColor" strokeWidth={1.65} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21H9.6v-.1A1.7 1.7 0 0 0 8.5 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3V9.6h.1A1.7 1.7 0 0 0 4.6 8.5a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.1A1.7 1.7 0 0 0 15.5 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.17.37.38.7.6 1 .28.3.66.45 1.1.45h.1v4h-.1c-.44 0-.82.15-1.1.45-.22.3-.43.63-.6 1Z" />
+            </svg>
+          </button>
+
+          {settingsOpen && (
+            <div className={`absolute right-0 top-[40px] z-50 w-[250px] border py-[6px] shadow-[0_10px_30px_rgba(0,0,0,0.35)] ${
+              dark ? "border-[#363636] bg-[#252525] text-[#e7e7e7]" : "border-[#d6d6d6] bg-white text-[#222]"
+            }`}>
+              <button
+                type="button"
+                disabled={backgroundSaving}
+                onClick={() => backgroundInputRef.current?.click()}
+                className={`w-full min-h-[58px] px-[13px] flex items-center gap-[12px] text-left disabled:opacity-55 ${dark ? "hover:bg-[#303030]" : "hover:bg-[#f2f2f2]"}`}
+              >
+                <span
+                  className={`w-[34px] h-[34px] shrink-0 border flex items-center justify-center overflow-hidden ${dark ? "border-[#444] bg-[#1c1c1c]" : "border-[#ddd] bg-[#f5f5f5]"}`}
+                  style={chatBackgroundUrl ? { backgroundImage: `url("${chatBackgroundUrl}")`, backgroundPosition: "center", backgroundSize: "cover" } : undefined}
+                >
+                  {!chatBackgroundUrl && (
+                    <svg className="w-[19px] h-[19px]" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+                      <rect x="3" y="3" width="18" height="18" rx="2" />
+                      <circle cx="8.5" cy="8.5" r="1.5" />
+                      <path d="m21 15-5-5L5 21" />
+                    </svg>
+                  )}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[14px]">聊天背景</span>
+                  <span className={`block mt-[2px] text-[11px] ${dark ? "text-[#888]" : "text-[#888]"}`}>
+                    {backgroundSaving ? "处理中..." : chatBackgroundUrl ? "已设置，点击更换" : "选择本地图片"}
+                  </span>
+                </span>
+                <svg className={`w-[16px] h-[16px] shrink-0 ${dark ? "text-[#777]" : "text-[#999]"}`} fill="none" stroke="currentColor" strokeWidth={1.7} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="m9 18 6-6-6-6" />
+                </svg>
+              </button>
+
+              {chatBackgroundUrl && (
+                <button
+                  type="button"
+                  disabled={backgroundSaving}
+                  onClick={() => void handleClearBackground()}
+                  className={`w-full h-[34px] px-[59px] text-left text-[12px] disabled:opacity-55 ${dark ? "text-[#aaa] hover:bg-[#303030]" : "text-[#777] hover:bg-[#f2f2f2]"}`}
+                >
+                  清除当前背景
+                </button>
+              )}
+
+              <div className={`mx-[12px] h-px ${dark ? "bg-[#383838]" : "bg-[#e6e6e6]"}`} />
+
+              <button
+                type="button"
+                onClick={() => {
+                  setSettingsOpen(false);
+                  onOpenSmartReply?.(session);
+                }}
+                className={`w-full min-h-[58px] px-[13px] flex items-center gap-[12px] text-left ${dark ? "hover:bg-[#303030]" : "hover:bg-[#f2f2f2]"}`}
+              >
+                <span className={`w-[34px] h-[34px] shrink-0 border flex items-center justify-center ${dark ? "border-[#444] bg-[#1c1c1c]" : "border-[#ddd] bg-[#f5f5f5]"}`}>
+                  <svg className="w-[20px] h-[20px]" fill="none" stroke="currentColor" strokeWidth={1.55} viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h8M8 14h5" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6.5 19.5 3 21l1-3.75A8.5 8.5 0 1 1 6.5 19.5Z" />
+                  </svg>
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[14px]">智能回复</span>
+                  <span className={`block mt-[2px] text-[11px] ${dark ? "text-[#888]" : "text-[#888]"}`}>配置当前聊天</span>
+                </span>
+                <svg className={`w-[16px] h-[16px] shrink-0 ${dark ? "text-[#777]" : "text-[#999]"}`} fill="none" stroke="currentColor" strokeWidth={1.7} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="m9 18 6-6-6-6" />
+                </svg>
+              </button>
+
+              {backgroundError && <div className="px-[13px] py-[7px] text-[12px] text-[#e06666]">{backgroundError}</div>}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* ─── Messages area ─── */}
       {loadingHistory && messages.length === 0 ? (
         /* While fetching initial history, show a stable placeholder
            instead of an empty chat that flashes before messages appear */
-        <div className={`flex-1 flex items-end justify-center pb-6 ${pageBg}`}>
+        <div className={`flex-1 flex items-end justify-center pb-6 ${pageBg}`} style={messageAreaStyle}>
           <span className={`text-[12px] ${mutedText}`}>加载历史消息...</span>
         </div>
       ) : (
         <div
           ref={messagesContainerRef}
           className={`chat-message-scroll ${dark ? "chat-message-scroll-dark" : "chat-message-scroll-light"} flex-1 min-h-0 ${pageBg}`}
+          style={messageAreaStyle}
         >
           <div className="py-2 pb-1">
             {/* Load older messages indicator */}
@@ -688,7 +937,28 @@ export default function ChatArea({
           dark={dark}
         />
       ) : (
-      <div className="shrink-0 min-h-[176px] border-t border-[#2a2a2a] bg-[#1e1e1e] px-[16px] py-[8px] pb-[max(8px,env(safe-area-inset-bottom))]">
+      <div
+        className={`shrink-0 ${dark ? "bg-[#1e1e1e]" : "bg-[#f7f7f7]"}`}
+        style={{ height: `${desktopComposerHeight}px` }}
+      >
+        <div
+          role="separator"
+          aria-label="调整输入区高度"
+          aria-orientation="horizontal"
+          aria-valuemin={DESKTOP_COMPOSER_MIN_HEIGHT}
+          aria-valuemax={composerMaxHeight()}
+          aria-valuenow={Math.round(desktopComposerHeight)}
+          tabIndex={0}
+          onPointerDown={handleComposerResizeStart}
+          onKeyDown={handleComposerResizeKeyDown}
+          className={`group h-[7px] touch-none cursor-row-resize border-t flex items-center justify-center outline-none ${
+            dark ? "border-[#2a2a2a] hover:bg-[#242424]" : "border-[#d8d8d8] hover:bg-[#ededed]"
+          }`}
+          title="拖动调整输入区高度"
+        >
+          <span className={`w-[42px] h-[2px] transition-colors ${dark ? "bg-[#454545] group-hover:bg-[#777]" : "bg-[#c8c8c8] group-hover:bg-[#888]"}`} />
+        </div>
+        <div className="h-[calc(100%-7px)] min-h-0 flex flex-col overflow-y-auto px-[16px] pt-[4px] pb-[max(8px,env(safe-area-inset-bottom))]">
         <div className="h-[34px] flex items-center justify-between">
           <div className="flex items-center gap-[14px]">
             {/* Voice/Keyboard toggle */}
@@ -778,12 +1048,11 @@ export default function ChatArea({
             onKeyDown={handleKeyDown}
             onFocus={() => setShowPlusMenu(false)}
             rows={4}
-            className="mt-[4px] block w-full bg-transparent text-white text-[15px] resize-none outline-none h-[86px] min-h-[86px] max-h-[124px] leading-[22px] placeholder-[#5c5c5c] overflow-y-auto"
+            className={`mt-[4px] block w-full flex-1 min-h-[42px] bg-transparent text-[15px] resize-none outline-none leading-[22px] overflow-y-auto ${dark ? "text-white placeholder-[#5c5c5c]" : "text-[#111] placeholder-[#999]"}`}
             placeholder=""
-            style={{ height: `${TEXTAREA_BASE_HEIGHT}px` }}
           />
         ) : (
-          <button className="mt-[4px] w-full h-[86px] text-[#999] text-[15px] flex items-center justify-center active:bg-[#252525]">
+          <button className={`mt-[4px] w-full flex-1 min-h-[42px] text-[#999] text-[15px] flex items-center justify-center ${dark ? "active:bg-[#252525]" : "active:bg-[#ededed]"}`}>
             按住 说话
           </button>
         )}
@@ -853,6 +1122,7 @@ export default function ChatArea({
             </div>
           </div>
         )}
+        </div>
       </div>
       )}
 
@@ -860,6 +1130,7 @@ export default function ChatArea({
       <input ref={albumInputRef}  type="file" accept="image/*"          className="hidden" onChange={handleImagePick} />
       <input ref={cameraInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handleImagePick} />
       <input ref={fileInputRef}   type="file"                           className="hidden" onChange={handleFilePick} />
+      <input ref={backgroundInputRef} type="file" accept="image/*" className="hidden" onChange={handleBackgroundPick} />
 
       {profileWxid && (
         <ContactProfileCard

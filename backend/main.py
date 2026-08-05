@@ -167,7 +167,7 @@ def _save_img_base64_to_cache(img_b64: str, msg_id: str) -> tuple[str | None, in
 
 # ─── Pending CDN image downloads (bridge callback → download endpoint) ──
 
-# When we call CDN_Download_Pic, we register a pending entry.
+# When we call CDN /download, we register a pending entry.
 # The callback handler checks for img_base64 and fulfills the Future.
 _pending_cdn_images: dict[str, asyncio.Future] = {}   # key → Future[str]  (str = cached file path)
 _pending_cdn_lock = asyncio.Lock()
@@ -1441,6 +1441,12 @@ def _is_callback_status_echo(msg: dict, sendorrecv: str, self_wxid: str) -> bool
     if not is_self_echo:
         return False
 
+    # A send-success callback can carry the real message ID and local media
+    # path. Keep it as a message update so history refreshes do not lose the
+    # path supplied by RecvType=1.
+    if any(msg.get(key) for key in ("img_path", "video_path", "file_path", "gif_path")):
+        return False
+
     if msgtype == "1" and not content:
         return True
     if msgtype == "3" and content in {"PC发图片消息成功", "发图片消息成功"}:
@@ -1518,9 +1524,90 @@ def _store_message_and_session(chat_id: str, msg: dict) -> dict:
     }
 
 
+_MEDIA_FIELDS_TO_PRESERVE = (
+    "img_path", "img_len", "db_image_id",
+    "video_path", "video_len",
+    "file_path", "file_len",
+    "gif_path", "gif_len",
+    "voice_hex", "voice_data", "voice_len",
+)
+
+
+def _merge_message_media_fields(message: dict, fallback: dict | None) -> dict:
+    merged = dict(message)
+    if not isinstance(fallback, dict):
+        return merged
+    for key in _MEDIA_FIELDS_TO_PRESERVE:
+        if not merged.get(key) and fallback.get(key):
+            merged[key] = fallback[key]
+    return merged
+
+
+def _find_history_image_media(message: dict, candidates: list[dict]) -> dict | None:
+    if str(message.get("msgtype", "")) != "3" or message.get("img_path"):
+        return None
+    content = str(message.get("msg", "") or "")
+    length_match = re.search(r'\blength="(\d+)"', content)
+    expected_length = int(length_match.group(1)) if length_match else 0
+    md5_match = re.search(r'\bmd5="([a-fA-F0-9]{32})"', content)
+    expected_md5 = md5_match.group(1).lower() if md5_match else ""
+    timestamp = int(message.get("timestamp") or message.get("time_unix") or 0)
+    direction = str(message.get("sendorrecv", "") or "")
+    best: tuple[int, dict] | None = None
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not candidate.get("img_path"):
+            continue
+        if str(candidate.get("msgtype", "")) != "3":
+            continue
+        if str(candidate.get("sendorrecv", "") or "") != direction:
+            continue
+        candidate_ts = int(candidate.get("timestamp") or candidate.get("time_unix") or 0)
+        delta = abs(timestamp - candidate_ts) if timestamp and candidate_ts else 999999
+        if delta > 120:
+            continue
+
+        candidate_path = str(candidate.get("img_path") or "")
+        candidate_content = str(candidate.get("msg", "") or "").strip().lower()
+        same_md5 = bool(expected_md5 and candidate_content == expected_md5)
+        same_size = False
+        if expected_length and candidate_path:
+            try:
+                same_size = os.path.isfile(candidate_path) and os.path.getsize(candidate_path) == expected_length
+            except OSError:
+                same_size = False
+        if expected_length and not same_size and not same_md5:
+            continue
+        if not expected_length and not same_md5 and delta > 2:
+            continue
+
+        score = (1000 if same_md5 else 0) + (500 if same_size else 0) - delta
+        if best is None or score > best[0]:
+            best = (score, candidate)
+    return best[1] if best else None
+
+
 def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
     self_wxid = _get_self_wxid()
     is_group = "@chatroom" in wxid
+    existing_messages: list[dict] = []
+    try:
+        existing_messages.extend(message_store.get_messages(wxid))
+    except Exception:
+        pass
+    try:
+        existing_messages.extend(
+            sqlite_cache.get_messages(wxid, 200, owner_wxid=_contact_owner_wxid())
+        )
+    except Exception:
+        pass
+    existing_by_id: dict[str, dict] = {}
+    for existing in existing_messages:
+        if not isinstance(existing, dict):
+            continue
+        existing_id = str(existing.get("id", "") or "")
+        if existing_id and existing_id not in existing_by_id:
+            existing_by_id[existing_id] = existing
     out: list[dict] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -1534,7 +1621,7 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
             if sender:
                 from_id = sender
         time_text = datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M:%S") if create_time else ""
-        out.append({
+        normalized = {
             "id": str(row.get("MsgSvrID", "") or f"db_{create_time}_{len(out)}"),
             "msgtype": msg_type,
             "time": time_text,
@@ -1548,7 +1635,14 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
             "sendorrecv": "1" if is_sender else "2",
             "isSender": is_sender,
             "bytesExtraHex": row.get("BytesExtraHex", "") if msg_type == "3" else "",
-        })
+        }
+        normalized = _merge_message_media_fields(
+            normalized,
+            existing_by_id.get(str(normalized.get("id", ""))),
+        )
+        media_fallback = _find_history_image_media(normalized, existing_messages)
+        normalized = _merge_message_media_fields(normalized, media_fallback)
+        out.append(normalized)
     out.sort(key=lambda m: (int(m.get("timestamp") or 0), str(m.get("id", ""))))
     return out
 
@@ -3095,7 +3189,7 @@ async def _process_wechat_callback(
                 if matched:
                     _log(f"[IMG_BASE64] ✓ Fulfilled pending CDN by msgsvrid:{mid}")
                 # If no match by msgsvrid AND there are pending CDN downloads,
-                # this might be a CDN_Download_Pic callback with a different msgsvrid.
+                # this might be a CDN /download callback with a different msgsvrid.
                 # Since we serialize CDN downloads (1 at a time), fulfilling the
                 # single pending download is safe.
                 if not matched and has_pending_cdn:
@@ -7903,12 +7997,33 @@ async def serve_db_image(media_id: str):
 # WeChat stores images under MsgAttach\<hash>\Image\<YYYY-MM>\<hash>.[jpg|dat]
 # The .jpg files are already decoded (by Hook callback). The .dat files need /DecodePic.
 # BytesExtra in the DB contains the relative paths to both Image and Thumb .dat files.
-_WECHAT_FILES_BASE = os.environ.get("WECHAT_FILES_BASE") or os.path.join(
-    os.environ.get("APPDATA", ""),
-    "WxDirDataPath",
-    config.RDV or "default",
-    "WeChat Files",
-)
+def _discover_wechat_files_base() -> str:
+    explicit = str(os.environ.get("WECHAT_FILES_BASE") or "").strip()
+    if explicit:
+        return explicit
+
+    data_root = os.path.join(os.environ.get("APPDATA", ""), "WxDirDataPath")
+    configured = os.path.join(data_root, config.RDV or "default", "WeChat Files")
+    if os.path.isdir(configured):
+        return configured
+
+    discovered: list[str] = []
+    try:
+        for entry in os.scandir(data_root):
+            candidate = os.path.join(entry.path, "WeChat Files")
+            if entry.is_dir() and os.path.isdir(candidate):
+                discovered.append(candidate)
+    except OSError:
+        pass
+    if not discovered:
+        return configured
+    discovered.sort(key=lambda path: os.path.getmtime(os.path.dirname(path)), reverse=True)
+    selected = discovered[0]
+    _log(f"[MEDIA] Auto-detected WeChat Files base: {selected}")
+    return selected
+
+
+_WECHAT_FILES_BASE = _discover_wechat_files_base()
 
 # Cache dir for decoded .dat images
 _IMG_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".img_cache")
@@ -8129,13 +8244,21 @@ def _cache_downloaded_image_file(source_path: str, cache_path: str) -> str:
     return source_path
 
 
-# Concurrency control for /DownPic:
-# - Local:  Lock (serialize to protect Hook DLL)
-# - Remote: Semaphore (allow a few concurrent CDN downloads)
-if config.IS_LOCAL_HOOK:
-    _download_pic_lock: asyncio.Lock | asyncio.Semaphore = asyncio.Lock()
-else:
-    _download_pic_lock = asyncio.Semaphore(3)
+def _cache_downloaded_image_bytes(data: bytes, cache_path: str) -> str:
+    if not data or len(data) < 16 or len(data) > 100 * 1024 * 1024:
+        return ""
+    if not _image_magic(data[:16]):
+        return ""
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        temp_path = cache_path + ".tmp"
+        with open(temp_path, "wb") as file:
+            file.write(data)
+        os.replace(temp_path, cache_path)
+        return cache_path if _nonempty_file(cache_path) else ""
+    except OSError as exc:
+        _log(f"[IMG_DL] cache write failed: {type(exc).__name__}: {exc}")
+        return ""
 
 
 def _find_local_image(raw: bytes) -> tuple[list[bytes], list[bytes], str | None]:
@@ -8232,7 +8355,7 @@ async def download_image(request: Request):
     Local hook strategy:
       1. Check local decoded .jpg files (from BytesExtra Image paths)
       2. Decode local .dat files via /DecodePic (Image then Thumb)
-      3. Call /DownPic to trigger WeChat CDN download, then re-check local paths
+      3. Call CDN /download and read its relative savePath through /localfile
 
     Protocol strategy:
       1. Parse aeskey and fileid from the image message XML
@@ -8454,56 +8577,71 @@ async def download_image(request: Request):
         if result:
             return _image_file_response(result, msg_id)
 
-    # Phase 3: trigger /DownPic, then re-check local files.
+    # Phase 3: history messages and RecvType=2 use the CDN /download endpoint.
     if msg_xml and ("<img" in msg_xml or "<msg>" in msg_xml):
-        xml_hash = hashlib.md5(msg_xml.encode("utf-8", errors="replace")).hexdigest()
-        cache_path = os.path.join(_IMG_CACHE_DIR, f"{xml_hash}.jpg")
+        if not has_cdn_params:
+            return {"error": "No CDN params in image XML for local download"}
 
-        # Already downloaded before?
-        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-            return _image_file_response(cache_path, msg_id)
+        for cached_path in cache_candidates:
+            if _nonempty_file(cached_path):
+                return _image_file_response(cached_path, msg_id)
 
-        # Serialize DownPic calls
-        async with _download_pic_lock:
-            if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-                return _image_file_response(cache_path, msg_id)
-            try:
-                result = await wechat_api.download_pic(msg_xml, cache_path)
-                _log(f"[DOWNLOAD_PIC] result: {result}")
-            except Exception as e:
-                _log(f"[DOWNLOAD_PIC] error: {e}")
-                return {"error": str(e)}
+        pending_key = f"cdn:{xml_hash}"
+        pending_future: asyncio.Future | None = None
+        if config.RECV_TYPE == 2:
+            pending_future = await _register_cdn_pending(pending_key)
+            if msg_id:
+                await _register_cdn_pending(f"msgsvrid:{msg_id}", existing_fut=pending_future)
 
-            # Poll: DownPic downloads to WeChat's cache asynchronously.
-            # Check our topath, WeChat's .jpg paths, AND try decoding new .dat files.
-            for i in range(20):  # ~10s total
-                # Check our specified topath
-                if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-                    _log(f"[DOWNLOAD_PIC] Found at topath after {i*0.5:.1f}s")
-                    return _image_file_response(cache_path, msg_id)
-                # Re-check WeChat local .jpg paths
-                if raw:
-                    _, _, found = _find_local_image(raw)
-                    if found:
-                        _log(f"[DOWNLOAD_PIC] Found local .jpg after {i*0.5:.1f}s")
-                        return _image_file_response(found, msg_id)
-                # Every 2s, also try decoding newly-appeared .dat files
-                if i > 0 and i % 4 == 0:
-                    if img_dat_paths:
-                        decoded = await _try_decode_dat(img_dat_paths, "Image-poll")
-                        if decoded:
-                            _log(f"[DOWNLOAD_PIC] Decoded .dat after {i*0.5:.1f}s")
-                            return _image_file_response(decoded, msg_id)
-                    if thumb_dat_paths:
-                        decoded = await _try_decode_dat(thumb_dat_paths, "Thumb-poll")
-                        if decoded:
-                            _log(f"[DOWNLOAD_PIC] Decoded thumb after {i*0.5:.1f}s")
-                            return _image_file_response(decoded, msg_id)
-                await asyncio.sleep(0.5)
+        try:
+            async with _cdn_download_sem:
+                for cached_path in cache_candidates:
+                    if _nonempty_file(cached_path):
+                        return _image_file_response(cached_path, msg_id)
 
-            _log(f"[DOWNLOAD_PIC] Timed out for xml_hash={xml_hash}")
+                _log(
+                    f"[IMG_DL] local CDN /download: decode_key={cdn_params['decode_key'][:16]}... "
+                    f"file_id={cdn_params['file_id'][:32]}... msg_id={msg_id}"
+                )
+                result = await wechat_api.cdn_download_pic(
+                    decode_key=cdn_params["decode_key"],
+                    file_id=cdn_params["file_id"],
+                    img_filename=download_filename,
+                )
+                _log(f"[IMG_DL] local CDN response: {result}")
 
-        return {"error": "Download timed out"}
+                returned_path = _extract_download_save_path(result)
+                ready_path = _cache_downloaded_image_file(returned_path, cache_path)
+                if ready_path:
+                    return _image_file_response(ready_path, msg_id)
+
+                relative_path = str(
+                    result.get("requested_save_path", f"downloads/{download_filename}")
+                    if isinstance(result, dict)
+                    else f"downloads/{download_filename}"
+                )
+                downloaded = await wechat_api.read_local_download(relative_path)
+                ready_path = _cache_downloaded_image_bytes(downloaded, cache_path)
+                if ready_path:
+                    _log(f"[IMG_DL] local CDN image ready: {ready_path}")
+                    return _image_file_response(ready_path, msg_id)
+
+            if pending_future:
+                try:
+                    callback_path = await asyncio.wait_for(pending_future, timeout=10.0)
+                    return _image_file_response(callback_path, msg_id)
+                except asyncio.TimeoutError:
+                    _log(f"[IMG_DL] local CDN callback timed out for msg_id={msg_id}")
+        except Exception as exc:
+            _log(f"[IMG_DL] local CDN /download error: {type(exc).__name__}: {exc}")
+            return {"error": str(exc)}
+        finally:
+            if pending_future:
+                await _cleanup_cdn_pending(pending_key)
+                if msg_id:
+                    await _cleanup_cdn_pending(f"msgsvrid:{msg_id}")
+
+        return {"error": "CDN /download did not produce an image"}
 
     return {"error": "No image data provided"}
 
