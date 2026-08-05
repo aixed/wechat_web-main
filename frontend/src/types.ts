@@ -132,6 +132,14 @@ export interface WeChatAccount {
   wechat_account?: string;
   profile?: Record<string, any>;
   peer?: string;
+  server_port?: string;
+  api_host?: string;
+  api_port?: number;
+  transport?: "http" | "ws";
+  connected?: boolean;
+  port_alive?: boolean;
+  probe_latency_ms?: number;
+  probe_error?: string;
   connected_at?: number;
   last_seen_at?: number;
   pending?: number;

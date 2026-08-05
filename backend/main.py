@@ -268,6 +268,10 @@ _RDV_MAX = int("7fffffff", 16)
 _RDV_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 _PROTOCOL_ACCOUNT_PROFILE_CACHE: dict[str, tuple[dict, float]] = {}
 _PROTOCOL_ACCOUNT_PROFILE_TTL_SEC = 15.0
+_LOCAL_HOOK_ACCOUNT_ID = "default"
+_LOCAL_HOOK_STARTED_AT = time.time()
+_local_hook_last_seen_at = 0.0
+_LOCAL_HOOK_PROBE_LOCK = asyncio.Lock()
 _runtime_init_task: asyncio.Task | None = None
 
 
@@ -909,6 +913,121 @@ def _login_status_from_response(data: dict) -> dict[str, str]:
     }
 
 
+async def _probe_local_hook_account() -> dict[str, Any]:
+    """Probe the configured local Hook HTTP port and build its account card."""
+    global _local_hook_last_seen_at
+
+    async with _LOCAL_HOOK_PROBE_LOCK:
+        probe_started_at = time.perf_counter()
+        checked_at = time.time()
+        port_alive = False
+        parsed = {"status": "", "message": "", "wxid": "", "nickname": ""}
+        probe_error = ""
+
+        try:
+            raw_status = await wechat_api.is_login_status()
+            parsed = _login_status_from_response(raw_status)
+            port_alive = True
+            _local_hook_last_seen_at = checked_at
+        except Exception as exc:
+            probe_error = f"{type(exc).__name__}: {exc}"
+
+        profile_raw = app_state.get("self_info") if isinstance(app_state.get("self_info"), dict) else {}
+        cached_identity = _self_identity_from_response(
+            profile_raw,
+            agent_id=_LOCAL_HOOK_ACCOUNT_ID,
+            current_wxid=parsed["wxid"],
+        )
+        cached_wxid = str(cached_identity.get("wxid") or "").strip()
+        has_complete_profile = bool(
+            cached_wxid
+            and cached_identity.get("nickname")
+            and cached_identity.get("avatar")
+        )
+        if not port_alive or parsed["status"] != "3":
+            _agent_self_profile_refreshed.discard(_LOCAL_HOOK_ACCOUNT_ID)
+        needs_profile = (
+            port_alive
+            and parsed["status"] == "3"
+            and (
+                _LOCAL_HOOK_ACCOUNT_ID not in _agent_self_profile_refreshed
+                or not has_complete_profile
+                or (parsed["wxid"] and cached_wxid != parsed["wxid"])
+            )
+        )
+        if needs_profile:
+            try:
+                fetched_profile = await wechat_api.get_self_info()
+                fetched_identity = _self_identity_from_response(
+                    fetched_profile,
+                    agent_id=_LOCAL_HOOK_ACCOUNT_ID,
+                    current_wxid=parsed["wxid"],
+                )
+                if not isinstance(fetched_profile, dict) or not any(
+                    fetched_identity.get(field) for field in ("wxid", "nickname", "avatar", "account")
+                ):
+                    raise ValueError("empty profile response")
+                profile_raw = fetched_profile
+                app_state["self_info"] = fetched_profile
+                _agent_self_profile_refreshed.add(_LOCAL_HOOK_ACCOUNT_ID)
+                profile_wxid = str(fetched_identity.get("wxid") or parsed["wxid"] or "").strip()
+                profile_avatar = str(fetched_identity.get("avatar") or "").strip()
+                if profile_wxid and profile_avatar:
+                    app_state.setdefault("avatar_urls", {})[profile_wxid] = profile_avatar
+                _log(f"[LOCAL_HOOK] GetSelfProfile loaded wxid={profile_wxid or '-'}")
+            except Exception as exc:
+                probe_error = probe_error or f"GetSelfProfile {type(exc).__name__}: {exc}"
+                _log(f"[LOCAL_HOOK] GetSelfProfile failed: {type(exc).__name__}: {exc}")
+
+        identity = _self_identity_from_response(
+            profile_raw,
+            agent_id=_LOCAL_HOOK_ACCOUNT_ID,
+            current_wxid=parsed["wxid"],
+        )
+        wxid = str(identity.get("wxid") or parsed["wxid"] or "").strip()
+        nickname = str(identity.get("nickname") or parsed["nickname"] or ("" if wxid else "本地微信")).strip()
+        if wxid:
+            _self_wxid_to_agent_id[wxid] = _LOCAL_HOOK_ACCOUNT_ID
+
+        status = parsed["status"] if port_alive else ""
+        login_message = parsed["message"] if port_alive else "本地 Hook 接口不可用"
+        if port_alive and not login_message:
+            login_message = "已登录" if status == "3" else "接口已连接"
+        probe_ms = (time.perf_counter() - probe_started_at) * 1000
+        peer = f"{config.HOOK_HOST}:{config.HOOK_PORT}"
+        return {
+            "id": _LOCAL_HOOK_ACCOUNT_ID,
+            "account_id": wxid or _LOCAL_HOOK_ACCOUNT_ID,
+            "wxid": wxid,
+            "nickname": nickname,
+            "avatar": str(identity.get("avatar") or ""),
+            "phone": str(identity.get("phone") or ""),
+            "region": str(identity.get("region") or ""),
+            "signature": str(identity.get("signature") or ""),
+            "wechat_account": str(identity.get("account") or ""),
+            "profile": identity.get("profile") if isinstance(identity.get("profile"), dict) else {},
+            "peer": peer,
+            "server_port": str(config.HOOK_PORT),
+            "start_port": config.HOOK_PORT,
+            "api_host": config.HOOK_HOST,
+            "api_port": config.HOOK_PORT,
+            "transport": "http",
+            "connected": port_alive,
+            "port_alive": port_alive,
+            "probe_latency_ms": round(probe_ms, 1),
+            "probe_error": probe_error,
+            "connected_at": _LOCAL_HOOK_STARTED_AT,
+            "last_seen_at": _local_hook_last_seen_at,
+            "pending": 0,
+            "initialized": bool(status == "3" and app_state.get("initialized")),
+            "login_status": status,
+            "login_message": login_message,
+            "login_status_updated_at": checked_at,
+            "active": _active_agent_id == _LOCAL_HOOK_ACCOUNT_ID,
+            "source": "hook",
+        }
+
+
 async def _refresh_agent_login_status(agent_id: str) -> dict[str, str]:
     """Poll /IsLoginStatus and update account-card metadata.
 
@@ -1101,7 +1220,7 @@ async def _refresh_account_card(agent_id: str) -> None:
 
 
 def _schedule_account_card_refresh() -> None:
-    if config.IS_PROTOCOL:
+    if config.IS_PROTOCOL or config.IS_LOCAL_HOOK:
         return
     now = time.time()
     for account in agent_manager.agents():
@@ -2063,6 +2182,15 @@ async def setup_initial_config(req: InitialSetupRequest):
 async def list_accounts():
     if config.IS_PROTOCOL:
         return await _list_protocol_accounts()
+    if config.IS_LOCAL_HOOK:
+        account = await _probe_local_hook_account()
+        return {
+            "active_id": _LOCAL_HOOK_ACCOUNT_ID if account.get("active") else "",
+            "accounts": [account],
+            "source": "hook",
+            "transport": "http",
+            "configured_endpoint": f"http://{config.HOOK_HOST}:{config.HOOK_PORT}",
+        }
     _schedule_account_card_refresh()
     return {
         "active_id": _active_agent_id or agent_manager.active_id(),
@@ -2076,6 +2204,36 @@ async def activate_account(req: ActivateAccountRequest):
     if config.IS_PROTOCOL:
         async with _ACCOUNT_LOCK:
             return await _activate_protocol_account(agent_id)
+    if config.IS_LOCAL_HOOK:
+        if agent_id != _LOCAL_HOOK_ACCOUNT_ID:
+            return {"ok": False, "error": "unknown local Hook account"}
+        async with _ACCOUNT_LOCK:
+            account = await _probe_local_hook_account()
+            if str(account.get("login_status") or "") != "3":
+                return {
+                    "ok": False,
+                    "error": "wechat login status is not ready",
+                    "login_status": {
+                        "status": str(account.get("login_status") or ""),
+                        "message": str(account.get("login_message") or "本地 Hook 接口不可用"),
+                        "wxid": str(account.get("wxid") or ""),
+                        "nickname": str(account.get("nickname") or ""),
+                        "avatar": str(account.get("avatar") or ""),
+                    },
+                    "account": account,
+                }
+            _activate_runtime(_LOCAL_HOOK_ACCOUNT_ID)
+            if not app_state.get("initialized"):
+                ready = await _run_backend_initialization(_LOCAL_HOOK_ACCOUNT_ID)
+                if not ready:
+                    account = await _probe_local_hook_account()
+                    return {
+                        "ok": False,
+                        "error": "local Hook initialization failed",
+                        "account": account,
+                    }
+            account = await _probe_local_hook_account()
+            return {"ok": True, "active_id": _LOCAL_HOOK_ACCOUNT_ID, "account": account}
     if not agent_id or not agent_manager.is_connected(agent_id):
         return {"ok": False, "error": "agent not connected"}
     async with _ACCOUNT_LOCK:
@@ -3066,6 +3224,20 @@ async def agent_websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/agent/status")
 async def agent_status():
+    if config.IS_LOCAL_HOOK:
+        account = await _probe_local_hook_account()
+        return {
+            "enabled": False,
+            "connected": bool(account.get("port_alive")),
+            "transport": "http",
+            "host": config.HOOK_HOST,
+            "port": config.HOOK_PORT,
+            "peer": account.get("peer", ""),
+            "login_status": account.get("login_status", ""),
+            "login_message": account.get("login_message", ""),
+            "probe_latency_ms": account.get("probe_latency_ms", 0),
+            "account": account,
+        }
     return {
         **agent_manager.status(),
         "enabled": config.AGENT_WS_ENABLED,
