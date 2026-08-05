@@ -1385,10 +1385,27 @@ function isSelfSentMessage(msg: ChatMessage): boolean {
   return String(msg.sendorrecv) === "1" || msg.isSender === 1;
 }
 
+function mergeMessageMedia(message: ChatMessage, fallback: ChatMessage): ChatMessage {
+  return {
+    ...message,
+    img_path: message.img_path || fallback.img_path,
+    db_image_id: message.db_image_id || fallback.db_image_id,
+    img_len: message.img_len || fallback.img_len,
+    video_path: message.video_path || fallback.video_path,
+    voice_len: message.voice_len || fallback.voice_len,
+    voice_hex: message.voice_hex || fallback.voice_hex,
+    voice_data: message.voice_data || fallback.voice_data,
+    gif_path: message.gif_path || fallback.gif_path,
+    file_path: message.file_path || fallback.file_path,
+    bytesExtraHex: message.bytesExtraHex || fallback.bytesExtraHex,
+  };
+}
+
 function isHookStatusEchoMessage(msg: ChatMessage): boolean {
   if (!isSelfSentMessage(msg)) return false;
   const msgType = String(msg.msgtype || "");
   const content = String(msg.msg || "").trim();
+  if (msg.img_path || msg.video_path || msg.file_path || msg.gif_path) return false;
   if (msgType === "1" && !content) return true;
   if (msgType === "3" && ["PC发图片消息成功", "发图片消息成功"].includes(content)) return true;
   return false;
@@ -2658,7 +2675,12 @@ export default function App() {
 
         setChatMessages((prev) => {
           const existing = prev[chatId] || [];
-          if (chatMsg.id && existing.some((m) => m.id === chatMsg.id)) return prev;
+          const sameIdIndex = chatMsg.id ? existing.findIndex((m) => m.id === chatMsg.id) : -1;
+          if (sameIdIndex >= 0) {
+            const updated = [...existing];
+            updated[sameIdIndex] = mergeMessageMedia(chatMsg, existing[sameIdIndex]);
+            return { ...prev, [chatId]: sortByTimestamp(dedupeMessagesForDisplay(updated)) };
+          }
 
           // If this is a real self-sent message, replace the matching synthetic
           // "send_..." placeholder instead of appending a duplicate.
@@ -2774,7 +2796,12 @@ export default function App() {
       if (!chatId || !chatMsg) return;
       setChatMessages((prev) => {
         const existing = prev[chatId] || [];
-        if (chatMsg.id && existing.some((m) => m.id === chatMsg.id)) return prev;
+        const sameIdIndex = chatMsg.id ? existing.findIndex((m) => m.id === chatMsg.id) : -1;
+        if (sameIdIndex >= 0) {
+          const updated = [...existing];
+          updated[sameIdIndex] = mergeMessageMedia(chatMsg, existing[sameIdIndex]);
+          return { ...prev, [chatId]: sortByTimestamp(dedupeMessagesForDisplay(updated)) };
+        }
         if (String(chatMsg.id || "").startsWith("send_") && existing.some((m) => isSyntheticMatch(chatMsg, m))) {
           return prev;
         }
@@ -2964,13 +2991,21 @@ export default function App() {
     }
   };
 
+  const handleOpenSmartReply = (session: Session) => {
+    setSmartReplyTarget({
+      wxid: session.wxid,
+      name: session.nickname || session.wxid,
+      avatar: session.avatar || "",
+    });
+    switchMode("smart-reply");
+  };
+
   const handleSessionMenuAction = async (action: SessionMenuAction, session: Session) => {
     if (session.aggregateCategory) return;
     const wxid = session.wxid;
     try {
       if (action === "smart_reply") {
-        setSmartReplyTarget({ wxid, name: session.nickname || wxid, avatar: session.avatar || "" });
-        switchMode("smart-reply");
+        handleOpenSmartReply(session);
         return;
       }
       if (action === "pin") {
@@ -3116,17 +3151,22 @@ export default function App() {
   const handleNewMessages = (wxid: string, msgs: ChatMessage[], options?: { replace?: boolean }) => {
     const displayMsgs = msgs.filter((msg) => !isHookStatusEchoMessage(msg));
     setChatMessages((prev) => {
-      if (options?.replace) {
-        return { ...prev, [wxid]: sortByTimestamp(dedupeMessagesForDisplay(displayMsgs)) };
-      }
       const existing = prev[wxid] || [];
+      const existingById = new Map(existing.map((message) => [message.id, message]));
+      const hydratedMessages = displayMsgs.map((message) => {
+        const fallback = existingById.get(message.id);
+        return fallback ? mergeMessageMedia(message, fallback) : message;
+      });
+      if (options?.replace) {
+        return { ...prev, [wxid]: sortByTimestamp(dedupeMessagesForDisplay(hydratedMessages)) };
+      }
       // DB history is authoritative — replace any existing messages with the same ID
       // (callback versions may have wrong sender/timestamp)
-      const incomingById = new Map(displayMsgs.map((m) => [m.id, m]));
+      const incomingById = new Map(hydratedMessages.map((m) => [m.id, m]));
       let merged = existing.map((m) => incomingById.get(m.id) || m);
       // Add any incoming messages that weren't already present
       const existingIds = new Set(existing.map((m) => m.id));
-      for (const m of displayMsgs) {
+      for (const m of hydratedMessages) {
         if (!existingIds.has(m.id)) merged.push(m);
       }
       // Remove synthetic send_... placeholders that now have a real counterpart
@@ -3540,6 +3580,7 @@ export default function App() {
               contactProfiles={contactProfiles}
               onRequestContactProfile={ensureContactProfiles}
               onInputChange={setHasUnsavedInput}
+              onOpenSmartReply={handleOpenSmartReply}
               dark={darkTheme}
             />
           </div>
@@ -3786,6 +3827,7 @@ export default function App() {
             contactProfiles={contactProfiles}
             onRequestContactProfile={ensureContactProfiles}
             onInputChange={setHasUnsavedInput}
+            onOpenSmartReply={handleOpenSmartReply}
             dark={darkTheme}
           />
         ) : (

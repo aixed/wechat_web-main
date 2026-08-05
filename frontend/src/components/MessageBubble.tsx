@@ -372,7 +372,7 @@ function ChatImage({ message, onEnlarge, compact = false }: {
       setSrc(getImageUrl(message.img_path));
       return;
     }
-    // DB image: try local file via BytesExtraHex, fall back to CDN_Download_Pic via msg_xml
+    // DB image: try local file via BytesExtraHex, then fall back to CDN /download.
     const hexData = message.bytesExtraHex || "";
     const msgXml = message.msg || "";
     if (!hexData && !msgXml) {

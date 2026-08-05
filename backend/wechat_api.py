@@ -1495,16 +1495,6 @@ async def cdn_init() -> dict:
     return {}
 
 
-async def download_pic(msg_xml: str, save_path: str) -> dict:
-    """Download an image using the message XML via /DownPic.
-    For history messages, Hook may require explicit /DownPic to pull from CDN.
-    """
-    if IS_HOOK:
-        r = await _post("/DownPic", json={"topath": save_path, "msg_xml": msg_xml})
-        return safe_json(r)
-    return {}
-
-
 async def down_file_or_pic(msg_id: str) -> dict:
     """Trigger WeChat to download a file/image by message server ID.
     Uses /DownFileorPic — this goes through WeChat's internal download
@@ -1549,10 +1539,6 @@ async def down_pic_4id(
     return {}
 
 
-# Remote download path for CDN images (on the Hook server)
-_CDN_DOWNLOAD_DIR = r"C:\Users\Administrator\Desktop\pic"
-
-
 async def cdn_download_pic(
     decode_key: str,
     file_id: str,
@@ -1561,7 +1547,7 @@ async def cdn_download_pic(
 ) -> dict:
     """Download an image from WeChat CDN via /download.
 
-    The downloaded image is saved on the remote Hook server's disk.
+    The downloaded image is saved below the Hook process download directory.
     After CDN_Init, the Hook may deliver the image via callback (img_base64).
 
     Parameters from the <img> XML of a type-3 message:
@@ -1570,21 +1556,51 @@ async def cdn_download_pic(
       - i_key       ← optional, for certain image types
     """
     if IS_HOOK:
-        img_path = f"{_CDN_DOWNLOAD_DIR}\\{img_filename}"
+        safe_filename = os.path.basename(str(img_filename or "down.jpg").replace("\\", "/"))
+        safe_filename = "".join(
+            char if char.isalnum() or char in ("_", "-", ".") else "_"
+            for char in safe_filename
+        ) or "down.jpg"
+        relative_path = f"downloads/{safe_filename}"
         body: dict = {
-            "savePath": img_path,
+            "savePath": relative_path,
             "aeskey": decode_key,
             "fileid": file_id,
             "chatType": 0,
             "largesVideo": 0,
-            "fileType": 2,
+            "fileType": 1,
         }
         if i_key:
             body["i_key"] = i_key
         r = await _post("/download", json=body, timeout=30.0,
                         bypass_circuit_breaker=True)
-        return safe_json(r)
+        result = safe_json(r)
+        if isinstance(result, dict):
+            result.setdefault("requested_save_path", relative_path)
+        return result
     return {}
+
+
+async def read_local_download(relative_path: str) -> bytes:
+    """Read a file produced by /download through the Hook /localfile route."""
+    if not IS_LOCAL_HOOK:
+        return b""
+    normalized = str(relative_path or "").replace("\\", "/").lstrip("/")
+    if not normalized or ".." in normalized.split("/"):
+        return b""
+    params = {"path": normalized}
+    session_id = _CURRENT_AGENT_ID.get().strip()
+    if session_id and session_id != "default":
+        params["session_id"] = session_id
+    try:
+        response = await client.get("/localfile", params=params, timeout=10.0)
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if response.status_code != 200 or "json" in content_type:
+            return b""
+        return response.content
+    except Exception as exc:
+        _log(f"[API] GET /localfile failed: {type(exc).__name__}: {exc}")
+        return b""
 
 
 async def decode_pic(ori_path: str, save_path: str) -> dict:
