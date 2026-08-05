@@ -150,6 +150,55 @@ html, body, #root {
   background-color: #a8a8a8;
 }
 
+/* Frosted bubble surfaces keep custom wallpapers visible in either theme. */
+.chat-bubble-wallpaper {
+  border-style: solid;
+  border-width: 1px;
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  -webkit-backdrop-filter: blur(10px) saturate(0.78);
+  backdrop-filter: blur(10px) saturate(0.78);
+}
+
+.chat-bubble-wallpaper-incoming-dark {
+  background: rgba(24, 26, 25, var(--chat-bubble-opacity, 0.78));
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+.chat-bubble-wallpaper-incoming-light {
+  background: rgba(255, 255, 255, var(--chat-bubble-opacity, 0.78));
+  border-color: rgba(0, 0, 0, 0.1);
+}
+
+.chat-bubble-wallpaper-self {
+  background: rgba(149, 236, 105, var(--chat-bubble-opacity, 0.78));
+  border-color: rgba(43, 104, 36, 0.16);
+}
+
+.chat-quote-wallpaper-incoming-dark {
+  background: rgba(255, 255, 255, 0.075);
+  border: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.chat-quote-wallpaper-incoming-light {
+  background: rgba(0, 0, 0, 0.055);
+  border: 1px solid rgba(0, 0, 0, 0.045);
+}
+
+.chat-quote-wallpaper-self {
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(45, 110, 38, 0.08);
+}
+
+.chat-bubble-text-readable,
+.chat-bubble-text-readable * {
+  color: #f4f6f5;
+  text-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.92),
+    0 0 4px rgba(0, 0, 0, 0.55);
+}
+
 /* Disable text selection on UI elements */
 .no-select {
   user-select: none;

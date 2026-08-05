@@ -14,6 +14,9 @@ interface MessageBubbleProps {
   onAvatarClick?: (wxid: string) => void;
   mobile?: boolean;
   dark?: boolean;
+  hasChatBackground?: boolean;
+  wallpaperBubbleOpacity?: number;
+  enhanceLowOpacityText?: boolean;
 }
 
 type ParsedFileMessage = {
@@ -444,8 +447,14 @@ function ChatImage({ message, onEnlarge, compact = false }: {
 
 export default function MessageBubble({
   message, isSelf, selfWxid, isGroup, senderName, avatarUrl, onAvatarClick, mobile = false, dark = true,
+  hasChatBackground = false, wallpaperBubbleOpacity = 78, enhanceLowOpacityText = true,
 }: MessageBubbleProps) {
   const msgtype = String(message.msgtype);
+  const useWallpaperSurface = hasChatBackground;
+  const hasVisibleWallpaperSurface = useWallpaperSurface && wallpaperBubbleOpacity > 0;
+  const lowOpacityTextClass = useWallpaperSurface && wallpaperBubbleOpacity < 50 && enhanceLowOpacityText
+    ? "chat-bubble-text-readable"
+    : "";
   const [enlargedImg, setEnlargedImg] = useState<string | null>(null);
   const [previewScale, setPreviewScale] = useState(1);
   const [previewOrigin, setPreviewOrigin] = useState("50% 50%");
@@ -646,9 +655,19 @@ export default function MessageBubble({
                 </div>
                 {parsed.refer && (
                   <div className={`mt-2 rounded-[3px] px-2.5 py-2 text-[13px] leading-[1.35] ${
-                    isSelf
-                      ? "bg-[#dff6d4] text-[#668060]"
-                      : dark ? "bg-[#3a3a3a] text-[#aaa]" : "bg-[#f0f0f0] text-[#777]"
+                    hasVisibleWallpaperSurface
+                      ? isSelf
+                        ? "chat-quote-wallpaper-self text-[#668060]"
+                        : dark
+                          ? "chat-quote-wallpaper-incoming-dark text-[#aaa]"
+                          : "chat-quote-wallpaper-incoming-light text-[#777]"
+                      : useWallpaperSurface
+                        ? isSelf
+                          ? "text-[#668060]"
+                          : dark ? "text-[#aaa]" : "text-[#777]"
+                      : isSelf
+                        ? "bg-[#dff6d4] text-[#668060]"
+                        : dark ? "bg-[#3a3a3a] text-[#aaa]" : "bg-[#f0f0f0] text-[#777]"
                   }`}>
                     {quotedImage ? (
                       <div className="flex items-center gap-2">
@@ -772,7 +791,6 @@ export default function MessageBubble({
   if (!content) return null;
 
   const noBubble = msgtype === "47" || msgtype === "3" || (msgtype === "43" && message.video_path);
-
   // Use fromid as the avatar key — for group messages this is the actual sender
   const avatarWxid = isSelf ? selfWxid : (message.fromid || "");
 
@@ -822,10 +840,16 @@ export default function MessageBubble({
           <div>{content}</div>
         ) : (
           <div
-            className={`text-[17px] ${
-              isSelf
-                ? "bg-[#95ec69] text-[#111]"
-                : dark ? "bg-[#2d2d2d] text-[#e0e0e0]" : "bg-white text-[#111]"
+            className={`text-[17px] ${lowOpacityTextClass} ${
+              useWallpaperSurface
+                ? isSelf
+                  ? `${hasVisibleWallpaperSurface ? "chat-bubble-wallpaper" : ""} chat-bubble-wallpaper-self text-[#111]`
+                  : dark
+                    ? `${hasVisibleWallpaperSurface ? "chat-bubble-wallpaper" : ""} chat-bubble-wallpaper-incoming-dark text-[#e0e0e0]`
+                    : `${hasVisibleWallpaperSurface ? "chat-bubble-wallpaper" : ""} chat-bubble-wallpaper-incoming-light text-[#111]`
+                : isSelf
+                  ? "bg-[#95ec69] text-[#111]"
+                  : dark ? "bg-[#2d2d2d] text-[#e0e0e0]" : "bg-white text-[#111]"
             }`}
             style={{
               padding: "8px 10px",
