@@ -1395,6 +1395,8 @@ function mergeMessageMedia(message: ChatMessage, fallback: ChatMessage): ChatMes
     voice_len: message.voice_len || fallback.voice_len,
     voice_hex: message.voice_hex || fallback.voice_hex,
     voice_data: message.voice_data || fallback.voice_data,
+    voice_path: message.voice_path || fallback.voice_path,
+    clientmsgid: message.clientmsgid || fallback.clientmsgid,
     gif_path: message.gif_path || fallback.gif_path,
     file_path: message.file_path || fallback.file_path,
     bytesExtraHex: message.bytesExtraHex || fallback.bytesExtraHex,
@@ -1402,10 +1404,11 @@ function mergeMessageMedia(message: ChatMessage, fallback: ChatMessage): ChatMes
 }
 
 function isHookStatusEchoMessage(msg: ChatMessage): boolean {
-  if (!isSelfSentMessage(msg)) return false;
   const msgType = String(msg.msgtype || "");
   const content = String(msg.msg || "").trim();
-  if (msg.img_path || msg.video_path || msg.file_path || msg.gif_path) return false;
+  if (msgType === "1" && content.toLowerCase() === "system message revoke/voice call") return true;
+  if (!isSelfSentMessage(msg)) return false;
+  if (msg.img_path || msg.video_path || msg.file_path || msg.gif_path || msg.voice_path) return false;
   if (msgType === "1" && !content) return true;
   if (msgType === "3" && ["PC发图片消息成功", "发图片消息成功"].includes(content)) return true;
   return false;
@@ -1525,6 +1528,8 @@ function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessag
     voice_len: msg.voice_len,
     voice_hex: msg.voice_hex,
     voice_data: msg.voice_data,
+    voice_path: msg.voice_path,
+    clientmsgid: msg.clientmsgid,
     gif_path: msg.gif_path,
     file_path: msg.file_path,
     info: msg.info,
@@ -3442,7 +3447,7 @@ export default function App() {
     hydrateDirectoryContacts();
     setRoute("contact");
   };
-  const handleSelectSession = (wxid: string) => {
+  const handleSelectSession = (wxid: string, seed?: Partial<Session>) => {
     if (wxid === OFFICIAL_AGGREGATE_ID) {
       openAccountCategory("official");
       return;
@@ -3451,7 +3456,7 @@ export default function App() {
       openAccountCategory("service");
       return;
     }
-    handleSelectChat(wxid);
+    handleSelectChat(wxid, seed);
   };
   const activeSession = sessions.find((s) => s.wxid === activeChat) || (activeChat ? {
     wxid: activeChat,

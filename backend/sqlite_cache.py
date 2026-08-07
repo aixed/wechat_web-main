@@ -452,7 +452,7 @@ class SqliteMessageCache:
             "video_path", "video_len",
             "file_path", "file_len",
             "gif_path", "gif_len",
-            "voice_hex", "voice_data", "voice_len",
+            "voice_hex", "voice_data", "voice_len", "voice_path", "clientmsgid",
         ):
             if not merged.get(key) and fallback.get(key):
                 merged[key] = fallback[key]
@@ -503,6 +503,48 @@ class SqliteMessageCache:
         messages.reverse()
         return messages
 
+    def get_media_messages(
+        self,
+        wxid: str,
+        start_timestamp: int,
+        end_timestamp: int,
+        *,
+        owner_wxid: str = "",
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        if not wxid:
+            return []
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT message_json
+                FROM messages
+                WHERE owner_wxid = ? AND wxid = ? AND timestamp BETWEEN ? AND ?
+                ORDER BY timestamp ASC, msg_id ASC
+                LIMIT ?
+                """,
+                (
+                    owner_wxid,
+                    str(wxid),
+                    int(start_timestamp),
+                    int(end_timestamp),
+                    max(1, min(int(limit or 1000), 5000)),
+                ),
+            ).fetchall()
+        messages: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                message = json.loads(row["message_json"])
+            except Exception:
+                continue
+            if any(message.get(field) for field in (
+                "img_path", "video_path", "file_path", "gif_path", "voice_path",
+                "voice_hex", "voice_data",
+            )):
+                messages.append(message)
+        return messages
+
     def search_messages(
         self,
         wxid: str,
@@ -533,8 +575,123 @@ class SqliteMessageCache:
         messages = [json.loads(row["message_json"]) for row in rows]
         return [message for message in messages if folded in str(message.get("msg", "")).casefold()]
 
-    def update_image_path_by_msg_id(self, msg_id: str, img_path: str, *, owner_wxid: str = "") -> int:
-        if not msg_id or not img_path:
+    def search_all_messages(
+        self,
+        keyword: str,
+        limit: int = 100,
+        *,
+        owner_wxid: str = "",
+    ) -> list[dict[str, Any]]:
+        keyword = str(keyword or "").strip()
+        if not keyword:
+            return []
+        owner_wxid = str(owner_wxid or "").strip()
+        limit = max(1, min(int(limit or 100), 200))
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT wxid, timestamp, message_json
+                FROM messages
+                WHERE owner_wxid = ? AND message_json LIKE ? ESCAPE '\\'
+                ORDER BY timestamp DESC, msg_id DESC
+                LIMIT ?
+                """,
+                (owner_wxid, f"%{escaped}%", limit * 10),
+            ).fetchall()
+
+        folded = keyword.casefold()
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                message = json.loads(row["message_json"])
+            except Exception:
+                continue
+            if folded not in str(message.get("msg", "")).casefold():
+                continue
+            wxid = str(row["wxid"] or "")
+            if not wxid:
+                continue
+            current = grouped.setdefault(wxid, {
+                "wxid": wxid,
+                "match_count": 0,
+                "latest_timestamp": 0,
+            })
+            current["match_count"] += 1
+            current["latest_timestamp"] = max(
+                int(current["latest_timestamp"]),
+                int(row["timestamp"] or 0),
+            )
+        return sorted(
+            grouped.values(),
+            key=lambda item: int(item.get("latest_timestamp") or 0),
+            reverse=True,
+        )[:limit]
+
+    def search_group_members(
+        self,
+        keyword: str,
+        limit: int = 100,
+        *,
+        owner_wxid: str = "",
+    ) -> list[dict[str, Any]]:
+        keyword = str(keyword or "").strip()
+        if not keyword:
+            return []
+        owner_wxid = str(owner_wxid or "").strip()
+        limit = max(1, min(int(limit or 100), 200))
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT gid, wxid, nickname, avatar, profile_json
+                FROM group_members
+                WHERE owner_wxid = ?
+                  AND (wxid LIKE ? ESCAPE '\\' OR nickname LIKE ? ESCAPE '\\' OR profile_json LIKE ? ESCAPE '\\')
+                ORDER BY gid, display_order
+                LIMIT ?
+                """,
+                (owner_wxid, f"%{escaped}%", f"%{escaped}%", f"%{escaped}%", limit),
+            ).fetchall()
+        return [{
+            "gid": str(row["gid"] or ""),
+            "wxid": str(row["wxid"] or ""),
+            "name": str(row["nickname"] or row["wxid"] or ""),
+            "avatar": str(row["avatar"] or ""),
+        } for row in rows]
+
+    def get_message_by_id(self, msg_id: str, *, owner_wxid: str = "") -> dict[str, Any] | None:
+        msg_id = str(msg_id or "").strip()
+        if not msg_id:
+            return None
+        owner_wxid = str(owner_wxid or "").strip()
+        with self._lock, self._connect() as conn:
+            params: list[Any] = [msg_id]
+            where = "msg_id = ?"
+            if owner_wxid:
+                where += " AND owner_wxid = ?"
+                params.append(owner_wxid)
+            row = conn.execute(
+                f"SELECT message_json FROM messages WHERE {where} ORDER BY updated_at DESC LIMIT 1",
+                params,
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["message_json"])
+        except Exception:
+            return None
+
+    def update_media_path_by_msg_id(
+        self,
+        msg_id: str,
+        field: str,
+        path: str,
+        *,
+        owner_wxid: str = "",
+    ) -> int:
+        allowed_fields = {"img_path", "video_path", "file_path", "gif_path", "voice_path"}
+        if field not in allowed_fields or not msg_id or not path:
             return 0
         now = int(time.time())
         updated = 0
@@ -554,7 +711,7 @@ class SqliteMessageCache:
                     msg = json.loads(row["message_json"])
                 except Exception:
                     continue
-                msg["img_path"] = img_path
+                msg[field] = path
                 conn.execute(
                     """
                     UPDATE messages
@@ -565,6 +722,14 @@ class SqliteMessageCache:
                 )
                 updated += 1
         return updated
+
+    def update_image_path_by_msg_id(self, msg_id: str, img_path: str, *, owner_wxid: str = "") -> int:
+        return self.update_media_path_by_msg_id(
+            msg_id,
+            "img_path",
+            img_path,
+            owner_wxid=owner_wxid,
+        )
 
     def put_media_blob(self, data: bytes, mime_type: str = "", filename: str = "") -> str:
         if not data:

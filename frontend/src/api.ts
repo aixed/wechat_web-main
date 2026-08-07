@@ -206,6 +206,34 @@ const withAgentQuery = (path: string, agentId = "") =>
 export const getSessions = (agentId = "") => fetchJSON(withAgentQuery("/api/sessions", agentId));
 export const refreshSessions = (agentId = "") => fetchJSON(withAgentQuery("/api/sessions/refresh", agentId));
 
+export type GlobalSearchEntry = {
+  wxid: string;
+  name?: string;
+  nickname?: string;
+  remark?: string;
+  account?: string;
+  avatar?: string;
+  is_group?: boolean;
+  matched_members?: Array<{ wxid?: string; name?: string; account?: string }>;
+  match_count?: number;
+  latest_timestamp?: number;
+};
+
+export type GlobalSearchResult = {
+  query: string;
+  contacts: GlobalSearchEntry[];
+  groups: GlobalSearchEntry[];
+  messages: GlobalSearchEntry[];
+  source?: "hook_db" | "cache";
+};
+
+export const searchLocalData = (query: string, limit = 30, signal?: AbortSignal) =>
+  fetchJSON(
+    `/api/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+    signal ? { signal } : undefined,
+    120_000,
+  ) as Promise<GlobalSearchResult>;
+
 // ─── Messages ────────────────────────────────────────────────────
 
 export const getMessages = (wxid: string, limit = 20) =>
@@ -262,6 +290,20 @@ export const sendFileUpload = async (wxid: string, file: File) => {
   form.append("wxid", wxid);
   form.append("file", file);
   const res = await fetchWithTimeout("/api/send/file-upload", { method: "POST", body: form, headers: authHeaders() }, 120_000);
+  return res.json();
+};
+
+export const sendVoiceUpload = async (wxid: string, file: Blob, durationMs: number) => {
+  const form = new FormData();
+  form.append("wxid", wxid);
+  form.append("duration_ms", String(durationMs));
+  form.append("file", file, file.type.includes("ogg") ? "voice.ogg" : "voice.webm");
+  const res = await fetchWithTimeout(
+    "/api/send/voice-upload",
+    { method: "POST", body: form, headers: authHeaders() },
+    180_000,
+  );
+  if (!res.ok) throw new Error(`Voice send failed (${res.status})`);
   return res.json();
 };
 
@@ -500,6 +542,12 @@ export const revokeMsg = (msgSvrid: number, toWxid: string) =>
     body: JSON.stringify({ msg_svrid: msgSvrid, to_wxid: toWxid }),
   });
 
+export const getMessageStruct = (msgId: string, chatId: string, timestamp = 0) =>
+  fetchJSON("/api/message-struct", {
+    method: "POST",
+    body: JSON.stringify({ msg_id: msgId, chat_id: chatId, timestamp }),
+  });
+
 export const markAsRead = (wxid: string) =>
   fetchJSON(`/api/mark-read/${wxid}`, { method: "POST" });
 
@@ -537,6 +585,65 @@ export const unmuteSession = (wxid: string) =>
 
 export const getImageUrl = (path: string) =>
   `/api/media/image?path=${encodeURIComponent(path)}${authQuery() ? `&${authQuery()}` : ""}`;
+
+export const getMediaUrl = (path: string, filename = "") => {
+  const query = new URLSearchParams({ path });
+  if (filename) query.set("filename", filename);
+  const auth = authQuery();
+  return `/api/media/file?${query.toString()}${auth ? `&${auth}` : ""}`;
+};
+
+type MediaResolveInput = {
+  msgId: string;
+  msgtype: string;
+  path?: string;
+  msgXml?: string;
+  filename?: string;
+  download?: boolean;
+};
+
+export const resolveMedia = async (input: MediaResolveInput): Promise<Blob> => {
+  const res = await fetchWithTimeout("/api/media/resolve", {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      msg_id: input.msgId,
+      msgtype: input.msgtype,
+      path: input.path || "",
+      msg_xml: input.msgXml || "",
+      filename: input.filename || "",
+      download: Boolean(input.download),
+    }),
+  }, 180_000);
+  if (!res.ok) throw new Error(`Media unavailable (${res.status})`);
+  return res.blob();
+};
+
+export const resolveVoice = async (message: {
+  id: string;
+  voice_hex?: string;
+  voice_data?: string;
+  voice_path?: string;
+  voice_len?: string;
+  clientmsgid?: string;
+  fromgid?: string;
+}): Promise<Blob> => {
+  const res = await fetchWithTimeout("/api/media/voice", {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      msg_id: message.id,
+      voice_hex: message.voice_hex || "",
+      voice_data: message.voice_data || "",
+      path: message.voice_path || "",
+      length: message.voice_len || "",
+      clientmsgid: message.clientmsgid || "",
+      fromgid: message.fromgid || "",
+    }),
+  }, 120_000);
+  if (!res.ok) throw new Error(`Voice unavailable (${res.status})`);
+  return res.blob();
+};
 
 export const getDbImageUrl = (mediaId: string) =>
   `/api/media/db-image/${encodeURIComponent(mediaId)}${authQuery() ? `?${authQuery()}` : ""}`;
