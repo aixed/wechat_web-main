@@ -118,7 +118,7 @@ class MessageStore:
             "video_path", "video_len",
             "file_path", "file_len",
             "gif_path", "gif_len",
-            "voice_hex", "voice_data", "voice_len",
+            "voice_hex", "voice_data", "voice_len", "voice_path", "clientmsgid",
         ):
             if not merged.get(key) and fallback.get(key):
                 merged[key] = fallback[key]

@@ -25,6 +25,8 @@ env/
 .run/
 backend/_uploads/
 backend/.img_cache/
+backend/.media_cache/
+backend/.voice_cache/
 backend/.avatar_cache/
 backend/.sticker_cache/
 backend/.sqlite_cache/

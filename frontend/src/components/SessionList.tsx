@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
 import type { Session } from "../types";
 import { DEFAULT_AVATAR_URL } from "../avatar";
+import { searchLocalData, type GlobalSearchEntry, type GlobalSearchResult } from "../api";
 
 export type SessionMenuAction = "pin" | "unpin" | "mark_unread" | "mute" | "unmute" | "smart_reply" | "delete";
 
 interface SessionListProps {
   sessions: Session[];
   activeWxid?: string | null;
-  onSelectChat: (wxid: string) => void;
+  onSelectChat: (wxid: string, seed?: Partial<Session>) => void;
   onSessionAction: (action: SessionMenuAction, session: Session) => void;
   onRefreshSessions: () => void;
   loading?: boolean;
@@ -75,6 +76,30 @@ function MuteIcon() {
   );
 }
 
+const emptySearchResult = (query = ""): GlobalSearchResult => ({
+  query,
+  contacts: [],
+  groups: [],
+  messages: [],
+});
+
+function searchEntryName(entry: GlobalSearchEntry) {
+  return entry.name || entry.remark || entry.nickname || entry.wxid;
+}
+
+function SearchAvatar({ entry }: { entry: GlobalSearchEntry }) {
+  return (
+    <Avatar
+      session={{
+        wxid: entry.wxid,
+        nickname: searchEntryName(entry),
+        avatar: entry.avatar || "",
+        is_group: Boolean(entry.is_group),
+      }}
+    />
+  );
+}
+
 export default function SessionList({
   sessions,
   activeWxid,
@@ -85,7 +110,61 @@ export default function SessionList({
   theme = "dark",
 }: SessionListProps) {
   const [menu, setMenu] = useState<{ x: number; y: number; session: Session } | null>(null);
+  const [query, setQuery] = useState("");
+  const [searchResult, setSearchResult] = useState<GlobalSearchResult>(() => emptySearchResult());
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
   const dark = theme !== "light";
+  const normalizedQuery = query.trim();
+
+  useEffect(() => {
+    if (!normalizedQuery) {
+      setSearchResult(emptySearchResult());
+      setSearching(false);
+      setSearchError("");
+      return;
+    }
+
+    const controller = new AbortController();
+    setSearchResult(emptySearchResult(normalizedQuery));
+    setSearching(true);
+    setSearchError("");
+    const timer = window.setTimeout(() => {
+      searchLocalData(normalizedQuery, 30, controller.signal)
+        .then((result) => {
+          if (controller.signal.aborted) return;
+          if (
+            !result
+            || !Array.isArray(result.contacts)
+            || !Array.isArray(result.groups)
+            || !Array.isArray(result.messages)
+          ) {
+            throw new Error("invalid_search_response");
+          }
+          setSearchResult({
+            query: normalizedQuery,
+            contacts: result.contacts,
+            groups: result.groups,
+            messages: result.messages,
+            source: result.source,
+          });
+        })
+        .catch((error) => {
+          if (controller.signal.aborted || error?.name === "AbortError") return;
+          console.error("[GLOBAL_SEARCH]", error);
+          setSearchResult(emptySearchResult(normalizedQuery));
+          setSearchError("搜索失败，请稍后重试");
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setSearching(false);
+        });
+    }, 300);
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [normalizedQuery]);
 
   useEffect(() => {
     if (!menu) return;
@@ -115,6 +194,17 @@ export default function SessionList({
     setMenu(null);
   };
 
+  const openSearchEntry = (entry: GlobalSearchEntry) => {
+    onSelectChat(entry.wxid, {
+      nickname: searchEntryName(entry),
+      avatar: entry.avatar || "",
+      is_group: Boolean(entry.is_group || entry.wxid.includes("@chatroom")),
+    });
+    setQuery("");
+  };
+
+  const resultCount = searchResult.contacts.length + searchResult.groups.length + searchResult.messages.length;
+
   return (
     <div className={`h-full w-full flex flex-col no-select ${dark ? "bg-[#191919]" : "bg-[#e9e8e8]"}`}>
       {/* Search bar */}
@@ -127,8 +217,23 @@ export default function SessionList({
           <input
             type="text"
             placeholder="搜索"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
             className={`bg-transparent border-none outline-none text-[14px] ml-[6px] w-full min-w-0 ${dark ? "text-[#999] placeholder-[#5c5c5c]" : "text-[#333] placeholder-[#888]"}`}
           />
+          {query ? (
+            <button
+              type="button"
+              onClick={() => setQuery("")}
+              title="清空搜索"
+              aria-label="清空搜索"
+              className={`ml-[4px] h-[20px] w-[20px] shrink-0 rounded-full flex items-center justify-center ${dark ? "bg-[#555] text-[#222] hover:bg-[#666]" : "bg-[#b8b8b8] text-[#eee] hover:bg-[#aaa]"}`}
+            >
+              <svg className="h-[12px] w-[12px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden>
+                <path strokeLinecap="round" d="m7 7 10 10M17 7 7 17" />
+              </svg>
+            </button>
+          ) : null}
         </div>
         <button
           type="button"
@@ -145,8 +250,30 @@ export default function SessionList({
         </button>
       </div>
 
-      {/* Session list */}
+      {/* Session list / global search results */}
       <div className="session-list-scroll flex-1 overflow-y-auto overflow-x-hidden">
+        {normalizedQuery ? (
+          <div className="pb-[12px]">
+            {searching && resultCount === 0 ? (
+              <div className={`text-center text-[14px] mt-20 ${dark ? "text-[#666]" : "text-[#888]"}`}>正在搜索本地数据...</div>
+            ) : null}
+            {!searching && searchError ? (
+              <div className={`text-center text-[14px] mt-20 ${dark ? "text-[#888]" : "text-[#777]"}`}>{searchError}</div>
+            ) : null}
+            {!searching && !searchError && resultCount === 0 ? (
+              <div className={`text-center text-[14px] mt-20 ${dark ? "text-[#666]" : "text-[#888]"}`}>未找到相关联系人、群聊或聊天记录</div>
+            ) : null}
+
+            <SearchSection title="联系人" entries={searchResult.contacts} dark={dark} onOpen={openSearchEntry} />
+            <SearchSection title="群聊" entries={searchResult.groups} dark={dark} onOpen={openSearchEntry} kind="group" />
+            <SearchSection title="聊天记录" entries={searchResult.messages} dark={dark} onOpen={openSearchEntry} kind="message" />
+
+            {searching && resultCount > 0 ? (
+              <div className={`py-[10px] text-center text-[12px] ${dark ? "text-[#666]" : "text-[#999]"}`}>正在更新...</div>
+            ) : null}
+          </div>
+        ) : (
+        <>
         {sessions.length === 0 && (
           <div className={`text-center text-[14px] mt-20 ${dark ? "text-[#5c5c5c]" : "text-[#999]"}`}>
             {loading ? "正在获取最近会话..." : "暂无会话，点击刷新获取最近会话"}
@@ -214,6 +341,8 @@ export default function SessionList({
             </div>
           );
         })}
+        </>
+        )}
       </div>
 
       {menu && (
@@ -236,6 +365,59 @@ export default function SessionList({
         </div>
       )}
     </div>
+  );
+}
+
+function SearchSection({
+  title,
+  entries,
+  kind = "contact",
+  dark,
+  onOpen,
+}: {
+  title: string;
+  entries: GlobalSearchEntry[];
+  kind?: "contact" | "group" | "message";
+  dark: boolean;
+  onOpen: (entry: GlobalSearchEntry) => void;
+}) {
+  if (entries.length === 0) return null;
+
+  return (
+    <section>
+      <div className={`h-[34px] px-[12px] flex items-end pb-[6px] text-[13px] ${dark ? "text-[#777] bg-[#161616]" : "text-[#888] bg-[#e3e2e2]"}`}>
+        {title}
+      </div>
+      {entries.map((entry) => {
+        let detail = entry.account ? `微信号：${entry.account}` : "";
+        if (kind === "group") {
+          const members = (entry.matched_members || []).slice(0, 2).map((member) => {
+            const account = member.account ? `（微信号：${member.account}）` : "";
+            return `${member.name || member.wxid || "群成员"}${account}`;
+          });
+          detail = members.length > 0 ? `包含：${members.join("、")}${(entry.matched_members || []).length > 2 ? "..." : ""}` : "群聊";
+        } else if (kind === "message") {
+          detail = `${Math.max(1, Number(entry.match_count) || 0)} 条相关聊天记录`;
+        } else if (!detail && entry.wxid && !entry.wxid.startsWith("wxid_")) {
+          detail = `微信号：${entry.wxid}`;
+        }
+
+        return (
+          <button
+            key={`${kind}:${entry.wxid}`}
+            type="button"
+            onClick={() => onOpen(entry)}
+            className={`w-full min-h-[64px] flex items-center px-[10px] py-[8px] text-left transition-colors ${dark ? "hover:bg-[#262626] active:bg-[#303030]" : "hover:bg-[#d9d9d9] active:bg-[#d1d1d1]"}`}
+          >
+            <SearchAvatar entry={entry} />
+            <span className="min-w-0 flex-1 ml-[12px]">
+              <span className={`block truncate text-[16px] leading-[21px] ${dark ? "text-[#e5e5e5]" : "text-[#111]"}`}>{searchEntryName(entry)}</span>
+              <span className={`block truncate mt-[3px] text-[13px] leading-[18px] ${dark ? "text-[#777]" : "text-[#777]"}`}>{detail}</span>
+            </span>
+          </button>
+        );
+      })}
+    </section>
   );
 }
 

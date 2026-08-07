@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import type { ChatMessage, ContactProfile, Session } from "../types";
-import { sendText, getMessages, getOlderMessages, sendImageUpload, sendFileUpload } from "../api";
+import { sendText, getMessages, getOlderMessages, sendImageUpload, sendFileUpload, sendVoiceUpload, getMessageStruct } from "../api";
 import MessageBubble from "./MessageBubble";
 import { DEFAULT_AVATAR_URL } from "../avatar";
 import { deleteChatBackground, getChatBackground, saveChatBackground } from "../chatBackgroundStore";
@@ -101,6 +101,13 @@ function imageFilesFromClipboardData(data: DataTransfer | null): File[] {
     .filter((file): file is File => Boolean(file));
 }
 
+function recalledMessageId(message: ChatMessage): string {
+  const content = String(message.msg || "");
+  const match = content.match(/<newmsgid>\s*(?:<!\[CDATA\[)?([^<\]\s]+)/i);
+  if (match?.[1]) return match[1].trim();
+  return String(message.id || "").trim();
+}
+
 export default function ChatArea({
   session, messages, selfWxid, onBack, onNewMessages, avatarMap, contactMap,
   contactProfiles, onRequestContactProfile, onInputChange, onOpenSmartReply, mobile = false, dark = true,
@@ -129,6 +136,9 @@ export default function ChatArea({
     () => readStoredBoolean(LOW_OPACITY_TEXT_CONTRAST_KEY, true),
   );
   const [desktopComposerHeight, setDesktopComposerHeight] = useState(DESKTOP_COMPOSER_DEFAULT_HEIGHT);
+  const [voiceRecording, setVoiceRecording] = useState(false);
+  const [voiceRecordingMs, setVoiceRecordingMs] = useState(0);
+  const [voiceError, setVoiceError] = useState("");
 
   const chatAreaRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -142,6 +152,15 @@ export default function ChatArea({
   const settingsMenuRef = useRef<HTMLDivElement>(null);
   const chatBackgroundUrlRef = useRef("");
   const activeBackgroundKeyRef = useRef("");
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceStreamRef = useRef<MediaStream | null>(null);
+  const voiceChunksRef = useRef<Blob[]>([]);
+  const voiceStartedAtRef = useRef(0);
+  const voicePointerHeldRef = useRef(false);
+  const voiceCancelledRef = useRef(false);
+  const voiceDurationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const voiceAutoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceErrorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isInitialScroll = useRef(true);
   const loadingOlderRef = useRef(false);
   const pendingImagesRef = useRef<PendingImage[]>([]);
@@ -569,6 +588,121 @@ export default function ChatArea({
     });
   };
 
+  const showVoiceError = useCallback((message: string) => {
+    setVoiceError(message);
+    if (voiceErrorTimerRef.current) clearTimeout(voiceErrorTimerRef.current);
+    voiceErrorTimerRef.current = setTimeout(() => setVoiceError(""), 2400);
+  }, []);
+
+  const stopVoiceRecording = useCallback((cancelled = false) => {
+    voicePointerHeldRef.current = false;
+    voiceCancelledRef.current = cancelled;
+    const recorder = mediaRecorderRef.current;
+    if (recorder?.state === "recording") recorder.stop();
+  }, []);
+
+  const startVoiceRecording = useCallback(async (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0 || sending || voiceRecording) return;
+    event.preventDefault();
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is unavailable in a few embedded browsers.
+    }
+    voicePointerHeldRef.current = true;
+    voiceCancelledRef.current = false;
+    setVoiceError("");
+
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      voicePointerHeldRef.current = false;
+      showVoiceError("当前浏览器无法录音");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      voiceStreamRef.current = stream;
+      const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"]
+        .find((candidate) => MediaRecorder.isTypeSupported(candidate));
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      voiceChunksRef.current = [];
+      voiceStartedAtRef.current = Date.now();
+      setVoiceRecordingMs(0);
+
+      recorder.addEventListener("dataavailable", (chunk) => {
+        if (chunk.data.size > 0) voiceChunksRef.current.push(chunk.data);
+      });
+      recorder.addEventListener("stop", () => {
+        const durationMs = Math.min(60_000, Date.now() - voiceStartedAtRef.current);
+        const chunks = voiceChunksRef.current;
+        const cancelled = voiceCancelledRef.current;
+        const recordedType = recorder.mimeType || mimeType || "audio/webm";
+        mediaRecorderRef.current = null;
+        voiceChunksRef.current = [];
+        voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+        voiceStreamRef.current = null;
+        if (voiceDurationTimerRef.current) clearInterval(voiceDurationTimerRef.current);
+        if (voiceAutoStopTimerRef.current) clearTimeout(voiceAutoStopTimerRef.current);
+        voiceDurationTimerRef.current = null;
+        voiceAutoStopTimerRef.current = null;
+        setVoiceRecording(false);
+        setVoiceRecordingMs(0);
+        if (cancelled || durationMs < 300 || chunks.length === 0) return;
+
+        const blob = new Blob(chunks, { type: recordedType });
+        setSending(true);
+        void sendVoiceUpload(session.wxid, blob, durationMs)
+          .catch((error) => {
+            console.error("[VOICE_SEND]", error);
+            showVoiceError("语音发送失败");
+          })
+          .finally(() => setSending(false));
+      }, { once: true });
+
+      recorder.start(250);
+      setVoiceRecording(true);
+      voiceDurationTimerRef.current = setInterval(() => {
+        setVoiceRecordingMs(Math.min(60_000, Date.now() - voiceStartedAtRef.current));
+      }, 100);
+      voiceAutoStopTimerRef.current = setTimeout(() => stopVoiceRecording(false), 60_000);
+      if (!voicePointerHeldRef.current) stopVoiceRecording(true);
+    } catch (error) {
+      voicePointerHeldRef.current = false;
+      voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+      voiceStreamRef.current = null;
+      console.error("[VOICE_RECORD]", error);
+      showVoiceError("无法使用麦克风");
+    }
+  }, [sending, session.wxid, showVoiceError, stopVoiceRecording, voiceRecording]);
+
+  const releaseVoiceRecording = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    try {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // Ignore pointer capture cleanup failures.
+    }
+    stopVoiceRecording(false);
+  }, [stopVoiceRecording]);
+
+  useEffect(() => () => {
+    voicePointerHeldRef.current = false;
+    voiceCancelledRef.current = true;
+    const recorder = mediaRecorderRef.current;
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      if (recorder.state === "recording") recorder.stop();
+    }
+    voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+    if (voiceDurationTimerRef.current) clearInterval(voiceDurationTimerRef.current);
+    if (voiceAutoStopTimerRef.current) clearTimeout(voiceAutoStopTimerRef.current);
+    if (voiceErrorTimerRef.current) clearTimeout(voiceErrorTimerRef.current);
+  }, [session.wxid]);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -581,6 +715,27 @@ export default function ChatArea({
     setInput(val);
     onInputChange?.(val.trim().length > 0 || pendingImages.length > 0);
   };
+
+  const handleReEdit = useCallback(async (message: ChatMessage) => {
+    const msgId = recalledMessageId(message);
+    if (!msgId) return;
+    try {
+      const result = await getMessageStruct(msgId, session.wxid, Number(message.timestamp || 0));
+      const content = String(result?.content || "");
+      if (!result?.ok || !content.trim()) return;
+      setInput(content);
+      setInputMode("text");
+      setShowPlusMenu(false);
+      onInputChange?.(true);
+      requestAnimationFrame(() => {
+        const textarea = textareaRef.current;
+        textarea?.focus();
+        if (textarea) textarea.setSelectionRange(content.length, content.length);
+      });
+    } catch (error) {
+      console.error("[RE_EDIT]", error);
+    }
+  }, [onInputChange, session.wxid]);
 
   const handleMobileInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
@@ -1059,6 +1214,7 @@ export default function ChatArea({
                   hasChatBackground={Boolean(chatBackgroundUrl)}
                   wallpaperBubbleOpacity={effectiveBubbleOpacity}
                   enhanceLowOpacityText={enhanceLowOpacityText}
+                  onReEdit={handleReEdit}
                 />
               );
             })}
@@ -1088,6 +1244,12 @@ export default function ChatArea({
           onToggleVoice={() => { setInputMode(inputMode === "text" ? "voice" : "text"); setShowPlusMenu(false); }}
           onTogglePlus={() => setShowPlusMenu((v) => !v)}
           onFocus={() => setShowPlusMenu(false)}
+          voiceRecording={voiceRecording}
+          voiceRecordingMs={voiceRecordingMs}
+          voiceError={voiceError}
+          onVoicePointerDown={startVoiceRecording}
+          onVoicePointerUp={releaseVoiceRecording}
+          onVoicePointerCancel={() => stopVoiceRecording(true)}
           dark={dark}
         />
       ) : (
@@ -1117,6 +1279,8 @@ export default function ChatArea({
           <div className="flex items-center gap-[14px]">
             {/* Voice/Keyboard toggle */}
             <button
+              type="button"
+              aria-label={inputMode === "text" ? "切换到语音输入" : "切换到文字输入"}
               onClick={() => { setInputMode(inputMode === "text" ? "voice" : "text"); setShowPlusMenu(false); }}
               className="w-[30px] h-[30px] flex items-center justify-center text-[#d6d6d6] active:text-[#fff]"
             >
@@ -1206,8 +1370,20 @@ export default function ChatArea({
             placeholder=""
           />
         ) : (
-          <button className={`mt-[4px] w-full flex-1 min-h-[42px] text-[#999] text-[15px] flex items-center justify-center ${dark ? "active:bg-[#252525]" : "active:bg-[#ededed]"}`}>
-            按住 说话
+          <button
+            type="button"
+            disabled={sending}
+            onPointerDown={startVoiceRecording}
+            onPointerUp={releaseVoiceRecording}
+            onPointerCancel={() => stopVoiceRecording(true)}
+            onContextMenu={(event) => event.preventDefault()}
+            className={`mt-[4px] w-full flex-1 min-h-[42px] select-none touch-none text-[15px] flex items-center justify-center ${
+              voiceRecording
+                ? "bg-[#07c160] text-white"
+                : dark ? "text-[#bbb] active:bg-[#252525]" : "text-[#444] active:bg-[#ededed]"
+            }`}
+          >
+            {voiceError || (voiceRecording ? `松开发送 ${Math.max(1, Math.ceil(voiceRecordingMs / 1000))}s` : "按住 说话")}
           </button>
         )}
 
@@ -1320,6 +1496,12 @@ function MobileChatInput({
   onToggleVoice,
   onTogglePlus,
   onFocus,
+  voiceRecording,
+  voiceRecordingMs,
+  voiceError,
+  onVoicePointerDown,
+  onVoicePointerUp,
+  onVoicePointerCancel,
   dark,
 }: {
   input: string;
@@ -1339,6 +1521,12 @@ function MobileChatInput({
   onToggleVoice: () => void;
   onTogglePlus: () => void;
   onFocus: () => void;
+  voiceRecording: boolean;
+  voiceRecordingMs: number;
+  voiceError: string;
+  onVoicePointerDown: (event: React.PointerEvent<HTMLButtonElement>) => void;
+  onVoicePointerUp: (event: React.PointerEvent<HTMLButtonElement>) => void;
+  onVoicePointerCancel: () => void;
   dark: boolean;
 }) {
   return (
@@ -1361,7 +1549,7 @@ function MobileChatInput({
       )}
 
       <div className="h-[58px] px-[10px] flex items-center gap-[8px]">
-        <button type="button" onClick={onToggleVoice} className={`w-[34px] h-[34px] rounded-full border flex items-center justify-center ${dark ? "border-[#d6d6d6] text-[#d6d6d6] active:bg-[#2a2a2a]" : "border-[#222] text-[#222] active:bg-[#e8e8e8]"}`}>
+        <button type="button" aria-label={inputMode === "text" ? "切换到语音输入" : "切换到文字输入"} onClick={onToggleVoice} className={`w-[34px] h-[34px] rounded-full border flex items-center justify-center ${dark ? "border-[#d6d6d6] text-[#d6d6d6] active:bg-[#2a2a2a]" : "border-[#222] text-[#222] active:bg-[#e8e8e8]"}`}>
           {inputMode === "text" ? (
             <svg className="w-[22px] h-[22px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 18.75a6 6 0 0 0 6-6v-1.5m-6 7.5a6 6 0 0 1-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 0 1-3-3V4.5a3 3 0 1 1 6 0v8.25a3 3 0 0 1-3 3Z" />
@@ -1390,7 +1578,21 @@ function MobileChatInput({
               </svg>
             </>
           ) : (
-            <button type="button" className={`w-full h-full text-[16px] ${dark ? "text-[#ddd] active:bg-[#333]" : "text-[#444] active:bg-[#f2f2f2]"}`}>按住 说话</button>
+            <button
+              type="button"
+              disabled={sending}
+              onPointerDown={onVoicePointerDown}
+              onPointerUp={onVoicePointerUp}
+              onPointerCancel={onVoicePointerCancel}
+              onContextMenu={(event) => event.preventDefault()}
+              className={`w-full h-full select-none touch-none text-[16px] ${
+                voiceRecording
+                  ? "bg-[#07c160] text-white"
+                  : dark ? "text-[#ddd] active:bg-[#333]" : "text-[#444] active:bg-[#f2f2f2]"
+              }`}
+            >
+              {voiceError || (voiceRecording ? `松开发送 ${Math.max(1, Math.ceil(voiceRecordingMs / 1000))}s` : "按住 说话")}
+            </button>
           )}
         </div>
 

@@ -188,6 +188,8 @@ export interface ChatMessage {
   voice_len?: string;
   voice_hex?: string;
   voice_data?: string;
+  voice_path?: string;
+  clientmsgid?: string;
   gif_path?: string;
   file_path?: string;
   info?: string;

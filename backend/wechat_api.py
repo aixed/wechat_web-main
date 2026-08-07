@@ -721,6 +721,20 @@ async def send_voice(wxid: str, voice_file: str, time_ms: int, file_data: str | 
         return {"error": "SendVoiceMsg not supported in remote mode"}
 
 
+async def download_voice(client_msg_id: str, length: int, from_gid: str, msg_svr_id: str) -> dict:
+    """Request the Silk payload for a voice message from the local Hook."""
+    if not IS_HOOK:
+        return {"error": "DownloadVoice not supported in remote mode"}
+    msg_svr_value: int | str = int(msg_svr_id) if str(msg_svr_id or "").isdigit() else str(msg_svr_id or "")
+    r = await _post("/DownloadVoice", json={
+        "clientmsgid": str(client_msg_id or ""),
+        "length": int(length or 0),
+        "fromgid": str(from_gid or ""),
+        "msgsvrid": msg_svr_value,
+    }, timeout=30.0 if IS_LOCAL_HOOK else 60.0)
+    return safe_json(r)
+
+
 async def send_gif(wxid: str, gifpath: str, file_data: str | None = None) -> dict:
     """Send GIF."""
     if IS_HOOK:
@@ -1277,6 +1291,55 @@ async def get_chat_history(wxid: str, limit: int = 50, before_time: int = 0, dbs
     return {"data": result_rows}
 
 
+async def search_local_messages(keyword: str, limit: int = 100) -> list[dict]:
+    """Search native Hook message databases and aggregate matches by conversation."""
+    keyword = str(keyword or "").strip()
+    if not IS_HOOK or not keyword:
+        return []
+
+    limit = max(1, min(int(limit or 100), 200))
+    escaped = (
+        keyword
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+        .replace("'", "''")
+    )
+    sql = (
+        "SELECT StrTalker, COUNT(*) AS MatchCount, MAX(CreateTime) AS LatestTime "
+        "FROM MSG "
+        f"WHERE StrContent LIKE '%{escaped}%' ESCAPE '\\' "
+        "AND Type NOT IN (9999, 10000, 10002) "
+        "GROUP BY StrTalker "
+        "ORDER BY LatestTime DESC "
+        f"LIMIT {limit}"
+    )
+    rows = await _query_db_parallel(_ALL_DBS, sql)
+    merged: dict[str, dict] = {}
+    for row in rows:
+        if isinstance(row, list):
+            talker = str(row[0] if len(row) > 0 else "")
+            count = int(row[1] if len(row) > 1 and row[1] else 0)
+            latest = int(row[2] if len(row) > 2 and row[2] else 0)
+        elif isinstance(row, dict):
+            talker = str(row.get("StrTalker") or row.get("strTalker") or "")
+            count = int(row.get("MatchCount") or row.get("matchcount") or 0)
+            latest = int(row.get("LatestTime") or row.get("latesttime") or 0)
+        else:
+            continue
+        if not talker:
+            continue
+        current = merged.setdefault(talker, {"wxid": talker, "match_count": 0, "latest_timestamp": 0})
+        current["match_count"] += count
+        current["latest_timestamp"] = max(int(current["latest_timestamp"]), latest)
+
+    return sorted(
+        merged.values(),
+        key=lambda item: int(item.get("latest_timestamp") or 0),
+        reverse=True,
+    )[:limit]
+
+
 def _parse_bulk_row(row) -> tuple[str, dict] | tuple[None, None]:
     """Parse a single row from the bulk last-messages query."""
     talker = ""
@@ -1579,6 +1642,38 @@ async def cdn_download_pic(
             result.setdefault("requested_save_path", relative_path)
         return result
     return {}
+
+
+async def cdn_download(
+    decode_key: str,
+    file_id: str,
+    save_path: str,
+    *,
+    file_type: int = 2,
+    chat_type: int = 0,
+    large_video: int = 0,
+) -> dict:
+    """Download a file or video through the Hook's generic CDN endpoint."""
+    if not IS_HOOK:
+        return {"error": "CDN download not supported in remote mode"}
+    body = {
+        "savePath": str(save_path or ""),
+        "aeskey": str(decode_key or ""),
+        "fileid": str(file_id or ""),
+        "chatType": int(chat_type),
+        "largesVideo": int(large_video),
+        "fileType": int(file_type),
+    }
+    r = await _post(
+        "/download",
+        json=body,
+        timeout=120.0 if IS_LOCAL_HOOK else 180.0,
+        bypass_circuit_breaker=True,
+    )
+    result = safe_json(r)
+    if isinstance(result, dict):
+        result.setdefault("requested_save_path", str(save_path or ""))
+    return result
 
 
 async def read_local_download(relative_path: str) -> bytes:

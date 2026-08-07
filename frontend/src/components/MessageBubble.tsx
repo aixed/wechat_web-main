@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef, type ReactNode, type WheelEvent, type MouseEvent } from "react";
 import type { ChatMessage } from "../types";
-import { getImageUrl, getDbImageUrl, downloadImage, authQuery } from "../api";
+import { getImageUrl, getDbImageUrl, getMediaUrl, downloadImage, resolveMedia, resolveVoice, authQuery } from "../api";
 import { replaceWechatEmojis } from "../utils/wechatEmoji";
 import { DEFAULT_AVATAR_URL } from "../avatar";
 
@@ -17,6 +17,7 @@ interface MessageBubbleProps {
   hasChatBackground?: boolean;
   wallpaperBubbleOpacity?: number;
   enhanceLowOpacityText?: boolean;
+  onReEdit?: (message: ChatMessage) => void;
 }
 
 type ParsedFileMessage = {
@@ -122,9 +123,21 @@ function FileTypeIcon({ extension, compact = false }: { extension: string; compa
   );
 }
 
-function FileMessageCard({ file, compact = false }: { file: ParsedFileMessage; compact?: boolean }) {
-  return (
-    <div className={`flex min-w-0 items-center gap-2.5 ${compact ? "max-w-[250px]" : "w-[250px]"}`}>
+function FileMessageCard({
+  file,
+  compact = false,
+  onOpen,
+  busy = false,
+  failed = false,
+}: {
+  file: ParsedFileMessage;
+  compact?: boolean;
+  onOpen?: () => void;
+  busy?: boolean;
+  failed?: boolean;
+}) {
+  const content = (
+    <>
       <div className="min-w-0 flex-1">
         <div className={`${compact ? "text-[13px]" : "text-[17px]"} truncate text-inherit`}>
           {file.title}
@@ -135,8 +148,178 @@ function FileMessageCard({ file, compact = false }: { file: ParsedFileMessage; c
           </div>
         )}
       </div>
-      <FileTypeIcon extension={file.extension} compact={compact} />
-    </div>
+      <span className={busy ? "animate-pulse" : ""}>
+        <FileTypeIcon extension={file.extension} compact={compact} />
+      </span>
+      {failed && <span className="text-[12px] text-[#d44]">!</span>}
+    </>
+  );
+  const className = `flex min-w-0 items-center gap-2.5 text-left ${compact ? "max-w-[250px]" : "w-[250px]"}`;
+  if (!onOpen) return <div className={className}>{content}</div>;
+  return (
+    <button type="button" className={`${className} cursor-pointer`} onClick={onOpen} disabled={busy} title={failed ? "文件不可用" : file.title}>
+      {content}
+    </button>
+  );
+}
+
+function FileAttachment({ message, file }: { message: ChatMessage; file: ParsedFileMessage }) {
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  const open = async () => {
+    if (busy) return;
+    setBusy(true);
+    setFailed(false);
+    const preview = ["pdf", "txt", "json", "xml", "jpg", "jpeg", "png", "gif", "webp", "mp3", "wav", "mp4", "webm"].includes(file.extension);
+    const target = preview ? window.open("about:blank", "_blank") : null;
+    try {
+      const blob = await resolveMedia({
+        msgId: message.id,
+        msgtype: String(message.msgtype),
+        path: message.file_path,
+        msgXml: message.msg,
+        filename: file.title,
+      });
+      const url = URL.createObjectURL(blob);
+      if (target) {
+        target.location.href = url;
+      } else {
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = file.title || "file";
+        link.click();
+      }
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (error) {
+      target?.close();
+      setFailed(true);
+      console.error("[FILE_OPEN]", error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <FileMessageCard file={file} onOpen={open} busy={busy} failed={failed} />;
+}
+
+function ResolvedVideo({ message }: { message: ChatMessage }) {
+  const [src, setSrc] = useState(() => message.video_path ? getMediaUrl(message.video_path) : "");
+  const [failed, setFailed] = useState(false);
+  const attemptedRef = useRef(false);
+  const objectUrlRef = useRef("");
+
+  useEffect(() => {
+    setSrc(message.video_path ? getMediaUrl(message.video_path) : "");
+    setFailed(false);
+    attemptedRef.current = false;
+  }, [message.id, message.video_path]);
+
+  const fallback = async () => {
+    if (attemptedRef.current) {
+      setFailed(true);
+      return;
+    }
+    attemptedRef.current = true;
+    try {
+      const blob = await resolveMedia({
+        msgId: message.id,
+        msgtype: String(message.msgtype),
+        path: message.video_path,
+        msgXml: message.msg,
+        filename: `video_${message.id}.mp4`,
+      });
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = URL.createObjectURL(blob);
+      setSrc(objectUrlRef.current);
+    } catch (error) {
+      setFailed(true);
+      console.error("[VIDEO_OPEN]", error);
+    }
+  };
+
+  useEffect(() => {
+    if (!src) void fallback();
+    return () => {
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = "";
+    };
+    // The fallback is intentionally triggered only when the message changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [message.id]);
+
+  if (failed) return <div className="px-3 py-2 text-[14px] text-[#999]">视频不可用</div>;
+  return (
+    <video
+      src={src || undefined}
+      className="max-w-[240px] max-h-[320px] rounded-[4px] bg-black"
+      controls
+      preload="metadata"
+      onError={() => void fallback()}
+    />
+  );
+}
+
+function VoiceMessage({ message, isSelf }: { message: ChatMessage; isSelf: boolean }) {
+  const [loading, setLoading] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const objectUrlRef = useRef("");
+  const rawDuration = Number.parseInt(String(message.voice_len || ""), 10);
+  const duration = Number.isFinite(rawDuration) && rawDuration > 0 ? Math.max(1, Math.ceil(rawDuration / 1000)) : 0;
+
+  useEffect(() => () => {
+    audioRef.current?.pause();
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+  }, []);
+
+  const toggle = async () => {
+    if (loading) return;
+    if (audioRef.current) {
+      if (audioRef.current.paused) {
+        await audioRef.current.play();
+      } else {
+        audioRef.current.pause();
+        setPlaying(false);
+      }
+      return;
+    }
+    setLoading(true);
+    setFailed(false);
+    try {
+      const blob = await resolveVoice(message);
+      const url = URL.createObjectURL(blob);
+      objectUrlRef.current = url;
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.addEventListener("play", () => setPlaying(true));
+      audio.addEventListener("pause", () => setPlaying(false));
+      audio.addEventListener("ended", () => setPlaying(false));
+      audio.addEventListener("error", () => { setPlaying(false); setFailed(true); });
+      await audio.play();
+    } catch (error) {
+      setFailed(true);
+      console.error("[VOICE_PLAY]", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={() => void toggle()}
+      className="flex min-w-[78px] items-center gap-2 text-left"
+      aria-label={playing ? "暂停语音" : "播放语音"}
+      title={failed ? "语音不可用" : undefined}
+    >
+      <svg className={`w-4 h-4 ${isSelf ? "text-[#333]" : "text-white"} ${playing ? "animate-pulse" : ""}`} fill="currentColor" viewBox="0 0 24 24">
+        <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z" />
+      </svg>
+      <span className="text-[17px]">{loading ? "..." : duration > 0 ? `${duration}\"` : "语音"}</span>
+      {failed && <span className="text-[12px] text-[#d44]">!</span>}
+    </button>
   );
 }
 
@@ -447,7 +630,7 @@ function ChatImage({ message, onEnlarge, compact = false }: {
 
 export default function MessageBubble({
   message, isSelf, selfWxid, isGroup, senderName, avatarUrl, onAvatarClick, mobile = false, dark = true,
-  hasChatBackground = false, wallpaperBubbleOpacity = 78, enhanceLowOpacityText = true,
+  hasChatBackground = false, wallpaperBubbleOpacity = 78, enhanceLowOpacityText = true, onReEdit,
 }: MessageBubbleProps) {
   const msgtype = String(message.msgtype);
   const useWallpaperSurface = hasChatBackground;
@@ -559,15 +742,7 @@ export default function MessageBubble({
         return <ChatImage message={message} onEnlarge={setEnlargedImg} />;
 
       case "34": {
-        const dur = message.voice_len ? Math.ceil(parseInt(message.voice_len) / 1000) : 0;
-        return (
-          <div className="flex items-center gap-2 min-w-[60px]">
-            <svg className={`w-4 h-4 ${isSelf ? "text-[#333]" : "text-white"}`} fill="currentColor" viewBox="0 0 24 24">
-              <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z" />
-            </svg>
-            <span className="text-[17px]">{dur > 0 ? `${dur}"` : "语音"}</span>
-          </div>
-        );
+        return <VoiceMessage message={message} isSelf={isSelf} />;
       }
 
       case "42":
@@ -591,22 +766,8 @@ export default function MessageBubble({
         }
 
       case "43":
-        if (message.video_path) {
-          return (
-            <div className="relative">
-              <video
-                src={getImageUrl(message.video_path)}
-                className="max-w-[200px] max-h-[200px] rounded-[4px]"
-                controls
-              />
-            </div>
-          );
-        }
-        return (
-          <div className="flex items-center gap-2 text-[17px]">
-            <span>🎬</span><span>[视频]</span>
-          </div>
-        );
+      case "62":
+        return <ResolvedVideo message={message} />;
 
       case "47":
         if (message.gif_path) {
@@ -705,14 +866,13 @@ export default function MessageBubble({
 
           if (appType === "6" || appType === "74") {
             const file = parseFileAppMessage(message.msg);
+            const parsedFile = file || {
+              title: doc.querySelector("title")?.textContent || "文件",
+              extension: extensionFromFilename(doc.querySelector("title")?.textContent || ""),
+              sizeText: "",
+            };
             return (
-              <FileMessageCard
-                file={file || {
-                  title: doc.querySelector("title")?.textContent || "文件",
-                  extension: extensionFromFilename(doc.querySelector("title")?.textContent || ""),
-                  sizeText: "",
-                }}
-              />
+              <FileAttachment message={message} file={parsedFile} />
             );
           }
 
@@ -776,10 +936,31 @@ export default function MessageBubble({
 
   // System messages — centered label
   if (msgtype === "10000" || msgtype === "10002") {
+    const isRecall = message.msg.includes("revokemsg");
+    const recallTimestamp = Number(message.timestamp || 0);
+    const recallAgeSeconds = Math.floor(Date.now() / 1000) - recallTimestamp;
+    const canReEdit = (
+      isRecall
+      && isSelf
+      && Boolean(onReEdit)
+      && recallTimestamp > 0
+      && recallAgeSeconds >= -5
+      && recallAgeSeconds <= 120
+    );
+    const systemText = isRecall && isSelf ? "你撤回了一条消息" : extractSystemText(message.msg);
     return (
       <div className="flex justify-center py-2 px-4">
         <div className={`text-[12px] rounded px-2.5 py-1 ${dark ? "bg-[#1e1e1e] text-[#888]" : "bg-[#dedede] text-[#999]"}`}>
-          {replaceWechatEmojis(extractSystemText(message.msg))}
+          {replaceWechatEmojis(systemText)}
+          {canReEdit && (
+            <button
+              type="button"
+              className={`ml-1.5 ${dark ? "text-[#7ea6d9] hover:text-[#a9c7ef]" : "text-[#576b95] hover:text-[#334b7d]"}`}
+              onClick={() => onReEdit?.(message)}
+            >
+              重新编辑
+            </button>
+          )}
         </div>
       </div>
     );

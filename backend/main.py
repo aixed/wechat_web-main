@@ -24,6 +24,9 @@ import re
 import html
 import subprocess
 import importlib
+import hashlib
+import mimetypes
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import config
@@ -1390,6 +1393,20 @@ def _normalize_callback_message(msg: dict, sendorrecv: str, self_wxid: str) -> t
     if from_gid and from_id == self_wxid and self_wxid:
         is_self_sent = True
 
+    callback_path = str(msg.get("path", "") or "").strip()
+    typed_path: dict[str, str] = {}
+    if callback_path:
+        path_field = {
+            "3": "img_path",
+            "34": "voice_path",
+            "43": "video_path",
+            "62": "video_path",
+            "47": "gif_path",
+            "49": "file_path",
+        }.get(msgtype)
+        if path_field:
+            typed_path[path_field] = callback_path
+
     normalized = {
         "id": str(msg.get("msgsvrid", "") or msg.get("clientmsgid", "") or f"cb_{msg_unix}_{chat_id}"),
         "msgtype": msgtype,
@@ -1403,16 +1420,18 @@ def _normalize_callback_message(msg: dict, sendorrecv: str, self_wxid: str) -> t
         "msg": str(msg.get("msg", "") or ""),
         "sendorrecv": "1" if is_self_sent else str(sendorrecv or ""),
         "isSender": 1 if is_self_sent else 0,
-        "img_path": msg.get("img_path"),
+        "img_path": msg.get("img_path") or typed_path.get("img_path"),
         "img_len": msg.get("img_len"),
-        "video_path": msg.get("video_path"),
+        "video_path": msg.get("video_path") or typed_path.get("video_path"),
         "video_len": msg.get("video_len"),
         "voice_len": msg.get("voice_len"),
         "voice_hex": msg.get("voice_hex"),
         "voice_data": msg.get("voice_data"),
-        "gif_path": msg.get("gif_path"),
+        "voice_path": msg.get("voice_path") or typed_path.get("voice_path"),
+        "clientmsgid": msg.get("clientmsgid"),
+        "gif_path": msg.get("gif_path") or typed_path.get("gif_path"),
         "gif_len": msg.get("gif_len"),
-        "file_path": msg.get("file_path"),
+        "file_path": msg.get("file_path") or typed_path.get("file_path"),
         "file_len": msg.get("file_len"),
         "info": msg.get("info"),
         "msgsource": msg.get("msgsource"),
@@ -1432,6 +1451,13 @@ def _is_callback_status_echo(msg: dict, sendorrecv: str, self_wxid: str) -> bool
 
     msgtype = str(msg.get("msgtype", "") or "")
     content = str(msg.get("msg", "") or "").strip()
+    if (
+        config.IS_HOOK
+        and msgtype == "1"
+        and content.casefold() == "system message revoke/voice call"
+    ):
+        return True
+
     from_id = str(msg.get("fromid", "") or "")
     from_gid = str(msg.get("fromgid", "") or "")
     is_self_echo = (
@@ -1444,7 +1470,7 @@ def _is_callback_status_echo(msg: dict, sendorrecv: str, self_wxid: str) -> bool
     # A send-success callback can carry the real message ID and local media
     # path. Keep it as a message update so history refreshes do not lose the
     # path supplied by RecvType=1.
-    if any(msg.get(key) for key in ("img_path", "video_path", "file_path", "gif_path")):
+    if any(msg.get(key) for key in ("path", "img_path", "video_path", "file_path", "gif_path", "voice_path")):
         return False
 
     if msgtype == "1" and not content:
@@ -1466,6 +1492,83 @@ def _is_protocol_internal_callback_message(msg: dict) -> bool:
 
     from_id = str(msg.get("fromid", "") or "").strip().casefold()
     return msgtype == "10002" and from_id == "weixin" and content.casefold().startswith("<sysmsg")
+
+
+def _recalled_message_id(content: str) -> str:
+    match = re.search(r"<newmsgid>\s*(?:<!\[CDATA\[)?([^<\]\s]+)", str(content or ""), re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _message_struct_content(payload: dict) -> tuple[str, str]:
+    if not isinstance(payload, dict):
+        return "", ""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    content = str(payload.get("content") or data.get("content") or "")
+    msgtype = str(payload.get("msgtype") or data.get("msgtype") or "")
+    return content, msgtype
+
+
+def _is_editable_recalled_text(content: str, msgtype: str) -> bool:
+    text = str(content or "").strip()
+    lowered = text.casefold()
+    return (
+        str(msgtype or "") == "1"
+        and bool(text)
+        and "<revokemsg" not in lowered
+        and lowered != "system message revoke/voice call"
+    )
+
+
+def _cached_recalled_text(chat_id: str, msg_id: str, timestamp: int = 0) -> str:
+    if not chat_id or not msg_id:
+        return ""
+
+    messages: list[dict] = []
+    try:
+        messages.extend(message_store.get_messages(chat_id))
+    except Exception:
+        pass
+    try:
+        messages.extend(sqlite_cache.get_messages(
+            chat_id,
+            200,
+            owner_wxid=_contact_owner_wxid(),
+        ))
+    except Exception:
+        pass
+
+    for message in messages:
+        if str(message.get("id", "") or "") != msg_id:
+            continue
+        content = str(message.get("msg", "") or "")
+        if _is_editable_recalled_text(content, str(message.get("msgtype", "") or "")):
+            return content
+
+    recall_timestamp = int(timestamp or 0)
+    for message in messages:
+        if _recalled_message_id(str(message.get("msg", "") or "")) != msg_id:
+            continue
+        recall_timestamp = max(
+            recall_timestamp,
+            int(message.get("timestamp") or message.get("time_unix") or 0),
+        )
+
+    candidates: list[dict] = []
+    for message in messages:
+        content = str(message.get("msg", "") or "")
+        if not _is_editable_recalled_text(content, str(message.get("msgtype", "") or "")):
+            continue
+        if int(message.get("isSender") or 0) != 1 and str(message.get("sendorrecv", "") or "") != "1":
+            continue
+        message_timestamp = int(message.get("timestamp") or message.get("time_unix") or 0)
+        if recall_timestamp and not (recall_timestamp - 120 <= message_timestamp <= recall_timestamp + 2):
+            continue
+        candidates.append(message)
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda message: int(message.get("timestamp") or message.get("time_unix") or 0), reverse=True)
+    return str(candidates[0].get("msg", "") or "")
 
 
 def _store_message_and_session(chat_id: str, msg: dict) -> dict:
@@ -1529,7 +1632,7 @@ _MEDIA_FIELDS_TO_PRESERVE = (
     "video_path", "video_len",
     "file_path", "file_len",
     "gif_path", "gif_len",
-    "voice_hex", "voice_data", "voice_len",
+    "voice_hex", "voice_data", "voice_len", "voice_path", "clientmsgid",
 )
 
 
@@ -1587,6 +1690,61 @@ def _find_history_image_media(message: dict, candidates: list[dict]) -> dict | N
     return best[1] if best else None
 
 
+def _find_history_file_media(message: dict, candidates: list[dict]) -> dict | None:
+    """Match RecvType=1 media callbacks whose ID differs from the MSG database row."""
+    msg_type = str(message.get("msgtype", "") or "")
+    path_field = {
+        "34": "voice_path",
+        "43": "video_path",
+        "62": "video_path",
+        "47": "gif_path",
+        "49": "file_path",
+    }.get(msg_type)
+    if not path_field or message.get(path_field):
+        return None
+
+    content = str(message.get("msg", "") or "")
+    timestamp = int(message.get("timestamp") or message.get("time_unix") or 0)
+    direction = str(message.get("sendorrecv", "") or "")
+    length_match = re.search(r'(?:\blength="|<totallen>)(\d+)', content, re.IGNORECASE)
+    expected_length = int(length_match.group(1)) if length_match else 0
+    title_match = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", content, re.IGNORECASE | re.DOTALL)
+    expected_title = html.unescape(title_match.group(1).strip()) if title_match else ""
+    best: tuple[int, dict] | None = None
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not candidate.get(path_field):
+            continue
+        if str(candidate.get("msgtype", "") or "") != msg_type:
+            continue
+        if str(candidate.get("sendorrecv", "") or "") != direction:
+            continue
+        candidate_ts = int(candidate.get("timestamp") or candidate.get("time_unix") or 0)
+        delta = abs(timestamp - candidate_ts) if timestamp and candidate_ts else 999999
+        if delta > 120:
+            continue
+
+        candidate_path = str(candidate.get(path_field) or "")
+        same_name = bool(expected_title and os.path.basename(candidate_path).casefold() == expected_title.casefold())
+        same_size = False
+        if expected_length:
+            try:
+                same_size = os.path.isfile(candidate_path) and os.path.getsize(candidate_path) == expected_length
+            except OSError:
+                pass
+        if expected_title and not same_name and not same_size:
+            continue
+        if expected_length and not same_size and not same_name:
+            continue
+        if not expected_title and not expected_length and delta > 2:
+            continue
+
+        score = (1000 if same_name else 0) + (500 if same_size else 0) - delta
+        if best is None or score > best[0]:
+            best = (score, candidate)
+    return best[1] if best else None
+
+
 def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
     self_wxid = _get_self_wxid()
     is_group = "@chatroom" in wxid
@@ -1601,6 +1759,21 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
         )
     except Exception:
         pass
+    row_timestamps = [
+        int(row.get("CreateTime") or 0)
+        for row in rows
+        if isinstance(row, dict) and row.get("CreateTime")
+    ]
+    if row_timestamps:
+        try:
+            existing_messages.extend(sqlite_cache.get_media_messages(
+                wxid,
+                min(row_timestamps) - 120,
+                max(row_timestamps) + 120,
+                owner_wxid=_contact_owner_wxid(),
+            ))
+        except Exception:
+            pass
     existing_by_id: dict[str, dict] = {}
     for existing in existing_messages:
         if not isinstance(existing, dict):
@@ -1642,6 +1815,8 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
         )
         media_fallback = _find_history_image_media(normalized, existing_messages)
         normalized = _merge_message_media_fields(normalized, media_fallback)
+        file_fallback = _find_history_file_media(normalized, existing_messages)
+        normalized = _merge_message_media_fields(normalized, file_fallback)
         out.append(normalized)
     out.sort(key=lambda m: (int(m.get("timestamp") or 0), str(m.get("id", ""))))
     return out
@@ -3406,6 +3581,239 @@ async def get_contacts():
 async def refresh_contacts():
     """Force refresh contacts from Hook without re-running InitContact."""
     return await _refresh_contacts_incremental(list_type="0", init_if_empty=True, force_details=True)
+
+
+def _search_contact_item(row: dict, *, is_group: bool | None = None) -> dict:
+    wxid = str(_row_value(row, "UserName", "userName", "username", "wxid", "gid") or "").strip()
+    remark = str(_row_value(row, "Remark", "remark", "markname") or "").strip()
+    nickname = str(_row_value(row, "NickName", "nickname", "gname", "name") or "").strip()
+    alias = str(_row_value(row, "Alias", "alias", "account") or "").strip()
+    avatar = str(_row_value(
+        row,
+        "SmallHeadImgUrl", "smallHeadImgUrl", "avatar", "BigHeadImgUrl", "bigHeadImgUrl",
+    ) or "").strip()
+    group = wxid.endswith("@chatroom") if is_group is None else is_group
+    if not avatar and wxid:
+        avatar = f"/api/avatar/{wxid}"
+    return {
+        "wxid": wxid,
+        "name": remark or nickname or alias or wxid,
+        "nickname": nickname,
+        "remark": remark,
+        "account": alias or (wxid if not wxid.startswith("wxid_") else ""),
+        "avatar": avatar,
+        "is_group": bool(group),
+    }
+
+
+def _search_matches_contact(contact: dict, keyword: str) -> bool:
+    folded = keyword.casefold()
+    profile = contact.get("profile") if isinstance(contact.get("profile"), dict) else {}
+    values = [
+        contact.get("wxid"), contact.get("name"),
+        profile.get("Alias"), profile.get("alias"),
+        profile.get("Remark"), profile.get("remark"),
+        profile.get("NickName"), profile.get("nickname"),
+        profile.get("PYInitial"), profile.get("QuanPin"),
+        profile.get("RemarkPYInitial"), profile.get("RemarkQuanPin"),
+    ]
+    return any(folded in str(value or "").casefold() for value in values)
+
+
+def _cached_search_results(keyword: str, limit: int, owner_wxid: str) -> tuple[list[dict], list[dict], list[dict]]:
+    cached_contacts = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+    matched = [
+        contact for contact in cached_contacts.values()
+        if _search_matches_contact(contact, keyword)
+    ][:limit]
+    contacts = [_search_contact_item(contact, is_group=False) for contact in matched if not contact.get("is_group")]
+    groups_by_id = {
+        str(contact.get("wxid") or ""): {
+            **_search_contact_item(contact, is_group=True),
+            "matched_members": [],
+        }
+        for contact in matched
+        if contact.get("is_group")
+    }
+    for member in sqlite_cache.search_group_members(keyword, limit * 4, owner_wxid=owner_wxid):
+        gid = str(member.get("gid") or "")
+        if not gid:
+            continue
+        group_contact = cached_contacts.get(gid) or {"wxid": gid, "name": gid, "is_group": True}
+        group = groups_by_id.setdefault(gid, {
+            **_search_contact_item(group_contact, is_group=True),
+            "matched_members": [],
+        })
+        group["matched_members"].append({
+            "wxid": str(member.get("wxid") or ""),
+            "name": str(member.get("name") or member.get("wxid") or ""),
+            "account": str(member.get("wxid") or ""),
+        })
+
+    message_hits = sqlite_cache.search_all_messages(keyword, limit, owner_wxid=owner_wxid)
+    sessions_by_id = {
+        str(row.get("strUsrName") or ""): row
+        for row in sqlite_cache.get_sessions(owner_wxid=owner_wxid)
+    }
+    messages = []
+    for hit in message_hits:
+        wxid = str(hit.get("wxid") or "")
+        contact = cached_contacts.get(wxid) or {}
+        session = sessions_by_id.get(wxid) or {}
+        item = _search_contact_item(contact or {
+            "wxid": wxid,
+            "name": session.get("strNickName") or wxid,
+        })
+        messages.append({
+            **item,
+            "match_count": int(hit.get("match_count") or 0),
+            "latest_timestamp": int(hit.get("latest_timestamp") or 0),
+        })
+    return contacts, list(groups_by_id.values())[:limit], messages
+
+
+@app.get("/api/search")
+async def search_local_data(q: str = "", limit: int = 30):
+    keyword = str(q or "").strip()
+    if not keyword:
+        return {"query": "", "contacts": [], "groups": [], "messages": []}
+    limit = max(1, min(int(limit or 30), 50))
+    owner_wxid = _contact_owner_wxid()
+
+    if config.IS_PROTOCOL:
+        contacts, groups, messages = _cached_search_results(keyword, limit, owner_wxid)
+        return {"query": keyword, "contacts": contacts, "groups": groups, "messages": messages, "source": "cache"}
+
+    escaped = (
+        keyword
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+        .replace("'", "''")
+    )
+    pattern = f"%{escaped}%"
+    contact_fields = (
+        "UserName", "Alias", "Remark", "NickName",
+        "PYInitial", "QuanPin", "RemarkPYInitial", "RemarkQuanPin",
+    )
+    contact_where = " OR ".join(f"contact.{field} LIKE '{pattern}' ESCAPE '\\'" for field in contact_fields)
+    member_where = " OR ".join(f"member.{field} LIKE '{pattern}' ESCAPE '\\'" for field in contact_fields)
+    contact_sql = (
+        "SELECT contact.UserName AS UserName, contact.Alias AS Alias, "
+        "contact.Remark AS Remark, contact.NickName AS NickName, "
+        "contact.PYInitial AS PYInitial, contact.QuanPin AS QuanPin, "
+        "contact.RemarkPYInitial AS RemarkPYInitial, contact.RemarkQuanPin AS RemarkQuanPin, "
+        "COALESCE(NULLIF(head.smallHeadImgUrl, ''), NULLIF(head.bigHeadImgUrl, ''), "
+        "NULLIF(contact.SmallHeadImgUrl, ''), contact.BigHeadImgUrl, '') AS SmallHeadImgUrl, "
+        "contact.Type AS Type, contact.VerifyFlag AS VerifyFlag "
+        "FROM Contact AS contact "
+        "LEFT JOIN ContactHeadImgUrl AS head ON head.usrName = contact.UserName "
+        f"WHERE {contact_where} LIMIT {limit * 4}"
+    )
+    member_sql = (
+        "SELECT room.ChatRoomName, group_contact.Remark AS GroupRemark, "
+        "group_contact.NickName AS GroupNickname, "
+        "COALESCE(NULLIF(group_head.smallHeadImgUrl, ''), NULLIF(group_head.bigHeadImgUrl, ''), "
+        "NULLIF(group_contact.SmallHeadImgUrl, ''), group_contact.BigHeadImgUrl, '') AS GroupAvatar, "
+        "member.UserName AS MemberWxid, member.Alias AS MemberAlias, "
+        "member.Remark AS MemberRemark, member.NickName AS MemberNickname "
+        "FROM Contact AS member "
+        "JOIN ChatRoom AS room ON instr('^G' || room.UserNameList || '^G', '^G' || member.UserName || '^G') > 0 "
+        "LEFT JOIN Contact AS group_contact ON group_contact.UserName = room.ChatRoomName "
+        "LEFT JOIN ContactHeadImgUrl AS group_head ON group_head.usrName = room.ChatRoomName "
+        f"WHERE {member_where} LIMIT {limit * 8}"
+    )
+
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    with wechat_api.use_agent(agent_id):
+        contact_payload, member_payload, native_message_hits = await asyncio.gather(
+            wechat_api.query_db("MicroMsg.db", contact_sql, timeout=30.0),
+            wechat_api.query_db("MicroMsg.db", member_sql, timeout=30.0),
+            wechat_api.search_local_messages(keyword, limit * 3),
+        )
+
+    contact_rows = contact_payload.get("data", []) if isinstance(contact_payload, dict) else []
+    member_rows = member_payload.get("data", []) if isinstance(member_payload, dict) else []
+    if not isinstance(contact_rows, list):
+        contact_rows = []
+    if not isinstance(member_rows, list):
+        member_rows = []
+
+    contacts: list[dict] = []
+    groups_by_id: dict[str, dict] = {}
+    for row in contact_rows:
+        if not isinstance(row, dict):
+            continue
+        item = _search_contact_item(row)
+        if not item["wxid"]:
+            continue
+        if item["is_group"]:
+            groups_by_id[item["wxid"]] = {**item, "matched_members": []}
+        elif item["wxid"] != owner_wxid:
+            contacts.append(item)
+
+    for row in member_rows:
+        if not isinstance(row, dict):
+            continue
+        gid = str(_row_value(row, "ChatRoomName", "chatRoomName", "gid") or "").strip()
+        if not gid:
+            continue
+        group_remark = str(_row_value(row, "GroupRemark") or "").strip()
+        group_nickname = str(_row_value(row, "GroupNickname") or "").strip()
+        group = groups_by_id.setdefault(gid, {
+            "wxid": gid,
+            "name": group_remark or group_nickname or gid,
+            "nickname": group_nickname,
+            "remark": group_remark,
+            "account": "",
+            "avatar": str(_row_value(row, "GroupAvatar") or f"/api/avatar/{gid}"),
+            "is_group": True,
+            "matched_members": [],
+        })
+        member_wxid = str(_row_value(row, "MemberWxid") or "")
+        member_alias = str(_row_value(row, "MemberAlias") or "")
+        member_name = str(
+            _row_value(row, "MemberRemark")
+            or _row_value(row, "MemberNickname")
+            or member_alias
+            or member_wxid
+        )
+        group["matched_members"].append({
+            "wxid": member_wxid,
+            "name": member_name,
+            "account": member_alias or (member_wxid if not member_wxid.startswith("wxid_") else ""),
+        })
+
+    cached_contacts = sqlite_cache.get_contacts(
+        [str(hit.get("wxid") or "") for hit in native_message_hits],
+        owner_wxid=owner_wxid,
+    )
+    sessions_by_id = {
+        str(row.get("strUsrName") or ""): row
+        for row in sqlite_cache.get_sessions(owner_wxid=owner_wxid)
+    }
+    messages: list[dict] = []
+    for hit in native_message_hits[:limit]:
+        wxid = str(hit.get("wxid") or "")
+        contact = cached_contacts.get(wxid) or {}
+        session = sessions_by_id.get(wxid) or {}
+        item = _search_contact_item(contact or {
+            "wxid": wxid,
+            "name": session.get("strNickName") or wxid,
+        })
+        messages.append({
+            **item,
+            "match_count": int(hit.get("match_count") or 0),
+            "latest_timestamp": int(hit.get("latest_timestamp") or 0),
+        })
+
+    return {
+        "query": keyword,
+        "contacts": contacts[:limit],
+        "groups": list(groups_by_id.values())[:limit],
+        "messages": messages,
+        "source": "hook_db",
+    }
 
 
 @app.get("/api/local-contacts")
@@ -5923,6 +6331,11 @@ class RevokeRequest(BaseModel):
     msg_svrid: int
     to_wxid: str
 
+class MessageStructRequest(BaseModel):
+    msg_id: str
+    chat_id: str = ""
+    timestamp: int = 0
+
 class SessionActionRequest(BaseModel):
     wxid: str
 
@@ -7892,6 +8305,79 @@ async def send_video_upload(wxid: str = Form(...), file: UploadFile = File(...))
     return _send_queued_response("video-upload", wxid, path=filepath)
 
 
+def _convert_recording_to_silk(input_path: str, output_path: str) -> None:
+    pcm_path = output_path + ".pcm"
+    converted = _run_media_command([
+        _ffmpeg_executable(), "-hide_banner", "-loglevel", "error",
+        "-i", input_path, "-vn", "-ac", "1", "-ar", "24000",
+        "-f", "s16le", "-y", pcm_path,
+    ], timeout=120)
+    if converted.returncode != 0 or not _nonempty_file(pcm_path):
+        error = converted.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Recording conversion failed: {error[:300]}")
+    encoded: subprocess.CompletedProcess | None = None
+    try:
+        encoder = _silk_codec_executable("encoder")
+        encoded = _run_media_command([
+            encoder, pcm_path, output_path,
+            "-tencent", "-Fs_API", "24000", "-Fs_maxInternal", "24000",
+            "-packetlength", "20", "-quiet",
+        ], timeout=120)
+    finally:
+        try:
+            os.unlink(pcm_path)
+        except OSError:
+            pass
+    if encoded is None or encoded.returncode != 0 or not _nonempty_file(output_path):
+        error = encoded.stderr.decode("utf-8", errors="replace").strip() if encoded else "encoder unavailable"
+        raise RuntimeError(f"Silk encode failed: {error[:300]}")
+
+
+@app.post("/api/send/voice-upload")
+async def send_voice_upload(
+    wxid: str = Form(...),
+    duration_ms: int = Form(...),
+    file: UploadFile = File(...),
+):
+    """Convert a browser recording to Tencent Silk v3 and send it through /SendVoiceMsg."""
+    duration_ms = max(300, min(int(duration_ms or 0), 60_000))
+    data = await file.read()
+    if not data or len(data) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Invalid voice recording")
+    extension = os.path.splitext(file.filename or "recording.webm")[1] or ".webm"
+    stem = f"voice_{int(time.time() * 1000)}_{_safe_media_filename_part(wxid, 'chat', 40)}"
+    input_path = os.path.join(_VOICE_CACHE_DIR, stem + extension)
+    silk_path = os.path.join(_VOICE_CACHE_DIR, stem + ".silk")
+    with open(input_path, "wb") as output:
+        output.write(data)
+    try:
+        await asyncio.to_thread(_convert_recording_to_silk, input_path, silk_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    finally:
+        try:
+            os.unlink(input_path)
+        except OSError:
+            pass
+
+    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _queue_send_job(
+        "voice-upload",
+        agent_id,
+        wxid,
+        "34",
+        "",
+        {"voice_path": silk_path, "voice_len": str(duration_ms)},
+        lambda: wechat_api.send_voice(wxid, silk_path, duration_ms),
+    )
+    return _send_queued_response(
+        "voice-upload",
+        wxid,
+        path=silk_path,
+        duration_ms=duration_ms,
+    )
+
+
 @app.post("/api/send/gif-upload")
 async def send_gif_upload(wxid: str = Form(...), file: UploadFile = File(...)):
     """Upload a GIF/sticker file from the browser and send it via WeChat."""
@@ -7919,6 +8405,56 @@ async def send_gif_upload(wxid: str = Form(...), file: UploadFile = File(...)):
 @app.post("/api/revoke")
 async def revoke_msg(req: RevokeRequest):
     return await wechat_api.revoke_msg(req.msg_svrid, req.to_wxid)
+
+
+@app.post("/api/message-struct")
+async def get_message_struct(req: MessageStructRequest):
+    msg_id = str(req.msg_id or "").strip()
+    if not msg_id:
+        return {"ok": False, "error": "missing_msg_id"}
+    recall_timestamp = int(req.timestamp or 0)
+    now = int(time.time())
+    if recall_timestamp <= 0 or now - recall_timestamp > 120 or recall_timestamp - now > 5:
+        return {
+            "ok": False,
+            "msg_id": msg_id,
+            "content": "",
+            "error": "re_edit_expired",
+        }
+
+    structure: dict = {}
+    try:
+        structure = await wechat_api.get_msg_struct(msg_id)
+    except Exception as e:
+        _log(f"[GET_MSG_STRUCT] failed msg_id={msg_id}: {type(e).__name__}: {e}")
+
+    content, msgtype = _message_struct_content(structure)
+    if _is_editable_recalled_text(content, msgtype):
+        return {
+            "ok": True,
+            "msg_id": msg_id,
+            "msgtype": msgtype,
+            "content": content,
+            "source": "message_struct",
+        }
+
+    cached_content = _cached_recalled_text(req.chat_id.strip(), msg_id, req.timestamp)
+    if cached_content:
+        return {
+            "ok": True,
+            "msg_id": msg_id,
+            "msgtype": "1",
+            "content": cached_content,
+            "source": "message_cache",
+        }
+
+    return {
+        "ok": False,
+        "msg_id": msg_id,
+        "msgtype": msgtype,
+        "content": "",
+        "error": "message_content_unavailable",
+    }
 
 
 @app.post("/api/mark-read/{wxid}")
@@ -7980,6 +8516,57 @@ async def serve_image(path: str):
     return {"error": "File not found"}
 
 
+def _media_path_field(msg_type: str) -> str:
+    return {
+        "3": "img_path",
+        "34": "voice_path",
+        "43": "video_path",
+        "62": "video_path",
+        "47": "gif_path",
+        "49": "file_path",
+    }.get(str(msg_type or ""), "file_path")
+
+
+def _media_file_response(path: str, filename: str = "", *, download: bool = False) -> FileResponse:
+    resolved_name = os.path.basename(filename or path) or "media"
+    media_type = mimetypes.guess_type(resolved_name)[0] or "application/octet-stream"
+    if download:
+        return FileResponse(path, media_type=media_type, filename=resolved_name)
+    return FileResponse(path, media_type=media_type)
+
+
+def _persist_media_path(msg_id: str, msg_type: str, path: str) -> None:
+    if not msg_id or not path:
+        return
+    try:
+        sqlite_cache.update_media_path_by_msg_id(
+            str(msg_id),
+            _media_path_field(msg_type),
+            path,
+            owner_wxid=_contact_owner_wxid(),
+        )
+    except Exception as exc:
+        _log(f"[MEDIA] path persistence failed for {msg_id}: {type(exc).__name__}: {exc}")
+
+
+def _cached_media_path(msg_id: str, msg_type: str) -> str:
+    if not msg_id:
+        return ""
+    try:
+        cached = sqlite_cache.get_message_by_id(str(msg_id), owner_wxid=_contact_owner_wxid())
+    except Exception:
+        return ""
+    return str((cached or {}).get(_media_path_field(msg_type)) or "")
+
+
+@app.get("/api/media/file")
+async def serve_local_media(path: str, filename: str = "", download: bool = False):
+    """Serve an already-known local media path through the authenticated backend."""
+    if not _nonempty_file(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return _media_file_response(path, filename, download=download)
+
+
 @app.get("/api/media/db-image/{media_id}")
 async def serve_db_image(media_id: str):
     """Serve an image blob stored in the per-account SQLite cache."""
@@ -8028,6 +8615,10 @@ _WECHAT_FILES_BASE = _discover_wechat_files_base()
 # Cache dir for decoded .dat images
 _IMG_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".img_cache")
 os.makedirs(_IMG_CACHE_DIR, exist_ok=True)
+_MEDIA_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".media_cache")
+_VOICE_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".voice_cache")
+os.makedirs(_MEDIA_CACHE_DIR, exist_ok=True)
+os.makedirs(_VOICE_CACHE_DIR, exist_ok=True)
 
 
 def _image_file_response(path: str, msg_id: str = ""):
@@ -8190,6 +8781,335 @@ def _nonempty_file(path: str) -> bool:
         return bool(path and os.path.isfile(path) and os.path.getsize(path) > 0)
     except Exception:
         return False
+
+
+def _xml_root(xml_text: str) -> ET.Element | None:
+    raw = str(xml_text or "").strip()
+    starts = [pos for token in ("<?xml", "<msg", "<appmsg", "<videomsg", "<img") if (pos := raw.find(token)) >= 0]
+    if starts:
+        raw = raw[min(starts):]
+    try:
+        return ET.fromstring(raw)
+    except ET.ParseError:
+        return None
+
+
+def _parse_media_download_params(msg_type: str, msg_xml: str, filename: str = "") -> dict[str, Any]:
+    """Extract Hook /download fields from image, video, or file message XML."""
+    msg_type = str(msg_type or "")
+    result: dict[str, Any] = {
+        "aeskey": "",
+        "fileid": "",
+        "filename": os.path.basename(str(filename or "").replace("\\", "/")),
+        "file_type": 1 if msg_type == "3" else 2,
+        "large_video": 0,
+    }
+    root = _xml_root(msg_xml)
+    if root is not None:
+        if msg_type == "3":
+            node = root.find(".//img") if root.tag != "img" else root
+            if node is not None:
+                result["aeskey"] = node.get("aeskey", "") or node.get("cdnthumbaeskey", "")
+                result["fileid"] = (
+                    node.get("cdnmidimgurl", "")
+                    or node.get("cdnbigimgurl", "")
+                    or node.get("cdnthumburl", "")
+                )
+        elif msg_type in {"43", "62"}:
+            node = root.find(".//videomsg") if root.tag != "videomsg" else root
+            if node is not None:
+                result["aeskey"] = node.get("aeskey", "") or node.get("cdnrawvideoaeskey", "")
+                result["fileid"] = node.get("cdnvideourl", "") or node.get("cdnrawvideourl", "")
+                result["large_video"] = 1 if node.get("cdnrawvideourl", "") else 0
+        elif msg_type == "49":
+            title = (root.findtext(".//appmsg/title") or root.findtext(".//title") or "").strip()
+            attach = root.find(".//appattach")
+            if title and not result["filename"]:
+                result["filename"] = os.path.basename(title.replace("\\", "/"))
+            if attach is not None:
+                result["aeskey"] = (attach.findtext("aeskey") or "").strip()
+                result["fileid"] = (attach.findtext("cdnattachurl") or "").strip()
+                attach_id = (attach.findtext("attachid") or "").strip()
+                if not result["fileid"] and attach_id and not attach_id.startswith("@cdn_"):
+                    result["fileid"] = attach_id
+
+    if not result["aeskey"] or not result["fileid"]:
+        if msg_type == "3":
+            image_params = _parse_img_xml_cdn_params(msg_xml)
+            result["aeskey"] = result["aeskey"] or image_params.get("decode_key", "")
+            result["fileid"] = result["fileid"] or image_params.get("file_id", "")
+        else:
+            aes_match = re.search(r'(?:\baeskey="|<aeskey>)([^"<]+)', str(msg_xml or ""), re.IGNORECASE)
+            file_match = re.search(
+                r'(?:\bcdnvideourl="|<cdnattachurl>)(?:<!\[CDATA\[)?([^"<\]]+)',
+                str(msg_xml or ""),
+                re.IGNORECASE,
+            )
+            result["aeskey"] = result["aeskey"] or (aes_match.group(1).strip() if aes_match else "")
+            result["fileid"] = result["fileid"] or (file_match.group(1).strip() if file_match else "")
+
+    if not result["filename"]:
+        extension = {"3": ".jpg", "43": ".mp4", "62": ".mp4"}.get(msg_type, ".bin")
+        result["filename"] = f"wechat_media{extension}"
+    return result
+
+
+async def _resolve_media_path(
+    *,
+    msg_id: str,
+    msg_type: str,
+    local_path: str,
+    msg_xml: str,
+    filename: str,
+) -> tuple[str, str]:
+    """Resolve local media first, then use Hook CDN and persist the new path."""
+    candidates = [str(local_path or "").strip(), _cached_media_path(msg_id, msg_type)]
+    for candidate in candidates:
+        if _nonempty_file(candidate):
+            _persist_media_path(msg_id, msg_type, candidate)
+            return candidate, os.path.basename(filename or candidate)
+
+    if not config.IS_LOCAL_HOOK:
+        raise HTTPException(status_code=404, detail="Local media file is unavailable")
+    params = _parse_media_download_params(msg_type, msg_xml, filename)
+    if (not params["aeskey"] or not params["fileid"]) and msg_id:
+        try:
+            structure = await wechat_api.get_msg_struct(msg_id)
+            structure_xml, structure_type = _message_struct_content(structure)
+            params = _parse_media_download_params(
+                structure_type if structure_type in {"3", "43", "49", "62"} else msg_type,
+                structure_xml,
+                filename,
+            )
+        except Exception as exc:
+            _log(f"[MEDIA] GetMsgStruct fallback failed for {msg_id}: {type(exc).__name__}: {exc}")
+    if not params["aeskey"] or not params["fileid"]:
+        raise HTTPException(status_code=404, detail="No usable local path or CDN parameters")
+
+    msg_part = _safe_media_filename_part(msg_id, "nomsg", 64)
+    source_name = os.path.basename(str(params["filename"] or "media").replace("\\", "/"))
+    extension = os.path.splitext(source_name)[1]
+    cache_name = f"{msg_part}_{hashlib.sha256(params['fileid'].encode('utf-8')).hexdigest()[:12]}{extension}"
+    cache_path = os.path.abspath(os.path.join(_MEDIA_CACHE_DIR, cache_name))
+    if _nonempty_file(cache_path):
+        _persist_media_path(msg_id, msg_type, cache_path)
+        return cache_path, source_name
+
+    async with _cdn_download_sem:
+        if not _nonempty_file(cache_path):
+            result = await wechat_api.cdn_download(
+                params["aeskey"],
+                params["fileid"],
+                cache_path,
+                file_type=int(params["file_type"]),
+                large_video=int(params["large_video"]),
+            )
+            returned_path = _extract_download_save_path(result)
+            for _ in range(20):
+                if _nonempty_file(returned_path) or _nonempty_file(cache_path):
+                    break
+                await asyncio.sleep(0.1)
+
+            ready_path = returned_path if _nonempty_file(returned_path) else cache_path
+            if not _nonempty_file(ready_path):
+                requested_path = str((result or {}).get("requested_save_path") or "") if isinstance(result, dict) else ""
+                downloaded = await wechat_api.read_local_download(requested_path)
+                if downloaded:
+                    temp_path = cache_path + ".tmp"
+                    with open(temp_path, "wb") as output:
+                        output.write(downloaded)
+                    os.replace(temp_path, cache_path)
+                    ready_path = cache_path
+            if not _nonempty_file(ready_path):
+                error = str((result or {}).get("error") or (result or {}).get("retmsg") or "CDN download failed")
+                raise HTTPException(status_code=502, detail=error)
+        else:
+            ready_path = cache_path
+
+    _persist_media_path(msg_id, msg_type, ready_path)
+    return ready_path, source_name
+
+
+@app.post("/api/media/resolve")
+async def resolve_media(request: Request):
+    body = await request.json()
+    msg_type = str(body.get("msgtype", "") or "")
+    path, filename = await _resolve_media_path(
+        msg_id=str(body.get("msg_id", "") or ""),
+        msg_type=msg_type,
+        local_path=str(body.get("path", "") or ""),
+        msg_xml=str(body.get("msg_xml", "") or ""),
+        filename=str(body.get("filename", "") or ""),
+    )
+    return _media_file_response(path, filename, download=bool(body.get("download", False)))
+
+
+def _silk_codec_executable(kind: str) -> str:
+    filename = f"silk_v3_{kind}.exe" if os.name == "nt" else f"silk_v3_{kind}"
+    configured = str(os.environ.get(f"SILK_{kind.upper()}_PATH") or "").strip()
+    candidates = [configured, shutil.which(filename) or ""]
+    backend_dir = os.path.dirname(__file__)
+    candidates.extend([
+        os.path.join(backend_dir, "tools", filename),
+        os.path.join(os.path.dirname(backend_dir), "tools", filename),
+        os.path.join(os.path.expanduser("~"), "Desktop", "OtherVersion", "3.7.6.44", filename),
+    ])
+    versions_dir = os.path.join(os.path.expanduser("~"), "Desktop", "OtherVersion")
+    try:
+        candidates.extend(
+            os.path.join(entry.path, filename)
+            for entry in os.scandir(versions_dir)
+            if entry.is_dir()
+        )
+    except OSError:
+        pass
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    raise RuntimeError(f"{filename} was not found; configure SILK_{kind.upper()}_PATH")
+
+
+def _run_media_command(command: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    return subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+        creationflags=creation_flags,
+    )
+
+
+def _binary_from_text(value: Any) -> bytes:
+    raw = str(value or "").strip()
+    if not raw:
+        return b""
+    compact = re.sub(r"\s+", "", raw)
+    if len(compact) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", compact):
+        try:
+            return bytes.fromhex(compact)
+        except ValueError:
+            pass
+    if "," in compact and compact.lower().startswith("data:"):
+        compact = compact.split(",", 1)[1]
+    try:
+        return base64.b64decode(compact, validate=True)
+    except Exception:
+        return b""
+
+
+def _voice_source_from_result(result: Any) -> tuple[bytes, str]:
+    stack = [result]
+    found_path = ""
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                lowered = str(key).replace("_", "").lower()
+                if lowered in {"voicehex", "voicedata", "filedata", "hex"}:
+                    payload = _binary_from_text(value)
+                    if payload:
+                        return payload, found_path
+                if lowered in {"voicepath", "filepath", "savepath", "path"} and isinstance(value, str):
+                    found_path = value.strip() or found_path
+                elif isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(current, list):
+            stack.extend(current)
+    return b"", found_path
+
+
+def _decode_silk_to_wav(silk_data: bytes, msg_id: str = "") -> tuple[str, str]:
+    if not silk_data or len(silk_data) > 25 * 1024 * 1024:
+        raise ValueError("Invalid Silk payload")
+    if b"#!SILK_V3" not in silk_data[:16]:
+        raise ValueError("Voice payload is not Silk v3")
+
+    digest = hashlib.sha256(silk_data).hexdigest()
+    stem = f"{_safe_media_filename_part(msg_id, 'voice', 48)}_{digest[:16]}"
+    silk_path = os.path.join(_VOICE_CACHE_DIR, f"{stem}.silk")
+    pcm_path = os.path.join(_VOICE_CACHE_DIR, f"{stem}.pcm")
+    wav_path = os.path.join(_VOICE_CACHE_DIR, f"{stem}.wav")
+    if _nonempty_file(wav_path):
+        return wav_path, silk_path
+
+    if not _nonempty_file(silk_path):
+        temp_silk = silk_path + ".tmp"
+        with open(temp_silk, "wb") as output:
+            output.write(silk_data)
+        os.replace(temp_silk, silk_path)
+
+    decoder = _silk_codec_executable("decoder")
+    decoded = _run_media_command([
+        decoder, silk_path, pcm_path, "-Fs_API", "24000", "-quiet",
+    ])
+    if decoded.returncode != 0 or not _nonempty_file(pcm_path):
+        error = decoded.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Silk decode failed: {error[:300]}")
+
+    converted = _run_media_command([
+        _ffmpeg_executable(), "-hide_banner", "-loglevel", "error",
+        "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", pcm_path,
+        "-y", wav_path,
+    ])
+    try:
+        os.unlink(pcm_path)
+    except OSError:
+        pass
+    if converted.returncode != 0 or not _nonempty_file(wav_path):
+        error = converted.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Voice conversion failed: {error[:300]}")
+    return wav_path, silk_path
+
+
+@app.post("/api/media/voice")
+async def resolve_voice(request: Request):
+    body = await request.json()
+    msg_id = str(body.get("msg_id", "") or "")
+    cached = sqlite_cache.get_message_by_id(msg_id, owner_wxid=_contact_owner_wxid()) if msg_id else None
+    local_path = str(body.get("path", "") or (cached or {}).get("voice_path") or "")
+    if _nonempty_file(local_path):
+        if os.path.splitext(local_path)[1].lower() in {".wav", ".mp3", ".ogg", ".m4a", ".webm"}:
+            return _media_file_response(local_path)
+        with open(local_path, "rb") as source:
+            silk_data = source.read(25 * 1024 * 1024 + 1)
+    else:
+        silk_data = b""
+
+    if not silk_data:
+        for value in (
+            body.get("voice_hex"), body.get("voice_data"),
+            (cached or {}).get("voice_hex"), (cached or {}).get("voice_data"),
+        ):
+            silk_data = _binary_from_text(value)
+            if silk_data:
+                break
+
+    if not silk_data and msg_id:
+        try:
+            voice_length = int(body.get("length") or (cached or {}).get("voice_len") or 0)
+        except (TypeError, ValueError):
+            voice_length = 0
+        hook_result = await wechat_api.download_voice(
+            str(body.get("clientmsgid") or (cached or {}).get("clientmsgid") or ""),
+            voice_length,
+            str(body.get("fromgid") or (cached or {}).get("fromgid") or ""),
+            msg_id,
+        )
+        silk_data, downloaded_path = _voice_source_from_result(hook_result)
+        if not silk_data and _nonempty_file(downloaded_path):
+            with open(downloaded_path, "rb") as source:
+                silk_data = source.read(25 * 1024 * 1024 + 1)
+
+    if not silk_data:
+        raise HTTPException(status_code=404, detail="Voice data is unavailable")
+    try:
+        wav_path, silk_path = await asyncio.to_thread(_decode_silk_to_wav, silk_data, msg_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _persist_media_path(msg_id, "34", silk_path)
+    return FileResponse(wav_path, media_type="audio/wav")
 
 
 def _extract_download_save_path(result: Any) -> str:
