@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { analyzeAiMessage, deleteSmartReply, getAiSettings, getGroupMemberDetails, getMcpTools, getSmartReplies, saveAiSettings, saveSmartReply, validateAiSettings, validateMcpConnection } from "../api";
 import type { AiAnalysisResult, AiProfile, AiSettings, McpConnection, McpTool, SmartReplyAiOutputMode, SmartReplyAiTask, SmartReplyConfig, SmartReplyMessageType, SmartReplyRule, SmartReplyTarget } from "../types";
 import { DEFAULT_AVATAR_URL } from "../avatar";
@@ -22,6 +22,19 @@ type TextReplyMode = "rules" | "ai";
 interface SmartReplyViewPreference {
   message_type?: SmartReplyMessageType;
   text_reply_mode?: TextReplyMode;
+  message_views?: Partial<Record<SmartReplyMessageType, SmartReplyMessageViewPreference>>;
+}
+
+interface SmartReplyMessageViewPreference {
+  reply_mode?: TextReplyMode;
+  members_expanded?: boolean;
+  file_types_expanded?: boolean;
+  skills_expanded?: boolean;
+  ai_test_expanded?: boolean;
+  ai_test_task_id?: string;
+  expanded_rule_id?: string;
+  expanded_skill_ids?: string[];
+  skill_instruction_heights?: Record<string, number>;
 }
 
 const SMART_REPLY_VIEW_PREFERENCES_KEY = "wechat-smart-reply-view-preferences-v1";
@@ -51,7 +64,7 @@ function readViewPreference(chatId: string): SmartReplyViewPreference {
   try {
     const stored = JSON.parse(window.localStorage.getItem(SMART_REPLY_VIEW_PREFERENCES_KEY) || "{}");
     const preference = stored?.[chatId];
-    return preference && typeof preference === "object" ? preference : {};
+    return preference && typeof preference === "object" && !Array.isArray(preference) ? preference : {};
   } catch {
     return {};
   }
@@ -61,12 +74,37 @@ function writeViewPreference(chatId: string, patch: SmartReplyViewPreference) {
   if (typeof window === "undefined" || !chatId) return;
   try {
     const stored = JSON.parse(window.localStorage.getItem(SMART_REPLY_VIEW_PREFERENCES_KEY) || "{}");
-    const preferences = stored && typeof stored === "object" ? stored : {};
+    const preferences = stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
     preferences[chatId] = { ...(preferences[chatId] || {}), ...patch };
     window.localStorage.setItem(SMART_REPLY_VIEW_PREFERENCES_KEY, JSON.stringify(preferences));
   } catch {
     // Browser storage can be unavailable in private or restricted contexts.
   }
+}
+
+function readMessageViewPreference(
+  chatId: string,
+  messageType: SmartReplyMessageType,
+): SmartReplyMessageViewPreference {
+  const view = readViewPreference(chatId).message_views?.[messageType];
+  return view && typeof view === "object" ? view : {};
+}
+
+function writeMessageViewPreference(
+  chatId: string,
+  messageType: SmartReplyMessageType,
+  patch: SmartReplyMessageViewPreference,
+) {
+  const preference = readViewPreference(chatId);
+  writeViewPreference(chatId, {
+    message_views: {
+      ...(preference.message_views || {}),
+      [messageType]: {
+        ...(preference.message_views?.[messageType] || {}),
+        ...patch,
+      },
+    },
+  });
 }
 
 function makeRule(messageType: SmartReplyMessageType = "text"): SmartReplyRule {
@@ -340,6 +378,7 @@ export default function SmartReplyManager({
   const [members, setMembers] = useState<GroupMember[]>([]);
   const [memberQuery, setMemberQuery] = useState("");
   const [membersExpanded, setMembersExpanded] = useState(false);
+  const [fileTypesExpanded, setFileTypesExpanded] = useState(false);
   const [listQuery, setListQuery] = useState("");
   const [pickerQuery, setPickerQuery] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -357,8 +396,94 @@ export default function SmartReplyManager({
   const [expandedRuleId, setExpandedRuleId] = useState<string | null>(null);
   const [skillsExpanded, setSkillsExpanded] = useState(false);
   const [expandedSkillIds, setExpandedSkillIds] = useState<Set<string>>(() => new Set());
+  const [skillInstructionHeights, setSkillInstructionHeights] = useState<Record<string, number>>({});
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+
+  const persistActiveMessageView = useCallback((patch: SmartReplyMessageViewPreference) => {
+    if (!draft?.chat_id) return;
+    writeMessageViewPreference(draft.chat_id, activeMessageType, patch);
+  }, [activeMessageType, draft?.chat_id]);
+
+  const applyMessageViewPreference = useCallback((
+    config: SmartReplyConfig,
+    messageType: SmartReplyMessageType,
+    legacyReplyMode?: TextReplyMode,
+  ) => {
+    const view = readMessageViewPreference(config.chat_id, messageType);
+    const tasks = config.ai_tasks.filter((task) => task.message_type === messageType);
+    const taskIds = new Set(tasks.map((task) => task.id));
+    const ruleIds = new Set(config.rules.filter((rule) => rule.message_type === messageType).map((rule) => rule.id));
+    const storedHeights = view.skill_instruction_heights
+      && typeof view.skill_instruction_heights === "object"
+      && !Array.isArray(view.skill_instruction_heights)
+      ? view.skill_instruction_heights
+      : {};
+    const restoredHeights = Object.fromEntries(
+      Object.entries(storedHeights)
+        .filter(([id, height]) => taskIds.has(id) && Number.isFinite(height))
+        .map(([id, height]) => [id, Math.max(94, Math.min(800, Math.round(height)))]),
+    );
+    const preferredReplyMode = view.reply_mode === "rules" || view.reply_mode === "ai"
+      ? view.reply_mode
+      : legacyReplyMode === "rules" || legacyReplyMode === "ai"
+        ? legacyReplyMode
+        : tasks.length > 0 ? "ai" : "rules";
+
+    setTextReplyMode(preferredReplyMode);
+    setMembersExpanded(
+      typeof view.members_expanded === "boolean"
+        ? view.members_expanded
+        : config.chat_id.endsWith("@chatroom")
+          && (config.target_senders_by_type[messageType] || []).length === 0,
+    );
+    setFileTypesExpanded(Boolean(view.file_types_expanded));
+    setSkillsExpanded(Boolean(view.skills_expanded));
+    setAiTestExpanded(messageType === "text" && Boolean(view.ai_test_expanded));
+    setAiTestTaskId(
+      view.ai_test_task_id && taskIds.has(view.ai_test_task_id)
+        ? view.ai_test_task_id
+        : tasks[0]?.id || "",
+    );
+    setExpandedRuleId(view.expanded_rule_id && ruleIds.has(view.expanded_rule_id) ? view.expanded_rule_id : null);
+    setExpandedSkillIds(new Set(
+      (Array.isArray(view.expanded_skill_ids) ? view.expanded_skill_ids : []).filter((id) => taskIds.has(id)),
+    ));
+    setSkillInstructionHeights(restoredHeights);
+  }, []);
+
+  const updateAiTestExpanded = useCallback((expanded: boolean) => {
+    setAiTestExpanded(expanded);
+    persistActiveMessageView({ ai_test_expanded: expanded });
+  }, [persistActiveMessageView]);
+
+  const updateExpandedRuleId = useCallback((id: string | null) => {
+    setExpandedRuleId(id);
+    persistActiveMessageView({ expanded_rule_id: id || "" });
+  }, [persistActiveMessageView]);
+
+  const updateExpandedSkillIds = useCallback((ids: Set<string>) => {
+    setExpandedSkillIds(ids);
+    persistActiveMessageView({ expanded_skill_ids: Array.from(ids) });
+  }, [persistActiveMessageView]);
+
+  const toggleMembersExpanded = useCallback(() => {
+    const expanded = !membersExpanded;
+    setMembersExpanded(expanded);
+    persistActiveMessageView({ members_expanded: expanded });
+  }, [membersExpanded, persistActiveMessageView]);
+
+  const toggleFileTypesExpanded = useCallback(() => {
+    const expanded = !fileTypesExpanded;
+    setFileTypesExpanded(expanded);
+    persistActiveMessageView({ file_types_expanded: expanded });
+  }, [fileTypesExpanded, persistActiveMessageView]);
+
+  const toggleSkillsExpanded = useCallback(() => {
+    const expanded = !skillsExpanded;
+    setSkillsExpanded(expanded);
+    persistActiveMessageView({ skills_expanded: expanded });
+  }, [persistActiveMessageView, skillsExpanded]);
 
   useEffect(() => {
     if (!expandedRuleId) return;
@@ -366,24 +491,24 @@ export default function SmartReplyManager({
       if (!(event.target instanceof Element)) return;
       const ruleElement = event.target.closest("[data-smart-reply-rule-id]");
       if (ruleElement?.getAttribute("data-smart-reply-rule-id") !== expandedRuleId) {
-        setExpandedRuleId(null);
+        updateExpandedRuleId(null);
       }
     };
     document.addEventListener("pointerdown", collapseOnOutsideClick);
     return () => document.removeEventListener("pointerdown", collapseOnOutsideClick);
-  }, [expandedRuleId]);
+  }, [expandedRuleId, updateExpandedRuleId]);
 
   useEffect(() => {
     if (!aiTestExpanded) return;
     const collapseTestOnOutsideClick = (event: MouseEvent) => {
       if (!(event.target instanceof Element)) return;
       if (!event.target.closest("[data-ai-test-panel]")) {
-        setAiTestExpanded(false);
+        updateAiTestExpanded(false);
       }
     };
     document.addEventListener("click", collapseTestOnOutsideClick);
     return () => document.removeEventListener("click", collapseTestOnOutsideClick);
-  }, [aiTestExpanded]);
+  }, [aiTestExpanded, updateAiTestExpanded]);
 
   const loadMembers = useCallback(async (chatId: string) => {
     setMembersLoading(true);
@@ -448,17 +573,8 @@ export default function SmartReplyManager({
       : cloned.ai_tasks.some((task) => task.message_type === preferredMessageType) ? "ai" : "rules";
     setDraft(cloned);
     setActiveMessageType(preferredMessageType);
-    setTextReplyMode(preferredReplyMode);
-    setAiTestTaskId(cloned.ai_tasks.find((task) => task.message_type === preferredMessageType)?.id || "");
+    applyMessageViewPreference(cloned, preferredMessageType, preferredReplyMode);
     setAiTestResult(null);
-    setAiTestExpanded(false);
-    setExpandedRuleId(null);
-    setSkillsExpanded(false);
-    setExpandedSkillIds(new Set());
-    setMembersExpanded(
-      cloned.chat_id.endsWith("@chatroom")
-      && (cloned.target_senders_by_type[preferredMessageType] || []).length === 0,
-    );
     setError("");
     setNotice("");
     if (config.chat_id.endsWith("@chatroom")) {
@@ -468,7 +584,7 @@ export default function SmartReplyManager({
       setMemberQuery("");
       setMembersLoading(false);
     }
-  }, [loadMembers]);
+  }, [applyMessageViewPreference, loadMembers]);
 
   const openTarget = useCallback((target: SmartReplyTarget, rows = configs) => {
     const existing = rows.find((config) => config.chat_id === target.wxid);
@@ -718,24 +834,34 @@ export default function SmartReplyManager({
 
   const addAiTask = () => {
     const task = makeAiSkill(activeMessageType);
+    const nextExpandedSkillIds = new Set(expandedSkillIds).add(task.id);
     setDraft((prev) => prev ? { ...prev, ai_tasks: [...prev.ai_tasks, task] } : prev);
     setSkillsExpanded(true);
-    setExpandedSkillIds((prev) => new Set(prev).add(task.id));
+    updateExpandedSkillIds(nextExpandedSkillIds);
+    persistActiveMessageView({ skills_expanded: true });
     setAiTestTaskId(task.id);
+    persistActiveMessageView({ ai_test_task_id: task.id });
     setNotice("");
     setAiTestResult(null);
   };
 
   const removeAiTask = (id: string) => {
-    setExpandedSkillIds((prev) => {
-      const next = new Set(prev);
-      next.delete(id);
-      return next;
-    });
+    const nextExpandedSkillIds = new Set(expandedSkillIds);
+    nextExpandedSkillIds.delete(id);
+    const nextHeights = { ...skillInstructionHeights };
+    const remainingTasks = (draft?.ai_tasks || []).filter((task) => task.id !== id);
+    const nextAiTestTaskId = aiTestTaskId === id
+      ? remainingTasks.find((task) => task.message_type === activeMessageType)?.id || ""
+      : aiTestTaskId;
+    delete nextHeights[id];
+    updateExpandedSkillIds(nextExpandedSkillIds);
+    setSkillInstructionHeights(nextHeights);
+    persistActiveMessageView({ skill_instruction_heights: nextHeights });
+    setAiTestTaskId(nextAiTestTaskId);
+    persistActiveMessageView({ ai_test_task_id: nextAiTestTaskId });
     setDraft((prev) => {
       if (!prev) return prev;
       const aiTasks = prev.ai_tasks.filter((task) => task.id !== id);
-      setAiTestTaskId((current) => current === id ? (aiTasks[0]?.id || "") : current);
       return { ...prev, ai_tasks: aiTasks };
     });
     setNotice("");
@@ -743,12 +869,53 @@ export default function SmartReplyManager({
   };
 
   const toggleSkillExpanded = (id: string) => {
-    setExpandedSkillIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+    const next = new Set(expandedSkillIds);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    updateExpandedSkillIds(next);
+  };
+
+  const commitSkillInstructionHeight = (taskId: string, height: number) => {
+    const normalizedHeight = Math.max(94, Math.min(800, Math.round(height)));
+    const nextHeights = { ...skillInstructionHeights, [taskId]: normalizedHeight };
+    setSkillInstructionHeights(nextHeights);
+    persistActiveMessageView({ skill_instruction_heights: nextHeights });
+  };
+
+  const startSkillInstructionResize = (event: ReactPointerEvent<HTMLDivElement>, taskId: string) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    const pointerId = event.pointerId;
+    const startY = event.clientY;
+    const startHeight = skillInstructionHeights[taskId] || 120;
+    let latestHeight = startHeight;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+
+    handle.setPointerCapture(pointerId);
+    document.body.style.cursor = "ns-resize";
+    document.body.style.userSelect = "none";
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      latestHeight = Math.max(94, Math.min(800, Math.round(startHeight + moveEvent.clientY - startY)));
+      setSkillInstructionHeights((current) => ({ ...current, [taskId]: latestHeight }));
+    };
+    const finishResize = (finishEvent: PointerEvent) => {
+      if (finishEvent.pointerId !== pointerId) return;
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", finishResize);
+      window.removeEventListener("pointercancel", finishResize);
+      if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      commitSkillInstructionHeight(taskId, latestHeight);
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", finishResize);
+    window.addEventListener("pointercancel", finishResize);
   };
 
   const testAiTask = async () => {
@@ -805,7 +972,7 @@ export default function SmartReplyManager({
         return;
       }
       updateDraft({ rules });
-      setExpandedRuleId(null);
+      updateExpandedRuleId(null);
       setError("");
       setNotice(`已导入 ${imported.length} 条规则，请保存`);
     } catch (value) {
@@ -935,20 +1102,18 @@ export default function SmartReplyManager({
   }, [availableTargets, pickerQuery]);
 
   const aiTestPanel = textReplyMode === "ai" && currentAiTasks.length > 0 ? (
-    <div data-ai-test-panel className={`mt-[24px] border-y ${dark ? "border-[#303030]" : "border-[#ddd]"}`}>
+    <div data-ai-test-panel className={`border-y ${dark ? "border-[#303030]" : "border-[#ddd]"}`}>
       <button
         type="button"
         aria-expanded={aiTestExpanded}
-        onClick={() => setAiTestExpanded((expanded) => !expanded)}
+        onClick={() => updateAiTestExpanded(!aiTestExpanded)}
         className={`w-full min-h-[58px] py-[10px] flex items-center gap-[12px] text-left ${dark ? "hover:bg-[#171717]" : "hover:bg-[#f7f7f7]"}`}
       >
         <div className="min-w-0 flex-1">
           <h3 className="text-[14px] font-medium">Skill 测试</h3>
           <div className={`mt-[3px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>选择自定义 Skill 测试，不发送微信消息</div>
         </div>
-        <svg className={`w-[18px] h-[18px] shrink-0 transition-transform ${aiTestExpanded ? "rotate-180" : ""} ${dark ? "text-[#777]" : "text-[#888]"}`} fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" />
-        </svg>
+        <CollapseChevron expanded={aiTestExpanded} dark={dark} />
       </button>
       {aiTestExpanded && (
         <div className={`pb-[18px] pt-[14px] border-t ${dark ? "border-[#292929]" : "border-[#e5e5e5]"}`}>
@@ -958,6 +1123,7 @@ export default function SmartReplyManager({
               value={aiTestTaskId || currentAiTasks[0]?.id || ""}
               onChange={(event) => {
                 setAiTestTaskId(event.target.value);
+                persistActiveMessageView({ ai_test_task_id: event.target.value });
                 setAiTestResult(null);
               }}
               className={`min-w-[220px] flex-1 h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}
@@ -1055,12 +1221,15 @@ export default function SmartReplyManager({
           <div className={`py-[48px] px-[20px] text-center text-[13px] ${dark ? "text-[#666]" : "text-[#999]"}`}>暂无智能回复配置</div>
         ) : filteredConfigs.map((config) => {
           const active = config.chat_id === draft?.chat_id;
+          const aiReplyEnabled = config.chat_id.endsWith("@chatroom")
+            && config.enabled
+            && config.ai_tasks.some((task) => task.enabled);
           return (
             <button
               type="button"
               key={config.chat_id}
               onClick={() => openConfig(config)}
-              className={`w-full h-[66px] px-[12px] flex items-center gap-[10px] text-left ${
+              className={`relative overflow-hidden w-full h-[66px] px-[12px] flex items-center gap-[10px] text-left ${aiReplyEnabled ? "ai-reply-enabled-border" : ""} ${
                 dark
                   ? (active ? "bg-[#303030]" : "hover:bg-[#242424]")
                   : (active ? "bg-[#d0d0d0]" : "hover:bg-[#dedede]")
@@ -1177,15 +1346,12 @@ export default function SmartReplyManager({
                     role="tab"
                     aria-selected={active}
                     onClick={() => {
+                      const preference = readViewPreference(draft.chat_id);
                       setActiveMessageType(option.value);
                       writeViewPreference(draft.chat_id, { message_type: option.value });
-                      setMembersExpanded((draft.target_senders_by_type[option.value] || []).length === 0);
+                      applyMessageViewPreference(draft, option.value, preference.text_reply_mode);
                       setMemberQuery("");
-                      setAiTestTaskId(draft.ai_tasks.find((task) => task.message_type === option.value)?.id || "");
                       setAiTestResult(null);
-                      setExpandedRuleId(null);
-                      setSkillsExpanded(false);
-                      setExpandedSkillIds(new Set());
                     }}
                     className="h-full"
                   >
@@ -1215,7 +1381,7 @@ export default function SmartReplyManager({
                 aria-selected={textReplyMode === "rules"}
                 onClick={() => {
                   setTextReplyMode("rules");
-                  writeViewPreference(draft.chat_id, { text_reply_mode: "rules" });
+                  persistActiveMessageView({ reply_mode: "rules" });
                 }}
                 className={`h-[38px] flex items-center gap-[7px] border-b-2 text-[13px] ${
                   textReplyMode === "rules"
@@ -1232,7 +1398,7 @@ export default function SmartReplyManager({
                 aria-selected={textReplyMode === "ai"}
                 onClick={() => {
                   setTextReplyMode("ai");
-                  writeViewPreference(draft.chat_id, { text_reply_mode: "ai" });
+                  persistActiveMessageView({ reply_mode: "ai" });
                 }}
                 className={`h-[38px] flex items-center gap-[7px] border-b-2 text-[13px] ${
                   textReplyMode === "ai"
@@ -1257,15 +1423,27 @@ export default function SmartReplyManager({
             </div>
           </section>
           ) : (
-          <section className={`py-[20px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
-            <div className="flex flex-wrap items-start justify-between gap-[10px]">
+          <section className={`border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+            <button
+              type="button"
+              title={fileTypesExpanded ? "收起文件内容识别" : "展开文件内容识别"}
+              aria-label={fileTypesExpanded ? "收起文件内容识别" : "展开文件内容识别"}
+              aria-expanded={fileTypesExpanded}
+              aria-controls="smart-reply-file-types"
+              onClick={toggleFileTypesExpanded}
+              className={`w-full py-[20px] flex flex-wrap items-center justify-between gap-[10px] text-left select-none ${dark ? "hover:bg-[#151515]" : "hover:bg-[#f7f7f7]"}`}
+            >
               <div>
                 <h2 className="text-[15px] font-medium">文件内容识别</h2>
                 <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>选择允许读取内容的文件类型</div>
               </div>
-              <span className={`text-[11px] ${dark ? "text-[#666]" : "text-[#999]"}`}>最大 2 MB</span>
-            </div>
-            <div className="mt-[14px] grid grid-cols-2 sm:grid-cols-4 gap-[8px]">
+              <span className="flex items-center gap-[10px]">
+                <span className={`text-[11px] ${dark ? "text-[#666]" : "text-[#999]"}`}>最大 2 MB</span>
+                <CollapseChevron expanded={fileTypesExpanded} dark={dark} />
+              </span>
+            </button>
+            {fileTypesExpanded && (
+            <div id="smart-reply-file-types" className="pb-[20px] grid grid-cols-2 sm:grid-cols-4 gap-[8px]">
               {FILE_TYPE_OPTIONS.map((option) => {
                 const enabled = option.available && draft.file_types.includes(option.value);
                 return (
@@ -1296,6 +1474,7 @@ export default function SmartReplyManager({
                 );
               })}
             </div>
+            )}
           </section>
           )}
 
@@ -1315,8 +1494,18 @@ export default function SmartReplyManager({
           )}
 
           {draft.chat_id.endsWith("@chatroom") && (
-          <section className={`py-[24px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
-            <div className="flex items-center justify-between gap-[12px]">
+          <section className={`border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+            <div className="relative">
+              <button
+              type="button"
+              title={membersExpanded ? "收起群成员" : "展开群成员"}
+              aria-label={membersExpanded ? "收起群成员" : "展开群成员"}
+              aria-expanded={membersExpanded}
+              aria-controls="smart-reply-member-picker"
+              onClick={toggleMembersExpanded}
+              className={`absolute inset-0 z-0 w-full rounded-[4px] outline-none focus-visible:ring-1 focus-visible:ring-[#07c160] ${dark ? "hover:bg-[#151515]" : "hover:bg-[#f7f7f7]"}`}
+              />
+              <div className="relative z-10 py-[24px] flex items-center justify-between gap-[12px] pointer-events-none select-none">
               <div>
                 <h2 className="text-[15px] font-medium">监听目标发送人的消息</h2>
                 <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>
@@ -1328,42 +1517,29 @@ export default function SmartReplyManager({
                   </div>
                 )}
               </div>
-              <div className="flex items-center gap-[8px]">
+              <div className="flex items-center gap-[8px] pointer-events-none">
                 {membersExpanded && selectableMemberWxids.length > 0 && (
                   <button
                     type="button"
-                    onClick={() => updateTargetSenders(
-                      allSelectableMembersSelected ? [] : selectableMemberWxids,
-                    )}
-                    className={`h-[34px] px-[6px] text-[13px] ${dark ? "text-[#9a9a9a] hover:text-white" : "text-[#666] hover:text-black"}`}
+                    onClick={() => updateTargetSenders(allSelectableMembersSelected ? [] : selectableMemberWxids)}
+                    className={`pointer-events-auto h-[34px] px-[6px] text-[13px] ${dark ? "text-[#9a9a9a] hover:text-white" : "text-[#666] hover:text-black"}`}
                   >
                     {allSelectableMembersSelected ? "取消全选" : "全选"}
                   </button>
                 )}
-                <button
-                  type="button"
-                  title={membersExpanded ? "收起群成员" : "展开群成员"}
-                  aria-label={membersExpanded ? "收起群成员" : "展开群成员"}
-                  aria-expanded={membersExpanded}
-                  aria-controls="smart-reply-member-picker"
-                  onClick={() => setMembersExpanded((expanded) => !expanded)}
-                  className={`w-[34px] h-[34px] shrink-0 flex items-center justify-center rounded-[5px] ${dark ? "text-[#999] hover:bg-[#222] hover:text-white" : "text-[#666] hover:bg-[#ededed] hover:text-black"}`}
-                >
-                  <svg
-                    className={`w-[18px] h-[18px] transition-transform ${membersExpanded ? "rotate-180" : ""}`}
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth={1.8}
-                    viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" />
-                  </svg>
-                </button>
+                <CollapseChevron
+                  expanded={membersExpanded}
+                  dark={dark}
+                  onClick={toggleMembersExpanded}
+                  label={membersExpanded ? "收起群成员" : "展开群成员"}
+                  className="mx-[8px] pointer-events-auto"
+                />
+              </div>
               </div>
             </div>
             {membersExpanded && (
-              <div id="smart-reply-member-picker">
-                <div className={`mt-[14px] h-[36px] max-w-[420px] rounded-[5px] border flex items-center px-[10px] ${dark ? "border-[#353535] bg-[#1b1b1b]" : "border-[#d5d5d5] bg-white"}`}>
+              <div id="smart-reply-member-picker" className="pb-[24px]">
+                <div className={`h-[36px] max-w-[420px] rounded-[5px] border flex items-center px-[10px] ${dark ? "border-[#353535] bg-[#1b1b1b]" : "border-[#d5d5d5] bg-white"}`}>
                   <svg className={`w-[15px] h-[15px] ${dark ? "text-[#666]" : "text-[#888]"}`} fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
                     <path strokeLinecap="round" d="m21 21-5-5m2-6a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z" />
                   </svg>
@@ -1406,8 +1582,6 @@ export default function SmartReplyManager({
             )}
           </section>
           )}
-
-          {activeMessageType === "text" && aiTestPanel}
 
           {(activeMessageType === "text" || activeMessageType === "image") && textReplyMode === "rules" ? (
           <section className="py-[24px]">
@@ -1511,7 +1685,7 @@ export default function SmartReplyManager({
                   ) : (
                     <button
                       type="button"
-                      onClick={() => setExpandedRuleId(rule.id)}
+                      onClick={() => updateExpandedRuleId(rule.id)}
                       className={`mt-[10px] block w-full h-[38px] rounded-[5px] border px-[10px] text-left text-[14px] leading-[36px] truncate ${dark ? "border-[#393939] bg-[#111] text-[#ddd]" : "border-[#d8d8d8] bg-[#fafafa] text-[#222]"}`}
                     >
                       {rule.reply_with_matched_line
@@ -1524,8 +1698,18 @@ export default function SmartReplyManager({
             </div>
           </section>
           ) : (
-          <section className="py-[24px]">
-            <div className="flex flex-wrap items-start justify-between gap-[12px]">
+          <section>
+            <div className="relative">
+              <button
+              type="button"
+              title={skillsExpanded ? "收起全部 Skill" : "展开全部 Skill"}
+              aria-label={skillsExpanded ? "收起全部 Skill" : "展开全部 Skill"}
+              aria-expanded={skillsExpanded}
+              aria-controls="smart-reply-skill-list"
+              onClick={toggleSkillsExpanded}
+              className={`absolute inset-0 z-0 w-full rounded-[4px] outline-none focus-visible:ring-1 focus-visible:ring-[#07c160] ${dark ? "hover:bg-[#151515]" : "hover:bg-[#f7f7f7]"}`}
+              />
+              <div className="relative z-10 py-[24px] flex flex-wrap items-start justify-between gap-[12px] pointer-events-none select-none">
               <div>
                 <div className="flex items-center gap-[8px]">
                   <h2 className="text-[15px] font-medium">自定义 Skill</h2>
@@ -1537,38 +1721,28 @@ export default function SmartReplyManager({
                 </div>
                 <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>{currentAiTasks.length} 个 Skill</div>
               </div>
-              <div className="flex items-center gap-[8px]">
+              <div className="flex items-center gap-[8px] pointer-events-none">
                 <button
                   type="button"
                   onClick={addAiTask}
-                  className={`h-[32px] px-[11px] rounded-[5px] border text-[13px] ${dark ? "border-[#3b3b3b] hover:bg-[#222]" : "border-[#d2d2d2] bg-white hover:bg-[#f0f0f0]"}`}
+                  className={`pointer-events-auto h-[32px] px-[11px] rounded-[5px] border text-[13px] ${dark ? "border-[#3b3b3b] hover:bg-[#222]" : "border-[#d2d2d2] bg-white hover:bg-[#f0f0f0]"}`}
                 >
                   新建 Skill
                 </button>
-                <button
-                  type="button"
-                  title={skillsExpanded ? "收起全部 Skill" : "展开全部 Skill"}
-                  aria-label={skillsExpanded ? "收起全部 Skill" : "展开全部 Skill"}
-                  aria-expanded={skillsExpanded}
-                  aria-controls="smart-reply-skill-list"
-                  onClick={() => setSkillsExpanded((expanded) => !expanded)}
-                  className={`w-[34px] h-[34px] shrink-0 flex items-center justify-center rounded-[5px] ${dark ? "text-[#999] hover:bg-[#222] hover:text-white" : "text-[#666] hover:bg-[#ededed] hover:text-black"}`}
-                >
-                  <svg
-                    className={`w-[18px] h-[18px] transition-transform ${skillsExpanded ? "rotate-180" : ""}`}
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth={1.8}
-                    viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" />
-                  </svg>
-                </button>
+                <CollapseChevron
+                  expanded={skillsExpanded}
+                  dark={dark}
+                  onClick={toggleSkillsExpanded}
+                  label={skillsExpanded ? "收起全部 Skill" : "展开全部 Skill"}
+                  className="mx-[8px] pointer-events-auto"
+                />
+              </div>
               </div>
             </div>
 
             {skillsExpanded && (
-            <div id="smart-reply-skill-list">
+            <div id="smart-reply-skill-list" className="pb-[24px]">
+            {activeMessageType === "text" && aiTestPanel}
             {currentAiTasks.length === 0 ? (
               <div className={`mt-[18px] py-[42px] border text-center text-[13px] rounded-[6px] ${dark ? "border-[#303030] text-[#666]" : "border-[#ddd] text-[#999]"}`}>
                 暂无自定义 Skill
@@ -1576,17 +1750,8 @@ export default function SmartReplyManager({
             ) : (
               <div className="mt-[14px] space-y-[12px]">
                 {currentAiTasks.map((task, index) => (
-                  <div key={task.id} className={`rounded-[6px] border p-[14px] ${dark ? "border-[#303030] bg-[#181818]" : "border-[#dcdcdc] bg-white"}`}>
-                    <div className="flex items-center gap-[10px]">
-                      <span className={`text-[12px] w-[22px] shrink-0 ${dark ? "text-[#666]" : "text-[#999]"}`}>{index + 1}</span>
-                      <Toggle checked={task.enabled} onChange={(enabled) => updateAiTask(task.id, { enabled })} />
-                      <input
-                        value={task.name}
-                        onChange={(event) => updateAiTask(task.id, { name: event.target.value })}
-                        maxLength={80}
-                        aria-label={`Skill ${index + 1} 名称`}
-                        className={`h-[36px] min-w-0 flex-1 rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}
-                      />
+                  <div key={task.id} className={`rounded-[6px] border overflow-hidden ${dark ? "border-[#303030] bg-[#181818]" : "border-[#dcdcdc] bg-white"}`}>
+                    <div className="relative">
                       <button
                         type="button"
                         title={expandedSkillIds.has(task.id) ? "收起 Skill" : "展开 Skill"}
@@ -1594,43 +1759,75 @@ export default function SmartReplyManager({
                         aria-expanded={expandedSkillIds.has(task.id)}
                         aria-controls={`smart-reply-skill-details-${task.id}`}
                         onClick={() => toggleSkillExpanded(task.id)}
-                        className={`w-[34px] h-[34px] shrink-0 flex items-center justify-center rounded-[5px] ${dark ? "text-[#999] hover:bg-[#292929] hover:text-white" : "text-[#666] hover:bg-[#ededed] hover:text-black"}`}
-                      >
-                        <svg
-                          className={`w-[18px] h-[18px] transition-transform ${expandedSkillIds.has(task.id) ? "rotate-180" : ""}`}
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth={1.8}
-                          viewBox="0 0 24 24"
-                        >
-                          <path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" />
-                        </svg>
-                      </button>
+                        className={`absolute inset-0 z-0 w-full outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[#07c160] ${dark ? "hover:bg-[#1d1d1d]" : "hover:bg-[#f7f7f7]"}`}
+                      />
+                      <div className="relative z-10 p-[14px] flex items-center gap-[10px] pointer-events-none select-none">
+                      <span className={`text-[12px] w-[22px] shrink-0 ${dark ? "text-[#666]" : "text-[#999]"}`}>{index + 1}</span>
+                      <span className="pointer-events-auto">
+                        <Toggle checked={task.enabled} onChange={(enabled) => updateAiTask(task.id, { enabled })} />
+                      </span>
+                      <input
+                        value={task.name}
+                        onChange={(event) => updateAiTask(task.id, { name: event.target.value })}
+                        maxLength={80}
+                        aria-label={`Skill ${index + 1} 名称`}
+                        className={`pointer-events-auto h-[36px] min-w-0 flex-1 sm:flex-none sm:basis-1/2 sm:mr-auto rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}
+                      />
+                      <CollapseChevron
+                        expanded={expandedSkillIds.has(task.id)}
+                        dark={dark}
+                        onClick={() => toggleSkillExpanded(task.id)}
+                        label={`${expandedSkillIds.has(task.id) ? "收起" : "展开"} Skill ${index + 1}`}
+                        className="pointer-events-auto"
+                      />
                       <button
                         type="button"
                         title="删除 Skill"
                         aria-label={`删除 Skill ${index + 1}`}
                         onClick={() => removeAiTask(task.id)}
-                        className={`w-[34px] h-[34px] flex items-center justify-center ${dark ? "text-[#888] hover:text-[#e57373]" : "text-[#777] hover:text-[#c33]"}`}
+                        className={`pointer-events-auto w-[34px] h-[34px] flex items-center justify-center ${dark ? "text-[#888] hover:text-[#e57373]" : "text-[#777] hover:text-[#c33]"}`}
                       >
                         <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5" />
                         </svg>
                       </button>
+                      </div>
                     </div>
 
                     {expandedSkillIds.has(task.id) && (
-                    <div id={`smart-reply-skill-details-${task.id}`}>
+                    <div id={`smart-reply-skill-details-${task.id}`} className={`px-[14px] pb-[14px] border-t ${dark ? "border-[#303030]" : "border-[#e8e8e8]"}`}>
                     <div className="mt-[16px]">
                       <label className={`block text-[12px] mb-[6px] ${dark ? "text-[#888]" : "text-[#666]"}`}>Skill 指令</label>
-                      <textarea
-                        value={task.instruction}
-                        onChange={(event) => updateAiTask(task.id, { instruction: event.target.value })}
-                        maxLength={4000}
-                        rows={4}
-                        placeholder="描述需要识别、提取或判断的内容"
-                        className={`block w-full h-[94px] resize-none overflow-y-auto rounded-[5px] border px-[10px] py-[8px] leading-[20px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
-                      />
+                      <div className="relative">
+                        <textarea
+                          value={task.instruction}
+                          onChange={(event) => updateAiTask(task.id, { instruction: event.target.value })}
+                          maxLength={4000}
+                          rows={4}
+                          placeholder="描述需要识别、提取或判断的内容"
+                          style={{ height: skillInstructionHeights[task.id] || 120 }}
+                          className={`block w-full min-h-[94px] max-h-[800px] resize-none overflow-y-auto rounded-[5px] border px-[10px] pt-[8px] pb-[14px] leading-[20px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
+                        />
+                        <div
+                          role="separator"
+                          aria-label="调整 Skill 指令高度"
+                          aria-orientation="horizontal"
+                          aria-valuemin={94}
+                          aria-valuemax={800}
+                          aria-valuenow={skillInstructionHeights[task.id] || 120}
+                          tabIndex={0}
+                          onPointerDown={(event) => startSkillInstructionResize(event, task.id)}
+                          onKeyDown={(event) => {
+                            if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+                            event.preventDefault();
+                            const delta = event.key === "ArrowUp" ? -10 : 10;
+                            commitSkillInstructionHeight(task.id, (skillInstructionHeights[task.id] || 120) + delta);
+                          }}
+                          className="group/resize absolute z-10 left-0 right-0 bottom-0 h-[10px] touch-none cursor-[ns-resize] outline-none"
+                        >
+                          <span className={`absolute left-1/2 bottom-[2px] h-[2px] w-[46px] -translate-x-1/2 rounded-full opacity-0 transition-opacity group-hover/resize:opacity-100 group-focus-visible/resize:opacity-100 ${dark ? "bg-[#777]" : "bg-[#999]"}`} />
+                        </div>
+                      </div>
                     </div>
 
                     <div className={`mt-[16px] rounded-[5px] border ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}>
@@ -1906,6 +2103,52 @@ function CompactToggle({
       <span className={`absolute left-[2px] top-[2px] w-[11px] h-[11px] rounded-full bg-white shadow transition-transform ${checked ? "translate-x-[11px]" : "translate-x-0"}`} />
     </button>
   );
+}
+
+function CollapseChevron({
+  expanded,
+  dark,
+  onClick,
+  label,
+  className = "",
+}: {
+  expanded: boolean;
+  dark: boolean;
+  onClick?: () => void;
+  label?: string;
+  className?: string;
+}) {
+  const classes = `w-[34px] h-[34px] shrink-0 rounded-[5px] flex items-center justify-center bg-transparent transition-colors outline-none focus-visible:ring-1 focus-visible:ring-[#07c160] ${
+    dark ? "text-[#999] hover:bg-[#292929] hover:text-white" : "text-[#666] hover:bg-[#ededed] hover:text-black"
+  } ${className}`;
+  const icon = (
+    <svg
+      className={`w-[18px] h-[18px] transition-transform ${expanded ? "rotate-180" : ""}`}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      viewBox="0 0 24 24"
+    >
+      <path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" />
+    </svg>
+  );
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        title={label}
+        aria-label={label}
+        aria-expanded={expanded}
+        onClick={onClick}
+        className={classes}
+      >
+        {icon}
+      </button>
+    );
+  }
+
+  return <span aria-hidden="true" className={classes}>{icon}</span>;
 }
 
 function makeAiProfileDraft(index = 0): AiProfile {
@@ -2279,9 +2522,7 @@ function AiSettingsDialog({
                     >
                       {active ? "已选择" : "设为使用"}
                     </button>
-                    <svg className={`w-[18px] h-[18px] shrink-0 transition-transform ${expanded ? "rotate-180" : ""} ${dark ? "text-[#777]" : "text-[#888]"}`} fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" />
-                    </svg>
+                    <CollapseChevron expanded={expanded} dark={dark} />
                   </div>
 
                   {expanded && (

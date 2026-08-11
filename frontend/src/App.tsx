@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, type FormEvent, type MouseEvent, type ReactNode, type TouchEvent } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef, type FormEvent, type MouseEvent, type ReactNode, type TouchEvent } from "react";
 import { useWebSocket } from "./useWebSocket";
 import SessionList, { type SessionMenuAction } from "./components/SessionList";
 import ChatArea from "./components/ChatArea";
@@ -20,6 +20,7 @@ import {
   getProtocolLoginStatus,
   getProtocolProfile,
   getProtocolRdvMapping,
+  getSmartReplies,
   getSessions,
   getGroupMemberDetails,
   getGroupMemberNames,
@@ -37,6 +38,7 @@ import {
   refreshSessions,
   saveInitialSetup,
   saveProtocolRdvMapping,
+  searchLocalData,
   setActiveAgentId,
   setAccessKey,
   startProtocolWechat,
@@ -45,8 +47,8 @@ import {
   unmuteSession,
   unpinChat,
 } from "./api";
-import type { BroadcastContentOrder, InitialSetupMode, ProtocolProxyConfig, ProtocolRdvMappingEntry } from "./api";
-import type { ContactProfile, Session, ChatMessage, SmartReplyTarget, WSMessage, WeChatAccount } from "./types";
+import type { BroadcastContentOrder, GlobalSearchEntry, GlobalSearchResult, InitialSetupMode, ProtocolProxyConfig, ProtocolRdvMappingEntry } from "./api";
+import type { ContactProfile, Session, ChatMessage, SmartReplyConfig, SmartReplyTarget, WSMessage, WeChatAccount } from "./types";
 import { replaceWechatEmojis } from "./utils/wechatEmoji";
 import { DEFAULT_AVATAR_URL } from "./avatar";
 
@@ -1478,9 +1480,22 @@ function removeCallbackEchoes(msgs: ChatMessage[]): ChatMessage[] {
   });
 }
 
+function removeCompletedFilePreviews(msgs: ChatMessage[]): ChatMessage[] {
+  const replacedIds = new Set<string>();
+  for (const msg of msgs) {
+    if (String(msg.msgtype || "") !== "49" || !msg.file_path) continue;
+    const match = String(msg.msg || "").match(
+      /<overwrite_newmsgid>\s*(\d+)\s*<\/overwrite_newmsgid>/i,
+    );
+    if (match?.[1]) replacedIds.add(match[1]);
+  }
+  if (replacedIds.size === 0) return msgs;
+  return msgs.filter((msg) => msg.file_path || !replacedIds.has(String(msg.id || "")));
+}
+
 function dedupeMessagesForDisplay(msgs: ChatMessage[]): ChatMessage[] {
   const visible = msgs.filter((msg) => !isHookStatusEchoMessage(msg));
-  return removeDuplicateSynthetics(removeCallbackEchoes(visible));
+  return removeCompletedFilePreviews(removeDuplicateSynthetics(removeCallbackEchoes(visible)));
 }
 
 function toChatMessage(msg: any, sendorrecv: string, myWxid: string): ChatMessage | null {
@@ -1579,6 +1594,7 @@ export default function App() {
   const [selfImageOpen, setSelfImageOpen] = useState(false);
   const [mobileTab, setMobileTab] = useState<MobileTab>("chats");
   const [smartReplyTarget, setSmartReplyTarget] = useState<SmartReplyTarget | null>(null);
+  const [smartReplyConfigs, setSmartReplyConfigs] = useState<SmartReplyConfig[]>([]);
   const [mobileContactCategory, setMobileContactCategory] = useState<ContactCategoryKey | null>(null);
   const [desktopContactCategory, setDesktopContactCategory] = useState<ContactCategoryKey | null>(null);
   const [localContactsPayload, setLocalContactsPayload] = useState<LocalContactsPayload | null>(null);
@@ -1624,6 +1640,15 @@ export default function App() {
   const routeSelfWxid = /^wxid_/i.test(routeAccountWxid) || routeAccountWxid.includes("@") ? routeAccountWxid : "";
   const effectiveSelfWxid = selfWxid || selectedAccountWxid || routeSelfWxid;
   const selfDisplayId = effectiveSelfWxid || accountRouteKey(selectedAccount) || routeAccountWxid;
+  const aiReplyEnabledChatIds = useMemo(() => new Set(
+    smartReplyConfigs
+      .filter((config) => (
+        config.chat_id.endsWith("@chatroom")
+        && config.enabled
+        && (config.ai_tasks || []).some((task) => task.enabled)
+      ))
+      .map((config) => config.chat_id),
+  ), [smartReplyConfigs]);
 
   const setRouteAccount = useCallback((accountWxid: string) => {
     const next = String(accountWxid || "").trim();
@@ -1658,6 +1683,7 @@ export default function App() {
     setSessionsHydrated(false);
     setMobileTab("chats");
     setSmartReplyTarget(null);
+    setSmartReplyConfigs([]);
     setMobileProfileDetailOpen(false);
     setDirectoryProfileWxid(null);
     setDirectoryProfileLoading(false);
@@ -2859,6 +2885,18 @@ export default function App() {
         );
       }
     }
+
+    if (wsMsg.type === "smart_reply_updated") {
+      const { config, chat_id: deletedChatId, deleted } = wsMsg.data;
+      if (config?.chat_id) {
+        setSmartReplyConfigs((prev) => [
+          config,
+          ...prev.filter((item) => item.chat_id !== config.chat_id),
+        ]);
+      } else if (deleted && deletedChatId) {
+        setSmartReplyConfigs((prev) => prev.filter((item) => item.chat_id !== deletedChatId));
+      }
+    }
   }, [selfWxid, effectiveSelfWxid, activeChat, contactMap, avatarMap, queueBriefLookup, hydrateGroupSenders, ensureContactProfiles, ensureGroupProfiles, applyContactProfileUpdates, selectedAccountId, protocolAccountSelected]);
 
   const { connected } = useWebSocket(handleWSMessage, authenticated && Boolean(selectedAccountId), selectedAccountId);
@@ -2882,6 +2920,23 @@ export default function App() {
     if (!authenticated || !selectedAccountId) return;
     hydrateChatSessions(false);
   }, [authenticated, selectedAccountId, hydrateChatSessions]);
+
+  useEffect(() => {
+    if (!authenticated || !selectedAccountId) return;
+    let cancelled = false;
+    const requestAccountId = selectedAccountId;
+    getSmartReplies()
+      .then((data) => {
+        if (cancelled || selectedAccountIdRef.current !== requestAccountId) return;
+        setSmartReplyConfigs(Array.isArray(data?.configs) ? data.configs as SmartReplyConfig[] : []);
+      })
+      .catch((error) => {
+        if (!cancelled) console.error("[SMART_REPLY_CONFIGS]", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticated, selectedAccountId]);
 
   useEffect(() => {
     if (!authenticated || !selectedAccountId) return;
@@ -3671,6 +3726,7 @@ export default function App() {
         <MobileMainShell
           tab={mobileTab}
           sessions={chatListSessions}
+          aiReplyEnabledChatIds={aiReplyEnabledChatIds}
           friends={friendEntries}
           groups={groupEntries}
           localFriends={localFriendEntries}
@@ -3690,6 +3746,7 @@ export default function App() {
           dark={darkTheme}
           onSwitchTab={switchMobileTab}
           onSelectChat={handleSelectSession}
+          onSessionAction={handleSessionMenuAction}
           onSelectContact={openDirectoryProfile}
           onSelectContactCategory={setMobileContactCategory}
           onHydrateContacts={hydrateDirectoryContacts}
@@ -3739,6 +3796,7 @@ export default function App() {
         {viewMode === "chats" && (
           <SessionList
             sessions={chatListSessions}
+            aiReplyEnabledChatIds={aiReplyEnabledChatIds}
             activeWxid={activeChat}
             onSelectChat={handleSelectSession}
             onSessionAction={handleSessionMenuAction}
@@ -6396,6 +6454,7 @@ function MobileTopBar({
 function MobileMainShell({
   tab,
   sessions,
+  aiReplyEnabledChatIds,
   friends,
   groups,
   localFriends,
@@ -6415,6 +6474,7 @@ function MobileMainShell({
   dark,
   onSwitchTab,
   onSelectChat,
+  onSessionAction,
   onSelectContact,
   onSelectContactCategory,
   onHydrateContacts,
@@ -6428,6 +6488,7 @@ function MobileMainShell({
 }: {
   tab: MobileTab;
   sessions: Session[];
+  aiReplyEnabledChatIds: ReadonlySet<string>;
   friends: DirectoryEntry[];
   groups: DirectoryEntry[];
   localFriends: DirectoryEntry[];
@@ -6447,6 +6508,7 @@ function MobileMainShell({
   dark: boolean;
   onSwitchTab: (tab: MobileTab) => void;
   onSelectChat: (wxid: string, fallback?: Partial<Session>) => void;
+  onSessionAction: (action: SessionMenuAction, session: Session) => void;
   onSelectContact: (entry: DirectoryEntry) => void;
   onSelectContactCategory: (category: ContactCategoryKey) => void;
   onHydrateContacts: (force?: boolean) => void;
@@ -6463,7 +6525,9 @@ function MobileMainShell({
       {tab === "chats" && (
         <MobileChatsView
           sessions={sessions}
+          aiReplyEnabledChatIds={aiReplyEnabledChatIds}
           onSelectChat={onSelectChat}
+          onSessionAction={onSessionAction}
           onRefreshSessions={onRefreshSessions}
           loading={sessionsLoading}
           dark={dark}
@@ -6534,25 +6598,107 @@ function localCategoryTitle(category: ContactCategoryKey): string {
 
 function MobileChatsView({
   sessions,
+  aiReplyEnabledChatIds,
   onSelectChat,
+  onSessionAction,
   onRefreshSessions,
   loading,
   dark,
 }: {
   sessions: Session[];
-  onSelectChat: (wxid: string) => void;
+  aiReplyEnabledChatIds: ReadonlySet<string>;
+  onSelectChat: (wxid: string, fallback?: Partial<Session>) => void;
+  onSessionAction: (action: SessionMenuAction, session: Session) => void;
   onRefreshSessions: () => void;
   loading: boolean;
   dark: boolean;
 }) {
+  const [query, setQuery] = useState("");
+  const [searchResult, setSearchResult] = useState<GlobalSearchResult>(() => emptyMobileSearchResult());
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [actionSession, setActionSession] = useState<Session | null>(null);
+  const normalizedQuery = query.trim();
+
+  useEffect(() => {
+    if (!normalizedQuery) {
+      setSearchResult(emptyMobileSearchResult());
+      setSearching(false);
+      setSearchError("");
+      return;
+    }
+    const controller = new AbortController();
+    setSearchResult(emptyMobileSearchResult(normalizedQuery));
+    setSearching(true);
+    setSearchError("");
+    const timer = window.setTimeout(() => {
+      searchLocalData(normalizedQuery, 30, controller.signal)
+        .then((result) => {
+          if (controller.signal.aborted) return;
+          if (!result || !Array.isArray(result.contacts) || !Array.isArray(result.groups) || !Array.isArray(result.messages)) {
+            throw new Error("invalid_search_response");
+          }
+          setSearchResult({
+            query: normalizedQuery,
+            contacts: result.contacts,
+            groups: result.groups,
+            messages: result.messages,
+            source: result.source,
+          });
+        })
+        .catch((error) => {
+          if (controller.signal.aborted || error?.name === "AbortError") return;
+          console.error("[MOBILE_GLOBAL_SEARCH]", error);
+          setSearchResult(emptyMobileSearchResult(normalizedQuery));
+          setSearchError("搜索失败，请稍后重试");
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setSearching(false);
+        });
+    }, 300);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [normalizedQuery]);
+
+  const openSearchEntry = (entry: GlobalSearchEntry) => {
+    onSelectChat(entry.wxid, {
+      nickname: mobileSearchEntryName(entry),
+      avatar: entry.avatar || "",
+      is_group: Boolean(entry.is_group || entry.wxid.includes("@chatroom")),
+    });
+    setQuery("");
+  };
+  const resultCount = searchResult.contacts.length + searchResult.groups.length + searchResult.messages.length;
+
   return (
     <div className="flex-1 min-h-0 overflow-y-auto pt-[calc(env(safe-area-inset-top)+8px)] pb-[10px]">
       <div className="h-[44px] px-[12px] flex items-center gap-[8px]">
-        <div className={`min-w-0 flex-1 h-[36px] rounded-[7px] flex items-center justify-center gap-[7px] ${dark ? "bg-[#242424] text-[#777]" : "bg-white text-[#b7b7b7]"}`}>
+        <div className={`min-w-0 flex-1 h-[36px] rounded-[7px] flex items-center gap-[7px] px-[10px] ${dark ? "bg-[#242424] text-[#777]" : "bg-white text-[#888]"}`}>
           <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" d="m21 21-5.2-5.2M10.8 18a7.2 7.2 0 1 1 0-14.4 7.2 7.2 0 0 1 0 14.4Z" />
           </svg>
-          <span className="text-[16px]">Search</span>
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索联系人、群聊或聊天记录"
+            aria-label="搜索联系人、群聊或聊天记录"
+            className={`min-w-0 flex-1 bg-transparent text-[14px] outline-none ${dark ? "text-[#ddd] placeholder:text-[#777]" : "text-[#222] placeholder:text-[#999]"}`}
+          />
+          {query && (
+            <button
+              type="button"
+              onClick={() => setQuery("")}
+              aria-label="清空搜索"
+              className={`w-[22px] h-[22px] shrink-0 rounded-full flex items-center justify-center ${dark ? "bg-[#444] text-[#aaa]" : "bg-[#ddd] text-[#777]"}`}
+            >
+              <svg className="w-[12px] h-[12px]" fill="none" stroke="currentColor" strokeWidth={2.2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" d="m7 7 10 10M17 7 7 17" />
+              </svg>
+            </button>
+          )}
         </div>
         <button
           type="button"
@@ -6568,25 +6714,123 @@ function MobileChatsView({
         </button>
       </div>
       <div className={dark ? "bg-[#111111]" : "bg-white"}>
+        {normalizedQuery ? (
+          <div className="pb-[12px]">
+            {searching && resultCount === 0 && (
+              <div className={`py-[48px] text-center text-[14px] ${dark ? "text-[#666]" : "text-[#999]"}`}>正在搜索本地数据...</div>
+            )}
+            {!searching && searchError && (
+              <div className={`py-[48px] text-center text-[14px] ${dark ? "text-[#888]" : "text-[#777]"}`}>{searchError}</div>
+            )}
+            {!searching && !searchError && resultCount === 0 && (
+              <div className={`py-[48px] text-center text-[14px] ${dark ? "text-[#666]" : "text-[#999]"}`}>未找到相关联系人、群聊或聊天记录</div>
+            )}
+            <MobileSearchSection title="联系人" entries={searchResult.contacts} dark={dark} onOpen={openSearchEntry} />
+            <MobileSearchSection title="群聊" entries={searchResult.groups} kind="group" dark={dark} onOpen={openSearchEntry} aiReplyEnabledChatIds={aiReplyEnabledChatIds} />
+            <MobileSearchSection title="聊天记录" entries={searchResult.messages} kind="message" dark={dark} onOpen={openSearchEntry} aiReplyEnabledChatIds={aiReplyEnabledChatIds} />
+            {searching && resultCount > 0 && <div className={`py-[10px] text-center text-[12px] ${dark ? "text-[#666]" : "text-[#999]"}`}>正在更新...</div>}
+          </div>
+        ) : (
+        <>
         {sessions.length === 0 && (
           <div className={`text-center text-[14px] py-[48px] ${dark ? "text-[#666]" : "text-[#999]"}`}>
             {loading ? "正在获取最近会话..." : "暂无会话，点击刷新获取最近会话"}
           </div>
         )}
         {sessions.map((session) => (
-          <MobileSessionRow key={session.wxid} session={session} onClick={() => onSelectChat(session.wxid)} dark={dark} />
+          <MobileSessionRow
+            key={session.wxid}
+            session={session}
+            onClick={() => onSelectChat(session.wxid)}
+            dark={dark}
+            aiReplyEnabled={Boolean(session.is_group && aiReplyEnabledChatIds.has(session.wxid))}
+            onLongPress={() => setActionSession(session)}
+          />
         ))}
+        </>
+        )}
       </div>
+      {actionSession && (
+        <div className="fixed inset-0 z-[80] flex items-end bg-black/45" onClick={() => setActionSession(null)}>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${actionSession.nickname || actionSession.wxid} 会话操作`}
+            className={`w-full rounded-t-[8px] px-[12px] pt-[10px] pb-[calc(12px+env(safe-area-inset-bottom))] ${dark ? "bg-[#242424] text-[#eee]" : "bg-white text-[#111]"}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className={`h-[38px] px-[8px] flex items-center text-[13px] truncate ${dark ? "text-[#888]" : "text-[#777]"}`}>{actionSession.nickname || actionSession.wxid}</div>
+            <div className="grid grid-cols-2 gap-[8px]">
+              <MobileSessionActionButton dark={dark} onClick={() => { onSessionAction(actionSession.pinned ? "unpin" : "pin", actionSession); setActionSession(null); }}>{actionSession.pinned ? "取消置顶" : "置顶聊天"}</MobileSessionActionButton>
+              <MobileSessionActionButton dark={dark} onClick={() => { onSessionAction("mark_unread", actionSession); setActionSession(null); }}>标记为未读</MobileSessionActionButton>
+              <MobileSessionActionButton dark={dark} onClick={() => { onSessionAction(actionSession.muted ? "unmute" : "mute", actionSession); setActionSession(null); }}>{actionSession.muted ? "开启提醒" : "消息免打扰"}</MobileSessionActionButton>
+              <MobileSessionActionButton dark={dark} onClick={() => { onSessionAction("smart_reply", actionSession); setActionSession(null); }}>智能回复</MobileSessionActionButton>
+            </div>
+            <MobileSessionActionButton danger dark={dark} className="mt-[8px]" onClick={() => { onSessionAction("delete", actionSession); setActionSession(null); }}>删除会话</MobileSessionActionButton>
+            <button type="button" onClick={() => setActionSession(null)} className={`mt-[8px] w-full h-[44px] rounded-[6px] text-[15px] ${dark ? "bg-[#333]" : "bg-[#f0f0f0]"}`}>取消</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function MobileSessionRow({ session, onClick, dark }: { session: Session; onClick: () => void; dark: boolean }) {
+function MobileSessionRow({
+  session,
+  onClick,
+  onLongPress,
+  dark,
+  aiReplyEnabled = false,
+}: {
+  session: Session;
+  onClick: () => void;
+  onLongPress: () => void;
+  dark: boolean;
+  aiReplyEnabled?: boolean;
+}) {
+  const longPressTimerRef = useRef<number | null>(null);
+  const longPressTriggeredRef = useRef(false);
+
+  const cancelLongPress = () => {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => cancelLongPress, []);
+
   return (
     <button
       type="button"
-      onClick={onClick}
-      className={`w-full h-[64px] pl-[12px] pr-[10px] flex items-center gap-[10px] text-left ${
+      onClick={(event) => {
+        if (longPressTriggeredRef.current) {
+          event.preventDefault();
+          longPressTriggeredRef.current = false;
+          return;
+        }
+        onClick();
+      }}
+      onPointerDown={(event) => {
+        if (event.pointerType === "mouse" && event.button !== 0) return;
+        cancelLongPress();
+        longPressTriggeredRef.current = false;
+        longPressTimerRef.current = window.setTimeout(() => {
+          longPressTriggeredRef.current = true;
+          longPressTimerRef.current = null;
+          onLongPress();
+        }, 520);
+      }}
+      onPointerUp={cancelLongPress}
+      onPointerCancel={cancelLongPress}
+      onPointerLeave={cancelLongPress}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        cancelLongPress();
+        longPressTriggeredRef.current = true;
+        onLongPress();
+      }}
+      className={`relative overflow-hidden w-full h-[64px] pl-[12px] pr-[10px] flex items-center gap-[10px] text-left ${aiReplyEnabled ? "ai-reply-enabled-border" : ""} ${
         dark
           ? (session.pinned ? "bg-[#232323] active:bg-[#2d2d2d]" : "active:bg-[#242424]")
           : (session.pinned ? "bg-[#e2e2e2] active:bg-[#d6d6d6]" : "active:bg-[#f4f4f4]")
@@ -6617,6 +6861,93 @@ function MobileSessionRow({ session, onClick, dark }: { session: Session; onClic
         </div>
       </div>
     </button>
+  );
+}
+
+function MobileSessionActionButton({
+  children,
+  onClick,
+  dark,
+  danger = false,
+  className = "",
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  dark: boolean;
+  danger?: boolean;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`w-full h-[44px] rounded-[6px] text-[14px] ${
+        danger
+          ? (dark ? "bg-[#352222] text-[#ef7777]" : "bg-[#fff0f0] text-[#c33]")
+          : (dark ? "bg-[#303030] active:bg-[#393939]" : "bg-[#f2f2f2] active:bg-[#e8e8e8]")
+      } ${className}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+const emptyMobileSearchResult = (query = ""): GlobalSearchResult => ({
+  query,
+  contacts: [],
+  groups: [],
+  messages: [],
+});
+
+function mobileSearchEntryName(entry: GlobalSearchEntry) {
+  return entry.name || entry.remark || entry.nickname || entry.wxid;
+}
+
+function MobileSearchSection({
+  title,
+  entries,
+  kind = "contact",
+  dark,
+  onOpen,
+  aiReplyEnabledChatIds,
+}: {
+  title: string;
+  entries: GlobalSearchEntry[];
+  kind?: "contact" | "group" | "message";
+  dark: boolean;
+  onOpen: (entry: GlobalSearchEntry) => void;
+  aiReplyEnabledChatIds?: ReadonlySet<string>;
+}) {
+  if (entries.length === 0) return null;
+  return (
+    <section>
+      <div className={`h-[32px] px-[14px] flex items-end pb-[5px] text-[12px] ${dark ? "bg-[#181818] text-[#777]" : "bg-[#ededed] text-[#888]"}`}>{title}</div>
+      {entries.map((entry) => {
+        const group = Boolean(entry.is_group || entry.wxid.includes("@chatroom"));
+        const aiReplyEnabled = group && Boolean(aiReplyEnabledChatIds?.has(entry.wxid));
+        let detail = entry.account ? `微信号：${entry.account}` : "";
+        if (kind === "group") {
+          const members = (entry.matched_members || []).slice(0, 2).map((member) => member.name || member.wxid || "群成员");
+          detail = members.length > 0 ? `包含：${members.join("、")}${(entry.matched_members || []).length > 2 ? "..." : ""}` : "群聊";
+        } else if (kind === "message") {
+          detail = `${Math.max(1, Number(entry.match_count) || 0)} 条相关聊天记录`;
+        }
+        return (
+          <button
+            key={`${kind}:${entry.wxid}`}
+            type="button"
+            onClick={() => onOpen(entry)}
+            className={`relative overflow-hidden w-full min-h-[64px] px-[12px] py-[8px] flex items-center gap-[10px] text-left ${aiReplyEnabled ? "ai-reply-enabled-border" : ""} ${dark ? "active:bg-[#242424]" : "active:bg-[#f2f2f2]"}`}
+          >
+            <MobileAvatar name={mobileSearchEntryName(entry)} avatar={entry.avatar || ""} group={group} size={44} />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-[16px] leading-[21px]">{mobileSearchEntryName(entry)}</span>
+              <span className={`mt-[2px] block truncate text-[13px] ${dark ? "text-[#777]" : "text-[#999]"}`}>{detail}</span>
+            </span>
+          </button>
+        );
+      })}
+    </section>
   );
 }
 

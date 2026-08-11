@@ -7,6 +7,7 @@ export type SessionMenuAction = "pin" | "unpin" | "mark_unread" | "mute" | "unmu
 
 interface SessionListProps {
   sessions: Session[];
+  aiReplyEnabledChatIds?: ReadonlySet<string>;
   activeWxid?: string | null;
   onSelectChat: (wxid: string, seed?: Partial<Session>) => void;
   onSessionAction: (action: SessionMenuAction, session: Session) => void;
@@ -102,6 +103,7 @@ function SearchAvatar({ entry }: { entry: GlobalSearchEntry }) {
 
 export default function SessionList({
   sessions,
+  aiReplyEnabledChatIds,
   activeWxid,
   onSelectChat,
   onSessionAction,
@@ -281,12 +283,13 @@ export default function SessionList({
         )}
         {sessions.map((session) => {
           const isActive = session.wxid === activeWxid;
+          const aiReplyEnabled = session.is_group && aiReplyEnabledChatIds?.has(session.wxid);
           return (
             <div
               key={session.wxid}
               onClick={() => onSelectChat(session.wxid)}
               onContextMenu={(e) => openContextMenu(e, session)}
-              className={`flex items-center px-0 py-0 cursor-pointer transition-colors ${
+              className={`relative overflow-hidden flex items-center px-0 py-0 cursor-pointer transition-colors ${aiReplyEnabled ? "ai-reply-enabled-border" : ""} ${
                 dark
                   ? (isActive
                     ? "bg-[#2f2f2f] hover:bg-[#2f2f2f]"

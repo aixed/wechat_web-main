@@ -92,6 +92,117 @@ class LocalHookMediaTests(unittest.IsolatedAsyncioTestCase):
                 }, "2", "wxid_self")
                 self.assertEqual(rf"C:\Media\message-{msgtype}.bin", normalized[field])
 
+    async def test_recvtype_one_skips_preliminary_file_notification(self):
+        preliminary = {
+            "msgtype": "49",
+            "msgsvrid": "preliminary-id",
+            "msg": (
+                "<msg><appmsg><title>report.txt</title><type>74</type>"
+                "<appattach><totallen>12</totallen></appattach></appmsg></msg>"
+            ),
+        }
+        completed = {
+            **preliminary,
+            "msgsvrid": "completed-id",
+            "file_path": r"C:\Downloads\report.txt",
+            "msg": (
+                "<msg><appmsg><title>report.txt</title><type>6</type>"
+                "<appattach><overwrite_newmsgid>preliminary-id</overwrite_newmsgid>"
+                "</appattach></appmsg></msg>"
+            ),
+        }
+
+        with (
+            patch.object(main.config, "IS_LOCAL_HOOK", True),
+            patch.object(main.config, "RECV_TYPE", 1),
+        ):
+            self.assertTrue(main._is_preliminary_local_hook_file_callback(preliminary))
+            self.assertFalse(main._is_preliminary_local_hook_file_callback(completed))
+
+    async def test_preliminary_file_filter_does_not_hide_other_app_messages(self):
+        link_message = {
+            "msgtype": "49",
+            "msg": "<msg><appmsg><title>Link</title><type>5</type></appmsg></msg>",
+        }
+        file_message = {
+            "msgtype": "49",
+            "msg": "<msg><appmsg><title>report.txt</title><type>74</type></appmsg></msg>",
+        }
+
+        with (
+            patch.object(main.config, "IS_LOCAL_HOOK", True),
+            patch.object(main.config, "RECV_TYPE", 2),
+        ):
+            self.assertFalse(main._is_preliminary_local_hook_file_callback(file_message))
+        with (
+            patch.object(main.config, "IS_LOCAL_HOOK", True),
+            patch.object(main.config, "RECV_TYPE", 1),
+        ):
+            self.assertFalse(main._is_preliminary_local_hook_file_callback(link_message))
+
+    async def test_callback_pipeline_only_processes_completed_file_message(self):
+        base_message = {
+            "msgtype": "49",
+            "fromgid": "group@chatroom",
+            "fromid": "wxid_friend",
+            "toid": "wxid_self",
+            "time": "2026-08-11 16:31:42",
+        }
+        preliminary = {
+            **base_message,
+            "msgsvrid": "8687698603635038383",
+            "msg": "<msg><appmsg><title>40081.txt</title><type>74</type></appmsg></msg>",
+        }
+        completed = {
+            **base_message,
+            "msgsvrid": "7752369933229611459",
+            "file_path": r"C:\Downloads\40081.txt",
+            "msg": (
+                "<msg><appmsg><title>40081.txt</title><type>6</type><appattach>"
+                "<overwrite_newmsgid>8687698603635038383</overwrite_newmsgid>"
+                "</appattach></appmsg></msg>"
+            ),
+        }
+        callback = {
+            "selfwxid": "wxid_self",
+            "sendorrecv": "2",
+            "agent_id": "test-agent",
+        }
+        session_update = {
+            "wxid": "group@chatroom",
+            "lastMsg": "friend: [file]",
+            "lastTime": "16:31",
+            "lastTimestamp": 1786437102,
+            "unread": 1,
+        }
+
+        with (
+            patch.object(main.config, "IS_LOCAL_HOOK", True),
+            patch.object(main.config, "IS_PROTOCOL", False),
+            patch.object(main.config, "RECV_TYPE", 1),
+            patch.object(main, "_agent_id_for_self_wxid", return_value="test-agent"),
+            patch.object(main, "_activate_runtime", return_value="test-agent"),
+            patch.object(main, "_put_self_info_field"),
+            patch.object(main, "_contact_owner_wxid", return_value="wxid_self"),
+            patch.object(main, "_ensure_contact_profiles", AsyncMock(return_value={})),
+            patch.object(main, "_load_session_cache_into_state"),
+            patch.object(main, "_schedule_smart_reply_message") as schedule_reply,
+            patch.object(main, "_store_message_and_session", return_value=session_update) as store_message,
+            patch.object(main.manager, "broadcast", AsyncMock()) as broadcast,
+        ):
+            await main._process_wechat_callback({**callback, "msglist": [preliminary]})
+            await main._process_wechat_callback({**callback, "msglist": [completed]})
+
+        schedule_reply.assert_called_once()
+        store_message.assert_called_once()
+        self.assertEqual("7752369933229611459", schedule_reply.call_args.kwargs["message"]["id"])
+        self.assertEqual("7752369933229611459", store_message.call_args.args[1]["id"])
+        self.assertEqual([], broadcast.await_args_list[0].args[0]["data"]["messages"])
+        self.assertEqual(
+            ["7752369933229611459"],
+            [message["id"] for message in broadcast.await_args_list[1].args[0]["data"]["messages"]],
+        )
+
     async def test_revoke_voice_call_placeholder_is_filtered(self):
         message = {
             "msgtype": "1",

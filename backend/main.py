@@ -1482,6 +1482,25 @@ def _is_callback_status_echo(msg: dict, sendorrecv: str, self_wxid: str) -> bool
     return False
 
 
+def _is_preliminary_local_hook_file_callback(msg: dict) -> bool:
+    """Identify RecvType=1's pathless notification before a file finishes downloading."""
+    if (
+        not config.IS_LOCAL_HOOK
+        or config.RECV_TYPE != 1
+        or not isinstance(msg, dict)
+        or str(msg.get("msgtype", "") or "") != "49"
+    ):
+        return False
+    if any(msg.get(key) for key in ("path", "file_path")):
+        return False
+
+    root = _xml_root(str(msg.get("msg", "") or ""))
+    if root is None:
+        return False
+    appmsg = root if root.tag == "appmsg" else root.find(".//appmsg")
+    return appmsg is not None and str(appmsg.findtext("type") or "").strip() == "74"
+
+
 def _is_protocol_internal_callback_message(msg: dict) -> bool:
     """Filter protocol sync events that must not become chat sessions."""
     if not config.IS_PROTOCOL or not isinstance(msg, dict):
@@ -4182,6 +4201,12 @@ async def _process_wechat_callback(
             continue
         if _is_callback_status_echo(msg, sendorrecv, self_wxid):
             _log(f"[CALLBACK] Skip status echo type={msgtype} content={content!r}")
+            continue
+        if _is_preliminary_local_hook_file_callback(msg):
+            _log(
+                f"[CALLBACK] Skip preliminary file notification "
+                f"svrid={msg.get('msgsvrid', '')}; waiting for callback with file_path"
+            )
             continue
         chat_id, normalized = _normalize_callback_message(msg, sendorrecv, self_wxid)
         if not chat_id or not normalized:

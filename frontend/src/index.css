@@ -229,3 +229,46 @@ html, body, #root {
   overscroll-behavior: none;
   overscroll-behavior-x: none;
 }
+
+.ai-reply-enabled-border {
+  --ai-border-angle: 0deg;
+}
+
+.ai-reply-enabled-border::after {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  z-index: 2;
+  padding: 1px;
+  border-radius: 3px;
+  pointer-events: none;
+  background: conic-gradient(
+    from var(--ai-border-angle),
+    transparent 0deg 110deg,
+    #07c160 126deg,
+    #45c8bd 178deg,
+    #f0c84b 230deg,
+    #e96f6f 282deg,
+    transparent 330deg 360deg
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: ai-reply-border-orbit 2.4s linear infinite;
+}
+
+@property --ai-border-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes ai-reply-border-orbit {
+  to { --ai-border-angle: 360deg; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-reply-enabled-border::after {
+    animation: none;
+  }
+}
