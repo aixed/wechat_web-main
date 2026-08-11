@@ -155,6 +155,7 @@ class SqliteMessageCache:
                     avatar TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     mention_only INTEGER NOT NULL DEFAULT 0,
+                    mention_message_types_json TEXT NOT NULL DEFAULT '[]',
                     use_no_src INTEGER NOT NULL DEFAULT 0,
                     message_types_json TEXT NOT NULL DEFAULT '["text"]',
                     file_types_json TEXT NOT NULL DEFAULT '["txt"]',
@@ -193,6 +194,16 @@ class SqliteMessageCache:
                     "ALTER TABLE smart_reply_configs "
                     "ADD COLUMN mention_only INTEGER NOT NULL DEFAULT 0"
                 )
+            if "mention_message_types_json" not in smart_reply_columns:
+                conn.execute(
+                    "ALTER TABLE smart_reply_configs "
+                    "ADD COLUMN mention_message_types_json TEXT NOT NULL DEFAULT '[]'"
+                )
+                conn.execute(
+                    "UPDATE smart_reply_configs "
+                    "SET mention_message_types_json = CASE "
+                    "WHEN mention_only != 0 THEN '[\"text\"]' ELSE '[]' END"
+                )
             if "use_no_src" not in smart_reply_columns:
                 conn.execute(
                     "ALTER TABLE smart_reply_configs "
@@ -208,6 +219,67 @@ class SqliteMessageCache:
                     "ALTER TABLE smart_reply_configs "
                     "ADD COLUMN file_types_json TEXT NOT NULL DEFAULT '[\"txt\"]'"
                 )
+
+    @staticmethod
+    def _scope_smart_reply_items(
+        items: list[Any],
+        message_types: list[Any],
+        supported_types: set[str],
+        *,
+        clone_skill_id: bool = False,
+    ) -> list[dict[str, Any]]:
+        legacy_targets = [
+            str(value or "").strip().lower()
+            for value in message_types
+            if str(value or "").strip().lower() in supported_types
+        ]
+        if not legacy_targets:
+            legacy_targets = ["text"]
+
+        scoped: list[dict[str, Any]] = []
+        used_ids: set[str] = set()
+        legacy_fingerprints: set[str] = set()
+        for item_index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            configured_type = str(item.get("message_type") or "").strip().lower()
+            if not configured_type:
+                ignored_keys = {"id", "message_type"}
+                if clone_skill_id:
+                    ignored_keys.add("skill_id")
+                fingerprint = json.dumps(
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key not in ignored_keys
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+                if fingerprint in legacy_fingerprints:
+                    continue
+                legacy_fingerprints.add(fingerprint)
+            targets = [configured_type] if configured_type else legacy_targets
+            base_id = str(item.get("id") or f"item_{item_index + 1}").strip()
+            for target_index, message_type in enumerate(targets):
+                clone = dict(item)
+                clone["message_type"] = message_type
+                candidate_id = base_id
+                if target_index > 0 or candidate_id in used_ids:
+                    candidate_id = f"{base_id}_{message_type}"
+                suffix = 2
+                while candidate_id in used_ids:
+                    candidate_id = f"{base_id}_{message_type}_{suffix}"
+                    suffix += 1
+                clone["id"] = candidate_id
+                used_ids.add(candidate_id)
+                if clone_skill_id and target_index > 0:
+                    skill_id = str(clone.get("skill_id") or base_id).strip()
+                    clone["skill_id"] = f"{skill_id}_{message_type}"
+                scoped.append(clone)
+        return scoped
 
     @staticmethod
     def _smart_reply_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -226,6 +298,10 @@ class SqliteMessageCache:
         except Exception:
             message_types = ["text"]
         try:
+            mention_message_types = json.loads(row["mention_message_types_json"] or "[]")
+        except Exception:
+            mention_message_types = ["text"] if bool(int(row["mention_only"] or 0)) else []
+        try:
             file_types = json.loads(row["file_types_json"] or '["txt"]')
         except Exception:
             file_types = ["txt"]
@@ -239,22 +315,38 @@ class SqliteMessageCache:
             rules = []
         if not isinstance(message_types, list) or not message_types:
             message_types = ["text"]
+        if not isinstance(mention_message_types, list):
+            mention_message_types = ["text"] if bool(int(row["mention_only"] or 0)) else []
         if not isinstance(file_types, list):
             file_types = ["txt"]
         if not isinstance(ai_tasks, list):
             ai_tasks = []
+        rules = SqliteMessageCache._scope_smart_reply_items(
+            rules,
+            message_types,
+            {"text", "image"},
+        )
+        ai_tasks = SqliteMessageCache._scope_smart_reply_items(
+            ai_tasks,
+            message_types,
+            {"text", "image", "file"},
+            clone_skill_id=True,
+        )
         return {
             "chat_id": str(row["chat_id"] or ""),
             "chat_name": str(row["chat_name"] or row["chat_id"] or ""),
             "avatar": str(row["avatar"] or ""),
             "enabled": bool(int(row["enabled"] or 0)),
             "mention_only": bool(int(row["mention_only"] or 0)),
+            "mention_message_types": [
+                str(item) for item in mention_message_types if str(item or "").strip()
+            ],
             "use_no_src": bool(int(row["use_no_src"] or 0)),
             "message_types": [str(item) for item in message_types if str(item or "").strip()],
             "file_types": [str(item) for item in file_types if str(item or "").strip()],
             "target_senders": [str(item) for item in target_senders if str(item or "").strip()],
-            "rules": [item for item in rules if isinstance(item, dict)],
-            "ai_tasks": [item for item in ai_tasks if isinstance(item, dict)],
+            "rules": rules,
+            "ai_tasks": ai_tasks,
             "reply_count": int(row["reply_count"] or 0),
             "last_triggered_at": int(row["last_triggered_at"] or 0),
             "created_at": int(row["created_at"] or 0),
@@ -290,6 +382,11 @@ class SqliteMessageCache:
         now = int(time.time())
         target_senders = config.get("target_senders") if isinstance(config.get("target_senders"), list) else []
         message_types = config.get("message_types") if isinstance(config.get("message_types"), list) else ["text"]
+        mention_message_types = (
+            config.get("mention_message_types")
+            if isinstance(config.get("mention_message_types"), list)
+            else (["text"] if bool(config.get("mention_only", False)) else [])
+        )
         file_types = config.get("file_types") if isinstance(config.get("file_types"), list) else ["txt"]
         rules = config.get("rules") if isinstance(config.get("rules"), list) else []
         ai_tasks = config.get("ai_tasks") if isinstance(config.get("ai_tasks"), list) else []
@@ -298,9 +395,10 @@ class SqliteMessageCache:
                 """
                 INSERT INTO smart_reply_configs (
                     owner_wxid, chat_id, chat_name, avatar, enabled, mention_only, use_no_src,
-                    message_types_json, file_types_json, target_senders_json, rules_json, ai_tasks_json,
+                    message_types_json, mention_message_types_json, file_types_json,
+                    target_senders_json, rules_json, ai_tasks_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(owner_wxid, chat_id) DO UPDATE SET
                     chat_name=excluded.chat_name,
                     avatar=excluded.avatar,
@@ -308,6 +406,7 @@ class SqliteMessageCache:
                     mention_only=excluded.mention_only,
                     use_no_src=excluded.use_no_src,
                     message_types_json=excluded.message_types_json,
+                    mention_message_types_json=excluded.mention_message_types_json,
                     file_types_json=excluded.file_types_json,
                     target_senders_json=excluded.target_senders_json,
                     rules_json=excluded.rules_json,
@@ -320,9 +419,10 @@ class SqliteMessageCache:
                     str(config.get("chat_name") or chat_id),
                     str(config.get("avatar") or ""),
                     1 if bool(config.get("enabled", True)) else 0,
-                    1 if bool(config.get("mention_only", False)) else 0,
+                    1 if "text" in mention_message_types else 0,
                     1 if bool(config.get("use_no_src", False)) else 0,
                     json.dumps(message_types, ensure_ascii=False),
+                    json.dumps(mention_message_types, ensure_ascii=False),
                     json.dumps(file_types, ensure_ascii=False),
                     json.dumps(target_senders, ensure_ascii=False),
                     json.dumps(rules, ensure_ascii=False),

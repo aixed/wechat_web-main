@@ -2322,8 +2322,17 @@ class ProtocolRdvMappingRequest(BaseModel):
     proxy: dict[str, Any] = Field(default_factory=dict)
 
 
+_SMART_REPLY_ALLOWED_MESSAGE_TYPES = {
+    "text", "image", "gif", "voice", "video", "file",
+    "xml", "system", "recall", "quote",
+}
+_SMART_REPLY_RULE_MESSAGE_TYPES = {"text", "image"}
+_SMART_REPLY_AI_MESSAGE_TYPES = {"text", "image", "file"}
+
+
 class SmartReplyRuleRequest(BaseModel):
     id: str = ""
+    message_type: str = "text"
     keyword: str
     reply: str = ""
     use_regex: bool = False
@@ -2332,6 +2341,7 @@ class SmartReplyRuleRequest(BaseModel):
 
 class SmartReplyAiTaskRequest(BaseModel):
     id: str = ""
+    message_type: str = "text"
     name: str = ""
     enabled: bool = True
     skill_type: str = "custom"
@@ -2355,6 +2365,7 @@ class SmartReplyConfigRequest(BaseModel):
     avatar: str = ""
     enabled: bool = True
     mention_only: bool = False
+    mention_message_types: list[str] | None = None
     use_no_src: bool = False
     message_types: list[str] = Field(default_factory=lambda: ["text"])
     file_types: list[str] = Field(default_factory=lambda: ["txt"])
@@ -2690,6 +2701,12 @@ async def terminate_protocol_session(req: ProtocolSessionRequest):
 
 
 def _normalize_ai_task(task: SmartReplyAiTaskRequest, index: int = 0) -> dict[str, Any]:
+    message_type = str(task.message_type or "text").strip().lower()
+    if message_type not in _SMART_REPLY_AI_MESSAGE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"message type does not support AI Skills: {message_type}",
+        )
     allowed_output_modes = {"result", "template", "silent"}
     output_mode = str(task.output_mode or "result").strip().lower()
     if output_mode not in allowed_output_modes:
@@ -2719,6 +2736,7 @@ def _normalize_ai_task(task: SmartReplyAiTaskRequest, index: int = 0) -> dict[st
         raise HTTPException(status_code=400, detail="enabled MCP Skills require a reply template")
     return {
         "id": task_id,
+        "message_type": message_type,
         "name": str(task.name or f"Skill {index + 1}").strip()[:80],
         "enabled": bool(task.enabled),
         "skill_type": "custom",
@@ -3021,19 +3039,31 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
     if len(target_senders) > 10000:
         raise HTTPException(status_code=400, detail="too many target senders")
 
-    allowed_message_types = {
-        "text", "image", "gif", "voice", "video", "file",
-        "xml", "system", "recall", "quote",
-    }
     message_types: list[str] = []
     for value in req.message_types:
         message_type = str(value or "").strip().lower()
-        if message_type not in allowed_message_types:
+        if message_type not in _SMART_REPLY_ALLOWED_MESSAGE_TYPES:
             raise HTTPException(status_code=400, detail=f"unsupported smart reply message type: {message_type}")
         if message_type not in message_types:
             message_types.append(message_type)
     if not message_types:
         raise HTTPException(status_code=400, detail="at least one message type is required")
+
+    raw_mention_message_types = (
+        req.mention_message_types
+        if req.mention_message_types is not None
+        else (["text"] if req.mention_only else [])
+    )
+    mention_message_types: list[str] = []
+    for value in raw_mention_message_types:
+        message_type = str(value or "").strip().lower()
+        if message_type != "text":
+            raise HTTPException(
+                status_code=400,
+                detail=f"message type does not support mention filtering: {message_type}",
+            )
+        if message_type not in mention_message_types:
+            mention_message_types.append(message_type)
 
     allowed_file_types = {"txt", "pdf", "xlsx", "docx"}
     file_types: list[str] = []
@@ -3045,7 +3075,20 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
             file_types.append(file_type)
 
     rules: list[dict[str, Any]] = []
-    for index, rule in enumerate(req.rules[:100]):
+    rule_counts: dict[str, int] = {}
+    for index, rule in enumerate(req.rules):
+        message_type = str(rule.message_type or "text").strip().lower()
+        if message_type not in _SMART_REPLY_RULE_MESSAGE_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"message type does not support keyword rules: {message_type}",
+            )
+        rule_counts[message_type] = rule_counts.get(message_type, 0) + 1
+        if rule_counts[message_type] > 100:
+            raise HTTPException(
+                status_code=400,
+                detail=f"too many keyword rules for message type: {message_type}",
+            )
         keyword = str(rule.keyword or "").strip()
         reply = str(rule.reply or "").strip()
         reply_with_matched_line = bool(rule.reply_with_matched_line)
@@ -3063,12 +3106,22 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
                 ) from exc
         rules.append({
             "id": str(rule.id or f"rule_{index + 1}")[:100],
+            "message_type": message_type,
             "keyword": keyword,
             "reply": reply,
             "use_regex": bool(rule.use_regex),
             "reply_with_matched_line": reply_with_matched_line,
         })
-    ai_tasks = [_normalize_ai_task(task, index) for index, task in enumerate(req.ai_tasks[:20])]
+    ai_tasks = [_normalize_ai_task(task, index) for index, task in enumerate(req.ai_tasks)]
+    ai_task_counts: dict[str, int] = {}
+    for task in ai_tasks:
+        task_message_type = str(task.get("message_type") or "text")
+        ai_task_counts[task_message_type] = ai_task_counts.get(task_message_type, 0) + 1
+        if ai_task_counts[task_message_type] > 20:
+            raise HTTPException(
+                status_code=400,
+                detail=f"too many AI Skills for message type: {task_message_type}",
+            )
     usable_mcp_connection_ids = {
         str(connection.get("id") or "")
         for connection in config.MCP_CONNECTIONS
@@ -3091,7 +3144,8 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
         "chat_name": str(req.chat_name or cached_contact.get("name") or chat_id).strip()[:200],
         "avatar": str(req.avatar or cached_contact.get("avatar") or "").strip()[:2000],
         "enabled": bool(req.enabled),
-        "mention_only": is_group and bool(req.mention_only),
+        "mention_only": is_group and "text" in mention_message_types,
+        "mention_message_types": mention_message_types if is_group else [],
         "use_no_src": bool(req.use_no_src),
         "message_types": message_types,
         "file_types": file_types,
@@ -3319,6 +3373,7 @@ def _preview_text(value: Any, limit: int = 80) -> str:
 
 _SMART_REPLY_TXT_MAX_BYTES = 2 * 1024 * 1024
 _SMART_REPLY_AI_INPUT_MAX_CHARS = 20_000
+_SMART_REPLY_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _read_smart_reply_txt(path: str) -> tuple[str, str]:
@@ -3401,11 +3456,98 @@ async def _smart_reply_file_ai_content(
     return prefix + content[:available_chars], "ok"
 
 
+def _ocr_response_text(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized_key = re.sub(r"[^a-z]", "", str(key).casefold())
+            if normalized_key in {"rettext", "ocrtext", "text"}:
+                text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+                if text:
+                    return text
+        for value in payload.values():
+            nested = _ocr_response_text(value)
+            if nested:
+                return nested
+    elif isinstance(payload, list):
+        for value in payload:
+            nested = _ocr_response_text(value)
+            if nested:
+                return nested
+    return ""
+
+
+async def _smart_reply_image_ocr(
+    message: dict[str, Any],
+    agent_id: str,
+) -> tuple[str, str, str]:
+    msg_xml = str(message.get("msg") or "")
+    params = _parse_media_download_params("3", msg_xml, "")
+    if (not params["aeskey"] or not params["fileid"]) and message.get("id"):
+        try:
+            with wechat_api.use_agent(agent_id), wechat_api.use_log_category("smart_reply"):
+                structure = await wechat_api.get_msg_struct(str(message.get("id") or ""))
+            structure_xml, structure_type = _message_struct_content(structure)
+            if structure_xml and structure_type in {"", "3"}:
+                msg_xml = structure_xml
+                params = _parse_media_download_params("3", msg_xml, "")
+        except Exception as exc:
+            return "", msg_xml, f"message_struct_failed:{type(exc).__name__}"
+    if not params["aeskey"] or not params["fileid"]:
+        return "", msg_xml, "missing_ocr_parameters"
+    try:
+        with wechat_api.use_agent(agent_id), wechat_api.use_log_category("smart_reply"):
+            result = await wechat_api.ocr_recognizes(params["aeskey"], params["fileid"])
+    except Exception as exc:
+        return "", msg_xml, f"ocr_failed:{type(exc).__name__}"
+    text = _ocr_response_text(result)
+    return text, msg_xml, "ok" if text else "ocr_empty"
+
+
+def _image_data_url_from_path(path: str) -> tuple[str, str]:
+    path = _ensure_browser_image_file(path)
+    if not _nonempty_file(path):
+        return "", "missing_image"
+    try:
+        size = os.path.getsize(path)
+        if size > _SMART_REPLY_IMAGE_MAX_BYTES:
+            return "", "oversized_image"
+        with open(path, "rb") as source:
+            payload = source.read(_SMART_REPLY_IMAGE_MAX_BYTES + 1)
+    except OSError:
+        return "", "unreadable_image"
+    if len(payload) > _SMART_REPLY_IMAGE_MAX_BYTES:
+        return "", "oversized_image"
+    media_type = _image_media_type_for_path(path)
+    if not media_type.startswith("image/"):
+        return "", "unsupported_image"
+    return f"data:{media_type};base64,{base64.b64encode(payload).decode('ascii')}", "ok"
+
+
+async def _smart_reply_image_data_url(
+    message: dict[str, Any],
+    msg_xml: str,
+    agent_id: str,
+) -> tuple[str, str]:
+    try:
+        with wechat_api.use_agent(agent_id), wechat_api.use_log_category("smart_reply"):
+            path, _ = await _resolve_media_path(
+                msg_id=str(message.get("id") or ""),
+                msg_type="3",
+                local_path=str(message.get("img_path") or message.get("path") or ""),
+                msg_xml=msg_xml,
+                filename="wechat_image.jpg",
+            )
+    except Exception as exc:
+        return "", f"resolve_failed:{type(exc).__name__}"
+    return await asyncio.to_thread(_image_data_url_from_path, path)
+
+
 async def _evaluate_ai_tasks(
     content: str,
     tasks: list[dict[str, Any]],
     *,
     message_id: str = "-",
+    image_data_url: str = "",
 ) -> tuple[str, ...]:
     enabled_tasks = [task for task in tasks if isinstance(task, dict) and bool(task.get("enabled"))]
     if not enabled_tasks:
@@ -3414,8 +3556,19 @@ async def _evaluate_ai_tasks(
     if not ai_service.configured:
         _smart_reply_log(f"[AI_REPLY] skipped message_id={message_id}: AI service is not configured")
         return ()
+    async def _analyze_task(task: dict[str, Any]) -> dict[str, Any]:
+        if image_data_url:
+            try:
+                return await ai_service.analyze_image(content, task, image_data_url)
+            except (AiServiceError, AttributeError) as exc:
+                _smart_reply_log(
+                    f"[AI_REPLY] image input unavailable message_id={message_id} "
+                    f"id={task.get('id', '')}: {type(exc).__name__}: {exc}; falling back to OCR text"
+                )
+        return await ai_service.analyze(content, task)
+
     results = await asyncio.gather(
-        *(ai_service.analyze(content, task) for task in enabled_tasks),
+        *(_analyze_task(task) for task in enabled_tasks),
         return_exceptions=True,
     )
     replies: list[str] = []
@@ -3479,20 +3632,81 @@ async def _process_smart_reply_message(
         config=config_row,
     )
     if not decision.should_send:
-        ai_tasks = config_row.get("ai_tasks") if isinstance(config_row, dict) else []
         msg_type = str(message.get("msgtype") or "")
-        if (
-            msg_type not in {"1", "49"}
-            or decision.reason not in {"keyword_not_matched", "too_few_lines", "pure_single_line"}
-            or not ai_tasks
-        ):
+        ai_message_type = {"1": "text", "3": "image", "49": "file"}.get(msg_type, "")
+        ai_tasks = [
+            task
+            for task in (config_row.get("ai_tasks") or [])
+            if isinstance(task, dict)
+            and str(task.get("message_type") or "text").strip() == ai_message_type
+        ] if isinstance(config_row, dict) else []
+        ai_candidate_reasons = {"keyword_not_matched", "too_few_lines", "pure_single_line"}
+        if decision.reason not in ai_candidate_reasons:
             _smart_reply_log(
                 f"[SMART_REPLY] skipped message_id={message_id} chat={chat_id} "
                 f"sender={message.get('fromid', '')} "
                 f"reason={decision.reason} msgtype={message.get('msgtype', '')} ai_tasks={len(ai_tasks or [])}"
             )
             return
-        if msg_type == "49":
+        raw_content = ""
+        image_data_url = ""
+        if msg_type == "3":
+            ocr_text, image_xml, ocr_reason = await _smart_reply_image_ocr(message, agent_id)
+            if ocr_text:
+                extracted_message = dict(message)
+                extracted_message["_smart_reply_content"] = ocr_text
+                decision = smart_reply_engine.evaluate(
+                    owner_wxid=owner_wxid,
+                    chat_id=chat_id,
+                    self_wxid=self_wxid,
+                    message=extracted_message,
+                    config=config_row,
+                )
+                if decision.should_send:
+                    _smart_reply_log(
+                        f"[SMART_REPLY] image OCR rule matched message_id={message_id} "
+                        f"chat={chat_id} text={_preview_text(ocr_text)!r}"
+                    )
+                elif decision.reason not in ai_candidate_reasons:
+                    _smart_reply_log(
+                        f"[SMART_REPLY] skipped image message_id={message_id} chat={chat_id} "
+                        f"reason={decision.reason} after_ocr=yes"
+                    )
+                    return
+            if not decision.should_send:
+                if not ai_tasks:
+                    _smart_reply_log(
+                        f"[SMART_REPLY] skipped image message_id={message_id} chat={chat_id} "
+                        f"reason={ocr_reason if not ocr_text else decision.reason} ai_tasks=0"
+                    )
+                    return
+                image_data_url, image_reason = await _smart_reply_image_data_url(
+                    message,
+                    image_xml,
+                    agent_id,
+                )
+                if not ocr_text and not image_data_url:
+                    _smart_reply_log(
+                        f"[SMART_REPLY] skipped image message_id={message_id} chat={chat_id} "
+                        f"ocr_reason={ocr_reason} image_reason={image_reason}"
+                    )
+                    return
+                raw_content = (
+                    f"图片 OCR 文字：\n{ocr_text}"
+                    if ocr_text
+                    else "图片消息（OCR 未识别到文字，请直接识别图片内容）"
+                )
+                _smart_reply_log(
+                    f"[SMART_REPLY] image prepared message_id={message_id} chat={chat_id} "
+                    f"ocr_reason={ocr_reason} image_reason={image_reason} "
+                    f"vision={'yes' if image_data_url else 'no'} text={_preview_text(ocr_text)!r}"
+                )
+        elif msg_type == "49":
+            if not ai_tasks:
+                _smart_reply_log(
+                    f"[SMART_REPLY] skipped file message_id={message_id} chat={chat_id} reason=no_ai_tasks"
+                )
+                return
             raw_content, file_reason = await _smart_reply_file_ai_content(
                 message,
                 config_row.get("file_types") if isinstance(config_row, dict) else None,
@@ -3503,32 +3717,49 @@ async def _process_smart_reply_message(
                     f"sender={message.get('fromid', '')} reason={file_reason}"
                 )
                 return
-        else:
+        elif msg_type == "1":
+            if not ai_tasks:
+                _smart_reply_log(
+                    f"[SMART_REPLY] skipped message_id={message_id} chat={chat_id} reason=no_ai_tasks"
+                )
+                return
             raw_content = str(message.get("msg") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-        _smart_reply_log(
-            f"[SMART_REPLY] evaluating AI message_id={message_id} chat={chat_id} "
-            f"sender={message.get('fromid', '')} "
-            f"reason={decision.reason} text={_preview_text(raw_content)!r}"
-        )
-        ai_replies = await _evaluate_ai_tasks(raw_content, ai_tasks, message_id=message_id)
-        decision = smart_reply_engine.reserve_ai_replies(
-            owner_wxid=owner_wxid,
-            chat_id=chat_id,
-            message=message,
-            replies=ai_replies,
-        )
-        if not decision.should_send:
+        else:
             _smart_reply_log(
-                f"[SMART_REPLY] AI produced no send message_id={message_id} chat={chat_id} "
-                f"sender={message.get('fromid', '')} "
-                f"reason={decision.reason} replies={len(ai_replies)}"
+                f"[SMART_REPLY] skipped message_id={message_id} chat={chat_id} "
+                f"reason=unsupported_async_message_type msgtype={msg_type}"
             )
             return
-        _smart_reply_log(
-            f"[SMART_REPLY] AI reserved message_id={message_id} chat={chat_id} "
-            f"sender={message.get('fromid', '')} "
-            f"count={len(decision.replies)}"
-        )
+        if not decision.should_send:
+            _smart_reply_log(
+                f"[SMART_REPLY] evaluating AI message_id={message_id} chat={chat_id} "
+                f"sender={message.get('fromid', '')} "
+                f"reason={decision.reason} text={_preview_text(raw_content)!r}"
+            )
+            ai_replies = await _evaluate_ai_tasks(
+                raw_content,
+                ai_tasks,
+                message_id=message_id,
+                image_data_url=image_data_url,
+            )
+            decision = smart_reply_engine.reserve_ai_replies(
+                owner_wxid=owner_wxid,
+                chat_id=chat_id,
+                message=message,
+                replies=ai_replies,
+            )
+            if not decision.should_send:
+                _smart_reply_log(
+                    f"[SMART_REPLY] AI produced no send message_id={message_id} chat={chat_id} "
+                    f"sender={message.get('fromid', '')} "
+                    f"reason={decision.reason} replies={len(ai_replies)}"
+                )
+                return
+            _smart_reply_log(
+                f"[SMART_REPLY] AI reserved message_id={message_id} chat={chat_id} "
+                f"sender={message.get('fromid', '')} "
+                f"count={len(decision.replies)}"
+            )
     evaluation_finished_at = time.perf_counter()
     evaluate_ms = (evaluation_finished_at - process_started_at) * 1000
     try:

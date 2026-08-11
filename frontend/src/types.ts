@@ -27,6 +27,7 @@ export interface Session {
 
 export interface SmartReplyRule {
   id: string;
+  message_type: SmartReplyMessageType;
   keyword: string;
   reply: string;
   use_regex: boolean;
@@ -37,6 +38,7 @@ export type SmartReplyAiOutputMode = "result" | "template" | "silent";
 
 export interface SmartReplyAiTask {
   id: string;
+  message_type: SmartReplyMessageType;
   name: string;
   enabled: boolean;
   skill_type: "custom";
@@ -118,6 +120,7 @@ export interface SmartReplyConfig {
   avatar?: string;
   enabled: boolean;
   mention_only: boolean;
+  mention_message_types: SmartReplyMessageType[];
   use_no_src: boolean;
   message_types: SmartReplyMessageType[];
   file_types: Array<"txt" | "pdf" | "xlsx" | "docx">;

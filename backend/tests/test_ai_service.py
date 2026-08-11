@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import httpx
@@ -79,6 +80,45 @@ class AiServiceProbeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AiServiceAnalyzeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_analyze_image_sends_responses_multimodal_input(self):
+        request_payloads = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            request_payloads.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={
+                "output": [{
+                    "content": [{
+                        "type": "output_text",
+                        "text": (
+                            '{"matched":true,"confidence":96,'
+                            '"result":"图片已识别","items":[],"reply":"图片已识别"}'
+                        ),
+                    }],
+                }],
+            })
+
+        service = AiService(
+            base_url="https://provider.test",
+            api_key="test-key",
+            model="vision-model",
+        )
+        await service._client.aclose()
+        service._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await service.analyze_image(
+                "图片 OCR 文字：40386",
+                {"name": "提取编号", "instruction": "提取图片中的编号"},
+                "data:image/png;base64,aGVsbG8=",
+            )
+        finally:
+            await service.close()
+
+        user_input = request_payloads[0]["input"][0]["content"]
+        self.assertEqual("input_text", user_input[0]["type"])
+        self.assertEqual("input_image", user_input[1]["type"])
+        self.assertEqual("data:image/png;base64,aGVsbG8=", user_input[1]["image_url"])
+        self.assertEqual("图片已识别", result["reply"])
+
     async def test_analyze_falls_back_to_chat_completions_when_responses_is_missing(self):
         requested_paths = []
 

@@ -69,12 +69,13 @@ function writeViewPreference(chatId: string, patch: SmartReplyViewPreference) {
   }
 }
 
-function makeRule(): SmartReplyRule {
+function makeRule(messageType: SmartReplyMessageType = "text"): SmartReplyRule {
   const suffix = typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
     : `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   return {
     id: `rule_${suffix}`,
+    message_type: messageType,
     keyword: "",
     reply: "",
     use_regex: false,
@@ -82,13 +83,14 @@ function makeRule(): SmartReplyRule {
   };
 }
 
-function makeAiSkill(): SmartReplyAiTask {
+function makeAiSkill(messageType: SmartReplyMessageType = "text"): SmartReplyAiTask {
   const suffix = typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
     : `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const id = `ai_skill_${suffix}`;
   return {
     id,
+    message_type: messageType,
     name: "未命名 Skill",
     enabled: true,
     skill_type: "custom",
@@ -140,32 +142,93 @@ function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
     avatar: target.avatar || "",
     enabled: true,
     mention_only: false,
+    mention_message_types: [],
     use_no_src: false,
     message_types: ["text"],
     file_types: ["txt"],
     target_senders: isGroup ? [] : [target.wxid],
-    rules: [makeRule()],
+    rules: [makeRule("text")],
     ai_tasks: [],
     reply_count: 0,
     last_triggered_at: 0,
   };
 }
 
+function stableSerialize(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableSerialize).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
+}
+
+function dedupeLegacyItems<T extends { message_type?: SmartReplyMessageType }>(
+  items: T[],
+  ignoredKeys: string[],
+): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (item.message_type) return true;
+    const record = item as Record<string, unknown>;
+    const fingerprint = stableSerialize(Object.fromEntries(
+      Object.entries(record).filter(([key]) => !ignoredKeys.includes(key)),
+    ));
+    if (seen.has(fingerprint)) return false;
+    seen.add(fingerprint);
+    return true;
+  });
+}
+
 function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
   const isGroup = config.chat_id.endsWith("@chatroom");
+  const configuredMessageTypes: SmartReplyMessageType[] = config.message_types?.length
+    ? [...config.message_types]
+    : ["text"];
+  const legacyRuleTypes = configuredMessageTypes.filter((value) => value === "text" || value === "image");
+  const legacyAiTypes = configuredMessageTypes.filter((value) => value === "text" || value === "image" || value === "file");
+  const rules = dedupeLegacyItems(config.rules || [], ["id", "message_type"]).flatMap((rule) => {
+    if (rule.message_type) return [{ ...rule }];
+    const messageTypes = legacyRuleTypes.length ? legacyRuleTypes : ["text" as const];
+    return messageTypes.map((messageType, index) => ({
+      ...rule,
+      id: index === 0 ? rule.id : `${rule.id}_${messageType}`,
+      message_type: messageType,
+    }));
+  });
+  const aiTasks = dedupeLegacyItems(config.ai_tasks || [], ["id", "skill_id", "message_type"]).flatMap((task) => {
+    if (task.message_type) return [{ ...task }];
+    const messageTypes = legacyAiTypes.length ? legacyAiTypes : ["text" as const];
+    return messageTypes.map((messageType, index) => ({
+      ...task,
+      id: index === 0 ? task.id : `${task.id}_${messageType}`,
+      skill_id: index === 0 ? task.skill_id : `${task.skill_id || task.id}_${messageType}`,
+      message_type: messageType,
+    }));
+  });
   return {
     ...config,
     mention_only: isGroup && Boolean(config.mention_only),
+    mention_message_types: isGroup
+      ? (Array.isArray(config.mention_message_types)
+        ? [...config.mention_message_types]
+        : (config.mention_only ? ["text"] : []))
+      : [],
     use_no_src: Boolean(config.use_no_src),
-    message_types: config.message_types?.length ? [...config.message_types] : ["text"],
+    message_types: [...configuredMessageTypes],
     file_types: Array.isArray(config.file_types) ? [...config.file_types] : ["txt"],
     target_senders: isGroup ? [...(config.target_senders || [])] : [config.chat_id],
-    rules: (config.rules || []).map((rule) => ({
+    rules: rules.map((rule) => ({
       ...rule,
       use_regex: Boolean(rule.use_regex),
       reply_with_matched_line: Boolean(rule.reply_with_matched_line),
     })),
-    ai_tasks: (config.ai_tasks || []).map((task) => ({
+    ai_tasks: aiTasks.map((task) => ({
       ...task,
       enabled: Boolean(task.enabled),
       skill_type: "custom",
@@ -252,6 +315,7 @@ export default function SmartReplyManager({
   const [membersLoading, setMembersLoading] = useState(false);
   const [members, setMembers] = useState<GroupMember[]>([]);
   const [memberQuery, setMemberQuery] = useState("");
+  const [membersExpanded, setMembersExpanded] = useState(false);
   const [listQuery, setListQuery] = useState("");
   const [pickerQuery, setPickerQuery] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -267,6 +331,8 @@ export default function SmartReplyManager({
   const [aiTesting, setAiTesting] = useState(false);
   const [aiTestExpanded, setAiTestExpanded] = useState(false);
   const [expandedRuleId, setExpandedRuleId] = useState<string | null>(null);
+  const [skillsExpanded, setSkillsExpanded] = useState(false);
+  const [expandedSkillIds, setExpandedSkillIds] = useState<Set<string>>(() => new Set());
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
@@ -355,14 +421,17 @@ export default function SmartReplyManager({
       : cloned.message_types[0] || "text";
     const preferredReplyMode = preference.text_reply_mode === "rules" || preference.text_reply_mode === "ai"
       ? preference.text_reply_mode
-      : cloned.ai_tasks.length > 0 ? "ai" : "rules";
+      : cloned.ai_tasks.some((task) => task.message_type === preferredMessageType) ? "ai" : "rules";
     setDraft(cloned);
     setActiveMessageType(preferredMessageType);
     setTextReplyMode(preferredReplyMode);
-    setAiTestTaskId(cloned.ai_tasks[0]?.id || "");
+    setAiTestTaskId(cloned.ai_tasks.find((task) => task.message_type === preferredMessageType)?.id || "");
     setAiTestResult(null);
     setAiTestExpanded(false);
     setExpandedRuleId(null);
+    setSkillsExpanded(false);
+    setExpandedSkillIds(new Set());
+    setMembersExpanded(cloned.chat_id.endsWith("@chatroom") && cloned.target_senders.length === 0);
     setError("");
     setNotice("");
     if (config.chat_id.endsWith("@chatroom")) {
@@ -496,7 +565,8 @@ export default function SmartReplyManager({
         chat_name: draft.chat_name,
         avatar: draft.avatar,
         enabled: draft.enabled,
-        mention_only: draft.mention_only,
+        mention_only: draft.mention_message_types.includes("text"),
+        mention_message_types: draft.mention_message_types.filter((value): value is "text" => value === "text"),
         use_no_src: draft.use_no_src,
         message_types: draft.message_types,
         file_types: draft.file_types,
@@ -554,7 +624,8 @@ export default function SmartReplyManager({
     } : prev);
   };
 
-  const currentAiTasks = draft?.ai_tasks || [];
+  const currentRules = (draft?.rules || []).filter((rule) => rule.message_type === activeMessageType);
+  const currentAiTasks = (draft?.ai_tasks || []).filter((task) => task.message_type === activeMessageType);
   const availableMcpConnections = (aiSettings?.mcp_connections || []).filter((connection) => connection.enabled);
 
   const updateAiTask = (id: string, patch: Partial<SmartReplyAiTask>) => {
@@ -597,14 +668,21 @@ export default function SmartReplyManager({
   };
 
   const addAiTask = () => {
-    const task = makeAiSkill();
+    const task = makeAiSkill(activeMessageType);
     setDraft((prev) => prev ? { ...prev, ai_tasks: [...prev.ai_tasks, task] } : prev);
+    setSkillsExpanded(true);
+    setExpandedSkillIds((prev) => new Set(prev).add(task.id));
     setAiTestTaskId(task.id);
     setNotice("");
     setAiTestResult(null);
   };
 
   const removeAiTask = (id: string) => {
+    setExpandedSkillIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
     setDraft((prev) => {
       if (!prev) return prev;
       const aiTasks = prev.ai_tasks.filter((task) => task.id !== id);
@@ -613,6 +691,15 @@ export default function SmartReplyManager({
     });
     setNotice("");
     setAiTestResult(null);
+  };
+
+  const toggleSkillExpanded = (id: string) => {
+    setExpandedSkillIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   };
 
   const testAiTask = async () => {
@@ -655,12 +742,16 @@ export default function SmartReplyManager({
       return;
     }
     try {
-      const imported = parseImportedRules(JSON.parse(await file.text()));
-      const onlyBlankRule = draft.rules.length === 1
-        && !draft.rules[0].keyword.trim()
-        && !draft.rules[0].reply.trim();
-      const rules = onlyBlankRule ? imported : [...draft.rules, ...imported];
-      if (rules.length > 100) {
+      const imported = parseImportedRules(JSON.parse(await file.text())).map((rule) => ({
+        ...rule,
+        message_type: activeMessageType,
+      }));
+      const onlyBlankRule = currentRules.length === 1
+        && !currentRules[0].keyword.trim()
+        && !currentRules[0].reply.trim();
+      const otherRules = draft.rules.filter((rule) => rule.message_type !== activeMessageType);
+      const rules = onlyBlankRule ? [...otherRules, ...imported] : [...draft.rules, ...imported];
+      if (currentRules.length + imported.length > 100) {
         setError("规则总数不能超过 100 条");
         return;
       }
@@ -679,7 +770,8 @@ export default function SmartReplyManager({
       version: 1,
       chat_id: draft.chat_id,
       chat_name: draft.chat_name,
-      rules: draft.rules.map((rule) => ({
+      message_type: activeMessageType,
+      rules: currentRules.map((rule) => ({
         keyword: rule.keyword,
         reply: rule.reply,
         use_regex: Boolean(rule.use_regex),
@@ -721,6 +813,17 @@ export default function SmartReplyManager({
       message_types: MESSAGE_TYPE_OPTIONS
         .map((option) => option.value)
         .filter((value) => selected.has(value)),
+    });
+  };
+
+  const toggleMentionMessageType = (messageType: SmartReplyMessageType) => {
+    if (!draft || messageType !== "text") return;
+    const selected = new Set(draft.mention_message_types || []);
+    if (selected.has(messageType)) selected.delete(messageType);
+    else selected.add(messageType);
+    updateDraft({
+      mention_only: selected.has("text"),
+      mention_message_types: Array.from(selected),
     });
   };
 
@@ -992,19 +1095,6 @@ export default function SmartReplyManager({
                     label="底层发送"
                   />
                 </div>
-                {draft.chat_id.endsWith("@chatroom") && (
-                <div
-                  className="flex items-center gap-[8px] text-[13px]"
-                  title="开启后只处理目标发送人 @ 当前账号的消息"
-                >
-                  <span>只处理 @本人 消息</span>
-                  <CompactToggle
-                    checked={draft.mention_only}
-                    onChange={(mention_only) => updateDraft({ mention_only })}
-                    label="只处理 @本人 消息"
-                  />
-                </div>
-                )}
               </div>
             </div>
             <div role="tablist" className={`mt-[14px] flex flex-wrap items-center gap-x-[12px] gap-y-[4px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
@@ -1027,7 +1117,11 @@ export default function SmartReplyManager({
                     onClick={() => {
                       setActiveMessageType(option.value);
                       writeViewPreference(draft.chat_id, { message_type: option.value });
+                      setAiTestTaskId(draft.ai_tasks.find((task) => task.message_type === option.value)?.id || "");
+                      setAiTestResult(null);
                       setExpandedRuleId(null);
+                      setSkillsExpanded(false);
+                      setExpandedSkillIds(new Set());
                     }}
                     className="h-full"
                   >
@@ -1045,11 +1139,12 @@ export default function SmartReplyManager({
             </div>
           </section>
 
-          {activeMessageType === "text" || activeMessageType === "file" ? (
+          {activeMessageType === "text" || activeMessageType === "image" || activeMessageType === "file" ? (
             <>
-          {activeMessageType === "text" ? (
+          {activeMessageType !== "file" ? (
           <section className="pt-[16px]">
-            <div role="tablist" aria-label="文本回复方式" className={`flex items-center gap-x-[20px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+            <div className={`flex flex-wrap items-center justify-between gap-x-[20px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+            <div role="tablist" aria-label={`${activeMessageType === "image" ? "图片" : "文本"}回复方式`} className="flex items-center gap-x-[20px]">
               <button
                 type="button"
                 role="tab"
@@ -1084,6 +1179,17 @@ export default function SmartReplyManager({
                 <span>AI 智能回复</span>
                 <span className={`w-[6px] h-[6px] rounded-full ${textReplyMode === "ai" ? "bg-[#07c160]" : (dark ? "bg-[#555]" : "bg-[#bbb]")}`} />
               </button>
+            </div>
+            {activeMessageType === "text" && draft.chat_id.endsWith("@chatroom") && (
+              <div className="h-[38px] flex items-center gap-[8px] text-[13px]">
+                <span>只处理 @本人 消息</span>
+                <CompactToggle
+                  checked={draft.mention_message_types.includes("text")}
+                  onChange={() => toggleMentionMessageType("text")}
+                  label="文本消息只处理 @本人"
+                />
+              </div>
+            )}
             </div>
           </section>
           ) : (
@@ -1129,6 +1235,21 @@ export default function SmartReplyManager({
           </section>
           )}
 
+          {activeMessageType === "image" && (
+          <section className={`py-[18px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+            <div className="flex flex-wrap items-center justify-between gap-[10px]">
+              <div>
+                <h2 className="text-[15px] font-medium">图片内容识别</h2>
+                <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>Hook OCR</div>
+              </div>
+              <div className="flex items-center gap-[7px] text-[12px] text-[#07c160]">
+                <span className="w-[6px] h-[6px] rounded-full bg-[#07c160]" />
+                <span>已接入</span>
+              </div>
+            </div>
+          </section>
+          )}
+
           {draft.chat_id.endsWith("@chatroom") && (
           <section className={`py-[24px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
             <div className="flex items-center justify-between gap-[12px]">
@@ -1141,55 +1262,80 @@ export default function SmartReplyManager({
                   </div>
                 )}
               </div>
-              {selectableMemberWxids.length > 0 && (
+              <div className="flex items-center gap-[8px]">
+                {membersExpanded && selectableMemberWxids.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => updateDraft({
+                      target_senders: allSelectableMembersSelected ? [] : selectableMemberWxids,
+                    })}
+                    className={`h-[34px] px-[6px] text-[13px] ${dark ? "text-[#9a9a9a] hover:text-white" : "text-[#666] hover:text-black"}`}
+                  >
+                    {allSelectableMembersSelected ? "取消全选" : "全选"}
+                  </button>
+                )}
                 <button
                   type="button"
-                  onClick={() => updateDraft({
-                    target_senders: allSelectableMembersSelected ? [] : selectableMemberWxids,
-                  })}
-                  className={`text-[13px] ${dark ? "text-[#9a9a9a] hover:text-white" : "text-[#666] hover:text-black"}`}
+                  title={membersExpanded ? "收起群成员" : "展开群成员"}
+                  aria-label={membersExpanded ? "收起群成员" : "展开群成员"}
+                  aria-expanded={membersExpanded}
+                  aria-controls="smart-reply-member-picker"
+                  onClick={() => setMembersExpanded((expanded) => !expanded)}
+                  className={`w-[34px] h-[34px] shrink-0 flex items-center justify-center rounded-[5px] ${dark ? "text-[#999] hover:bg-[#222] hover:text-white" : "text-[#666] hover:bg-[#ededed] hover:text-black"}`}
                 >
-                  {allSelectableMembersSelected ? "取消全选" : "全选"}
+                  <svg
+                    className={`w-[18px] h-[18px] transition-transform ${membersExpanded ? "rotate-180" : ""}`}
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={1.8}
+                    viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" />
+                  </svg>
                 </button>
-              )}
+              </div>
             </div>
-            <div className={`mt-[14px] h-[36px] max-w-[420px] rounded-[5px] border flex items-center px-[10px] ${dark ? "border-[#353535] bg-[#1b1b1b]" : "border-[#d5d5d5] bg-white"}`}>
-              <svg className={`w-[15px] h-[15px] ${dark ? "text-[#666]" : "text-[#888]"}`} fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
-                <path strokeLinecap="round" d="m21 21-5-5m2-6a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z" />
-              </svg>
-              <input value={memberQuery} onChange={(event) => setMemberQuery(event.target.value)} placeholder="搜索群成员" className="ml-[7px] min-w-0 flex-1 bg-transparent outline-none text-[13px]" />
-            </div>
-            {membersLoading ? (
-              <div className={`py-[22px] text-[13px] ${dark ? "text-[#666]" : "text-[#999]"}`}>正在加载群成员...</div>
-            ) : (
-              <div className="mt-[12px] grid grid-cols-1 xl:grid-cols-2 gap-x-[28px] max-h-[280px] overflow-y-auto pane-scroll">
-                {memberRows.map((member) => {
-                  const checked = draft.target_senders.includes(member.wxid);
-                  const isSelf = Boolean(normalizedSelfWxid && member.wxid === normalizedSelfWxid);
-                  return (
-                    <label
-                      key={member.wxid}
-                      title={isSelf ? "当前登录账号" : undefined}
-                      className={`h-[52px] flex items-center gap-[10px] border-b cursor-pointer ${
-                        dark ? "border-[#252525]" : "border-[#e5e5e5]"
-                      } ${isSelf ? (dark ? "bg-[#151515] text-[#686868]" : "bg-[#f1f1f1] text-[#999]") : ""}`}
-                    >
-                      <input type="checkbox" checked={checked} onChange={() => toggleSender(member.wxid)} className={`w-[16px] h-[16px] accent-[#07c160] ${isSelf ? "opacity-60" : ""}`} />
-                      <div className={isSelf ? "opacity-55 grayscale" : ""}>
-                        <TargetAvatar target={member} size={34} />
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-[7px] min-w-0">
-                          <span className="text-[13px] truncate">{member.name}</span>
-                          {isSelf && (
-                            <span className={`shrink-0 text-[10px] ${dark ? "text-[#626262]" : "text-[#999]"}`}>自己</span>
-                          )}
-                        </div>
-                        <div className={`text-[10px] truncate mt-[1px] ${dark ? "text-[#606060]" : "text-[#aaa]"}`}>{member.wxid}</div>
-                      </div>
-                    </label>
-                  );
-                })}
+            {membersExpanded && (
+              <div id="smart-reply-member-picker">
+                <div className={`mt-[14px] h-[36px] max-w-[420px] rounded-[5px] border flex items-center px-[10px] ${dark ? "border-[#353535] bg-[#1b1b1b]" : "border-[#d5d5d5] bg-white"}`}>
+                  <svg className={`w-[15px] h-[15px] ${dark ? "text-[#666]" : "text-[#888]"}`} fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+                    <path strokeLinecap="round" d="m21 21-5-5m2-6a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z" />
+                  </svg>
+                  <input value={memberQuery} onChange={(event) => setMemberQuery(event.target.value)} placeholder="搜索群成员" className="ml-[7px] min-w-0 flex-1 bg-transparent outline-none text-[13px]" />
+                </div>
+                {membersLoading ? (
+                  <div className={`py-[22px] text-[13px] ${dark ? "text-[#666]" : "text-[#999]"}`}>正在加载群成员...</div>
+                ) : (
+                  <div className="mt-[12px] grid grid-cols-1 xl:grid-cols-2 gap-x-[28px] max-h-[280px] overflow-y-auto pane-scroll">
+                    {memberRows.map((member) => {
+                      const checked = draft.target_senders.includes(member.wxid);
+                      const isSelf = Boolean(normalizedSelfWxid && member.wxid === normalizedSelfWxid);
+                      return (
+                        <label
+                          key={member.wxid}
+                          title={isSelf ? "当前登录账号" : undefined}
+                          className={`h-[52px] flex items-center gap-[10px] border-b cursor-pointer ${
+                            dark ? "border-[#252525]" : "border-[#e5e5e5]"
+                          } ${isSelf ? (dark ? "bg-[#151515] text-[#686868]" : "bg-[#f1f1f1] text-[#999]") : ""}`}
+                        >
+                          <input type="checkbox" checked={checked} onChange={() => toggleSender(member.wxid)} className={`w-[16px] h-[16px] accent-[#07c160] ${isSelf ? "opacity-60" : ""}`} />
+                          <div className={isSelf ? "opacity-55 grayscale" : ""}>
+                            <TargetAvatar target={member} size={34} />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-[7px] min-w-0">
+                              <span className="text-[13px] truncate">{member.name}</span>
+                              {isSelf && (
+                                <span className={`shrink-0 text-[10px] ${dark ? "text-[#626262]" : "text-[#999]"}`}>自己</span>
+                              )}
+                            </div>
+                            <div className={`text-[10px] truncate mt-[1px] ${dark ? "text-[#606060]" : "text-[#aaa]"}`}>{member.wxid}</div>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
           </section>
@@ -1197,12 +1343,12 @@ export default function SmartReplyManager({
 
           {activeMessageType === "text" && aiTestPanel}
 
-          {activeMessageType === "text" && textReplyMode === "rules" ? (
+          {(activeMessageType === "text" || activeMessageType === "image") && textReplyMode === "rules" ? (
           <section className="py-[24px]">
             <div className="flex flex-wrap items-start justify-between gap-[10px]">
               <div>
                 <h2 className="text-[15px] font-medium">关键词规则</h2>
-                <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>{draft.rules.length} 条</div>
+                <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>{currentRules.length} 条</div>
               </div>
               <div className="flex flex-wrap items-center justify-end gap-[8px]">
                 <label className={`h-[32px] px-[11px] inline-flex items-center rounded-[5px] border text-[13px] cursor-pointer ${dark ? "border-[#3b3b3b] hover:bg-[#222]" : "border-[#d2d2d2] bg-white hover:bg-[#f0f0f0]"}`}>
@@ -1227,7 +1373,7 @@ export default function SmartReplyManager({
                 </button>
                 <button
                   type="button"
-                  onClick={() => updateDraft({ rules: [...draft.rules, makeRule()] })}
+                  onClick={() => updateDraft({ rules: [...draft.rules, makeRule(activeMessageType)] })}
                   className={`h-[32px] px-[11px] rounded-[5px] border text-[13px] ${dark ? "border-[#3b3b3b] hover:bg-[#222]" : "border-[#d2d2d2] bg-white hover:bg-[#f0f0f0]"}`}
                 >
                   添加规则
@@ -1235,7 +1381,7 @@ export default function SmartReplyManager({
               </div>
             </div>
             <div className="mt-[14px] space-y-[10px]">
-              {draft.rules.map((rule, index) => (
+              {currentRules.map((rule, index) => (
                 <div
                   key={rule.id}
                   data-smart-reply-rule-id={rule.id}
@@ -1253,7 +1399,7 @@ export default function SmartReplyManager({
                     <button
                       type="button"
                       title="删除规则"
-                      disabled={draft.rules.length <= 1}
+                      disabled={currentRules.length <= 1}
                       onClick={() => updateDraft({ rules: draft.rules.filter((item) => item.id !== rule.id) })}
                       className={`w-[34px] h-[34px] flex items-center justify-center disabled:opacity-25 ${dark ? "text-[#888] hover:text-[#e57373]" : "text-[#777] hover:text-[#c33]"}`}
                     >
@@ -1333,9 +1479,30 @@ export default function SmartReplyManager({
                 >
                   新建 Skill
                 </button>
+                <button
+                  type="button"
+                  title={skillsExpanded ? "收起全部 Skill" : "展开全部 Skill"}
+                  aria-label={skillsExpanded ? "收起全部 Skill" : "展开全部 Skill"}
+                  aria-expanded={skillsExpanded}
+                  aria-controls="smart-reply-skill-list"
+                  onClick={() => setSkillsExpanded((expanded) => !expanded)}
+                  className={`w-[34px] h-[34px] shrink-0 flex items-center justify-center rounded-[5px] ${dark ? "text-[#999] hover:bg-[#222] hover:text-white" : "text-[#666] hover:bg-[#ededed] hover:text-black"}`}
+                >
+                  <svg
+                    className={`w-[18px] h-[18px] transition-transform ${skillsExpanded ? "rotate-180" : ""}`}
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth={1.8}
+                    viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" />
+                  </svg>
+                </button>
               </div>
             </div>
 
+            {skillsExpanded && (
+            <div id="smart-reply-skill-list">
             {currentAiTasks.length === 0 ? (
               <div className={`mt-[18px] py-[42px] border text-center text-[13px] rounded-[6px] ${dark ? "border-[#303030] text-[#666]" : "border-[#ddd] text-[#999]"}`}>
                 暂无自定义 Skill
@@ -1356,6 +1523,25 @@ export default function SmartReplyManager({
                       />
                       <button
                         type="button"
+                        title={expandedSkillIds.has(task.id) ? "收起 Skill" : "展开 Skill"}
+                        aria-label={`${expandedSkillIds.has(task.id) ? "收起" : "展开"} Skill ${index + 1}`}
+                        aria-expanded={expandedSkillIds.has(task.id)}
+                        aria-controls={`smart-reply-skill-details-${task.id}`}
+                        onClick={() => toggleSkillExpanded(task.id)}
+                        className={`w-[34px] h-[34px] shrink-0 flex items-center justify-center rounded-[5px] ${dark ? "text-[#999] hover:bg-[#292929] hover:text-white" : "text-[#666] hover:bg-[#ededed] hover:text-black"}`}
+                      >
+                        <svg
+                          className={`w-[18px] h-[18px] transition-transform ${expandedSkillIds.has(task.id) ? "rotate-180" : ""}`}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth={1.8}
+                          viewBox="0 0 24 24"
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" d="m6 9 6 6 6-6" />
+                        </svg>
+                      </button>
+                      <button
+                        type="button"
                         title="删除 Skill"
                         aria-label={`删除 Skill ${index + 1}`}
                         onClick={() => removeAiTask(task.id)}
@@ -1367,6 +1553,8 @@ export default function SmartReplyManager({
                       </button>
                     </div>
 
+                    {expandedSkillIds.has(task.id) && (
+                    <div id={`smart-reply-skill-details-${task.id}`}>
                     <div className="mt-[16px]">
                       <label className={`block text-[12px] mb-[6px] ${dark ? "text-[#888]" : "text-[#666]"}`}>Skill 指令</label>
                       <textarea
@@ -1528,10 +1716,14 @@ export default function SmartReplyManager({
                         </label>
                       )}
                     </div>
+                    </div>
+                    )}
 
                   </div>
                 ))}
               </div>
+            )}
+            </div>
             )}
           </section>
           )}

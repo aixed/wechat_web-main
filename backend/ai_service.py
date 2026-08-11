@@ -184,16 +184,45 @@ class AiService:
         await self._client.aclose()
 
     async def analyze(self, message: str, task: dict[str, Any]) -> dict[str, Any]:
+        return await self._analyze(message, task)
+
+    async def analyze_image(
+        self,
+        message: str,
+        task: dict[str, Any],
+        image_data_url: str,
+    ) -> dict[str, Any]:
+        image_data_url = str(image_data_url or "").strip()
+        if not image_data_url.startswith("data:image/"):
+            raise AiServiceError("image data is missing or unsupported")
+        return await self._analyze(message, task, image_data_url=image_data_url)
+
+    async def _analyze(
+        self,
+        message: str,
+        task: dict[str, Any],
+        *,
+        image_data_url: str = "",
+    ) -> dict[str, Any]:
         if not self.configured:
             raise AiServiceError("AI service is not configured")
         content = str(message or "").strip()
         if not content:
             raise AiServiceError("message is empty")
         instructions = _skill_instructions(task)
+        responses_input: Any = content[:20000]
+        if image_data_url:
+            responses_input = [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": content[:20000]},
+                    {"type": "input_image", "image_url": image_data_url},
+                ],
+            }]
         payload = {
             "model": self.model,
             "instructions": instructions,
-            "input": content[:20000],
+            "input": responses_input,
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -227,11 +256,17 @@ class AiService:
                     if attempt == 0:
                         await asyncio.sleep(0.4)
 
+            chat_user_content: Any = content[:20000]
+            if image_data_url:
+                chat_user_content = [
+                    {"type": "text", "text": content[:20000]},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ]
             chat_payload = {
                 "model": self.model,
                 "messages": [
                     {"role": "system", "content": instructions},
-                    {"role": "user", "content": content[:20000]},
+                    {"role": "user", "content": chat_user_content},
                 ],
                 "response_format": {"type": "json_object"},
                 "temperature": 0,

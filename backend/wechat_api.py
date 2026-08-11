@@ -1602,6 +1602,21 @@ async def down_pic_4id(
     return {}
 
 
+async def ocr_recognizes(aeskey: str, cdnmidimgurl: str) -> dict:
+    """Recognize text in a WeChat CDN image through the Hook OCR endpoint."""
+    if not IS_HOOK:
+        return {"error": "OCR is only available in Hook mode"}
+    r = await _post(
+        "/OcrRecognizes",
+        json={
+            "aeskey": str(aeskey or "").strip(),
+            "cdnmidimgurl": str(cdnmidimgurl or "").strip(),
+        },
+        timeout=60.0 if IS_LOCAL_HOOK else 90.0,
+    )
+    return safe_json(r)
+
+
 async def cdn_download_pic(
     decode_key: str,
     file_id: str,

@@ -202,7 +202,11 @@ class SmartReplyEngine:
             return SmartReplyDecision(reason="chat_not_configured")
 
         sender = str(message.get("fromid") or "").strip()
-        raw_content = str(message.get("msg") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        raw_content = str(
+            message.get("_smart_reply_content")
+            if message.get("_smart_reply_content") is not None
+            else message.get("msg") or ""
+        ).replace("\r\n", "\n").replace("\r", "\n").strip()
         is_self = (
             str(message.get("sendorrecv") or "") == "1"
             or int(message.get("isSender") or 0) == 1
@@ -240,7 +244,19 @@ class SmartReplyEngine:
         }
         if sender not in target_senders:
             return SmartReplyDecision(reason="sender_not_allowed")
-        if chat_id.endswith("@chatroom") and bool(config.get("mention_only")) and not _mentions_self(message, self_wxid):
+        configured_mention_types = config.get("mention_message_types")
+        mention_message_types = {
+            str(value or "").strip()
+            for value in configured_mention_types
+            if str(value or "").strip()
+        } if isinstance(configured_mention_types, list) else (
+            {"text"} if bool(config.get("mention_only")) else set()
+        )
+        if (
+            chat_id.endswith("@chatroom")
+            and message_category in mention_message_types
+            and not _mentions_self(message, self_wxid)
+        ):
             return SmartReplyDecision(reason="mention_required")
 
         lowered = content.casefold()
@@ -251,10 +267,19 @@ class SmartReplyEngine:
         candidate = SmartReplyDecision(reason="keyword_not_matched")
         matched_lines_by_index: dict[int, str] = {}
         fixed_replies: list[str] = []
-        # Each message category has its own rule surface. Only text rules are
-        # implemented today; enabled non-text categories remain inert until
-        # their dedicated configuration is added.
-        message_rules = (config.get("rules") or []) if message_category == "text" else []
+        has_extracted_image_content = (
+            message_category == "image" and message.get("_smart_reply_content") is not None
+        )
+        message_rules = (
+            [
+                rule
+                for rule in (config.get("rules") or [])
+                if isinstance(rule, dict)
+                and str(rule.get("message_type") or "text").strip() == message_category
+            ]
+            if message_category == "text" or has_extracted_image_content
+            else []
+        )
         for rule in message_rules:
             if not isinstance(rule, dict):
                 continue
@@ -288,7 +313,12 @@ class SmartReplyEngine:
 
         # Keyword rules remain the fast path. When AI tasks are enabled, let the
         # async AI stage handle unmatched text before legacy line-count replies.
-        ai_tasks = config.get("ai_tasks") if isinstance(config, dict) else []
+        ai_tasks = [
+            task
+            for task in (config.get("ai_tasks") or [])
+            if isinstance(task, dict)
+            and str(task.get("message_type") or "text").strip() == message_category
+        ] if isinstance(config, dict) else []
         if not candidate.should_send and any(
             isinstance(task, dict) and bool(task.get("enabled"))
             for task in (ai_tasks or [])

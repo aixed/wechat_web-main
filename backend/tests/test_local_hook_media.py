@@ -13,6 +13,26 @@ from sqlite_cache import SqliteMessageCache
 
 
 class LocalHookMediaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ocr_recognizes_uses_hook_ocr_endpoint(self):
+        response = httpx.Response(
+            200,
+            json={"Ret Text": "recognized text"},
+            request=httpx.Request("POST", "http://127.0.0.1:30001/OcrRecognizes"),
+        )
+        with (
+            patch.object(wechat_api, "IS_HOOK", True),
+            patch.object(wechat_api, "IS_LOCAL_HOOK", True),
+            patch.object(wechat_api, "_post", AsyncMock(return_value=response)) as post,
+        ):
+            result = await wechat_api.ocr_recognizes("aes-key", "image-file-id")
+
+        post.assert_awaited_once_with(
+            "/OcrRecognizes",
+            json={"aeskey": "aes-key", "cdnmidimgurl": "image-file-id"},
+            timeout=60.0,
+        )
+        self.assertEqual("recognized text", result["Ret Text"])
+
     async def test_cdn_download_uses_download_endpoint_and_relative_path(self):
         response = httpx.Response(
             200,

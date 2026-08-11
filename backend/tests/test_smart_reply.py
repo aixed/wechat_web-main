@@ -287,6 +287,28 @@ class SmartReplyEngineTests(unittest.TestCase):
         )
         self.assertEqual(("received",), decision.replies)
 
+    def test_mention_filter_only_applies_to_configured_message_category(self):
+        image_decision = self.evaluate(
+            "[图片]",
+            cfg=config(
+                message_types=["image"],
+                mention_only=True,
+                mention_message_types=["text"],
+                ai_tasks=[{"id": "image_ai", "enabled": True}],
+            ),
+            msgtype="3",
+            msgsource="<msgsource><atuserlist>wxid_other</atuserlist></msgsource>",
+        )
+        self.assertEqual("keyword_not_matched", image_decision.reason)
+
+        text_decision = self.evaluate(
+            "urgent without self mention",
+            now=12.0,
+            cfg=config(mention_message_types=["text"]),
+            msgsource="<msgsource><atuserlist>wxid_other</atuserlist></msgsource>",
+        )
+        self.assertEqual("mention_required", text_decision.reason)
+
     def test_empty_location_image_and_non_text_messages_are_filtered(self):
         self.assertEqual("empty_message", self.evaluate(" ").reason)
         self.assertEqual("ignored_prefix", self.evaluate("[位置]\na\nurgent").reason)
@@ -346,6 +368,66 @@ class SmartReplyEngineTests(unittest.TestCase):
                 decision = self.evaluate("", now=60.0 + index * 2, cfg=media_config, msgtype=msg_type)
                 self.assertEqual("keyword_not_matched", decision.reason)
                 self.assertFalse(decision.should_send)
+
+    def test_extracted_image_ocr_content_uses_keyword_rules(self):
+        decision = self.evaluate(
+            "<msg><img aeskey=\"a\" cdnmidimgurl=\"b\" /></msg>",
+            cfg=config(
+                message_types=["image"],
+                rules=[{
+                    "id": "image_rule",
+                    "message_type": "image",
+                    "keyword": "urgent",
+                    "reply": "received",
+                    "use_regex": False,
+                    "reply_with_matched_line": False,
+                }],
+            ),
+            msgtype="3",
+            _smart_reply_content="OCR found an URGENT request",
+        )
+        self.assertEqual(("received",), decision.replies)
+        self.assertEqual("keyword_matched", decision.reason)
+
+    def test_rules_and_ai_tasks_are_isolated_by_message_type(self):
+        scoped_config = config(
+            message_types=["text", "image", "file"],
+            rules=[
+                {
+                    "id": "text_rule",
+                    "message_type": "text",
+                    "keyword": "urgent",
+                    "reply": "text reply",
+                    "use_regex": False,
+                    "reply_with_matched_line": False,
+                },
+                {
+                    "id": "image_rule",
+                    "message_type": "image",
+                    "keyword": "urgent",
+                    "reply": "image reply",
+                    "use_regex": False,
+                    "reply_with_matched_line": False,
+                },
+            ],
+            ai_tasks=[
+                {"id": "text_disabled", "message_type": "text", "enabled": False},
+                {"id": "file_enabled", "message_type": "file", "enabled": True},
+            ],
+        )
+        text_decision = self.evaluate("urgent text", cfg=scoped_config)
+        image_decision = self.evaluate(
+            "<msg><img /></msg>",
+            now=12.0,
+            cfg=scoped_config,
+            msgtype="3",
+            _smart_reply_content="urgent image",
+        )
+        unmatched_text = self.evaluate("纯中文", now=14.0, cfg=scoped_config)
+
+        self.assertEqual(("text reply",), text_decision.replies)
+        self.assertEqual(("image reply",), image_decision.replies)
+        self.assertEqual("pure_single_line", unmatched_text.reason)
 
     def test_single_line_messages_are_filtered(self):
         self.assertEqual("pure_single_line", self.evaluate("English").reason)
@@ -430,6 +512,7 @@ class SmartReplyStorageTests(unittest.TestCase):
     def test_crud_stats_and_owner_isolation(self):
         ai_tasks = [{
             "id": "ai_task_1",
+            "message_type": "text",
             "name": "SQL analyzer",
             "enabled": True,
             "skill_type": "custom",
@@ -448,6 +531,7 @@ class SmartReplyStorageTests(unittest.TestCase):
         )
         self.assertTrue(saved["enabled"])
         self.assertTrue(saved["mention_only"])
+        self.assertEqual(["text"], saved["mention_message_types"])
         self.assertTrue(saved["use_no_src"])
         self.assertEqual(["text"], saved["message_types"])
         self.assertEqual(["txt"], saved["file_types"])
@@ -476,8 +560,288 @@ class SmartReplyStorageTests(unittest.TestCase):
         self.assertTrue(self.cache.delete_smart_reply_config(CHAT_ID, owner_wxid=OWNER))
         self.assertIsNone(self.cache.get_smart_reply_config(CHAT_ID, owner_wxid=OWNER))
 
+    def test_legacy_shared_items_are_copied_to_enabled_message_types(self):
+        legacy_task = {
+            "id": "legacy_ai",
+            "name": "Legacy",
+            "enabled": True,
+            "instruction": "Handle the message",
+        }
+        saved = self.cache.upsert_smart_reply_config(
+            config(
+                message_types=["text", "image", "file"],
+                ai_tasks=[legacy_task],
+            ),
+            owner_wxid=OWNER,
+        )
+
+        self.assertEqual(
+            ["text", "image"],
+            [rule["message_type"] for rule in saved["rules"]],
+        )
+        self.assertEqual(
+            ["text", "image", "file"],
+            [task["message_type"] for task in saved["ai_tasks"]],
+        )
+        self.assertEqual(3, len({task["id"] for task in saved["ai_tasks"]}))
+
+    def test_duplicate_legacy_items_are_deduplicated_before_scoping(self):
+        legacy_rule = {
+            "id": "legacy_rule_1",
+            "keyword": "urgent",
+            "reply": "received",
+            "use_regex": False,
+            "reply_with_matched_line": False,
+        }
+        legacy_task = {
+            "id": "legacy_ai_1",
+            "skill_id": "extract_sql",
+            "name": "Extract SQL",
+            "enabled": True,
+            "instruction": "Extract the SQL identifier",
+        }
+        saved = self.cache.upsert_smart_reply_config(
+            config(
+                message_types=["text", "file"],
+                rules=[legacy_rule, {**legacy_rule, "id": "legacy_rule_2"}],
+                ai_tasks=[
+                    legacy_task,
+                    {
+                        **legacy_task,
+                        "id": "legacy_ai_2",
+                        "skill_id": "extract_sql_file",
+                    },
+                ],
+            ),
+            owner_wxid=OWNER,
+        )
+
+        self.assertEqual(1, len(saved["rules"]))
+        self.assertEqual(["text"], [rule["message_type"] for rule in saved["rules"]])
+        self.assertEqual(2, len(saved["ai_tasks"]))
+        self.assertEqual(
+            ["text", "file"],
+            [task["message_type"] for task in saved["ai_tasks"]],
+        )
+
+        reread = self.cache.get_smart_reply_config(CHAT_ID, owner_wxid=OWNER)
+        self.assertEqual(saved["rules"], reread["rules"])
+        self.assertEqual(saved["ai_tasks"], reread["ai_tasks"])
+
+        resaved = self.cache.upsert_smart_reply_config(reread, owner_wxid=OWNER)
+        self.assertEqual(1, len(resaved["rules"]))
+        self.assertEqual(2, len(resaved["ai_tasks"]))
+
 
 class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_process_ignores_ai_tasks_from_other_message_types(self):
+        import main
+
+        temp_dir = tempfile.TemporaryDirectory()
+        cache = SqliteMessageCache(os.path.join(temp_dir.name, "cache.sqlite3"))
+        analyzed: list[str] = []
+
+        class FakeAiService:
+            configured = True
+
+            async def analyze(self, content, _task):
+                analyzed.append(content)
+                return {"matched": False, "confidence": 0, "result": "", "items": [], "reply": ""}
+
+        old_cache = main.sqlite_cache
+        old_engine = main.smart_reply_engine
+        old_ai_service = main.ai_service
+        try:
+            main.sqlite_cache = cache
+            main.smart_reply_engine = SmartReplyEngine(cooldown=0)
+            main.ai_service = FakeAiService()
+            cache.upsert_smart_reply_config(
+                config(
+                    message_types=["text", "file"],
+                    rules=[],
+                    ai_tasks=[{
+                        "id": "file_only",
+                        "message_type": "file",
+                        "name": "File Skill",
+                        "enabled": True,
+                        "instruction": "Handle files",
+                    }],
+                ),
+                owner_wxid=OWNER,
+            )
+
+            await main._process_smart_reply_message(
+                owner_wxid=OWNER,
+                agent_id="agent_1",
+                self_wxid=OWNER,
+                chat_id=CHAT_ID,
+                message=message("纯文本消息", id="text_1"),
+            )
+        finally:
+            main.sqlite_cache = old_cache
+            main.smart_reply_engine = old_engine
+            main.ai_service = old_ai_service
+            temp_dir.cleanup()
+
+        self.assertEqual([], analyzed)
+
+    async def test_image_ocr_text_runs_keyword_rule_without_mention(self):
+        import main
+
+        temp_dir = tempfile.TemporaryDirectory()
+        cache = SqliteMessageCache(os.path.join(temp_dir.name, "cache.sqlite3"))
+        sent: list[tuple[str, str]] = []
+
+        async def fake_ocr(_aeskey, _fileid):
+            return {"Ret Text": "This is an urgent image request"}
+
+        async def fake_send_text(wxid, text):
+            sent.append((wxid, text))
+            return {"SendTextMsg": "1"}
+
+        async def noop(*_args, **_kwargs):
+            return None
+
+        old_cache = main.sqlite_cache
+        old_engine = main.smart_reply_engine
+        old_ocr = main.wechat_api.ocr_recognizes
+        old_send_text = main.wechat_api.send_text
+        old_broadcast = main.manager.broadcast
+        old_local_sent = main._broadcast_local_sent_for_agent
+        try:
+            main.sqlite_cache = cache
+            main.smart_reply_engine = SmartReplyEngine(cooldown=0)
+            main.wechat_api.ocr_recognizes = fake_ocr
+            main.wechat_api.send_text = fake_send_text
+            main.manager.broadcast = noop
+            main._broadcast_local_sent_for_agent = noop
+            cache.upsert_smart_reply_config(
+                config(
+                    message_types=["image"],
+                    mention_message_types=["text"],
+                ),
+                owner_wxid=OWNER,
+            )
+
+            await main._process_smart_reply_message(
+                owner_wxid=OWNER,
+                agent_id="agent_1",
+                self_wxid=OWNER,
+                chat_id=CHAT_ID,
+                message=message(
+                    '<msg><img aeskey="aes-key" cdnmidimgurl="image-file-id" /></msg>',
+                    msgtype="3",
+                    id="image_rule_1",
+                    msgsource="<msgsource><atuserlist>wxid_other</atuserlist></msgsource>",
+                ),
+            )
+        finally:
+            main.sqlite_cache = old_cache
+            main.smart_reply_engine = old_engine
+            main.wechat_api.ocr_recognizes = old_ocr
+            main.wechat_api.send_text = old_send_text
+            main.manager.broadcast = old_broadcast
+            main._broadcast_local_sent_for_agent = old_local_sent
+            temp_dir.cleanup()
+
+        self.assertEqual([(CHAT_ID, "received")], sent)
+
+    async def test_image_ai_falls_back_to_ocr_text_when_vision_is_unsupported(self):
+        import main
+
+        temp_dir = tempfile.TemporaryDirectory()
+        cache = SqliteMessageCache(os.path.join(temp_dir.name, "cache.sqlite3"))
+        calls: list[tuple[str, str]] = []
+        sent: list[tuple[str, str]] = []
+
+        class FakeAiService:
+            configured = True
+
+            async def analyze_image(self, content, _task, _image_data_url):
+                calls.append(("image", content))
+                raise main.AiServiceError("model does not support image input")
+
+            async def analyze(self, content, _task):
+                calls.append(("text", content))
+                return {
+                    "matched": True,
+                    "confidence": 98,
+                    "result": "识别到编号 40386",
+                    "items": [],
+                    "reply": "识别到编号 40386",
+                }
+
+        async def fake_ocr(_message, _agent_id):
+            return "编号 40386", "<msg><img /></msg>", "ok"
+
+        async def fake_image_data(_message, _xml, _agent_id):
+            return "data:image/png;base64,aGVsbG8=", "ok"
+
+        async def fake_send_text(wxid, text):
+            sent.append((wxid, text))
+            return {"SendTextMsg": "1"}
+
+        async def noop(*_args, **_kwargs):
+            return None
+
+        old_cache = main.sqlite_cache
+        old_engine = main.smart_reply_engine
+        old_ai_service = main.ai_service
+        old_ocr = main._smart_reply_image_ocr
+        old_image_data = main._smart_reply_image_data_url
+        old_send_text = main.wechat_api.send_text
+        old_broadcast = main.manager.broadcast
+        old_local_sent = main._broadcast_local_sent_for_agent
+        try:
+            main.sqlite_cache = cache
+            main.smart_reply_engine = SmartReplyEngine(cooldown=0)
+            main.ai_service = FakeAiService()
+            main._smart_reply_image_ocr = fake_ocr
+            main._smart_reply_image_data_url = fake_image_data
+            main.wechat_api.send_text = fake_send_text
+            main.manager.broadcast = noop
+            main._broadcast_local_sent_for_agent = noop
+            cache.upsert_smart_reply_config(
+                config(
+                    message_types=["image"],
+                    mention_message_types=["text"],
+                    rules=[],
+                    ai_tasks=[{
+                        "id": "image_ai",
+                        "name": "图片编号识别",
+                        "enabled": True,
+                        "instruction": "识别图片编号",
+                        "confidence": 85,
+                        "output_mode": "result",
+                        "reply_template": "{{result}}",
+                    }],
+                ),
+                owner_wxid=OWNER,
+            )
+
+            await main._process_smart_reply_message(
+                owner_wxid=OWNER,
+                agent_id="agent_1",
+                self_wxid=OWNER,
+                chat_id=CHAT_ID,
+                message=message("<msg><img /></msg>", msgtype="3", id="image_ai_1"),
+            )
+        finally:
+            main.sqlite_cache = old_cache
+            main.smart_reply_engine = old_engine
+            main.ai_service = old_ai_service
+            main._smart_reply_image_ocr = old_ocr
+            main._smart_reply_image_data_url = old_image_data
+            main.wechat_api.send_text = old_send_text
+            main.manager.broadcast = old_broadcast
+            main._broadcast_local_sent_for_agent = old_local_sent
+            temp_dir.cleanup()
+
+        self.assertEqual("image", calls[0][0])
+        self.assertEqual("text", calls[1][0])
+        self.assertIn("编号 40386", calls[1][1])
+        self.assertEqual([(CHAT_ID, "识别到编号 40386")], sent)
+
     async def test_txt_reader_supports_common_encodings_and_rejects_bad_files(self):
         import main
 

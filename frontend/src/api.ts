@@ -685,6 +685,7 @@ export const saveSmartReply = (chatId: string, config: {
   avatar?: string;
   enabled: boolean;
   mention_only: boolean;
+  mention_message_types: Array<"text">;
   use_no_src: boolean;
   message_types: Array<
     "text" | "image" | "gif" | "voice" | "video" | "file" |
