@@ -450,6 +450,7 @@ class SmartReplyStorageTests(unittest.TestCase):
         self.assertTrue(saved["mention_only"])
         self.assertTrue(saved["use_no_src"])
         self.assertEqual(["text"], saved["message_types"])
+        self.assertEqual(["txt"], saved["file_types"])
         self.assertEqual([SENDER], saved["target_senders"])
         self.assertEqual(ai_tasks, saved["ai_tasks"])
         self.assertEqual([], self.cache.list_smart_reply_configs(owner_wxid="other_owner"))
@@ -477,6 +478,164 @@ class SmartReplyStorageTests(unittest.TestCase):
 
 
 class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_txt_reader_supports_common_encodings_and_rejects_bad_files(self):
+        import main
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            utf8_path = os.path.join(temp_dir, "utf8.txt")
+            gb_path = os.path.join(temp_dir, "gb18030.txt")
+            empty_path = os.path.join(temp_dir, "empty.txt")
+            invalid_path = os.path.join(temp_dir, "invalid.txt")
+            oversized_path = os.path.join(temp_dir, "oversized.txt")
+            with open(utf8_path, "wb") as output:
+                output.write("\ufeff需求 40386\x00".encode("utf-8"))
+            with open(gb_path, "wb") as output:
+                output.write("全国统筹 SQL40387".encode("gb18030"))
+            with open(empty_path, "wb"):
+                pass
+            with open(invalid_path, "wb") as output:
+                output.write(b"\x81")
+            with open(oversized_path, "wb") as output:
+                output.write(b"x" * (main._SMART_REPLY_TXT_MAX_BYTES + 1))
+
+            self.assertEqual(("需求 40386", "ok"), main._read_smart_reply_txt(utf8_path))
+            self.assertEqual(("全国统筹 SQL40387", "ok"), main._read_smart_reply_txt(gb_path))
+            self.assertEqual(("", "empty_file"), main._read_smart_reply_txt(empty_path))
+            self.assertEqual(("", "decode_failed"), main._read_smart_reply_txt(invalid_path))
+            self.assertEqual(("", "oversized_file"), main._read_smart_reply_txt(oversized_path))
+            self.assertEqual(("", "missing_file"), main._read_smart_reply_txt(os.path.join(temp_dir, "missing.txt")))
+
+    async def test_file_ai_content_skips_non_txt_before_resolving(self):
+        import main
+
+        resolve_calls: list[dict] = []
+
+        async def fake_resolve(**kwargs):
+            resolve_calls.append(kwargs)
+            return "", ""
+
+        old_resolve = main._resolve_media_path
+        try:
+            main._resolve_media_path = fake_resolve
+            content, reason = await main._smart_reply_file_ai_content(
+                message(
+                    '<msg><appmsg><type>6</type><title>需求40386.pdf</title></appmsg></msg>',
+                    msgtype="49",
+                    id="file_pdf_1",
+                ),
+                ["txt"],
+            )
+        finally:
+            main._resolve_media_path = old_resolve
+
+        self.assertEqual("", content)
+        self.assertEqual("unsupported_file_type:pdf", reason)
+        self.assertEqual([], resolve_calls)
+
+    async def test_txt_file_runs_ai_and_mcp_reply_flow(self):
+        import main
+
+        temp_dir = tempfile.TemporaryDirectory()
+        cache = SqliteMessageCache(os.path.join(temp_dir.name, "cache.sqlite3"))
+        txt_path = os.path.join(temp_dir.name, "需求40386.txt")
+        with open(txt_path, "w", encoding="utf-8") as output:
+            output.write("请保存并提交 SQL 编号 40386")
+        analyzed: list[str] = []
+        mcp_results: list[dict] = []
+        sent: list[tuple[str, str]] = []
+
+        class FakeAiService:
+            configured = True
+
+            async def analyze(self, content, _task):
+                analyzed.append(content)
+                return {
+                    "matched": True,
+                    "confidence": 99,
+                    "result": "40386",
+                    "identifier": "40386",
+                    "items": [],
+                    "reply": "40386",
+                }
+
+        async def fake_mcp_task_reply(_task, result):
+            mcp_results.append(result)
+            return ("需求 40386 保存并提交成功，需求编号：5400000000382472",)
+
+        async def fake_send_text(wxid, text):
+            sent.append((wxid, text))
+            return {"SendTextMsg": "1"}
+
+        async def noop(*_args, **_kwargs):
+            return None
+
+        old_cache = main.sqlite_cache
+        old_engine = main.smart_reply_engine
+        old_ai_service = main.ai_service
+        old_mcp_task_reply = main._mcp_task_reply
+        old_send_text = main.wechat_api.send_text
+        old_broadcast = main.manager.broadcast
+        old_local_sent = main._broadcast_local_sent_for_agent
+        try:
+            main.sqlite_cache = cache
+            main.smart_reply_engine = SmartReplyEngine(cooldown=0)
+            main.ai_service = FakeAiService()
+            main._mcp_task_reply = fake_mcp_task_reply
+            main.wechat_api.send_text = fake_send_text
+            main.manager.broadcast = noop
+            main._broadcast_local_sent_for_agent = noop
+            cache.upsert_smart_reply_config(
+                config(
+                    message_types=["file"],
+                    file_types=["txt"],
+                    rules=[],
+                    ai_tasks=[{
+                        "id": "extract_sql",
+                        "name": "提取 SQL",
+                        "enabled": True,
+                        "instruction": "提取 SQL 编号",
+                        "confidence": 85,
+                        "output_mode": "result",
+                        "reply_template": "{{result}}",
+                        "preserve_formatting": True,
+                        "send_items_separately": False,
+                        "max_parallel": 1,
+                        "mcp_enabled": True,
+                    }],
+                ),
+                owner_wxid=OWNER,
+            )
+
+            await main._process_smart_reply_message(
+                owner_wxid=OWNER,
+                agent_id="agent_1",
+                self_wxid=OWNER,
+                chat_id=CHAT_ID,
+                message=message(
+                    '<msg><appmsg><type>6</type><title>需求40386.txt</title></appmsg></msg>',
+                    msgtype="49",
+                    id="file_txt_1",
+                    file_path=txt_path,
+                    file_len=os.path.getsize(txt_path),
+                ),
+            )
+        finally:
+            main.sqlite_cache = old_cache
+            main.smart_reply_engine = old_engine
+            main.ai_service = old_ai_service
+            main._mcp_task_reply = old_mcp_task_reply
+            main.wechat_api.send_text = old_send_text
+            main.manager.broadcast = old_broadcast
+            main._broadcast_local_sent_for_agent = old_local_sent
+            temp_dir.cleanup()
+
+        self.assertEqual(["文件名：需求40386.txt\n文件内容：\n请保存并提交 SQL 编号 40386"], analyzed)
+        self.assertEqual("40386", mcp_results[0]["identifier"])
+        self.assertEqual(
+            [(CHAT_ID, "需求 40386 保存并提交成功，需求编号：5400000000382472")],
+            sent,
+        )
+
     async def test_low_level_text_reply_uses_no_src_sender(self):
         import main
 

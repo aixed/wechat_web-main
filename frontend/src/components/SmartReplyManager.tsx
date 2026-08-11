@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { analyzeAiMessage, deleteSmartReply, getAiSettings, getGroupMemberDetails, getSmartReplies, saveAiSettings, saveSmartReply, validateAiSettings } from "../api";
-import type { AiAnalysisResult, AiProfile, AiSettings, SmartReplyAiOutputMode, SmartReplyAiTask, SmartReplyConfig, SmartReplyMessageType, SmartReplyRule, SmartReplyTarget } from "../types";
+import { analyzeAiMessage, deleteSmartReply, getAiSettings, getGroupMemberDetails, getMcpTools, getSmartReplies, saveAiSettings, saveSmartReply, validateAiSettings, validateMcpConnection } from "../api";
+import type { AiAnalysisResult, AiProfile, AiSettings, McpConnection, McpTool, SmartReplyAiOutputMode, SmartReplyAiTask, SmartReplyConfig, SmartReplyMessageType, SmartReplyRule, SmartReplyTarget } from "../types";
 import { DEFAULT_AVATAR_URL } from "../avatar";
 
 interface GroupMember {
@@ -38,6 +38,13 @@ const MESSAGE_TYPE_OPTIONS: Array<{ value: SmartReplyMessageType; label: string 
   { value: "recall", label: "撤回消息" },
   { value: "quote", label: "引用消息" },
 ];
+
+const FILE_TYPE_OPTIONS = [
+  { value: "txt", label: "TXT", available: true },
+  { value: "pdf", label: "PDF", available: false },
+  { value: "xlsx", label: "XLSX", available: false },
+  { value: "docx", label: "DOCX", available: false },
+] as const;
 
 function readViewPreference(chatId: string): SmartReplyViewPreference {
   if (typeof window === "undefined") return {};
@@ -93,7 +100,36 @@ function makeAiSkill(): SmartReplyAiTask {
     preserve_formatting: true,
     send_items_separately: false,
     max_parallel: 3,
+    mcp_enabled: false,
+    mcp_connection_id: "",
+    mcp_tool_name: "",
+    mcp_arguments_template: "{}",
+    mcp_reply_template: "{{mcp_text}}",
   };
+}
+
+function defaultMcpArguments(tool?: McpTool): string {
+  if (!tool) return "{}";
+  const schema = tool.inputSchema && typeof tool.inputSchema === "object" ? tool.inputSchema : {};
+  const properties = schema.properties && typeof schema.properties === "object"
+    ? schema.properties as Record<string, { type?: string; default?: unknown }>
+    : {};
+  const values: Record<string, unknown> = {};
+  Object.entries(properties).forEach(([key, property]) => {
+    if (key === "identifier" || key === "identifier_id") values[key] = "{{identifier}}";
+    else if (property && Object.prototype.hasOwnProperty.call(property, "default")) values[key] = property.default;
+    else if (property?.type === "boolean") values[key] = false;
+    else if (property?.type === "number" || property?.type === "integer") values[key] = 0;
+    else values[key] = "";
+  });
+  return JSON.stringify(values, null, 2);
+}
+
+function defaultMcpReplyTemplate(toolName: string): string {
+  if (toolName === "submit_data_maintenance") {
+    return "需求 {{identifier}} 保存并提交成功，需求编号：{{work_num}}";
+  }
+  return "{{mcp_text}}";
 }
 
 function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
@@ -106,6 +142,7 @@ function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
     mention_only: false,
     use_no_src: false,
     message_types: ["text"],
+    file_types: ["txt"],
     target_senders: isGroup ? [] : [target.wxid],
     rules: [makeRule()],
     ai_tasks: [],
@@ -121,6 +158,7 @@ function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
     mention_only: isGroup && Boolean(config.mention_only),
     use_no_src: Boolean(config.use_no_src),
     message_types: config.message_types?.length ? [...config.message_types] : ["text"],
+    file_types: Array.isArray(config.file_types) ? [...config.file_types] : ["txt"],
     target_senders: isGroup ? [...(config.target_senders || [])] : [config.chat_id],
     rules: (config.rules || []).map((rule) => ({
       ...rule,
@@ -134,6 +172,11 @@ function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
       skill_id: task.skill_id || task.id,
       preserve_formatting: Boolean(task.preserve_formatting),
       send_items_separately: Boolean(task.send_items_separately),
+      mcp_enabled: Boolean(task.mcp_enabled),
+      mcp_connection_id: task.mcp_connection_id || "",
+      mcp_tool_name: task.mcp_tool_name || "",
+      mcp_arguments_template: task.mcp_arguments_template || "{}",
+      mcp_reply_template: task.mcp_reply_template || "{{mcp_text}}",
     })),
   };
 }
@@ -216,6 +259,8 @@ export default function SmartReplyManager({
   const [textReplyMode, setTextReplyMode] = useState<TextReplyMode>("rules");
   const [aiSettings, setAiSettings] = useState<AiSettings | null>(null);
   const [aiSettingsOpen, setAiSettingsOpen] = useState(false);
+  const [mcpToolsByConnection, setMcpToolsByConnection] = useState<Record<string, McpTool[]>>({});
+  const [mcpToolsLoading, setMcpToolsLoading] = useState<Record<string, boolean>>({});
   const [aiTestTaskId, setAiTestTaskId] = useState("");
   const [aiTestMessage, setAiTestMessage] = useState("");
   const [aiTestResult, setAiTestResult] = useState<AiAnalysisResult | null>(null);
@@ -284,6 +329,21 @@ export default function SmartReplyManager({
       setAiSettingsOpen(true);
     }
   };
+
+  const loadMcpTools = useCallback(async (connectionId: string, force = false) => {
+    const normalizedId = connectionId.trim();
+    if (!normalizedId || mcpToolsLoading[normalizedId] || (!force && mcpToolsByConnection[normalizedId])) return;
+    setMcpToolsLoading((prev) => ({ ...prev, [normalizedId]: true }));
+    try {
+      const data = await getMcpTools(normalizedId);
+      const tools = Array.isArray(data?.tools) ? data.tools as McpTool[] : [];
+      setMcpToolsByConnection((prev) => ({ ...prev, [normalizedId]: tools }));
+    } catch {
+      setMcpToolsByConnection((prev) => ({ ...prev, [normalizedId]: [] }));
+    } finally {
+      setMcpToolsLoading((prev) => ({ ...prev, [normalizedId]: false }));
+    }
+  }, [mcpToolsByConnection, mcpToolsLoading]);
 
   const openConfig = useCallback((config: SmartReplyConfig) => {
     const cloned = cloneConfig(config);
@@ -366,6 +426,15 @@ export default function SmartReplyManager({
     };
   }, []);
 
+  useEffect(() => {
+    const enabledConnectionIds = new Set(
+      (draft?.ai_tasks || [])
+        .filter((task) => task.mcp_enabled && task.mcp_connection_id)
+        .map((task) => task.mcp_connection_id),
+    );
+    enabledConnectionIds.forEach((connectionId) => void loadMcpTools(connectionId));
+  }, [draft?.ai_tasks, loadMcpTools]);
+
   const save = async () => {
     if (!draft || saving) return;
     const normalizedRules = draft.rules.map((rule) => ({
@@ -398,6 +467,24 @@ export default function SmartReplyManager({
       setError("请完整填写 Skill 名称和任务指令");
       return;
     }
+    const incompleteMcpTask = aiTasks.find((task) => task.mcp_enabled && (!task.mcp_connection_id || !task.mcp_tool_name));
+    if (incompleteMcpTask) {
+      setError(`请为 Skill“${incompleteMcpTask.name}”选择 MCP 连接和工具`);
+      return;
+    }
+    const invalidMcpArguments = aiTasks.find((task) => {
+      if (!task.mcp_enabled) return false;
+      try {
+        const parsed = JSON.parse(task.mcp_arguments_template || "{}");
+        return !parsed || typeof parsed !== "object" || Array.isArray(parsed);
+      } catch {
+        return true;
+      }
+    });
+    if (invalidMcpArguments) {
+      setError(`Skill“${invalidMcpArguments.name}”的 MCP 参数必须是 JSON 对象`);
+      return;
+    }
     if (rules.length === 0 && aiTasks.length === 0) {
       setError("请至少配置一条关键词规则或一个 AI 任务");
       return;
@@ -412,6 +499,7 @@ export default function SmartReplyManager({
         mention_only: draft.mention_only,
         use_no_src: draft.use_no_src,
         message_types: draft.message_types,
+        file_types: draft.file_types,
         target_senders: draft.target_senders,
         rules,
         ai_tasks: aiTasks,
@@ -467,6 +555,7 @@ export default function SmartReplyManager({
   };
 
   const currentAiTasks = draft?.ai_tasks || [];
+  const availableMcpConnections = (aiSettings?.mcp_connections || []).filter((connection) => connection.enabled);
 
   const updateAiTask = (id: string, patch: Partial<SmartReplyAiTask>) => {
     setDraft((prev) => prev ? {
@@ -475,6 +564,36 @@ export default function SmartReplyManager({
     } : prev);
     setNotice("");
     setAiTestResult(null);
+  };
+
+  const toggleTaskMcp = (task: SmartReplyAiTask, enabled: boolean) => {
+    const connectionId = task.mcp_connection_id || availableMcpConnections[0]?.id || "";
+    updateAiTask(task.id, {
+      mcp_enabled: enabled,
+      mcp_connection_id: connectionId,
+      mcp_tool_name: enabled ? task.mcp_tool_name : "",
+    });
+    if (enabled && connectionId) void loadMcpTools(connectionId);
+    if (enabled && !connectionId) void openAiSettings();
+  };
+
+  const selectTaskMcpConnection = (task: SmartReplyAiTask, connectionId: string) => {
+    updateAiTask(task.id, {
+      mcp_connection_id: connectionId,
+      mcp_tool_name: "",
+      mcp_arguments_template: "{}",
+      mcp_reply_template: "{{mcp_text}}",
+    });
+    if (connectionId) void loadMcpTools(connectionId);
+  };
+
+  const selectTaskMcpTool = (task: SmartReplyAiTask, toolName: string) => {
+    const tool = (mcpToolsByConnection[task.mcp_connection_id] || []).find((item) => item.name === toolName);
+    updateAiTask(task.id, {
+      mcp_tool_name: toolName,
+      mcp_arguments_template: defaultMcpArguments(tool),
+      mcp_reply_template: defaultMcpReplyTemplate(toolName),
+    });
   };
 
   const addAiTask = () => {
@@ -605,6 +724,14 @@ export default function SmartReplyManager({
     });
   };
 
+  const toggleFileType = (fileType: SmartReplyConfig["file_types"][number]) => {
+    if (!draft) return;
+    const selected = new Set(draft.file_types || []);
+    if (selected.has(fileType)) selected.delete(fileType);
+    else selected.add(fileType);
+    updateDraft({ file_types: Array.from(selected) });
+  };
+
   const memberRows = useMemo(() => {
     const byId = new Map(members.map((member) => [member.wxid, member]));
     for (const wxid of draft?.target_senders || []) {
@@ -720,8 +847,8 @@ export default function SmartReplyManager({
         <div className="flex items-center gap-[2px]">
           <button
             type="button"
-            title={aiSettings?.configured ? "全局 AI 设置" : "配置全局 AI 服务"}
-            aria-label="全局 AI 设置"
+            title="AI 与 MCP 设置"
+            aria-label="AI 与 MCP 设置"
             onClick={() => void openAiSettings()}
             className={`relative w-[34px] h-[34px] flex items-center justify-center rounded-[5px] ${dark ? "text-[#bbb] hover:bg-[#292929]" : "text-[#444] hover:bg-[#d8d8d8]"}`}
           >
@@ -807,6 +934,20 @@ export default function SmartReplyManager({
           <div className={`text-[11px] truncate mt-[1px] ${dark ? "text-[#666]" : "text-[#999]"}`}>{draft.chat_id}</div>
         </div>
         {notice && <span className="text-[12px] text-[#07c160] shrink-0">{notice}</span>}
+        {mobile && (
+          <button
+            type="button"
+            title="AI 与 MCP 设置"
+            aria-label="AI 与 MCP 设置"
+            onClick={() => void openAiSettings()}
+            className={`w-[34px] h-[34px] shrink-0 flex items-center justify-center rounded-[5px] ${dark ? "text-[#bbb] hover:bg-[#292929]" : "text-[#444] hover:bg-[#ededed]"}`}
+          >
+            <svg className="w-[19px] h-[19px]" fill="none" stroke="currentColor" strokeWidth={1.7} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21H9.6v-.1A1.7 1.7 0 0 0 8.5 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3V9.6h.1A1.7 1.7 0 0 0 4.6 8.5a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.1A1.7 1.7 0 0 0 15.5 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.17.37.38.7.6 1 .28.3.66.45 1.1.45h.1v4h-.1c-.44 0-.82.15-1.1.45-.22.3-.43.63-.6 1Z" />
+            </svg>
+          </button>
+        )}
         <button
           type="button"
           onClick={save}
@@ -904,8 +1045,9 @@ export default function SmartReplyManager({
             </div>
           </section>
 
-          {activeMessageType === "text" ? (
+          {activeMessageType === "text" || activeMessageType === "file" ? (
             <>
+          {activeMessageType === "text" ? (
           <section className="pt-[16px]">
             <div role="tablist" aria-label="文本回复方式" className={`flex items-center gap-x-[20px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
               <button
@@ -944,6 +1086,48 @@ export default function SmartReplyManager({
               </button>
             </div>
           </section>
+          ) : (
+          <section className={`py-[20px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+            <div className="flex flex-wrap items-start justify-between gap-[10px]">
+              <div>
+                <h2 className="text-[15px] font-medium">文件内容识别</h2>
+                <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>选择允许读取内容的文件类型</div>
+              </div>
+              <span className={`text-[11px] ${dark ? "text-[#666]" : "text-[#999]"}`}>最大 2 MB</span>
+            </div>
+            <div className="mt-[14px] grid grid-cols-2 sm:grid-cols-4 gap-[8px]">
+              {FILE_TYPE_OPTIONS.map((option) => {
+                const enabled = option.available && draft.file_types.includes(option.value);
+                return (
+                  <div
+                    key={option.value}
+                    className={`min-w-0 h-[58px] rounded-[6px] border px-[10px] flex items-center justify-between gap-[8px] ${
+                      option.available
+                        ? (dark ? "border-[#393939] bg-[#171717]" : "border-[#d8d8d8] bg-white")
+                        : (dark ? "border-[#292929] bg-[#141414] text-[#666]" : "border-[#e3e3e3] bg-[#f3f3f3] text-[#999]")
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="text-[13px] font-medium truncate">{option.label}</div>
+                      <div className={`mt-[2px] text-[10px] ${option.available ? (dark ? "text-[#777]" : "text-[#888]") : ""}`}>
+                        {option.available ? "文本读取" : "待接入"}
+                      </div>
+                    </div>
+                    {option.available ? (
+                      <CompactToggle
+                        checked={enabled}
+                        onChange={() => toggleFileType(option.value)}
+                        label={`${enabled ? "关闭" : "启用"}${option.label} 文件识别`}
+                      />
+                    ) : (
+                      <span className={`shrink-0 w-[6px] h-[6px] rounded-full ${dark ? "bg-[#444]" : "bg-[#bbb]"}`} />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+          )}
 
           {draft.chat_id.endsWith("@chatroom") && (
           <section className={`py-[24px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
@@ -1011,9 +1195,9 @@ export default function SmartReplyManager({
           </section>
           )}
 
-          {aiTestPanel}
+          {activeMessageType === "text" && aiTestPanel}
 
-          {textReplyMode === "rules" ? (
+          {activeMessageType === "text" && textReplyMode === "rules" ? (
           <section className="py-[24px]">
             <div className="flex flex-wrap items-start justify-between gap-[10px]">
               <div>
@@ -1195,6 +1379,88 @@ export default function SmartReplyManager({
                       />
                     </div>
 
+                    <div className={`mt-[16px] rounded-[5px] border ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}>
+                      <div className="min-h-[44px] px-[10px] py-[9px] flex flex-wrap items-center justify-between gap-[10px]">
+                        <div>
+                          <div className="text-[13px]">调用 MCP 工具</div>
+                          <div className={`mt-[2px] text-[11px] ${dark ? "text-[#666]" : "text-[#999]"}`}>
+                            {task.mcp_enabled && task.mcp_tool_name ? task.mcp_tool_name : "未启用"}
+                          </div>
+                        </div>
+                        <Toggle checked={task.mcp_enabled} onChange={(enabled) => toggleTaskMcp(task, enabled)} />
+                      </div>
+
+                      {task.mcp_enabled && (
+                        <div className={`px-[10px] pb-[11px] pt-[10px] border-t space-y-[12px] ${dark ? "border-[#292929]" : "border-[#e5e5e5]"}`}>
+                          <div className="grid grid-cols-1 lg:grid-cols-2 gap-[12px]">
+                            <div>
+                              <label className={`block text-[12px] mb-[6px] ${dark ? "text-[#888]" : "text-[#666]"}`}>MCP 连接</label>
+                              <select
+                                value={task.mcp_connection_id}
+                                onChange={(event) => selectTaskMcpConnection(task, event.target.value)}
+                                className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#171717]" : "border-[#d8d8d8] bg-white"}`}
+                              >
+                                <option value="">选择连接</option>
+                                {availableMcpConnections.map((connection) => (
+                                  <option key={connection.id} value={connection.id}>{connection.name}</option>
+                                ))}
+                              </select>
+                            </div>
+                            <div>
+                              <label className={`block text-[12px] mb-[6px] ${dark ? "text-[#888]" : "text-[#666]"}`}>MCP 工具</label>
+                              <select
+                                value={task.mcp_tool_name}
+                                disabled={!task.mcp_connection_id || Boolean(mcpToolsLoading[task.mcp_connection_id])}
+                                onChange={(event) => selectTaskMcpTool(task, event.target.value)}
+                                className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] disabled:opacity-55 ${dark ? "border-[#393939] bg-[#171717]" : "border-[#d8d8d8] bg-white"}`}
+                              >
+                                <option value="">{mcpToolsLoading[task.mcp_connection_id] ? "加载工具中" : "选择工具"}</option>
+                                {(mcpToolsByConnection[task.mcp_connection_id] || []).map((tool) => (
+                                  <option key={tool.name} value={tool.name}>{String(tool.annotations?.title || tool.name)}</option>
+                                ))}
+                              </select>
+                            </div>
+                          </div>
+
+                          {task.mcp_tool_name && (
+                            <>
+                              {(mcpToolsByConnection[task.mcp_connection_id] || []).find((tool) => tool.name === task.mcp_tool_name)?.description && (
+                                <div className={`text-[12px] leading-[19px] ${dark ? "text-[#777]" : "text-[#777]"}`}>
+                                  {(mcpToolsByConnection[task.mcp_connection_id] || []).find((tool) => tool.name === task.mcp_tool_name)?.description}
+                                </div>
+                              )}
+                              {Boolean((mcpToolsByConnection[task.mcp_connection_id] || []).find((tool) => tool.name === task.mcp_tool_name)?.annotations?.destructiveHint) && (
+                                <div className={`px-[9px] py-[7px] rounded-[4px] text-[12px] ${dark ? "bg-[#33251b] text-[#e0a63b]" : "bg-[#fff6df] text-[#906318]"}`}>
+                                  此工具会修改外部系统，Skill 匹配后将直接执行。
+                                </div>
+                              )}
+                              <div className="grid grid-cols-1 lg:grid-cols-2 gap-[12px]">
+                                <div>
+                                  <label className={`block text-[12px] mb-[6px] ${dark ? "text-[#888]" : "text-[#666]"}`}>工具参数 JSON</label>
+                                  <textarea
+                                    value={task.mcp_arguments_template}
+                                    onChange={(event) => updateAiTask(task.id, { mcp_arguments_template: event.target.value })}
+                                    rows={4}
+                                    spellCheck={false}
+                                    className={`block w-full h-[94px] resize-none rounded-[5px] border px-[10px] py-[8px] font-mono text-[12px] leading-[19px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#171717]" : "border-[#d8d8d8] bg-white"}`}
+                                  />
+                                </div>
+                                <div>
+                                  <label className={`block text-[12px] mb-[6px] ${dark ? "text-[#888]" : "text-[#666]"}`}>MCP 回复模板</label>
+                                  <textarea
+                                    value={task.mcp_reply_template}
+                                    onChange={(event) => updateAiTask(task.id, { mcp_reply_template: event.target.value })}
+                                    rows={4}
+                                    className={`block w-full h-[94px] resize-none rounded-[5px] border px-[10px] py-[8px] text-[12px] leading-[19px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#171717]" : "border-[#d8d8d8] bg-white"}`}
+                                  />
+                                </div>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
                     <div className={`mt-[16px] pt-[16px] border-t grid grid-cols-1 lg:grid-cols-2 gap-x-[20px] gap-y-[16px] ${dark ? "border-[#2d2d2d]" : "border-[#e4e4e4]"}`}>
                       <div>
                         <div className="flex items-center justify-between gap-[10px]">
@@ -1320,9 +1586,10 @@ export default function SmartReplyManager({
           onClose={() => setAiSettingsOpen(false)}
           onSaved={(settings) => {
             setAiSettings(settings);
+            setMcpToolsByConnection({});
             setAiSettingsOpen(false);
             setError("");
-            setNotice("AI 服务配置已保存");
+            setNotice("AI 与 MCP 配置已保存");
             window.setTimeout(() => setNotice(""), 1800);
           }}
         />
@@ -1425,6 +1692,32 @@ function normalizeAiProfiles(settings: AiSettings | null): AiProfile[] {
   return [makeAiProfileDraft(0)];
 }
 
+function makeMcpConnectionDraft(index: number): McpConnection {
+  const suffix = typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  return {
+    id: `mcp_connection_${suffix}`,
+    name: `MCP 连接 ${index + 1}`,
+    url: "",
+    enabled: true,
+    token_configured: false,
+    token: "",
+  };
+}
+
+function normalizeMcpConnections(settings: AiSettings | null): McpConnection[] {
+  const connections = Array.isArray(settings?.mcp_connections) ? settings.mcp_connections : [];
+  return connections.map((connection, index) => ({
+    id: connection.id || `mcp_connection_${index + 1}`,
+    name: connection.name || `MCP 连接 ${index + 1}`,
+    url: connection.url || "",
+    enabled: connection.enabled !== false,
+    token_configured: Boolean(connection.token_configured || connection.token),
+    token: connection.token || "",
+  }));
+}
+
 function AiSettingsDialog({
   dark,
   settings,
@@ -1437,7 +1730,9 @@ function AiSettingsDialog({
   onSaved: (settings: AiSettings) => void;
 }) {
   const initialProfiles = useMemo(() => normalizeAiProfiles(settings), [settings]);
+  const initialMcpConnections = useMemo(() => normalizeMcpConnections(settings), [settings]);
   const [profiles, setProfiles] = useState<AiProfile[]>(initialProfiles);
+  const [mcpConnections, setMcpConnections] = useState<McpConnection[]>(initialMcpConnections);
   const [activeProfileId, setActiveProfileId] = useState(settings?.active_profile_id || initialProfiles[0]?.id || "");
   const [expandedProfileId, setExpandedProfileId] = useState(() => {
     const incomplete = initialProfiles.find((profile) =>
@@ -1448,7 +1743,9 @@ function AiSettingsDialog({
   const [showApiKeyById, setShowApiKeyById] = useState<Record<string, boolean>>({});
   const [savingSettings, setSavingSettings] = useState(false);
   const [validatingProfileId, setValidatingProfileId] = useState("");
+  const [validatingConnectionId, setValidatingConnectionId] = useState("");
   const [settingsFeedback, setSettingsFeedback] = useState<{ kind: "success" | "error"; message: string; profileId?: string } | null>(null);
+  const [mcpFeedback, setMcpFeedback] = useState<Record<string, { kind: "success" | "error"; message: string }>>({});
 
   const activeProfile = profiles.find((profile) => profile.id === activeProfileId) || profiles[0];
 
@@ -1480,10 +1777,60 @@ function AiSettingsDialog({
       api_key: (profile.api_key || "").trim(),
       model: profile.model.trim(),
     })),
+    mcp_connections: mcpConnections.map((connection) => ({
+      id: connection.id,
+      name: connection.name.trim(),
+      url: connection.url.trim().replace(/\/+$/, ""),
+      token: (connection.token || "").trim(),
+      enabled: connection.enabled,
+    })),
   });
 
+  const updateMcpConnection = (id: string, patch: Partial<McpConnection>) => {
+    setMcpConnections((prev) => prev.map((connection) => connection.id === id ? { ...connection, ...patch } : connection));
+    setMcpFeedback((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
+
+  const validateConnection = async (connection: McpConnection) => {
+    if (savingSettings || validatingProfileId || validatingConnectionId) return;
+    if (!connection.name.trim() || !connection.url.trim()) {
+      setMcpFeedback((prev) => ({ ...prev, [connection.id]: { kind: "error", message: "请填写连接名称和 MCP 地址" } }));
+      return;
+    }
+    setValidatingConnectionId(connection.id);
+    setMcpFeedback((prev) => {
+      const next = { ...prev };
+      delete next[connection.id];
+      return next;
+    });
+    try {
+      const data = await validateMcpConnection({
+        id: connection.id,
+        name: connection.name.trim(),
+        url: connection.url.trim().replace(/\/+$/, ""),
+        token: (connection.token || "").trim(),
+        enabled: connection.enabled,
+      });
+      if (!data?.ok) {
+        setMcpFeedback((prev) => ({ ...prev, [connection.id]: { kind: "error", message: errorText(data?.detail || data?.error) } }));
+        return;
+      }
+      const serverName = String(data?.server?.title || data?.server?.name || connection.name);
+      const toolCount = Array.isArray(data?.tools) ? data.tools.length : 0;
+      setMcpFeedback((prev) => ({ ...prev, [connection.id]: { kind: "success", message: `${serverName} 连接成功，发现 ${toolCount} 个工具` } }));
+    } catch {
+      setMcpFeedback((prev) => ({ ...prev, [connection.id]: { kind: "error", message: "连接失败，请检查地址、Token 和 MCP 服务状态" } }));
+    } finally {
+      setValidatingConnectionId("");
+    }
+  };
+
   const validateProfile = async (profile: AiProfile) => {
-    if (savingSettings || validatingProfileId) return;
+    if (savingSettings || validatingProfileId || validatingConnectionId) return;
     if (!profileIsComplete(profile)) {
       setExpandedProfileId(profile.id);
       setSettingsFeedback({ kind: "error", profileId: profile.id, message: "请完整填写 API 地址、API Key 和模型" });
@@ -1519,6 +1866,11 @@ function AiSettingsDialog({
     }
     if (!activeProfile || !profileIsComplete(activeProfile)) {
       setSettingsFeedback({ kind: "error", message: "请选择一个可用的配置作为当前使用模型" });
+      return;
+    }
+    const incompleteConnection = mcpConnections.find((connection) => !connection.name.trim() || !connection.url.trim());
+    if (incompleteConnection) {
+      setMcpFeedback((prev) => ({ ...prev, [incompleteConnection.id]: { kind: "error", message: "请完整填写该 MCP 连接后再保存" } }));
       return;
     }
     setSavingSettings(true);
@@ -1561,6 +1913,25 @@ function AiSettingsDialog({
     setSettingsFeedback(null);
   };
 
+  const addMcpConnection = () => {
+    const connection = makeMcpConnectionDraft(mcpConnections.length);
+    setMcpConnections((prev) => [...prev, connection]);
+    setMcpFeedback((prev) => {
+      const next = { ...prev };
+      delete next[connection.id];
+      return next;
+    });
+  };
+
+  const removeMcpConnection = (id: string) => {
+    setMcpConnections((prev) => prev.filter((connection) => connection.id !== id));
+    setMcpFeedback((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
+
   const collapseOnBlank = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (!(event.target instanceof Element)) return;
     if (!event.target.closest("[data-ai-profile-card]") && !event.target.closest("[data-ai-dialog-action]")) {
@@ -1579,7 +1950,7 @@ function AiSettingsDialog({
       >
         <div className={`h-[58px] px-[18px] border-b flex items-center ${dark ? "border-[#333]" : "border-[#e5e5e5]"}`}>
           <div className="min-w-0 flex-1">
-            <div id="ai-settings-title" className="font-medium">全局 AI 设置</div>
+            <div id="ai-settings-title" className="font-medium">AI 与 MCP 设置</div>
             <div className={`mt-[3px] text-[12px] truncate ${dark ? "text-[#777]" : "text-[#888]"}`}>
               当前使用：{activeProfile?.name || "未选择"}{activeProfile?.model ? ` · ${activeProfile.model}` : ""}
             </div>
@@ -1592,7 +1963,7 @@ function AiSettingsDialog({
         <div className="pane-scroll flex-1 min-h-0 overflow-y-auto p-[18px]" onMouseDown={collapseOnBlank}>
           <div className="flex items-center justify-between gap-[12px] mb-[12px]">
             <div className={`text-[12px] leading-[19px] ${dark ? "text-[#888]" : "text-[#777]"}`}>
-              可以添加多个模型配置，绿色圆点表示当前智能回复实际使用的配置。点击卡片展开编辑，点击空白处收起。
+              AI 模型
             </div>
             <button
               type="button"
@@ -1774,11 +2145,115 @@ function AiSettingsDialog({
               {settingsFeedback.message}
             </div>
           )}
+
+          <section className={`mt-[22px] pt-[20px] border-t ${dark ? "border-[#343434]" : "border-[#e1e1e1]"}`}>
+            <div className="flex items-center justify-between gap-[12px] mb-[12px]">
+              <div>
+                <h3 className="text-[14px] font-medium">MCP 连接</h3>
+                <div className={`mt-[3px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>{mcpConnections.length} 个连接</div>
+              </div>
+              <button
+                type="button"
+                data-ai-dialog-action
+                onClick={addMcpConnection}
+                className={`h-[32px] px-[12px] rounded-[5px] border text-[13px] shrink-0 ${dark ? "border-[#3b3b3b] hover:bg-[#292929]" : "border-[#d2d2d2] bg-white hover:bg-[#f0f0f0]"}`}
+              >
+                新建连接
+              </button>
+            </div>
+
+            {mcpConnections.length === 0 ? (
+              <div className={`py-[30px] text-center border rounded-[6px] text-[13px] ${dark ? "border-[#333] text-[#666]" : "border-[#ddd] text-[#999]"}`}>暂无 MCP 连接</div>
+            ) : (
+              <div className="space-y-[10px]">
+                {mcpConnections.map((connection, index) => {
+                  const feedback = mcpFeedback[connection.id];
+                  return (
+                    <div key={connection.id} className={`rounded-[7px] border p-[14px] ${dark ? "border-[#333] bg-[#181818]" : "border-[#ddd] bg-white"}`}>
+                      <div className="flex flex-wrap items-center gap-[10px]">
+                        <span className={`w-[9px] h-[9px] rounded-full shrink-0 ${connection.enabled ? "bg-[#07c160]" : (dark ? "bg-[#555]" : "bg-[#bbb]")}`} />
+                        <input
+                          value={connection.name}
+                          onChange={(event) => updateMcpConnection(connection.id, { name: event.target.value })}
+                          aria-label={`MCP 连接 ${index + 1} 名称`}
+                          placeholder={`MCP 连接 ${index + 1}`}
+                          className={`h-[36px] min-w-[160px] flex-1 rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111]" : "border-[#d8d8d8] bg-[#fafafa]"}`}
+                        />
+                        <label className="flex items-center gap-[7px] text-[12px] cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={connection.enabled}
+                            onChange={(event) => updateMcpConnection(connection.id, { enabled: event.target.checked })}
+                            className="w-[16px] h-[16px] accent-[#07c160]"
+                          />
+                          启用
+                        </label>
+                        <button
+                          type="button"
+                          title="删除 MCP 连接"
+                          aria-label={`删除 MCP 连接 ${index + 1}`}
+                          onClick={() => removeMcpConnection(connection.id)}
+                          className={`w-[34px] h-[34px] flex items-center justify-center ${dark ? "text-[#888] hover:text-[#e57373]" : "text-[#777] hover:text-[#c33]"}`}
+                        >
+                          <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 11v5m4-5v5" />
+                          </svg>
+                        </button>
+                      </div>
+
+                      <div className="mt-[12px] grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_260px] gap-[12px]">
+                        <div>
+                          <label className={`block text-[12px] mb-[6px] ${dark ? "text-[#999]" : "text-[#666]"}`}>MCP 地址</label>
+                          <input
+                            value={connection.url}
+                            onChange={(event) => updateMcpConnection(connection.id, { url: event.target.value })}
+                            placeholder="http://127.0.0.1:8765/mcp"
+                            autoComplete="off"
+                            className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
+                          />
+                        </div>
+                        <div>
+                          <label className={`block text-[12px] mb-[6px] ${dark ? "text-[#999]" : "text-[#666]"}`}>Bearer Token</label>
+                          <input
+                            type="password"
+                            value={connection.token || ""}
+                            onChange={(event) => updateMcpConnection(connection.id, { token: event.target.value, token_configured: Boolean(event.target.value.trim()) })}
+                            placeholder="可选"
+                            autoComplete="new-password"
+                            className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="mt-[12px] flex flex-wrap items-center justify-between gap-[10px]">
+                        <div className="min-w-0 flex-1">
+                          {feedback && (
+                            <div role="status" className={`px-[10px] py-[7px] rounded-[5px] text-[12px] ${feedback.kind === "success" ? (dark ? "bg-[#173d28] text-[#68db95]" : "bg-[#edf9f1] text-[#237844]") : (dark ? "bg-[#281919] text-[#f0a0a0]" : "bg-[#fff2f2] text-[#b74242]")}`}>
+                              {feedback.message}
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          data-ai-dialog-action
+                          disabled={savingSettings || Boolean(validatingProfileId) || Boolean(validatingConnectionId)}
+                          onClick={() => void validateConnection(connection)}
+                          className={`h-[32px] px-[12px] rounded-[5px] border text-[13px] disabled:opacity-50 ${dark ? "border-[#4a4a4a] hover:bg-[#292929]" : "border-[#c9c9c9] hover:bg-[#f2f2f2]"}`}
+                        >
+                          {validatingConnectionId === connection.id ? "连接中" : "连接并读取工具"}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         </div>
 
         <div className={`h-[58px] px-[16px] border-t flex items-center justify-end gap-[9px] ${dark ? "border-[#333]" : "border-[#e5e5e5]"}`}>
-          <button type="button" disabled={savingSettings || Boolean(validatingProfileId)} onClick={onClose} className={`h-[34px] px-[14px] rounded-[5px] border text-[13px] ${dark ? "border-[#414141]" : "border-[#d0d0d0]"}`}>取消</button>
-          <button type="button" disabled={savingSettings || Boolean(validatingProfileId)} onClick={() => void submit()} className="h-[34px] px-[14px] rounded-[5px] bg-[#07c160] text-white text-[13px] disabled:bg-[#315541]">{savingSettings ? "保存中" : "保存"}</button>
+          <button type="button" disabled={savingSettings || Boolean(validatingProfileId) || Boolean(validatingConnectionId)} onClick={onClose} className={`h-[34px] px-[14px] rounded-[5px] border text-[13px] ${dark ? "border-[#414141]" : "border-[#d0d0d0]"}`}>取消</button>
+          <button type="button" disabled={savingSettings || Boolean(validatingProfileId) || Boolean(validatingConnectionId)} onClick={() => void submit()} className="h-[34px] px-[14px] rounded-[5px] bg-[#07c160] text-white text-[13px] disabled:bg-[#315541]">{savingSettings ? "保存中" : "保存"}</button>
         </div>
       </div>
     </div>

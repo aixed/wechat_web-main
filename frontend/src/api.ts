@@ -1,4 +1,4 @@
-import type { AiProfile, SmartReplyAiTask } from "./types";
+import type { AiProfile, McpConnection, SmartReplyAiTask } from "./types";
 
 const BASE = "";  // Same origin via Vite proxy
 export const ACCESS_KEY_STORAGE = "wechat_web_access_key";
@@ -690,6 +690,7 @@ export const saveSmartReply = (chatId: string, config: {
     "text" | "image" | "gif" | "voice" | "video" | "file" |
     "xml" | "system" | "recall" | "quote"
   >;
+  file_types: Array<"txt" | "pdf" | "xlsx" | "docx">;
   target_senders: string[];
   rules: Array<{
     id: string;
@@ -716,6 +717,7 @@ export type AiSettingsPayload = {
   model?: string;
   active_profile_id?: string;
   profiles?: Array<Pick<AiProfile, "id" | "name" | "base_url" | "model"> & { api_key?: string }>;
+  mcp_connections?: Array<Pick<McpConnection, "id" | "name" | "url" | "enabled"> & { token?: string }>;
 };
 
 export const validateAiSettings = (settings: AiSettingsPayload) =>
@@ -735,3 +737,12 @@ export const analyzeAiMessage = (message: string, task: SmartReplyAiTask) =>
     method: "POST",
     body: JSON.stringify({ message, task }),
   }, 75_000);
+
+export const validateMcpConnection = (connection: Pick<McpConnection, "id" | "name" | "url" | "enabled"> & { token?: string }) =>
+  fetchJSON("/api/mcp/validate", {
+    method: "POST",
+    body: JSON.stringify(connection),
+  }, 75_000);
+
+export const getMcpTools = (connectionId: string) =>
+  fetchJSON(`/api/mcp/connections/${encodeURIComponent(connectionId)}/tools`, {}, 75_000);

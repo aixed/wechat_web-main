@@ -138,6 +138,8 @@ AI_API_KEY = ""
 AI_MODEL = ""
 AI_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("ai_timeout_seconds", 60)))
 AI_MAX_CONCURRENCY = max(1, min(20, int(_cfg.get("ai_max_concurrency", 3))))
+MCP_CONNECTIONS: list[dict[str, Any]] = []
+MCP_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("mcp_timeout_seconds", 180)))
 
 
 def _normalize_ai_profile(raw: Any, index: int = 0) -> dict[str, Any] | None:
@@ -198,9 +200,46 @@ def _resolve_ai_settings(document: dict[str, Any]) -> tuple[list[dict[str, Any]]
     return profiles, active_profile_id, active
 
 
+def _normalize_mcp_connection(raw: Any, index: int = 0) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    connection_id = str(raw.get("id") or f"mcp_connection_{index + 1}").strip()[:100]
+    url = str(raw.get("url") or raw.get("endpoint") or "").strip().rstrip("/")
+    token = str(raw.get("token") or raw.get("api_key") or "").strip()
+    name = str(raw.get("name") or url or f"MCP 连接 {index + 1}").strip()[:80]
+    return {
+        "id": connection_id or f"mcp_connection_{index + 1}",
+        "name": name or f"MCP 连接 {index + 1}",
+        "url": url,
+        "token": token,
+        "enabled": _to_bool(raw.get("enabled"), True),
+    }
+
+
+def _resolve_mcp_connections(document: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_connections = document.get("mcp_connections")
+    connections: list[dict[str, Any]] = []
+    if isinstance(raw_connections, list):
+        for index, raw in enumerate(raw_connections):
+            connection = _normalize_mcp_connection(raw, index)
+            if connection:
+                connections.append(connection)
+    if not connections and raw_connections is None:
+        default_url = str(os.environ.get("MCP_URL") or "http://127.0.0.1:8765/mcp").strip().rstrip("/")
+        connections.append({
+            "id": "local_mcp",
+            "name": "本地 MCP",
+            "url": default_url,
+            "token": str(os.environ.get("MCP_TOKEN") or "").strip(),
+            "enabled": True,
+        })
+    return connections
+
+
 def _apply_ai_settings(document: dict[str, Any]) -> dict:
-    global AI_ACTIVE_PROFILE_ID, AI_PROFILES, AI_BASE_URL, AI_API_KEY, AI_MODEL
+    global AI_ACTIVE_PROFILE_ID, AI_PROFILES, AI_BASE_URL, AI_API_KEY, AI_MODEL, MCP_CONNECTIONS
     profiles, active_profile_id, active = _resolve_ai_settings(document)
+    MCP_CONNECTIONS = _resolve_mcp_connections(document)
     AI_PROFILES = profiles
     AI_ACTIVE_PROFILE_ID = active_profile_id
     AI_BASE_URL = str(active.get("base_url") or "").strip().rstrip("/")
@@ -223,6 +262,16 @@ def _apply_ai_settings(document: dict[str, Any]) -> dict:
             }
             for profile in AI_PROFILES
         ],
+        "mcp_connections": [
+            {
+                "id": str(connection.get("id") or ""),
+                "name": str(connection.get("name") or ""),
+                "url": str(connection.get("url") or ""),
+                "enabled": bool(connection.get("enabled", True)),
+                "token_configured": bool(connection.get("token")),
+            }
+            for connection in MCP_CONNECTIONS
+        ],
     }
 
 
@@ -242,8 +291,9 @@ def save_ai_settings(
     model: str = "",
     profiles: list[dict[str, Any]] | None = None,
     active_profile_id: str = "",
+    mcp_connections: list[dict[str, Any]] | None = None,
 ) -> dict:
-    """Persist AI settings while preserving config.yaml comments and formatting."""
+    """Persist AI and MCP settings while preserving config.yaml formatting."""
     from ruamel.yaml import YAML
 
     parser = YAML()
@@ -257,6 +307,10 @@ def save_ai_settings(
     existing_profiles = {
         str(profile.get("id") or ""): profile
         for profile in _resolve_ai_settings(document)[0]
+    }
+    existing_mcp_connections = {
+        str(connection.get("id") or ""): connection
+        for connection in _resolve_mcp_connections(document)
     }
     normalized_profiles: list[dict[str, Any]] = []
     if profiles is not None:
@@ -309,6 +363,27 @@ def save_ai_settings(
     document["ai_base_url"] = str(active.get("base_url") or "").strip().rstrip("/")
     document["ai_api_key"] = str(active.get("api_key") or "").strip()
     document["ai_model"] = str(active.get("model") or "").strip()
+    if mcp_connections is not None:
+        normalized_mcp_connections: list[dict[str, Any]] = []
+        seen_mcp_ids: set[str] = set()
+        for index, raw_connection in enumerate(mcp_connections):
+            connection = _normalize_mcp_connection(raw_connection, index)
+            if not connection:
+                continue
+            if not connection["token"]:
+                connection["token"] = str(
+                    existing_mcp_connections.get(connection["id"], {}).get("token") or ""
+                )
+            base_id = connection["id"] or f"mcp_connection_{index + 1}"
+            connection_id = base_id
+            suffix = 2
+            while connection_id in seen_mcp_ids:
+                connection_id = f"{base_id}_{suffix}"
+                suffix += 1
+            connection["id"] = connection_id
+            seen_mcp_ids.add(connection_id)
+            normalized_mcp_connections.append(connection)
+        document["mcp_connections"] = normalized_mcp_connections
     temp_path = _CONFIG_PATH + ".tmp"
     try:
         with open(temp_path, "w", encoding="utf-8") as stream:
@@ -467,6 +542,16 @@ def _load_initial_config_template() -> Any:
         "ai_profiles": [],
         "ai_timeout_seconds": 60,
         "ai_max_concurrency": 3,
+        "mcp_connections": [
+            {
+                "id": "local_mcp",
+                "name": "本地 MCP",
+                "url": "http://127.0.0.1:8765/mcp",
+                "token": "",
+                "enabled": True,
+            }
+        ],
+        "mcp_timeout_seconds": 180,
     }
 
 

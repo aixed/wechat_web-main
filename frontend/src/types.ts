@@ -48,6 +48,11 @@ export interface SmartReplyAiTask {
   preserve_formatting: boolean;
   send_items_separately: boolean;
   max_parallel: number;
+  mcp_enabled: boolean;
+  mcp_connection_id: string;
+  mcp_tool_name: string;
+  mcp_arguments_template: string;
+  mcp_reply_template: string;
 }
 
 export interface AiProfile {
@@ -60,6 +65,22 @@ export interface AiProfile {
   model: string;
 }
 
+export interface McpTool {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+}
+
+export interface McpConnection {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  token_configured: boolean;
+  token?: string;
+}
+
 export interface AiSettings {
   configured: boolean;
   api_key_configured: boolean;
@@ -68,6 +89,7 @@ export interface AiSettings {
   model: string;
   active_profile_id: string;
   profiles: AiProfile[];
+  mcp_connections: McpConnection[];
 }
 
 export interface AiAnalysisResult {
@@ -98,6 +120,7 @@ export interface SmartReplyConfig {
   mention_only: boolean;
   use_no_src: boolean;
   message_types: SmartReplyMessageType[];
+  file_types: Array<"txt" | "pdf" | "xlsx" | "docx">;
   target_senders: string[];
   rules: SmartReplyRule[];
   ai_tasks: SmartReplyAiTask[];

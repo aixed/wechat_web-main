@@ -39,6 +39,7 @@ from sqlite_cache import SqliteMessageCache
 from pb_parser import parse_raw_pb
 from smart_reply import SmartReplyEngine
 from ai_service import AiService, AiServiceError
+from mcp_service import McpService, McpServiceError
 from daily_log import append_daily_log
 
 
@@ -248,6 +249,7 @@ ai_service = AiService(
     timeout_seconds=config.AI_TIMEOUT_SECONDS,
     max_concurrency=config.AI_MAX_CONCURRENCY,
 )
+mcp_service = McpService(timeout_seconds=config.MCP_TIMEOUT_SECONDS)
 _active_agent_id = ""
 _account_runtimes: dict[str, dict] = {}
 _self_wxid_to_agent_id: dict[str, str] = {}
@@ -2196,6 +2198,7 @@ async def lifespan(app: FastAPI):
     await wechat_api.client.aclose()
     await protocol_api.close()
     await ai_service.close()
+    await mcp_service.close()
     _log("[SHUTDOWN] Done.")
 
 
@@ -2340,6 +2343,11 @@ class SmartReplyAiTaskRequest(BaseModel):
     preserve_formatting: bool = True
     send_items_separately: bool = False
     max_parallel: int = Field(default=1, ge=1, le=10)
+    mcp_enabled: bool = False
+    mcp_connection_id: str = ""
+    mcp_tool_name: str = ""
+    mcp_arguments_template: str = "{}"
+    mcp_reply_template: str = "{{mcp_text}}"
 
 
 class SmartReplyConfigRequest(BaseModel):
@@ -2349,6 +2357,7 @@ class SmartReplyConfigRequest(BaseModel):
     mention_only: bool = False
     use_no_src: bool = False
     message_types: list[str] = Field(default_factory=lambda: ["text"])
+    file_types: list[str] = Field(default_factory=lambda: ["txt"])
     target_senders: list[str] = Field(default_factory=list)
     rules: list[SmartReplyRuleRequest] = Field(default_factory=list)
     ai_tasks: list[SmartReplyAiTaskRequest] = Field(default_factory=list)
@@ -2362,12 +2371,21 @@ class AiProfileRequest(BaseModel):
     model: str = ""
 
 
+class McpConnectionRequest(BaseModel):
+    id: str = ""
+    name: str = ""
+    url: str = ""
+    token: str = ""
+    enabled: bool = True
+
+
 class AiSettingsRequest(BaseModel):
     base_url: str = ""
     api_key: str = ""
     model: str = ""
     active_profile_id: str = ""
     profiles: list[AiProfileRequest] = Field(default_factory=list)
+    mcp_connections: list[McpConnectionRequest] | None = None
 
 
 class AiAnalyzeRequest(BaseModel):
@@ -2684,6 +2702,21 @@ def _normalize_ai_task(task: SmartReplyAiTaskRequest, index: int = 0) -> dict[st
     reply_template = str(task.reply_template or "").strip()
     if output_mode == "template" and not reply_template:
         raise HTTPException(status_code=400, detail="template AI replies require a reply template")
+    mcp_enabled = bool(task.mcp_enabled)
+    mcp_connection_id = str(task.mcp_connection_id or "").strip()
+    mcp_tool_name = str(task.mcp_tool_name or "").strip()
+    mcp_arguments_template = str(task.mcp_arguments_template or "{}").strip() or "{}"
+    mcp_reply_template = str(task.mcp_reply_template or "{{mcp_text}}").strip()
+    try:
+        parsed_mcp_arguments = json.loads(mcp_arguments_template)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="MCP arguments must be a valid JSON object") from exc
+    if not isinstance(parsed_mcp_arguments, dict):
+        raise HTTPException(status_code=400, detail="MCP arguments must be a JSON object")
+    if mcp_enabled and (not mcp_connection_id or not mcp_tool_name):
+        raise HTTPException(status_code=400, detail="enabled MCP Skills require a connection and tool")
+    if mcp_enabled and not mcp_reply_template:
+        raise HTTPException(status_code=400, detail="enabled MCP Skills require a reply template")
     return {
         "id": task_id,
         "name": str(task.name or f"Skill {index + 1}").strip()[:80],
@@ -2697,6 +2730,11 @@ def _normalize_ai_task(task: SmartReplyAiTaskRequest, index: int = 0) -> dict[st
         "preserve_formatting": bool(task.preserve_formatting),
         "send_items_separately": bool(task.send_items_separately),
         "max_parallel": max(1, min(10, int(task.max_parallel))),
+        "mcp_enabled": mcp_enabled,
+        "mcp_connection_id": mcp_connection_id[:100],
+        "mcp_tool_name": mcp_tool_name[:200],
+        "mcp_arguments_template": json.dumps(parsed_mcp_arguments, ensure_ascii=False),
+        "mcp_reply_template": mcp_reply_template[:4000],
     }
 
 
@@ -2727,6 +2765,19 @@ def _ai_settings_payload(*, include_api_key: bool = False) -> dict[str, Any]:
     }
     if include_api_key:
         payload["api_key"] = config.AI_API_KEY
+    mcp_connections: list[dict[str, Any]] = []
+    for connection in config.MCP_CONNECTIONS:
+        connection_payload = {
+            "id": str(connection.get("id") or ""),
+            "name": str(connection.get("name") or ""),
+            "url": str(connection.get("url") or ""),
+            "enabled": bool(connection.get("enabled", True)),
+            "token_configured": bool(connection.get("token")),
+        }
+        if include_api_key:
+            connection_payload["token"] = str(connection.get("token") or "")
+        mcp_connections.append(connection_payload)
+    payload["mcp_connections"] = mcp_connections
     return payload
 
 
@@ -2822,9 +2873,85 @@ async def validate_ai_settings(req: AiSettingsRequest):
     return {"ok": True, "model": model, "models_url": result.get("models_url", "")}
 
 
+def _normalize_mcp_connection_request(
+    req: McpConnectionRequest,
+    index: int = 0,
+) -> dict[str, Any]:
+    connection_id = str(req.id or f"mcp_connection_{index + 1}").strip()[:100]
+    url = str(req.url or "").strip().rstrip("/")
+    try:
+        parsed_url = httpx.URL(url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid MCP URL") from exc
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.host:
+        raise HTTPException(status_code=400, detail="MCP URL must use http or https")
+    existing = next(
+        (item for item in config.MCP_CONNECTIONS if str(item.get("id") or "") == connection_id),
+        {},
+    )
+    return {
+        "id": connection_id or f"mcp_connection_{index + 1}",
+        "name": str(req.name or url or f"MCP 连接 {index + 1}").strip()[:80],
+        "url": url,
+        "token": str(req.token or "").strip() or str(existing.get("token") or ""),
+        "enabled": bool(req.enabled),
+    }
+
+
+def _mcp_connection(connection_id: str) -> dict[str, Any] | None:
+    normalized_id = str(connection_id or "").strip()
+    return next(
+        (
+            connection
+            for connection in config.MCP_CONNECTIONS
+            if str(connection.get("id") or "") == normalized_id
+        ),
+        None,
+    )
+
+
+@app.post("/api/mcp/validate")
+async def validate_mcp_connection(req: McpConnectionRequest):
+    connection = _normalize_mcp_connection_request(req)
+    try:
+        discovery = await mcp_service.discover(
+            url=str(connection.get("url") or ""),
+            token=str(connection.get("token") or ""),
+        )
+    except McpServiceError as exc:
+        raise HTTPException(status_code=400, detail=f"MCP connection failed: {exc}") from exc
+    return {"ok": True, **discovery}
+
+
+@app.get("/api/mcp/connections/{connection_id}/tools")
+async def list_mcp_connection_tools(connection_id: str):
+    config.reload_ai_settings()
+    connection = _mcp_connection(connection_id)
+    if connection is None:
+        raise HTTPException(status_code=404, detail="MCP connection not found")
+    if not bool(connection.get("enabled", True)):
+        raise HTTPException(status_code=400, detail="MCP connection is disabled")
+    try:
+        discovery = await mcp_service.discover(
+            url=str(connection.get("url") or ""),
+            token=str(connection.get("token") or ""),
+        )
+    except McpServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "connection_id": connection_id, **discovery}
+
+
 @app.put("/api/ai/settings")
 async def save_ai_settings(req: AiSettingsRequest):
     _normalize_ai_settings_request(req)
+    normalized_mcp_connections = (
+        [
+            _normalize_mcp_connection_request(connection, index)
+            for index, connection in enumerate(req.mcp_connections)
+        ]
+        if req.mcp_connections is not None
+        else None
+    )
     if req.profiles:
         existing_profiles = {
             str(profile.get("id") or ""): profile
@@ -2843,6 +2970,7 @@ async def save_ai_settings(req: AiSettingsRequest):
         config.save_ai_settings(
             profiles=profiles,
             active_profile_id=str(req.active_profile_id or "").strip(),
+            mcp_connections=normalized_mcp_connections,
         )
     else:
         profile = _profile_payload_from_request(req)
@@ -2850,6 +2978,7 @@ async def save_ai_settings(req: AiSettingsRequest):
             base_url=str(profile.get("base_url") or ""),
             api_key=str(profile.get("api_key") or ""),
             model=str(profile.get("model") or ""),
+            mcp_connections=normalized_mcp_connections,
         )
     ai_service.configure(
         base_url=config.AI_BASE_URL,
@@ -2906,6 +3035,15 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
     if not message_types:
         raise HTTPException(status_code=400, detail="at least one message type is required")
 
+    allowed_file_types = {"txt", "pdf", "xlsx", "docx"}
+    file_types: list[str] = []
+    for value in req.file_types:
+        file_type = str(value or "").strip().lower().lstrip(".")
+        if file_type not in allowed_file_types:
+            raise HTTPException(status_code=400, detail=f"unsupported smart reply file type: {file_type}")
+        if file_type not in file_types:
+            file_types.append(file_type)
+
     rules: list[dict[str, Any]] = []
     for index, rule in enumerate(req.rules[:100]):
         keyword = str(rule.keyword or "").strip()
@@ -2931,6 +3069,18 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
             "reply_with_matched_line": reply_with_matched_line,
         })
     ai_tasks = [_normalize_ai_task(task, index) for index, task in enumerate(req.ai_tasks[:20])]
+    usable_mcp_connection_ids = {
+        str(connection.get("id") or "")
+        for connection in config.MCP_CONNECTIONS
+        if bool(connection.get("enabled", True))
+    }
+    for task in ai_tasks:
+        task_connection_id = str(task.get("mcp_connection_id") or "")
+        if bool(task.get("mcp_enabled")) and task_connection_id not in usable_mcp_connection_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"MCP connection is missing or disabled: {task_connection_id}",
+            )
     if not rules and not ai_tasks:
         raise HTTPException(status_code=400, detail="at least one keyword rule or AI task is required")
 
@@ -2944,6 +3094,7 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
         "mention_only": is_group and bool(req.mention_only),
         "use_no_src": bool(req.use_no_src),
         "message_types": message_types,
+        "file_types": file_types,
         "target_senders": target_senders,
         "rules": rules,
         "ai_tasks": ai_tasks,
@@ -3019,10 +3170,235 @@ def _ai_result_replies(task: dict[str, Any], result: dict[str, Any]) -> tuple[st
     return tuple(reply for reply in replies if reply)
 
 
+def _ai_result_matches(task: dict[str, Any], result: dict[str, Any]) -> bool:
+    return bool(result.get("matched")) and int(result.get("confidence") or 0) >= int(
+        task.get("confidence") or 0
+    )
+
+
+def _extract_skill_identifier(result: dict[str, Any]) -> str:
+    candidates = [
+        str(result.get("result") or ""),
+        *(str(item or "") for item in (result.get("items") or [])),
+        str(result.get("reply") or ""),
+    ]
+    for candidate in candidates:
+        matched = re.search(r"(?i)(?:xzsb\s*[-_:：]?\s*)?(?<!\d)(\d{4,5})(?!\d)", candidate)
+        if matched:
+            return matched.group(1)
+    return ""
+
+
+def _replace_mcp_argument_tokens(value: Any, replacements: dict[str, Any]) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _replace_mcp_argument_tokens(item, replacements) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_replace_mcp_argument_tokens(item, replacements) for item in value]
+    if not isinstance(value, str):
+        return value
+    if value in replacements:
+        return replacements[value]
+    rendered = value
+    for marker, replacement in replacements.items():
+        if marker in rendered:
+            replacement_text = (
+                json.dumps(replacement, ensure_ascii=False)
+                if isinstance(replacement, (dict, list))
+                else str(replacement)
+            )
+            rendered = rendered.replace(marker, replacement_text)
+    return rendered
+
+
+def _render_mcp_arguments(task: dict[str, Any], result: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    identifier = _extract_skill_identifier(result)
+    replacements: dict[str, Any] = {
+        "{{result}}": str(result.get("result") or ""),
+        "{{reply}}": str(result.get("reply") or ""),
+        "{{items}}": result.get("items") or [],
+        "{{identifier}}": identifier,
+    }
+    try:
+        template = json.loads(str(task.get("mcp_arguments_template") or "{}"))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise McpServiceError("MCP arguments are not valid JSON") from exc
+    if not isinstance(template, dict):
+        raise McpServiceError("MCP arguments must be a JSON object")
+    arguments = _replace_mcp_argument_tokens(template, replacements)
+    if not isinstance(arguments, dict):
+        raise McpServiceError("MCP arguments must resolve to a JSON object")
+    if "{{identifier}}" in str(task.get("mcp_arguments_template") or "") and not identifier:
+        raise McpServiceError("AI result did not contain a 4 or 5 digit SQL identifier")
+    return arguments, identifier
+
+
+def _flatten_mcp_values(value: Any, prefix: str = "") -> dict[str, str]:
+    flattened: dict[str, str] = {}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key)
+            path = f"{prefix}.{key_text}" if prefix else key_text
+            nested = _flatten_mcp_values(item, path)
+            flattened.update(nested)
+            if not isinstance(item, (dict, list)):
+                flattened.setdefault(key_text, str(item if item is not None else ""))
+        return flattened
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            flattened.update(_flatten_mcp_values(item, f"{prefix}.{index}" if prefix else str(index)))
+        return flattened
+    if prefix:
+        flattened[prefix] = str(value if value is not None else "")
+    return flattened
+
+
+def _render_mcp_reply(
+    task: dict[str, Any],
+    ai_result: dict[str, Any],
+    mcp_result: dict[str, Any],
+    identifier: str,
+) -> str:
+    structured = mcp_result.get("structured")
+    text = str(mcp_result.get("text") or "").strip()
+    try:
+        mcp_json = json.dumps(structured, ensure_ascii=False) if structured is not None else ""
+    except (TypeError, ValueError):
+        mcp_json = ""
+    values = {
+        "result": str(ai_result.get("result") or ""),
+        "reply": str(ai_result.get("reply") or ""),
+        "identifier": identifier,
+        "mcp_text": text,
+        "mcp_json": mcp_json,
+        **_flatten_mcp_values(structured),
+    }
+    rendered = str(task.get("mcp_reply_template") or "{{mcp_text}}").strip()
+    for key, value in sorted(values.items(), key=lambda item: len(item[0]), reverse=True):
+        rendered = rendered.replace(f"{{{{mcp.{key}}}}}", value)
+        rendered = rendered.replace(f"{{{{{key}}}}}", value)
+    return rendered.strip()
+
+
+async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple[str, ...]:
+    if not _ai_result_matches(task, result):
+        return ()
+    connection_id = str(task.get("mcp_connection_id") or "")
+    connection = _mcp_connection(connection_id)
+    if connection is None:
+        raise McpServiceError(f"MCP connection not found: {connection_id}")
+    if not bool(connection.get("enabled", True)):
+        raise McpServiceError(f"MCP connection is disabled: {connection_id}")
+    arguments, identifier = _render_mcp_arguments(task, result)
+    tool_name = str(task.get("mcp_tool_name") or "")
+    called = await mcp_service.call_tool(
+        url=str(connection.get("url") or ""),
+        token=str(connection.get("token") or ""),
+        tool_name=tool_name,
+        arguments=arguments,
+    )
+    structured = called.get("structured")
+    if (
+        tool_name == "submit_data_maintenance"
+        and isinstance(structured, dict)
+        and structured.get("submitted") is False
+    ):
+        raise McpServiceError("MCP data maintenance request was not submitted")
+    if str(task.get("output_mode") or "result") == "silent":
+        return ()
+    reply = _render_mcp_reply(task, result, called, identifier)
+    if not bool(task.get("preserve_formatting", True)):
+        reply = " ".join(reply.split())
+    return (reply,) if reply else ()
+
+
 def _preview_text(value: Any, limit: int = 80) -> str:
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     text = " ".join(text.split())
     return text[:limit] + ("..." if len(text) > limit else "")
+
+
+_SMART_REPLY_TXT_MAX_BYTES = 2 * 1024 * 1024
+_SMART_REPLY_AI_INPUT_MAX_CHARS = 20_000
+
+
+def _read_smart_reply_txt(path: str) -> tuple[str, str]:
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return "", "missing_file"
+    if size <= 0:
+        return "", "empty_file"
+    if size > _SMART_REPLY_TXT_MAX_BYTES:
+        return "", "oversized_file"
+    try:
+        with open(path, "rb") as source:
+            payload = source.read(_SMART_REPLY_TXT_MAX_BYTES + 1)
+    except OSError:
+        return "", "unreadable_file"
+    if len(payload) > _SMART_REPLY_TXT_MAX_BYTES:
+        return "", "oversized_file"
+
+    decoded: str | None = None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            decoded = payload.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if decoded is None:
+        return "", "decode_failed"
+    decoded = decoded.replace("\x00", "").strip()
+    if not decoded:
+        return "", "empty_file"
+    return decoded, "ok"
+
+
+async def _smart_reply_file_ai_content(
+    message: dict[str, Any],
+    enabled_file_types: list[str] | None,
+) -> tuple[str, str]:
+    msg_xml = str(message.get("msg") or "")
+    local_path = str(message.get("file_path") or message.get("path") or "").strip()
+    filename_hint = str(message.get("filename") or "").strip()
+    if not filename_hint and local_path:
+        filename_hint = os.path.basename(local_path)
+    params = _parse_media_download_params("49", msg_xml, "")
+    parsed_filename = os.path.basename(str(params.get("filename") or "").replace("\\", "/"))
+    filename = filename_hint if parsed_filename == "wechat_media.bin" else parsed_filename
+    filename = os.path.basename(str(filename or filename_hint or "wechat_media.bin").replace("\\", "/"))
+    extension = os.path.splitext(filename)[1].lower().lstrip(".")
+    configured_types = {
+        str(value or "").strip().lower().lstrip(".")
+        for value in (enabled_file_types if isinstance(enabled_file_types, list) else ["txt"])
+    }
+    if extension != "txt" or "txt" not in configured_types:
+        return "", f"unsupported_file_type:{extension or 'unknown'}"
+
+    declared_size = message.get("file_len")
+    try:
+        if declared_size not in (None, "") and int(declared_size) > _SMART_REPLY_TXT_MAX_BYTES:
+            return "", "oversized_file"
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        path, resolved_filename = await _resolve_media_path(
+            msg_id=str(message.get("id") or ""),
+            msg_type="49",
+            local_path=local_path,
+            msg_xml=msg_xml,
+            filename=filename,
+        )
+    except Exception as exc:
+        return "", f"resolve_failed:{type(exc).__name__}"
+    filename = os.path.basename(str(resolved_filename or filename).replace("\\", "/")) or filename
+    content, reason = await asyncio.to_thread(_read_smart_reply_txt, path)
+    if reason != "ok":
+        return "", reason
+
+    prefix = f"文件名：{filename}\n文件内容：\n"
+    available_chars = max(0, _SMART_REPLY_AI_INPUT_MAX_CHARS - len(prefix))
+    return prefix + content[:available_chars], "ok"
 
 
 async def _evaluate_ai_tasks(
@@ -3050,7 +3426,21 @@ async def _evaluate_ai_tasks(
                 f"{type(result).__name__}: {result}"
             )
             continue
-        task_replies = _ai_result_replies(task, result)
+        if bool(task.get("mcp_enabled")):
+            try:
+                task_replies = await _mcp_task_reply(task, result)
+            except McpServiceError as exc:
+                _smart_reply_log(
+                    f"[MCP_REPLY] task failed message_id={message_id} id={task.get('id', '')} "
+                    f"tool={task.get('mcp_tool_name', '')}: {exc}"
+                )
+                continue
+            _smart_reply_log(
+                f"[MCP_REPLY] task completed message_id={message_id} id={task.get('id', '')} "
+                f"tool={task.get('mcp_tool_name', '')} replies={len(task_replies)}"
+            )
+        else:
+            task_replies = _ai_result_replies(task, result)
         _smart_reply_log(
             f"[AI_REPLY] task result message_id={message_id} id={task.get('id', '')} "
             f"matched={result.get('matched')} "
@@ -3090,8 +3480,9 @@ async def _process_smart_reply_message(
     )
     if not decision.should_send:
         ai_tasks = config_row.get("ai_tasks") if isinstance(config_row, dict) else []
+        msg_type = str(message.get("msgtype") or "")
         if (
-            str(message.get("msgtype") or "") != "1"
+            msg_type not in {"1", "49"}
             or decision.reason not in {"keyword_not_matched", "too_few_lines", "pure_single_line"}
             or not ai_tasks
         ):
@@ -3101,7 +3492,19 @@ async def _process_smart_reply_message(
                 f"reason={decision.reason} msgtype={message.get('msgtype', '')} ai_tasks={len(ai_tasks or [])}"
             )
             return
-        raw_content = str(message.get("msg") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if msg_type == "49":
+            raw_content, file_reason = await _smart_reply_file_ai_content(
+                message,
+                config_row.get("file_types") if isinstance(config_row, dict) else None,
+            )
+            if not raw_content:
+                _smart_reply_log(
+                    f"[SMART_REPLY] skipped file message_id={message_id} chat={chat_id} "
+                    f"sender={message.get('fromid', '')} reason={file_reason}"
+                )
+                return
+        else:
+            raw_content = str(message.get("msg") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         _smart_reply_log(
             f"[SMART_REPLY] evaluating AI message_id={message_id} chat={chat_id} "
             f"sender={message.get('fromid', '')} "
