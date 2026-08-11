@@ -160,6 +160,7 @@ class SqliteMessageCache:
                     message_types_json TEXT NOT NULL DEFAULT '["text"]',
                     file_types_json TEXT NOT NULL DEFAULT '["txt"]',
                     target_senders_json TEXT NOT NULL DEFAULT '[]',
+                    target_senders_by_type_json TEXT NOT NULL DEFAULT '{}',
                     rules_json TEXT NOT NULL DEFAULT '[]',
                     ai_tasks_json TEXT NOT NULL DEFAULT '[]',
                     reply_count INTEGER NOT NULL DEFAULT 0,
@@ -218,6 +219,11 @@ class SqliteMessageCache:
                 conn.execute(
                     "ALTER TABLE smart_reply_configs "
                     "ADD COLUMN file_types_json TEXT NOT NULL DEFAULT '[\"txt\"]'"
+                )
+            if "target_senders_by_type_json" not in smart_reply_columns:
+                conn.execute(
+                    "ALTER TABLE smart_reply_configs "
+                    "ADD COLUMN target_senders_by_type_json TEXT NOT NULL DEFAULT '{}'"
                 )
 
     @staticmethod
@@ -290,6 +296,10 @@ class SqliteMessageCache:
         except Exception:
             target_senders = []
         try:
+            target_senders_by_type = json.loads(row["target_senders_by_type_json"] or "{}")
+        except Exception:
+            target_senders_by_type = {}
+        try:
             rules = json.loads(row["rules_json"] or "[]")
         except Exception:
             rules = []
@@ -311,6 +321,8 @@ class SqliteMessageCache:
             ai_tasks = []
         if not isinstance(target_senders, list):
             target_senders = []
+        if not isinstance(target_senders_by_type, dict):
+            target_senders_by_type = {}
         if not isinstance(rules, list):
             rules = []
         if not isinstance(message_types, list) or not message_types:
@@ -321,6 +333,34 @@ class SqliteMessageCache:
             file_types = ["txt"]
         if not isinstance(ai_tasks, list):
             ai_tasks = []
+        normalized_message_types = [
+            str(item or "").strip().lower()
+            for item in message_types
+            if str(item or "").strip()
+        ]
+        legacy_target_senders = [
+            str(item or "").strip()
+            for item in target_senders
+            if str(item or "").strip()
+        ]
+        normalized_senders_by_type: dict[str, list[str]] = {}
+        for raw_message_type, raw_senders in target_senders_by_type.items():
+            message_type = str(raw_message_type or "").strip().lower()
+            if not message_type or not isinstance(raw_senders, list):
+                continue
+            normalized_senders_by_type[message_type] = list(dict.fromkeys(
+                str(item or "").strip()
+                for item in raw_senders
+                if str(item or "").strip()
+            ))
+        for message_type in normalized_message_types:
+            if message_type not in normalized_senders_by_type:
+                normalized_senders_by_type[message_type] = list(legacy_target_senders)
+        target_senders = list(dict.fromkeys(
+            sender
+            for senders in normalized_senders_by_type.values()
+            for sender in senders
+        ))
         rules = SqliteMessageCache._scope_smart_reply_items(
             rules,
             message_types,
@@ -342,9 +382,10 @@ class SqliteMessageCache:
                 str(item) for item in mention_message_types if str(item or "").strip()
             ],
             "use_no_src": bool(int(row["use_no_src"] or 0)),
-            "message_types": [str(item) for item in message_types if str(item or "").strip()],
+            "message_types": normalized_message_types,
             "file_types": [str(item) for item in file_types if str(item or "").strip()],
-            "target_senders": [str(item) for item in target_senders if str(item or "").strip()],
+            "target_senders": target_senders,
+            "target_senders_by_type": normalized_senders_by_type,
             "rules": rules,
             "ai_tasks": ai_tasks,
             "reply_count": int(row["reply_count"] or 0),
@@ -381,6 +422,11 @@ class SqliteMessageCache:
             raise ValueError("chat_id is required")
         now = int(time.time())
         target_senders = config.get("target_senders") if isinstance(config.get("target_senders"), list) else []
+        target_senders_by_type = (
+            config.get("target_senders_by_type")
+            if isinstance(config.get("target_senders_by_type"), dict)
+            else {}
+        )
         message_types = config.get("message_types") if isinstance(config.get("message_types"), list) else ["text"]
         mention_message_types = (
             config.get("mention_message_types")
@@ -396,9 +442,9 @@ class SqliteMessageCache:
                 INSERT INTO smart_reply_configs (
                     owner_wxid, chat_id, chat_name, avatar, enabled, mention_only, use_no_src,
                     message_types_json, mention_message_types_json, file_types_json,
-                    target_senders_json, rules_json, ai_tasks_json,
+                    target_senders_json, target_senders_by_type_json, rules_json, ai_tasks_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(owner_wxid, chat_id) DO UPDATE SET
                     chat_name=excluded.chat_name,
                     avatar=excluded.avatar,
@@ -409,6 +455,7 @@ class SqliteMessageCache:
                     mention_message_types_json=excluded.mention_message_types_json,
                     file_types_json=excluded.file_types_json,
                     target_senders_json=excluded.target_senders_json,
+                    target_senders_by_type_json=excluded.target_senders_by_type_json,
                     rules_json=excluded.rules_json,
                     ai_tasks_json=excluded.ai_tasks_json,
                     updated_at=excluded.updated_at
@@ -425,6 +472,7 @@ class SqliteMessageCache:
                     json.dumps(mention_message_types, ensure_ascii=False),
                     json.dumps(file_types, ensure_ascii=False),
                     json.dumps(target_senders, ensure_ascii=False),
+                    json.dumps(target_senders_by_type, ensure_ascii=False),
                     json.dumps(rules, ensure_ascii=False),
                     json.dumps(ai_tasks, ensure_ascii=False),
                     now,

@@ -147,6 +147,7 @@ function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
     message_types: ["text"],
     file_types: ["txt"],
     target_senders: isGroup ? [] : [target.wxid],
+    target_senders_by_type: { text: isGroup ? [] : [target.wxid] },
     rules: [makeRule("text")],
     ai_tasks: [],
     reply_count: 0,
@@ -185,6 +186,12 @@ function dedupeLegacyItems<T extends { message_type?: SmartReplyMessageType }>(
   });
 }
 
+function flattenTargetSenders(
+  sendersByType: Partial<Record<SmartReplyMessageType, string[]>>,
+): string[] {
+  return Array.from(new Set(Object.values(sendersByType).flatMap((senders) => senders || [])));
+}
+
 function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
   const isGroup = config.chat_id.endsWith("@chatroom");
   const configuredMessageTypes: SmartReplyMessageType[] = config.message_types?.length
@@ -192,6 +199,22 @@ function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
     : ["text"];
   const legacyRuleTypes = configuredMessageTypes.filter((value) => value === "text" || value === "image");
   const legacyAiTypes = configuredMessageTypes.filter((value) => value === "text" || value === "image" || value === "file");
+  const legacyTargetSenders = isGroup ? [...(config.target_senders || [])] : [config.chat_id];
+  const rawSendersByType = config.target_senders_by_type && typeof config.target_senders_by_type === "object"
+    ? config.target_senders_by_type
+    : {};
+  const knownMessageTypes = new Set(MESSAGE_TYPE_OPTIONS.map((option) => option.value));
+  const senderMessageTypes = Array.from(new Set([
+    ...configuredMessageTypes,
+    ...Object.keys(rawSendersByType).filter(
+      (value): value is SmartReplyMessageType => knownMessageTypes.has(value as SmartReplyMessageType),
+    ),
+  ]));
+  const targetSendersByType = Object.fromEntries(senderMessageTypes.map((messageType) => {
+    const configuredSenders = rawSendersByType[messageType];
+    const senders = Array.isArray(configuredSenders) ? configuredSenders : legacyTargetSenders;
+    return [messageType, isGroup ? Array.from(new Set(senders)) : [config.chat_id]];
+  })) as Partial<Record<SmartReplyMessageType, string[]>>;
   const rules = dedupeLegacyItems(config.rules || [], ["id", "message_type"]).flatMap((rule) => {
     if (rule.message_type) return [{ ...rule }];
     const messageTypes = legacyRuleTypes.length ? legacyRuleTypes : ["text" as const];
@@ -222,7 +245,8 @@ function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
     use_no_src: Boolean(config.use_no_src),
     message_types: [...configuredMessageTypes],
     file_types: Array.isArray(config.file_types) ? [...config.file_types] : ["txt"],
-    target_senders: isGroup ? [...(config.target_senders || [])] : [config.chat_id],
+    target_senders: flattenTargetSenders(targetSendersByType),
+    target_senders_by_type: targetSendersByType,
     rules: rules.map((rule) => ({
       ...rule,
       use_regex: Boolean(rule.use_regex),
@@ -431,7 +455,10 @@ export default function SmartReplyManager({
     setExpandedRuleId(null);
     setSkillsExpanded(false);
     setExpandedSkillIds(new Set());
-    setMembersExpanded(cloned.chat_id.endsWith("@chatroom") && cloned.target_senders.length === 0);
+    setMembersExpanded(
+      cloned.chat_id.endsWith("@chatroom")
+      && (cloned.target_senders_by_type[preferredMessageType] || []).length === 0,
+    );
     setError("");
     setNotice("");
     if (config.chat_id.endsWith("@chatroom")) {
@@ -520,12 +547,17 @@ export default function SmartReplyManager({
       instruction: task.instruction.trim(),
       reply_template: task.reply_template.trim(),
     }));
-    if (draft.target_senders.length === 0) {
-      setError("请选择至少一位目标发送人");
-      return;
-    }
     if (draft.message_types.length === 0) {
       setError("请至少选择一种消息类型");
+      return;
+    }
+    const messageTypeWithoutSenders = draft.message_types.find(
+      (messageType) => (draft.target_senders_by_type[messageType] || []).length === 0,
+    );
+    if (messageTypeWithoutSenders) {
+      const label = MESSAGE_TYPE_OPTIONS.find((option) => option.value === messageTypeWithoutSenders)?.label
+        || messageTypeWithoutSenders;
+      setError(`请为${label}选择至少一位目标发送人`);
       return;
     }
     if (rules.some((rule) => !rule.keyword || (!rule.reply_with_matched_line && !rule.reply))) {
@@ -536,13 +568,13 @@ export default function SmartReplyManager({
       setError("请完整填写 Skill 名称和任务指令");
       return;
     }
-    const incompleteMcpTask = aiTasks.find((task) => task.mcp_enabled && (!task.mcp_connection_id || !task.mcp_tool_name));
+    const incompleteMcpTask = aiTasks.find((task) => task.mcp_enabled && !task.mcp_connection_id);
     if (incompleteMcpTask) {
-      setError(`请为 Skill“${incompleteMcpTask.name}”选择 MCP 连接和工具`);
+      setError(`请为 Skill“${incompleteMcpTask.name}”选择 MCP 连接`);
       return;
     }
     const invalidMcpArguments = aiTasks.find((task) => {
-      if (!task.mcp_enabled) return false;
+      if (!task.mcp_enabled || !task.mcp_tool_name) return false;
       try {
         const parsed = JSON.parse(task.mcp_arguments_template || "{}");
         return !parsed || typeof parsed !== "object" || Array.isArray(parsed);
@@ -571,6 +603,7 @@ export default function SmartReplyManager({
         message_types: draft.message_types,
         file_types: draft.file_types,
         target_senders: draft.target_senders,
+        target_senders_by_type: draft.target_senders_by_type,
         rules,
         ai_tasks: aiTasks,
       });
@@ -614,6 +647,22 @@ export default function SmartReplyManager({
 
   const updateDraft = (patch: Partial<SmartReplyConfig>) => {
     setDraft((prev) => prev ? { ...prev, ...patch } : prev);
+    setNotice("");
+  };
+
+  const updateTargetSenders = (senders: string[]) => {
+    setDraft((prev) => {
+      if (!prev) return prev;
+      const targetSendersByType = {
+        ...prev.target_senders_by_type,
+        [activeMessageType]: Array.from(new Set(senders)),
+      };
+      return {
+        ...prev,
+        target_senders: flattenTargetSenders(targetSendersByType),
+        target_senders_by_type: targetSendersByType,
+      };
+    });
     setNotice("");
   };
 
@@ -788,9 +837,14 @@ export default function SmartReplyManager({
     URL.revokeObjectURL(url);
   };
 
+  const currentTargetSenders = useMemo(
+    () => draft?.target_senders_by_type[activeMessageType] || [],
+    [activeMessageType, draft?.target_senders_by_type],
+  );
+
   const toggleSender = (wxid: string) => {
     if (!draft) return;
-    const selected = new Set(draft.target_senders);
+    const selected = new Set(currentTargetSenders);
     if (selected.has(wxid)) selected.delete(wxid);
     else {
       if (normalizedSelfWxid && wxid === normalizedSelfWxid) {
@@ -801,7 +855,7 @@ export default function SmartReplyManager({
       }
       selected.add(wxid);
     }
-    updateDraft({ target_senders: Array.from(selected) });
+    updateTargetSenders(Array.from(selected));
   };
 
   const toggleMessageType = (messageType: SmartReplyMessageType) => {
@@ -809,10 +863,18 @@ export default function SmartReplyManager({
     const selected = new Set(draft.message_types);
     if (selected.has(messageType)) selected.delete(messageType);
     else selected.add(messageType);
+    const targetSendersByType = { ...draft.target_senders_by_type };
+    if (!targetSendersByType[messageType]) {
+      targetSendersByType[messageType] = draft.chat_id.endsWith("@chatroom")
+        ? [...currentTargetSenders]
+        : [draft.chat_id];
+    }
     updateDraft({
       message_types: MESSAGE_TYPE_OPTIONS
         .map((option) => option.value)
         .filter((value) => selected.has(value)),
+      target_senders: flattenTargetSenders(targetSendersByType),
+      target_senders_by_type: targetSendersByType,
     });
   };
 
@@ -837,14 +899,14 @@ export default function SmartReplyManager({
 
   const memberRows = useMemo(() => {
     const byId = new Map(members.map((member) => [member.wxid, member]));
-    for (const wxid of draft?.target_senders || []) {
+    for (const wxid of currentTargetSenders) {
       if (!byId.has(wxid)) byId.set(wxid, { wxid, name: wxid });
     }
     const query = memberQuery.trim().toLocaleLowerCase();
     return Array.from(byId.values()).filter((member) =>
       !query || member.name.toLocaleLowerCase().includes(query) || member.wxid.toLocaleLowerCase().includes(query)
     );
-  }, [draft?.target_senders, memberQuery, members]);
+  }, [currentTargetSenders, memberQuery, members]);
 
   const selectableMemberWxids = useMemo(
     () => members
@@ -853,9 +915,9 @@ export default function SmartReplyManager({
     [members, normalizedSelfWxid],
   );
   const allSelectableMembersSelected = selectableMemberWxids.length > 0
-    && selectableMemberWxids.every((wxid) => draft?.target_senders.includes(wxid));
+    && selectableMemberWxids.every((wxid) => currentTargetSenders.includes(wxid));
   const selfSelected = Boolean(
-    normalizedSelfWxid && draft?.target_senders.includes(normalizedSelfWxid),
+    normalizedSelfWxid && currentTargetSenders.includes(normalizedSelfWxid),
   );
 
   const filteredConfigs = useMemo(() => {
@@ -1117,6 +1179,8 @@ export default function SmartReplyManager({
                     onClick={() => {
                       setActiveMessageType(option.value);
                       writeViewPreference(draft.chat_id, { message_type: option.value });
+                      setMembersExpanded((draft.target_senders_by_type[option.value] || []).length === 0);
+                      setMemberQuery("");
                       setAiTestTaskId(draft.ai_tasks.find((task) => task.message_type === option.value)?.id || "");
                       setAiTestResult(null);
                       setExpandedRuleId(null);
@@ -1255,7 +1319,9 @@ export default function SmartReplyManager({
             <div className="flex items-center justify-between gap-[12px]">
               <div>
                 <h2 className="text-[15px] font-medium">监听目标发送人的消息</h2>
-                <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>已选择 {draft.target_senders.length} 人</div>
+                <div className={`mt-[4px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>
+                  {MESSAGE_TYPE_OPTIONS.find((option) => option.value === activeMessageType)?.label} · 已选择 {currentTargetSenders.length} 人
+                </div>
                 {selfSelected && (
                   <div role="alert" className={`mt-[5px] text-[12px] ${dark ? "text-[#d4a657]" : "text-[#a76b00]"}`}>
                     当前登录账号已被选中，建议取消以避免误配置。
@@ -1266,9 +1332,9 @@ export default function SmartReplyManager({
                 {membersExpanded && selectableMemberWxids.length > 0 && (
                   <button
                     type="button"
-                    onClick={() => updateDraft({
-                      target_senders: allSelectableMembersSelected ? [] : selectableMemberWxids,
-                    })}
+                    onClick={() => updateTargetSenders(
+                      allSelectableMembersSelected ? [] : selectableMemberWxids,
+                    )}
                     className={`h-[34px] px-[6px] text-[13px] ${dark ? "text-[#9a9a9a] hover:text-white" : "text-[#666] hover:text-black"}`}
                   >
                     {allSelectableMembersSelected ? "取消全选" : "全选"}
@@ -1308,7 +1374,7 @@ export default function SmartReplyManager({
                 ) : (
                   <div className="mt-[12px] grid grid-cols-1 xl:grid-cols-2 gap-x-[28px] max-h-[280px] overflow-y-auto pane-scroll">
                     {memberRows.map((member) => {
-                      const checked = draft.target_senders.includes(member.wxid);
+                      const checked = currentTargetSenders.includes(member.wxid);
                       const isSelf = Boolean(normalizedSelfWxid && member.wxid === normalizedSelfWxid);
                       return (
                         <label
@@ -1572,7 +1638,7 @@ export default function SmartReplyManager({
                         <div>
                           <div className="text-[13px]">调用 MCP 工具</div>
                           <div className={`mt-[2px] text-[11px] ${dark ? "text-[#666]" : "text-[#999]"}`}>
-                            {task.mcp_enabled && task.mcp_tool_name ? task.mcp_tool_name : "未启用"}
+                            {!task.mcp_enabled ? "未启用" : task.mcp_tool_name || "由 Agent 自动选择"}
                           </div>
                         </div>
                         <Toggle checked={task.mcp_enabled} onChange={(enabled) => toggleTaskMcp(task, enabled)} />
@@ -1602,7 +1668,7 @@ export default function SmartReplyManager({
                                 onChange={(event) => selectTaskMcpTool(task, event.target.value)}
                                 className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] disabled:opacity-55 ${dark ? "border-[#393939] bg-[#171717]" : "border-[#d8d8d8] bg-white"}`}
                               >
-                                <option value="">{mcpToolsLoading[task.mcp_connection_id] ? "加载工具中" : "选择工具"}</option>
+                                <option value="">{mcpToolsLoading[task.mcp_connection_id] ? "加载工具中" : "由 Agent 自动选择"}</option>
                                 {(mcpToolsByConnection[task.mcp_connection_id] || []).map((tool) => (
                                   <option key={tool.name} value={tool.name}>{String(tool.annotations?.title || tool.name)}</option>
                                 ))}

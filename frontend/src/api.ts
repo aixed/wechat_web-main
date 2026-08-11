@@ -1,4 +1,4 @@
-import type { AiProfile, McpConnection, SmartReplyAiTask } from "./types";
+import type { AiProfile, McpConnection, SmartReplyAiTask, SmartReplyConfig } from "./types";
 
 const BASE = "";  // Same origin via Vite proxy
 export const ACCESS_KEY_STORAGE = "wechat_web_access_key";
@@ -693,6 +693,7 @@ export const saveSmartReply = (chatId: string, config: {
   >;
   file_types: Array<"txt" | "pdf" | "xlsx" | "docx">;
   target_senders: string[];
+  target_senders_by_type: SmartReplyConfig["target_senders_by_type"];
   rules: Array<{
     id: string;
     keyword: string;

@@ -2370,6 +2370,7 @@ class SmartReplyConfigRequest(BaseModel):
     message_types: list[str] = Field(default_factory=lambda: ["text"])
     file_types: list[str] = Field(default_factory=lambda: ["txt"])
     target_senders: list[str] = Field(default_factory=list)
+    target_senders_by_type: dict[str, list[str]] | None = None
     rules: list[SmartReplyRuleRequest] = Field(default_factory=list)
     ai_tasks: list[SmartReplyAiTaskRequest] = Field(default_factory=list)
 
@@ -2730,10 +2731,8 @@ def _normalize_ai_task(task: SmartReplyAiTaskRequest, index: int = 0) -> dict[st
         raise HTTPException(status_code=400, detail="MCP arguments must be a valid JSON object") from exc
     if not isinstance(parsed_mcp_arguments, dict):
         raise HTTPException(status_code=400, detail="MCP arguments must be a JSON object")
-    if mcp_enabled and (not mcp_connection_id or not mcp_tool_name):
-        raise HTTPException(status_code=400, detail="enabled MCP Skills require a connection and tool")
-    if mcp_enabled and not mcp_reply_template:
-        raise HTTPException(status_code=400, detail="enabled MCP Skills require a reply template")
+    if mcp_enabled and not mcp_connection_id:
+        raise HTTPException(status_code=400, detail="enabled MCP Skills require a connection")
     return {
         "id": task_id,
         "message_type": message_type,
@@ -3025,20 +3024,6 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
         raise HTTPException(status_code=400, detail="chat id is required")
     is_group = chat_id.endswith("@chatroom")
 
-    target_senders: list[str] = []
-    seen_senders: set[str] = set()
-    for value in req.target_senders:
-        sender = str(value or "").strip()
-        if sender and sender not in seen_senders:
-            seen_senders.add(sender)
-            target_senders.append(sender)
-    if not is_group:
-        target_senders = [chat_id]
-    elif not target_senders:
-        raise HTTPException(status_code=400, detail="at least one target sender is required")
-    if len(target_senders) > 10000:
-        raise HTTPException(status_code=400, detail="too many target senders")
-
     message_types: list[str] = []
     for value in req.message_types:
         message_type = str(value or "").strip().lower()
@@ -3048,6 +3033,60 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
             message_types.append(message_type)
     if not message_types:
         raise HTTPException(status_code=400, detail="at least one message type is required")
+
+    def normalize_senders(values: list[str]) -> list[str]:
+        senders: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            sender = str(value or "").strip()
+            if sender and sender not in seen:
+                seen.add(sender)
+                senders.append(sender)
+        if len(senders) > 10000:
+            raise HTTPException(status_code=400, detail="too many target senders")
+        return senders
+
+    legacy_target_senders = normalize_senders(req.target_senders)
+    if req.target_senders_by_type is None:
+        target_senders_by_type = {
+            message_type: list(legacy_target_senders)
+            for message_type in message_types
+        }
+    else:
+        target_senders_by_type = {}
+        for raw_message_type, raw_senders in req.target_senders_by_type.items():
+            message_type = str(raw_message_type or "").strip().lower()
+            if message_type not in _SMART_REPLY_ALLOWED_MESSAGE_TYPES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unsupported smart reply message type: {message_type}",
+                )
+            target_senders_by_type[message_type] = normalize_senders(raw_senders)
+
+    if not is_group:
+        stored_message_types = list(dict.fromkeys([
+            *message_types,
+            *target_senders_by_type.keys(),
+        ]))
+        target_senders_by_type = {
+            message_type: [chat_id]
+            for message_type in stored_message_types
+        }
+    else:
+        for message_type in message_types:
+            if not target_senders_by_type.get(message_type):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"at least one target sender is required for message type: {message_type}",
+                )
+
+    target_senders: list[str] = []
+    seen_target_senders: set[str] = set()
+    for message_type in [*message_types, *target_senders_by_type.keys()]:
+        for sender in target_senders_by_type.get(message_type, []):
+            if sender not in seen_target_senders:
+                seen_target_senders.add(sender)
+                target_senders.append(sender)
 
     raw_mention_message_types = (
         req.mention_message_types
@@ -3150,6 +3189,7 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
         "message_types": message_types,
         "file_types": file_types,
         "target_senders": target_senders,
+        "target_senders_by_type": target_senders_by_type,
         "rules": rules,
         "ai_tasks": ai_tasks,
     }
@@ -3333,6 +3373,55 @@ def _render_mcp_reply(
     return rendered.strip()
 
 
+def _mcp_reply_required_values(
+    arguments: dict[str, Any],
+    ai_result: dict[str, Any],
+    mcp_result: dict[str, Any],
+) -> tuple[str, str]:
+    flattened = _flatten_mcp_values(mcp_result.get("structured"))
+    identifier = (
+        _extract_skill_identifier(ai_result)
+        or str(arguments.get("identifier") or arguments.get("identifier_id") or "").strip()
+        or flattened.get("identifier", "").strip()
+    )
+    work_num = (
+        flattened.get("work_num", "").strip()
+        or flattened.get("workNum", "").strip()
+        or flattened.get("work_number", "").strip()
+    )
+    return identifier, work_num
+
+
+def _ensure_mcp_reply_values(reply: str, identifier: str, work_num: str) -> str:
+    text = str(reply or "").strip()
+    missing: list[str] = []
+    if identifier and identifier not in text:
+        missing.append(f"需求 {identifier}")
+    if work_num and work_num not in text:
+        missing.append(f"需求编号：{work_num}")
+    if missing:
+        prefix = "，".join(missing)
+        text = f"{prefix}\n{text}" if text else prefix
+    return text
+
+
+def _fallback_mcp_reply(
+    task: dict[str, Any],
+    result: dict[str, Any],
+    called: dict[str, Any],
+    identifier: str,
+    work_num: str,
+) -> str:
+    parts: list[str] = []
+    rendered = _render_mcp_reply(task, result, called, identifier)
+    if rendered and rendered not in {"{{mcp_text}}", "{{mcp_json}}"}:
+        parts.append(rendered)
+    for skill_reply in _ai_result_replies(task, result):
+        if skill_reply and not any(skill_reply in part for part in parts):
+            parts.append(skill_reply)
+    return _ensure_mcp_reply_values("\n".join(parts), identifier, work_num)
+
+
 async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple[str, ...]:
     if not _ai_result_matches(task, result):
         return ()
@@ -3342,8 +3431,36 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
         raise McpServiceError(f"MCP connection not found: {connection_id}")
     if not bool(connection.get("enabled", True)):
         raise McpServiceError(f"MCP connection is disabled: {connection_id}")
-    arguments, identifier = _render_mcp_arguments(task, result)
     tool_name = str(task.get("mcp_tool_name") or "")
+    if tool_name:
+        arguments, identifier = _render_mcp_arguments(task, result)
+    else:
+        discovered = await mcp_service.discover(
+            url=str(connection.get("url") or ""),
+            token=str(connection.get("token") or ""),
+        )
+        tools = [tool for tool in (discovered.get("tools") or []) if isinstance(tool, dict)]
+        if not hasattr(ai_service, "select_mcp_tool"):
+            raise McpServiceError("AI service does not support automatic MCP tool selection")
+        try:
+            selected = await ai_service.select_mcp_tool(
+                str(task.get("_source_content") or ""),
+                task,
+                result,
+                tools,
+            )
+        except AiServiceError as exc:
+            raise McpServiceError(f"AI MCP tool selection failed: {exc}") from exc
+        if not bool(selected.get("should_call")):
+            return _ai_result_replies(task, result)
+        tool_name = str(selected.get("tool_name") or "").strip()
+        available_names = {str(tool.get("name") or "") for tool in tools}
+        if not tool_name or tool_name not in available_names:
+            raise McpServiceError(f"AI selected an unavailable MCP tool: {tool_name or '(empty)'}")
+        arguments = selected.get("arguments")
+        if not isinstance(arguments, dict):
+            raise McpServiceError("AI MCP tool arguments must be a JSON object")
+        identifier = _extract_skill_identifier(result)
     called = await mcp_service.call_tool(
         url=str(connection.get("url") or ""),
         token=str(connection.get("token") or ""),
@@ -3359,7 +3476,27 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
         raise McpServiceError("MCP data maintenance request was not submitted")
     if str(task.get("output_mode") or "result") == "silent":
         return ()
-    reply = _render_mcp_reply(task, result, called, identifier)
+    identifier, work_num = _mcp_reply_required_values(arguments, result, called)
+    reply = ""
+    if hasattr(ai_service, "compose_mcp_reply") and bool(getattr(ai_service, "configured", False)):
+        try:
+            reply = await ai_service.compose_mcp_reply(
+                message=str(task.get("_source_content") or ""),
+                task=task,
+                analysis=result,
+                tool_name=tool_name,
+                arguments=arguments,
+                mcp_result={"text": called.get("text"), "structured": called.get("structured")},
+                identifier=identifier,
+                work_num=work_num,
+            )
+        except AiServiceError as exc:
+            _smart_reply_log(
+                f"[MCP_REPLY] final AI composition failed id={task.get('id', '')}: {type(exc).__name__}: {exc}"
+            )
+    if not reply:
+        reply = _fallback_mcp_reply(task, result, called, identifier, work_num)
+    reply = _ensure_mcp_reply_values(reply, identifier, work_num)
     if not bool(task.get("preserve_formatting", True)):
         reply = " ".join(reply.split())
     return (reply,) if reply else ()
@@ -3374,6 +3511,8 @@ def _preview_text(value: Any, limit: int = 80) -> str:
 _SMART_REPLY_TXT_MAX_BYTES = 2 * 1024 * 1024
 _SMART_REPLY_AI_INPUT_MAX_CHARS = 20_000
 _SMART_REPLY_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+_LOCAL_MEDIA_SETTLE_SECONDS = 6.0
+_LOCAL_MEDIA_SETTLE_INTERVAL_SECONDS = 0.2
 
 
 def _read_smart_reply_txt(path: str) -> tuple[str, str]:
@@ -3445,6 +3584,18 @@ async def _smart_reply_file_ai_content(
             filename=filename,
         )
     except Exception as exc:
+        try:
+            path_exists = os.path.exists(local_path)
+            path_size = os.path.getsize(local_path) if path_exists else 0
+        except OSError:
+            path_exists = False
+            path_size = 0
+        detail = str(getattr(exc, "detail", exc) or "")
+        _smart_reply_log(
+            f"[SMART_REPLY] file resolve failed message_id={message.get('id', '')} "
+            f"path={local_path!r} exists={path_exists} size={path_size} "
+            f"error={type(exc).__name__}: {detail}"
+        )
         return "", f"resolve_failed:{type(exc).__name__}"
     filename = os.path.basename(str(resolved_filename or filename).replace("\\", "/")) or filename
     content, reason = await asyncio.to_thread(_read_smart_reply_txt, path)
@@ -3581,16 +3732,17 @@ async def _evaluate_ai_tasks(
             continue
         if bool(task.get("mcp_enabled")):
             try:
-                task_replies = await _mcp_task_reply(task, result)
+                mcp_task = {**task, "_source_content": content}
+                task_replies = await _mcp_task_reply(mcp_task, result)
             except McpServiceError as exc:
                 _smart_reply_log(
                     f"[MCP_REPLY] task failed message_id={message_id} id={task.get('id', '')} "
-                    f"tool={task.get('mcp_tool_name', '')}: {exc}"
+                    f"tool={task.get('mcp_tool_name') or 'auto'}: {exc}"
                 )
-                continue
+                task_replies = _ai_result_replies(task, result)
             _smart_reply_log(
                 f"[MCP_REPLY] task completed message_id={message_id} id={task.get('id', '')} "
-                f"tool={task.get('mcp_tool_name', '')} replies={len(task_replies)}"
+                f"tool={task.get('mcp_tool_name') or 'auto'} replies={len(task_replies)}"
             )
         else:
             task_replies = _ai_result_replies(task, result)
@@ -9417,6 +9569,31 @@ def _nonempty_file(path: str) -> bool:
         return False
 
 
+async def _wait_for_local_media_path(
+    msg_id: str,
+    msg_type: str,
+    candidates: list[str],
+) -> str:
+    tracked = [str(candidate or "").strip() for candidate in candidates if str(candidate or "").strip()]
+    waitable = [
+        candidate
+        for candidate in tracked
+        if os.path.isdir(os.path.dirname(os.path.abspath(candidate)))
+    ]
+    if not waitable:
+        return ""
+
+    deadline = time.monotonic() + _LOCAL_MEDIA_SETTLE_SECONDS
+    while True:
+        cached = _cached_media_path(msg_id, msg_type)
+        for candidate in [*waitable, cached]:
+            if _nonempty_file(candidate):
+                return candidate
+        if time.monotonic() >= deadline:
+            return ""
+        await asyncio.sleep(_LOCAL_MEDIA_SETTLE_INTERVAL_SECONDS)
+
+
 def _xml_root(xml_text: str) -> ET.Element | None:
     raw = str(xml_text or "").strip()
     starts = [pos for token in ("<?xml", "<msg", "<appmsg", "<videomsg", "<img") if (pos := raw.find(token)) >= 0]
@@ -9502,6 +9679,11 @@ async def _resolve_media_path(
         if _nonempty_file(candidate):
             _persist_media_path(msg_id, msg_type, candidate)
             return candidate, os.path.basename(filename or candidate)
+
+    settled_path = await _wait_for_local_media_path(msg_id, msg_type, candidates)
+    if settled_path:
+        _persist_media_path(msg_id, msg_type, settled_path)
+        return settled_path, os.path.basename(filename or settled_path)
 
     if not config.IS_LOCAL_HOOK:
         raise HTTPException(status_code=404, detail="Local media file is unavailable")

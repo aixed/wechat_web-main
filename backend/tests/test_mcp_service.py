@@ -132,6 +132,16 @@ class McpSmartReplyTests(unittest.IsolatedAsyncioTestCase):
                     "raw": {},
                 }
 
+        class FakeAiService:
+            configured = True
+
+            async def compose_mcp_reply(self, **kwargs):
+                self.kwargs = kwargs
+                return (
+                    "需求 40386 保存并提交成功，需求编号：5400000000382472\n"
+                    "SQL 用途：查询待处理需求。\n执行风险：请确认查询范围。"
+                )
+
         task = {
             "confidence": 85,
             "output_mode": "result",
@@ -150,9 +160,11 @@ class McpSmartReplyTests(unittest.IsolatedAsyncioTestCase):
             "reply": "40386\n该 SQL 用于查询待处理需求。",
         }
         old_service = main.mcp_service
+        old_ai_service = main.ai_service
         old_connections = config.MCP_CONNECTIONS
         try:
             main.mcp_service = FakeMcpService()
+            main.ai_service = FakeAiService()
             config.MCP_CONNECTIONS = [{
                 "id": "local_mcp",
                 "name": "本地 MCP",
@@ -163,10 +175,14 @@ class McpSmartReplyTests(unittest.IsolatedAsyncioTestCase):
             replies = await main._mcp_task_reply(task, ai_result)
         finally:
             main.mcp_service = old_service
+            main.ai_service = old_ai_service
             config.MCP_CONNECTIONS = old_connections
 
         self.assertEqual(
-            ("需求 40386 保存并提交成功，需求编号：5400000000382472",),
+            (
+                "需求 40386 保存并提交成功，需求编号：5400000000382472\n"
+                "SQL 用途：查询待处理需求。\n执行风险：请确认查询范围。",
+            ),
             replies,
         )
         self.assertEqual(
@@ -174,6 +190,108 @@ class McpSmartReplyTests(unittest.IsolatedAsyncioTestCase):
             calls[0]["arguments"],
         )
         self.assertEqual("submit_data_maintenance", calls[0]["tool_name"])
+
+    async def test_agent_selects_mcp_tool_and_final_reply_keeps_skill_analysis(self):
+        import main
+
+        calls: list[dict] = []
+        selections: list[dict] = []
+
+        class FakeMcpService:
+            async def discover(self, **_kwargs):
+                return {
+                    "tools": [{
+                        "name": "submit_data_maintenance",
+                        "description": "保存并提交数据维护需求",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "identifier": {"type": "string"},
+                                "force": {"type": "boolean"},
+                            },
+                            "required": ["identifier"],
+                        },
+                    }],
+                }
+
+            async def call_tool(self, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "text": "submitted",
+                    "structured": {
+                        "identifier": "40396",
+                        "submitted": True,
+                        "work_num": "5400000000383001",
+                    },
+                    "raw": {},
+                }
+
+        class FakeAiService:
+            configured = True
+
+            async def select_mcp_tool(self, message, task, analysis, tools):
+                selections.append({
+                    "message": message,
+                    "task": task,
+                    "analysis": analysis,
+                    "tools": tools,
+                })
+                return {
+                    "should_call": True,
+                    "tool_name": "submit_data_maintenance",
+                    "arguments": {"identifier": "40396", "force": False},
+                }
+
+            async def compose_mcp_reply(self, **_kwargs):
+                return "SQL 用途：更新数据维护配置。\n执行风险：提交前需确认影响范围。"
+
+        task = {
+            "id": "auto_submit",
+            "name": "提取并提交 SQL",
+            "instruction": "提取编号，提交后说明 SQL 用途和风险",
+            "confidence": 85,
+            "output_mode": "result",
+            "preserve_formatting": True,
+            "mcp_enabled": True,
+            "mcp_connection_id": "local_mcp",
+            "mcp_tool_name": "",
+            "mcp_arguments_template": "{}",
+            "mcp_reply_template": "{{mcp_text}}",
+            "_source_content": "文件名：40396.txt\n文件内容：\nupdate config set value=1",
+        }
+        ai_result = {
+            "matched": True,
+            "confidence": 97,
+            "result": "需求 40396；SQL 用途：更新数据维护配置。",
+            "items": [],
+            "reply": "需求 40396；SQL 用途：更新数据维护配置。",
+        }
+        old_service = main.mcp_service
+        old_ai_service = main.ai_service
+        old_connections = config.MCP_CONNECTIONS
+        try:
+            main.mcp_service = FakeMcpService()
+            main.ai_service = FakeAiService()
+            config.MCP_CONNECTIONS = [{
+                "id": "local_mcp",
+                "name": "本地 MCP",
+                "url": "http://127.0.0.1:8765/mcp",
+                "token": "",
+                "enabled": True,
+            }]
+            replies = await main._mcp_task_reply(task, ai_result)
+        finally:
+            main.mcp_service = old_service
+            main.ai_service = old_ai_service
+            config.MCP_CONNECTIONS = old_connections
+
+        self.assertEqual("submit_data_maintenance", calls[0]["tool_name"])
+        self.assertEqual({"identifier": "40396", "force": False}, calls[0]["arguments"])
+        self.assertEqual("submit_data_maintenance", selections[0]["tools"][0]["name"])
+        self.assertIn("需求 40396", replies[0])
+        self.assertIn("需求编号：5400000000383001", replies[0])
+        self.assertIn("SQL 用途", replies[0])
+        self.assertIn("执行风险", replies[0])
 
 
 class McpConfigTests(unittest.TestCase):

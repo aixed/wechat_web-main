@@ -157,6 +157,83 @@ class AiServiceAnalyzeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["matched"])
         self.assertEqual("可以，收到。", result["reply"])
 
+    async def test_mcp_tool_selection_uses_schema_and_composes_skill_reply(self):
+        request_payloads = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content.decode("utf-8"))
+            request_payloads.append(payload)
+            schema_name = payload["text"]["format"]["name"]
+            if schema_name == "smart_reply_mcp_tool_choice":
+                text = json.dumps({
+                    "should_call": True,
+                    "tool_name": "submit_data_maintenance",
+                    "arguments_json": json.dumps({"identifier": "40396", "force": False}),
+                }, ensure_ascii=False)
+            else:
+                text = json.dumps({
+                    "reply": (
+                        "需求 40396 保存并提交成功，需求编号：5400000000383001\n"
+                        "SQL 用途：更新配置。\n执行风险：确认影响范围。"
+                    ),
+                }, ensure_ascii=False)
+            return httpx.Response(200, json={
+                "output": [{"content": [{"type": "output_text", "text": text}]}],
+            })
+
+        service = AiService(
+            base_url="https://provider.test",
+            api_key="test-key",
+            model="agent-model",
+        )
+        await service._client.aclose()
+        service._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        task = {
+            "name": "提取并提交 SQL",
+            "instruction": "识别编号后调用合适的工具，并说明 SQL 用途和执行风险",
+        }
+        analysis = {
+            "matched": True,
+            "confidence": 98,
+            "result": "需求 40396，SQL 用于更新配置",
+            "items": [],
+            "reply": "需求 40396，SQL 用于更新配置",
+        }
+        try:
+            selected = await service.select_mcp_tool(
+                "文件名：40396.txt\n文件内容：update config set value=1",
+                task,
+                analysis,
+                [{
+                    "name": "submit_data_maintenance",
+                    "description": "保存并提交数据维护需求",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"identifier": {"type": "string"}},
+                        "required": ["identifier"],
+                    },
+                }],
+            )
+            reply = await service.compose_mcp_reply(
+                message="update config set value=1",
+                task=task,
+                analysis=analysis,
+                tool_name=selected["tool_name"],
+                arguments=selected["arguments"],
+                mcp_result={"structured": {"work_num": "5400000000383001"}},
+                identifier="40396",
+                work_num="5400000000383001",
+            )
+        finally:
+            await service.close()
+
+        self.assertEqual("submit_data_maintenance", selected["tool_name"])
+        self.assertEqual({"identifier": "40396", "force": False}, selected["arguments"])
+        selection_prompt = json.loads(request_payloads[0]["input"])
+        self.assertEqual("submit_data_maintenance", selection_prompt["available_tools"][0]["name"])
+        self.assertIn("需求编号：5400000000383001", reply)
+        self.assertIn("执行风险", reply)
+
 
 if __name__ == "__main__":
     unittest.main()

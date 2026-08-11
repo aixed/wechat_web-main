@@ -125,6 +125,7 @@ export interface SmartReplyConfig {
   message_types: SmartReplyMessageType[];
   file_types: Array<"txt" | "pdf" | "xlsx" | "docx">;
   target_senders: string[];
+  target_senders_by_type: Partial<Record<SmartReplyMessageType, string[]>>;
   rules: SmartReplyRule[];
   ai_tasks: SmartReplyAiTask[];
   reply_count?: number;

@@ -252,6 +252,64 @@ class SmartReplyEngineTests(unittest.TestCase):
         own = self.evaluate("a\nb\nurgent", sendorrecv="1")
         self.assertEqual("self_message", own.reason)
 
+    def test_sender_whitelist_is_isolated_by_message_type(self):
+        image_sender = "wxid_image_sender"
+        scoped_config = config(
+            message_types=["text", "image"],
+            target_senders=[SENDER, image_sender],
+            target_senders_by_type={
+                "text": [SENDER],
+                "image": [image_sender],
+            },
+            rules=[
+                {
+                    "id": "text_rule",
+                    "message_type": "text",
+                    "keyword": "urgent",
+                    "reply": "text received",
+                    "use_regex": False,
+                    "reply_with_matched_line": False,
+                },
+                {
+                    "id": "image_rule",
+                    "message_type": "image",
+                    "keyword": "urgent",
+                    "reply": "image received",
+                    "use_regex": False,
+                    "reply_with_matched_line": False,
+                },
+            ],
+        )
+
+        text_allowed = self.evaluate("urgent", cfg=scoped_config, now=10.0)
+        self.assertEqual(("text received",), text_allowed.replies)
+        text_denied = self.evaluate(
+            "urgent text",
+            cfg=scoped_config,
+            now=12.0,
+            fromid=image_sender,
+        )
+        self.assertEqual("sender_not_allowed", text_denied.reason)
+
+        image_allowed = self.evaluate(
+            "<msg><img /></msg>",
+            cfg=scoped_config,
+            now=14.0,
+            msgtype="3",
+            fromid=image_sender,
+            _smart_reply_content="urgent",
+        )
+        self.assertEqual(("image received",), image_allowed.replies)
+        image_denied = self.evaluate(
+            "<msg><img /></msg>",
+            cfg=scoped_config,
+            now=16.0,
+            msgtype="3",
+            fromid=SENDER,
+            _smart_reply_content="urgent image",
+        )
+        self.assertEqual("sender_not_allowed", image_denied.reason)
+
     def test_mention_filter_is_optional_and_defaults_to_all_target_messages(self):
         decision = self.evaluate(
             "urgent without mention",
@@ -536,6 +594,7 @@ class SmartReplyStorageTests(unittest.TestCase):
         self.assertEqual(["text"], saved["message_types"])
         self.assertEqual(["txt"], saved["file_types"])
         self.assertEqual([SENDER], saved["target_senders"])
+        self.assertEqual({"text": [SENDER]}, saved["target_senders_by_type"])
         self.assertEqual(ai_tasks, saved["ai_tasks"])
         self.assertEqual([], self.cache.list_smart_reply_configs(owner_wxid="other_owner"))
 
@@ -631,6 +690,124 @@ class SmartReplyStorageTests(unittest.TestCase):
         resaved = self.cache.upsert_smart_reply_config(reread, owner_wxid=OWNER)
         self.assertEqual(1, len(resaved["rules"]))
         self.assertEqual(2, len(resaved["ai_tasks"]))
+
+    def test_target_senders_are_persisted_per_message_type(self):
+        image_sender = "wxid_image_sender"
+        saved = self.cache.upsert_smart_reply_config(
+            config(
+                message_types=["text", "image"],
+                target_senders=[SENDER, image_sender],
+                target_senders_by_type={
+                    "text": [SENDER],
+                    "image": [image_sender],
+                },
+            ),
+            owner_wxid=OWNER,
+        )
+
+        self.assertEqual([SENDER, image_sender], saved["target_senders"])
+        self.assertEqual(
+            {"text": [SENDER], "image": [image_sender]},
+            saved["target_senders_by_type"],
+        )
+
+        reread = self.cache.get_smart_reply_config(CHAT_ID, owner_wxid=OWNER)
+        self.assertEqual(saved["target_senders_by_type"], reread["target_senders_by_type"])
+
+        legacy = self.cache.upsert_smart_reply_config(
+            config(
+                chat_id="legacy@chatroom",
+                message_types=["text", "file"],
+                target_senders=[SENDER],
+            ),
+            owner_wxid=OWNER,
+        )
+        self.assertEqual(
+            {"text": [SENDER], "file": [SENDER]},
+            legacy["target_senders_by_type"],
+        )
+
+
+class SmartReplyRequestTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import main
+
+        cls.main = main
+
+    def normalize(self, **overrides):
+        payload = {
+            "chat_name": "Test group",
+            "message_types": ["text", "image"],
+            "target_senders": [SENDER],
+            "rules": [{
+                "id": "rule_1",
+                "message_type": "text",
+                "keyword": "urgent",
+                "reply": "received",
+            }],
+        }
+        payload.update(overrides)
+        request = self.main.SmartReplyConfigRequest(**payload)
+        old_get_contacts = self.main.sqlite_cache.get_contacts
+        try:
+            self.main.sqlite_cache.get_contacts = lambda *_args, **_kwargs: {}
+            return self.main._normalized_smart_reply_config(CHAT_ID, request)
+        finally:
+            self.main.sqlite_cache.get_contacts = old_get_contacts
+
+    def test_request_preserves_senders_per_message_type(self):
+        image_sender = "wxid_image_sender"
+        normalized = self.normalize(
+            target_senders=[SENDER, image_sender],
+            target_senders_by_type={
+                "text": [SENDER],
+                "image": [image_sender],
+            },
+        )
+
+        self.assertEqual([SENDER, image_sender], normalized["target_senders"])
+        self.assertEqual(
+            {"text": [SENDER], "image": [image_sender]},
+            normalized["target_senders_by_type"],
+        )
+
+    def test_legacy_request_copies_senders_to_enabled_message_types(self):
+        normalized = self.normalize()
+        self.assertEqual(
+            {"text": [SENDER], "image": [SENDER]},
+            normalized["target_senders_by_type"],
+        )
+
+    def test_request_rejects_enabled_message_type_without_senders(self):
+        with self.assertRaises(self.main.HTTPException) as raised:
+            self.normalize(target_senders_by_type={"text": [SENDER], "image": []})
+        self.assertEqual(400, raised.exception.status_code)
+        self.assertIn("target sender", str(raised.exception.detail))
+        self.assertIn("image", str(raised.exception.detail))
+
+    def test_request_allows_agent_selected_mcp_tool(self):
+        old_connections = self.main.config.MCP_CONNECTIONS
+        try:
+            self.main.config.MCP_CONNECTIONS = [{
+                "id": "local_mcp",
+                "url": "http://127.0.0.1:8765/mcp",
+                "enabled": True,
+            }]
+            normalized = self.normalize(ai_tasks=[{
+                "id": "auto_mcp",
+                "message_type": "text",
+                "name": "自动提交",
+                "instruction": "识别需求并调用合适的 MCP 工具",
+                "mcp_enabled": True,
+                "mcp_connection_id": "local_mcp",
+                "mcp_tool_name": "",
+            }])
+        finally:
+            self.main.config.MCP_CONNECTIONS = old_connections
+
+        self.assertTrue(normalized["ai_tasks"][0]["mcp_enabled"])
+        self.assertEqual("", normalized["ai_tasks"][0]["mcp_tool_name"])
 
 
 class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):

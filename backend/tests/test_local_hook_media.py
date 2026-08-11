@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import time
@@ -277,6 +278,37 @@ class LocalHookMediaTests(unittest.IsolatedAsyncioTestCase):
             download.assert_not_awaited()
         finally:
             os.unlink(media_path)
+
+    async def test_media_resolver_waits_for_callback_path_to_finish_writing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            media_path = os.path.join(temp_dir, "delayed.txt")
+
+            async def finish_write():
+                await asyncio.sleep(0.03)
+                with open(media_path, "wb") as output:
+                    output.write(b"ready")
+
+            writer = asyncio.create_task(finish_write())
+            with (
+                patch.object(main, "_LOCAL_MEDIA_SETTLE_SECONDS", 0.5),
+                patch.object(main, "_LOCAL_MEDIA_SETTLE_INTERVAL_SECONDS", 0.01),
+                patch.object(main, "_cached_media_path", return_value=""),
+                patch.object(main, "_persist_media_path") as persist,
+                patch.object(wechat_api, "cdn_download", AsyncMock()) as download,
+            ):
+                path, name = await main._resolve_media_path(
+                    msg_id="delayed-message",
+                    msg_type="49",
+                    local_path=media_path,
+                    msg_xml="",
+                    filename="delayed.txt",
+                )
+            await writer
+
+            self.assertEqual(media_path, path)
+            self.assertEqual("delayed.txt", name)
+            persist.assert_called_once_with("delayed-message", "49", media_path)
+            download.assert_not_awaited()
 
     async def test_media_resolver_downloads_when_local_path_is_missing(self):
         xml = (

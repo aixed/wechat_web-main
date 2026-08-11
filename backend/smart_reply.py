@@ -237,9 +237,15 @@ class SmartReplyEngine:
         if not content:
             return SmartReplyDecision(reason="empty_message")
 
+        configured_senders_by_type = config.get("target_senders_by_type")
+        raw_target_senders = (
+            configured_senders_by_type.get(message_category, [])
+            if isinstance(configured_senders_by_type, dict)
+            else config.get("target_senders") or []
+        )
         target_senders = {
             str(wxid or "").strip()
-            for wxid in (config.get("target_senders") or [])
+            for wxid in raw_target_senders
             if str(wxid or "").strip()
         }
         if sender not in target_senders:
