@@ -89,7 +89,7 @@ def use_log_category(category: str):
         _CURRENT_LOG_CATEGORY.reset(token)
 
 # Concurrency control:
-#  - Local Hook defaults to 1 (serialize everything — DLL injection can be fragile)
+#  - Local Hook defaults to 20 so batches of rule replies can be submitted together
 #  - Remote Hook/Protocol defaults to 10 so slow calls don't block profile/avatar/send APIs
 if HOOK_API_CONCURRENCY <= 1:
     _hook_lock: asyncio.Lock | asyncio.Semaphore = asyncio.Lock()

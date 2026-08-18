@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import time
@@ -811,6 +812,88 @@ class SmartReplyRequestTests(unittest.TestCase):
 
 
 class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_multiple_rule_replies_enter_send_stage_concurrently(self):
+        import main
+
+        reply_count = 10
+        replies = [f"reply-{index}" for index in range(reply_count)]
+        rules = [
+            {
+                "id": f"rule-{index}",
+                "keyword": "urgent",
+                "reply": reply,
+                "use_regex": False,
+                "reply_with_matched_line": False,
+            }
+            for index, reply in enumerate(replies)
+        ]
+        temp_dir = tempfile.TemporaryDirectory()
+        cache = SqliteMessageCache(os.path.join(temp_dir.name, "cache.sqlite3"))
+        release_sends = asyncio.Event()
+        all_sends_started = asyncio.Event()
+        active_sends = 0
+        peak_sends = 0
+        broadcasted: list[str] = []
+
+        async def fake_send_text(_wxid, _text):
+            nonlocal active_sends, peak_sends
+            active_sends += 1
+            peak_sends = max(peak_sends, active_sends)
+            if active_sends == reply_count:
+                all_sends_started.set()
+            try:
+                await release_sends.wait()
+                return {"SendTextMsg": "1"}
+            finally:
+                active_sends -= 1
+
+        async def fake_local_sent(_agent_id, _chat_id, _msg_type, reply):
+            broadcasted.append(reply)
+
+        async def noop_broadcast(*_args, **_kwargs):
+            return None
+
+        old_cache = main.sqlite_cache
+        old_engine = main.smart_reply_engine
+        old_send_text = main.wechat_api.send_text
+        old_broadcast = main.manager.broadcast
+        old_local_sent = main._broadcast_local_sent_for_agent
+        process_task = None
+        try:
+            main.sqlite_cache = cache
+            main.smart_reply_engine = SmartReplyEngine(cooldown=0)
+            main.wechat_api.send_text = fake_send_text
+            main.manager.broadcast = noop_broadcast
+            main._broadcast_local_sent_for_agent = fake_local_sent
+            cache.upsert_smart_reply_config(config(rules=rules), owner_wxid=OWNER)
+
+            process_task = asyncio.create_task(main._process_smart_reply_message(
+                owner_wxid=OWNER,
+                agent_id="agent_1",
+                self_wxid=OWNER,
+                chat_id=CHAT_ID,
+                message=message("urgent", id="concurrent-rules"),
+            ))
+            await asyncio.wait_for(all_sends_started.wait(), timeout=2)
+            self.assertEqual(reply_count, peak_sends)
+            release_sends.set()
+            await asyncio.wait_for(process_task, timeout=2)
+
+            saved = cache.get_smart_reply_config(CHAT_ID, owner_wxid=OWNER)
+            self.assertIsNotNone(saved)
+            self.assertEqual(reply_count, saved["reply_count"])
+            self.assertEqual(replies, broadcasted)
+        finally:
+            release_sends.set()
+            if process_task is not None and not process_task.done():
+                await asyncio.gather(process_task, return_exceptions=True)
+            main.sqlite_cache = old_cache
+            main.smart_reply_engine = old_engine
+            main.wechat_api.send_text = old_send_text
+            main.manager.broadcast = old_broadcast
+            main._broadcast_local_sent_for_agent = old_local_sent
+            temp_dir.cleanup()
+
     async def test_process_ignores_ai_tasks_from_other_message_types(self):
         import main
 

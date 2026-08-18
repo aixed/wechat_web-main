@@ -395,9 +395,9 @@ def save_ai_settings(
     return _apply_ai_settings(document)
 
 # Hook/API request concurrency. QueryDB uses its own per-DB pool in wechat_api.
-# Local Hook keeps the conservative single-call path by default; remote
-# Hook/Protocol can handle parallel calls.
-HOOK_API_CONCURRENCY = int(_cfg.get("hook_api_concurrency", 1 if IS_LOCAL_HOOK else 10))
+# Local Hook text replies are commonly emitted in batches, so keep enough slots
+# available for one rule evaluation to submit all of its replies concurrently.
+HOOK_API_CONCURRENCY = int(_cfg.get("hook_api_concurrency", 20 if IS_LOCAL_HOOK else 10))
 if HOOK_API_CONCURRENCY < 1:
     print(f"[CONFIG] ⚠ invalid hook_api_concurrency={HOOK_API_CONCURRENCY!r}, using 1", flush=True)
     HOOK_API_CONCURRENCY = 1
@@ -523,7 +523,7 @@ def _load_initial_config_template() -> Any:
         "server_host": "0.0.0.0",
         "server_port": 5000,
         "web_access_key": DEFAULT_WEB_ACCESS_KEY,
-        "hook_api_concurrency": 10,
+        "hook_api_concurrency": 20,
         "frontend_host": "0.0.0.0",
         "frontend_port": 80,
         "agent_ws_enabled": True,
@@ -588,7 +588,7 @@ def save_initial_setup_config(
     document["server_port"] = _clean_port(document.get("server_port"), default=5000, field="server_port")
     document["frontend_host"] = str(document.get("frontend_host") or "0.0.0.0")
     document["frontend_port"] = _clean_port(document.get("frontend_port"), default=80, field="frontend_port")
-    document["hook_api_concurrency"] = 1 if mode_number == 1 else 10
+    document["hook_api_concurrency"] = 20 if mode_number == 1 else 10
     document["recvtype"] = _clean_port(document.get("recvtype"), default=1, field="recvtype")
 
     document[f"{mode_name}_host"] = selected_host

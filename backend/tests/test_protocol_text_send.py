@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -10,6 +11,37 @@ import wechat_api
 
 
 class ProtocolTextSendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hook_api_slot_allows_twenty_in_flight_requests(self):
+        old_lock = wechat_api._hook_lock
+        release_requests = asyncio.Event()
+        twenty_started = asyncio.Event()
+        active = 0
+        peak = 0
+
+        async def occupy_slot():
+            nonlocal active, peak
+            async with wechat_api._hook_api_slot(False):
+                active += 1
+                peak = max(peak, active)
+                if active == 20:
+                    twenty_started.set()
+                try:
+                    await release_requests.wait()
+                finally:
+                    active -= 1
+
+        wechat_api._hook_lock = asyncio.Semaphore(20)
+        tasks = [asyncio.create_task(occupy_slot()) for _ in range(21)]
+        try:
+            await asyncio.wait_for(twenty_started.wait(), timeout=2)
+            await asyncio.sleep(0)
+            self.assertEqual(20, peak)
+            self.assertEqual(1, sum(not task.done() for task in tasks) - active)
+        finally:
+            release_requests.set()
+            await asyncio.gather(*tasks)
+            wechat_api._hook_lock = old_lock
+
     def test_remote_ws_setting_only_applies_to_remote_hook(self):
         self.assertFalse(app_config._resolve_agent_ws_enabled("local_hook", True))
         self.assertTrue(app_config._resolve_agent_ws_enabled("remote_hook", True))

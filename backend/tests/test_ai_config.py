@@ -24,6 +24,17 @@ class WebAccessKeyTests(unittest.TestCase):
             self.assertEqual(("env-key", False), config._resolve_web_access_key({"web_access_key": "config-key"}))
 
 
+class InitialSetupConfigTests(unittest.TestCase):
+    def test_local_hook_setup_writes_twenty_request_slots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            with patch.object(config, "_CONFIG_PATH", os.fspath(config_path)):
+                config.save_initial_setup_config(wechat_mode=1)
+
+            saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(20, saved["hook_api_concurrency"])
+
+
 class AiConfigReloadTests(unittest.TestCase):
     def test_reload_ai_settings_reads_runtime_file_changes(self):
         old_path = config._CONFIG_PATH

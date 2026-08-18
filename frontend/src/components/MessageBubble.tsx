@@ -640,6 +640,7 @@ export default function MessageBubble({
     : "";
   const [enlargedImg, setEnlargedImg] = useState<string | null>(null);
   const [previewScale, setPreviewScale] = useState(1);
+  const [previewRotation, setPreviewRotation] = useState(0);
   const [previewOrigin, setPreviewOrigin] = useState("50% 50%");
   const [previewOffset, setPreviewOffset] = useState({ x: 0, y: 0 });
   const [isPreviewDragging, setIsPreviewDragging] = useState(false);
@@ -649,6 +650,7 @@ export default function MessageBubble({
 
   useEffect(() => {
     setPreviewScale(1);
+    setPreviewRotation(0);
     setPreviewOrigin("50% 50%");
     setPreviewOffset({ x: 0, y: 0 });
     setIsPreviewDragging(false);
@@ -659,6 +661,7 @@ export default function MessageBubble({
   const closeImagePreview = () => {
     setEnlargedImg(null);
     setPreviewScale(1);
+    setPreviewRotation(0);
     setPreviewOrigin("50% 50%");
     setPreviewOffset({ x: 0, y: 0 });
     setIsPreviewDragging(false);
@@ -728,6 +731,15 @@ export default function MessageBubble({
     previewDragStartRef.current = null;
     setIsPreviewDragging(false);
   };
+
+  const rotateImagePreview = (degrees: number) => {
+    stopImagePreviewDragging();
+    didPreviewDragRef.current = false;
+    setPreviewOrigin("50% 50%");
+    setPreviewRotation((current) => (current + degrees + 360) % 360);
+  };
+
+  const previewIsSideways = previewRotation % 180 !== 0;
 
   const renderContent = () => {
     switch (msgtype) {
@@ -1073,6 +1085,33 @@ export default function MessageBubble({
             ×
           </button>
           <div
+            className="absolute bottom-5 left-1/2 z-[10000] flex -translate-x-1/2 items-center gap-1 rounded-[5px] border border-white/15 bg-[#1d1d1d]/90 p-1 shadow-lg shadow-black/40 backdrop-blur-sm"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              aria-label="向左旋转"
+              title="向左旋转"
+              className="flex h-10 w-10 items-center justify-center rounded-[3px] text-white transition hover:bg-white/15 active:bg-white/25"
+              onClick={() => rotateImagePreview(-90)}
+            >
+              <svg className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 8V3m0 5h5M4.8 8A8 8 0 1 1 4 14" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              aria-label="向右旋转"
+              title="向右旋转"
+              className="flex h-10 w-10 items-center justify-center rounded-[3px] text-white transition hover:bg-white/15 active:bg-white/25"
+              onClick={() => rotateImagePreview(90)}
+            >
+              <svg className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M20 8V3m0 5h-5m4.2 0A8 8 0 1 0 20 14" />
+              </svg>
+            </button>
+          </div>
+          <div
             className="select-none"
             style={{
               cursor: isPreviewDragging ? "grabbing" : "grab",
@@ -1091,7 +1130,9 @@ export default function MessageBubble({
               className="max-w-[95vw] max-h-[90vh] object-contain"
               draggable={false}
               style={{
-                transform: `scale(${previewScale})`,
+                maxWidth: previewIsSideways ? "calc(100vh - 150px)" : "95vw",
+                maxHeight: previewIsSideways ? "95vw" : "calc(100vh - 150px)",
+                transform: `rotate(${previewRotation}deg) scale(${previewScale})`,
                 transformOrigin: previewOrigin,
                 transition: isPreviewDragging ? "none" : "transform 80ms ease-out",
                 willChange: "transform",

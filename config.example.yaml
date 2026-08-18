@@ -39,9 +39,9 @@ server_port: 5000
 # 默认 key 为 admin。首次运行可用 admin 进入，但请在 config.yaml 中修改 web_access_key。
 # 不要把真实密钥提交到 Git，可在 config.yaml 或 WECHAT_WEB_ACCESS_KEY 中配置。
 web_access_key: "admin"
-# Hook/API 并发数：本地 Hook 建议 1；远程 Hook/远程协议可设为 5-20。
-# 不配置时本地 Hook 默认 1，远程模式默认 10。
-hook_api_concurrency: 10
+# Hook/API 并发数：本地 Hook 默认 20，用于并发发送同一条消息命中的多条规则回复。
+# 远程 Hook/远程协议默认 10；修改后需重启后端。
+hook_api_concurrency: 20
 
 # --- 前端服务 ---
 # Vite 会直接读取 frontend_host/frontend_port。
