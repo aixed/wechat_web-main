@@ -3,6 +3,9 @@ config.yaml
 .env
 .env.*
 
+# Hook API capture containing real account data - keep local only
+PC微信协议_3.9.10.16_go.postman_collection.json
+
 # Logs
 *.log
 login.log
