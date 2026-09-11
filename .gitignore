@@ -24,6 +24,7 @@ env/
 # Backend runtime data and caches
 .run/
 backend/_uploads/
+backend/rdv_wxid_mapping.json
 backend/.img_cache/
 backend/.media_cache/
 backend/.voice_cache/

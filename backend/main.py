@@ -1356,11 +1356,55 @@ def _time_to_hhmm(time_text: str) -> str:
     return time_text[:5]
 
 
+def _callback_value(msg: dict, *keys: str) -> str:
+    """Read a callback field while tolerating Hook naming variants."""
+    for key in keys:
+        value = msg.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _xml_tag_value(content: str, tag_name: str) -> str:
+    """Extract a simple text field from Hook XML when a top-level field is absent."""
+    if not content:
+        return ""
+    try:
+        root = ET.fromstring(content)
+    except (ET.ParseError, TypeError):
+        return ""
+    wanted = str(tag_name or "").casefold()
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1].casefold() == wanted:
+            value = str(element.text or "").strip()
+            if value:
+                return value
+    return ""
+
+
 def _normalize_callback_message(msg: dict, sendorrecv: str, self_wxid: str) -> tuple[str, dict] | tuple[None, None]:
     chat_id = ""
-    from_gid = str(msg.get("fromgid", "") or "")
-    from_id = str(msg.get("fromid", "") or "")
-    to_id = str(msg.get("toid", "") or "")
+    from_gid = _callback_value(
+        msg,
+        "fromgid",
+        "from_gid",
+        "groupid",
+        "group_id",
+        "chatroomid",
+        "chatroom_id",
+    )
+    from_id = _callback_value(
+        msg,
+        "fromid",
+        "from_id",
+        "sender_wxid",
+        "senderid",
+        "sender_id",
+    )
+    to_id = _callback_value(msg, "toid", "to_id", "receiver_wxid", "receiver_id")
+    # Some Hook builds omit fromid for app/file messages but include it in XML.
+    if from_gid and (not from_id or from_id == from_gid):
+        from_id = _xml_tag_value(str(msg.get("msg", "") or ""), "fromusername") or from_id
     if from_gid:
         chat_id = from_gid
     elif from_id and from_id == self_wxid:
@@ -1387,8 +1431,9 @@ def _normalize_callback_message(msg: dict, sendorrecv: str, self_wxid: str) -> t
 
     # Detect self-sent messages: either sendorrecv="1", or fromid matches self
     # (mobile-sent messages arrive with sendorrecv="2" but fromid = self_wxid)
+    message_direction = _callback_value(msg, "sendorrecv", "send_or_recv") or str(sendorrecv or "")
     is_self_sent = (
-        str(sendorrecv) == "1" or
+        message_direction == "1" or
         (from_id == self_wxid and self_wxid and not from_gid)
     )
     # For group messages sent from mobile: fromid=self in a group context
@@ -1420,7 +1465,7 @@ def _normalize_callback_message(msg: dict, sendorrecv: str, self_wxid: str) -> t
         "fromgid": from_gid,
         "fromtype": str(msg.get("fromtype", "2" if from_gid else "1")),
         "msg": str(msg.get("msg", "") or ""),
-        "sendorrecv": "1" if is_self_sent else str(sendorrecv or ""),
+        "sendorrecv": "1" if is_self_sent else message_direction,
         "isSender": 1 if is_self_sent else 0,
         "img_path": msg.get("img_path") or typed_path.get("img_path"),
         "img_len": msg.get("img_len"),
@@ -1441,6 +1486,8 @@ def _normalize_callback_message(msg: dict, sendorrecv: str, self_wxid: str) -> t
             msg.get("atuserlist")
             or msg.get("atUserList")
             or msg.get("at_user_list")
+            or msg.get("atlist")
+            or msg.get("at_list")
         ),
     }
     return chat_id, normalized
@@ -7170,6 +7217,14 @@ _BROADCAST_IMG_CDN_KEYS = (
 def _send_result_ok(result: dict) -> bool:
     if not isinstance(result, dict):
         return False
+    # Hook text endpoints explicitly return {"SendTextMsg": "1"} (or the
+    # NoSrc equivalent).  A returned "0" means the Hook rejected the send,
+    # even though the HTTP request itself completed successfully.
+    for marker in ("SendTextMsg", "SendTextMsg_NoSrc"):
+        if marker in result:
+            return str(result.get(marker) or "").strip().casefold() in {
+                "1", "true", "ok", "success",
+            }
     if result.get("ok") is False:
         return False
     if result.get("error"):

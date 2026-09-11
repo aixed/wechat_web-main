@@ -812,6 +812,14 @@ class SmartReplyRequestTests(unittest.TestCase):
 
 
 class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
+    def test_send_result_ok_requires_hook_success_flag(self):
+        import main
+
+        self.assertTrue(main._send_result_ok({"SendTextMsg": "1"}))
+        self.assertTrue(main._send_result_ok({"SendTextMsg_NoSrc": "success"}))
+        self.assertFalse(main._send_result_ok({"SendTextMsg": "0"}))
+        self.assertFalse(main._send_result_ok({"SendTextMsg_NoSrc": "failed"}))
+
     async def test_multiple_rule_replies_enter_send_stage_concurrently(self):
         import main
 

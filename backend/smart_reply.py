@@ -166,7 +166,12 @@ def _mention_targets(message: dict[str, Any]) -> set[str]:
 
 def _mentions_self(message: dict[str, Any], self_wxid: str) -> bool:
     self_wxid = str(self_wxid or "").strip()
-    return bool(self_wxid and self_wxid in _mention_targets(message))
+    if not self_wxid:
+        return False
+    return self_wxid.casefold() in {
+        str(target or "").strip().casefold()
+        for target in _mention_targets(message)
+    }
 
 
 class SmartReplyEngine:
@@ -244,11 +249,11 @@ class SmartReplyEngine:
             else config.get("target_senders") or []
         )
         target_senders = {
-            str(wxid or "").strip()
+            str(wxid or "").strip().casefold()
             for wxid in raw_target_senders
             if str(wxid or "").strip()
         }
-        if sender not in target_senders:
+        if sender.casefold() not in target_senders:
             return SmartReplyDecision(reason="sender_not_allowed")
         configured_mention_types = config.get("mention_message_types")
         mention_message_types = {
