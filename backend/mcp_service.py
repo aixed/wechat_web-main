@@ -50,7 +50,10 @@ def _response_payload(response: httpx.Response, request_id: int | None) -> dict[
         raise McpServiceError("MCP returned an empty response")
     if request_id is None:
         return payloads[-1]
-    return next((item for item in payloads if item.get("id") == request_id), payloads[-1])
+    matching = next((item for item in payloads if item.get("id") == request_id), None)
+    if matching is None:
+        raise McpServiceError("MCP response request ID does not match")
+    return matching
 
 
 def _tool_text(result: dict[str, Any]) -> str:
@@ -88,6 +91,7 @@ class McpService:
         headers = {
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
+            "MCP-Protocol-Version": "2025-03-26",
         }
         if str(token or "").strip():
             headers["Authorization"] = f"Bearer {str(token).strip()}"

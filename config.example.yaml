@@ -95,3 +95,12 @@ ai_profiles: []
 #     model: "gpt-5.6-sol"
 ai_timeout_seconds: 60
 ai_max_concurrency: 3
+
+# 数据运维完整流程可能包含多个登录、填报、审核和执行请求。
+mcp_timeout_seconds: 600
+mcp_connections:
+  - id: local_mcp
+    name: 养老保险全国统筹数据安全运维管理
+    url: http://127.0.0.1:8765/mcp
+    token: ""
+    enabled: true

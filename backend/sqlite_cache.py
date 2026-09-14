@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from threading import RLock
 from typing import Any, Iterator
@@ -179,6 +180,19 @@ class SqliteMessageCache:
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY (owner_wxid, key)
                 );
+
+                CREATE TABLE IF NOT EXISTS query_conversations (
+                    owner_wxid TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    sender_wxid TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    turns_json TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY (owner_wxid, chat_id, sender_wxid)
+                );
+                CREATE INDEX IF NOT EXISTS idx_query_conversations_created
+                    ON query_conversations (created_at);
                 """
             )
             smart_reply_columns = {
@@ -225,6 +239,33 @@ class SqliteMessageCache:
                     "ALTER TABLE smart_reply_configs "
                     "ADD COLUMN target_senders_by_type_json TEXT NOT NULL DEFAULT '{}'"
                 )
+
+    def get_query_conversation(self, chat_id: str, sender_wxid: str, *, owner_wxid: str, now: float | None = None) -> dict[str, Any] | None:
+        """Return this sender's query session; hard expiry is seven days."""
+        current = time.time() if now is None else float(now)
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM query_conversations WHERE created_at <= ?", (current - 7 * 86400,))
+            row = conn.execute("SELECT * FROM query_conversations WHERE owner_wxid=? AND chat_id=? AND sender_wxid=?", (owner_wxid, chat_id, sender_wxid)).fetchone()
+            if row is None:
+                return None
+            return {"session_id": row["session_id"], "created_at": row["created_at"], "updated_at": row["updated_at"], "turns": json.loads(row["turns_json"])}
+
+    def append_query_turn(self, chat_id: str, sender_wxid: str, turn: dict[str, Any], *, owner_wxid: str, now: float | None = None) -> dict[str, Any]:
+        if not owner_wxid or not chat_id or not sender_wxid:
+            raise ValueError("查询会话缺少账号、聊天或发送人")
+        current = time.time() if now is None else float(now)
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM query_conversations WHERE created_at <= ?", (current - 7 * 86400,))
+            row = conn.execute("SELECT * FROM query_conversations WHERE owner_wxid=? AND chat_id=? AND sender_wxid=?", (owner_wxid, chat_id, sender_wxid)).fetchone()
+            session_id = row["session_id"] if row else uuid.uuid4().hex
+            created_at = row["created_at"] if row else current
+            turns = json.loads(row["turns_json"]) if row else []
+            message_id = str(turn.get("message_id") or "")
+            if not message_id or not any(t.get("message_id") == message_id and t.get("message") == turn.get("message") and t.get("arguments") == turn.get("arguments") for t in turns):
+                turns.append(turn)
+            turns = turns[-12:]
+            conn.execute("INSERT OR REPLACE INTO query_conversations (owner_wxid,chat_id,sender_wxid,session_id,created_at,updated_at,turns_json) VALUES (?,?,?,?,?,?,?)", (owner_wxid,chat_id,sender_wxid,session_id,created_at,current,json.dumps(turns,ensure_ascii=False)))
+            return {"session_id": session_id, "created_at": created_at, "updated_at": current, "turns": turns}
 
     @staticmethod
     def _scope_smart_reply_items(

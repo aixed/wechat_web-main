@@ -392,6 +392,7 @@ class SmartReplyEngine:
         message: dict[str, Any],
         replies: tuple[str, ...],
         now: float | None = None,
+        conversation: bool = False,
     ) -> SmartReplyDecision:
         """Apply the same de-duplication and cooldown gates to AI-generated replies."""
         normalized_replies = tuple(str(reply or "").strip() for reply in replies if str(reply or "").strip())
@@ -402,7 +403,12 @@ class SmartReplyEngine:
         if not sender or not content:
             return SmartReplyDecision(reason="empty_message")
         current = time.monotonic() if now is None else float(now)
-        dedup_key = (str(owner_wxid or ""), chat_id, sender, content)
+        # Conversational read-only queries may repeat wording after another
+        # turn. Keep callback de-duplication by message ID and allow immediate
+        # follow-ups; the normal rule/workflow cooldown remains unchanged.
+        message_id = str(message.get("id") or "")
+        dedup_content = f"query_message:{message_id}:{content}" if conversation and message_id else content
+        dedup_key = (str(owner_wxid or ""), chat_id, sender, dedup_content)
         cooldown_key = (str(owner_wxid or ""), chat_id)
         with self._lock:
             self._purge_seen(current)
@@ -413,7 +419,7 @@ class SmartReplyEngine:
             while len(self._seen) > self.dedup_limit:
                 self._seen.popitem(last=False)
             last_sent = self._last_sent.get(cooldown_key)
-            if last_sent is not None and current - last_sent < self.cooldown:
+            if not conversation and last_sent is not None and current - last_sent < self.cooldown:
                 return SmartReplyDecision(reason="cooldown")
             self._last_sent[cooldown_key] = current
         return SmartReplyDecision(replies=normalized_replies, reason="ai_matched")

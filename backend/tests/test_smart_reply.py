@@ -518,6 +518,16 @@ class SmartReplyEngineTests(unittest.TestCase):
             self.assertTrue(decision.should_send)
         self.assertEqual(3, len(engine._seen))
 
+    def test_query_conversation_repeats_and_immediate_followups_keep_callback_dedup(self):
+        def reserve(identifier, *, sender=SENDER, conversation=True, now=10):
+            return self.engine.reserve_ai_replies(owner_wxid=OWNER,chat_id=CHAT_ID,
+                message=message('待执行呢',id=identifier,fromid=sender),replies=('数据运维查询结果',),conversation=conversation,now=now)
+        self.assertTrue(reserve('one').should_send)
+        self.assertTrue(reserve('two',now=10.1).should_send)
+        self.assertEqual('duplicate',reserve('two',now=10.2).reason)
+        self.assertTrue(reserve('three',sender='other',now=10.3).should_send)
+        self.assertEqual('cooldown',reserve('normal',conversation=False,now=10.4).reason)
+
     def test_ai_replies_use_dedup_and_cooldown_gates(self):
         first = self.engine.reserve_ai_replies(
             owner_wxid=OWNER,
@@ -1120,7 +1130,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
             invalid_path = os.path.join(temp_dir, "invalid.txt")
             oversized_path = os.path.join(temp_dir, "oversized.txt")
             with open(utf8_path, "wb") as output:
-                output.write("\ufeff需求 40386\x00".encode("utf-8"))
+                output.write("\ufeff需求 40386".encode("utf-8"))
             with open(gb_path, "wb") as output:
                 output.write("全国统筹 SQL40387".encode("gb18030"))
             with open(empty_path, "wb"):

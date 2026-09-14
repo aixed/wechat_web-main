@@ -139,7 +139,7 @@ AI_MODEL = ""
 AI_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("ai_timeout_seconds", 60)))
 AI_MAX_CONCURRENCY = max(1, min(20, int(_cfg.get("ai_max_concurrency", 3))))
 MCP_CONNECTIONS: list[dict[str, Any]] = []
-MCP_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("mcp_timeout_seconds", 180)))
+MCP_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("mcp_timeout_seconds", 600)))
 
 
 def _normalize_ai_profile(raw: Any, index: int = 0) -> dict[str, Any] | None:
@@ -551,7 +551,7 @@ def _load_initial_config_template() -> Any:
                 "enabled": True,
             }
         ],
-        "mcp_timeout_seconds": 180,
+        "mcp_timeout_seconds": 600,
     }
 
 
