@@ -37,12 +37,13 @@ from ws_manager import manager
 from message_store import MessageStore
 from sqlite_cache import SqliteMessageCache
 from pb_parser import parse_raw_pb
-from smart_reply import SmartReplyEngine
+from smart_reply import SmartReplyEngine, _mention_targets
 from ai_service import AiService, AiServiceError
 from mcp_service import McpService, McpServiceError
-from domp_bridge import WORKFLOW_TOOL, workflow_arguments, workflow_reply, split_reply
-from domp_query_bridge import QUERY_TOOL, QUERY_REPLY_PREFIX, query_candidate, query_followup, query_analysis_content, query_arguments, query_tool_call, query_reply, query_reply_chunks, query_memory_turn, owner_query_config, execution_details_requested
+from domp_bridge import WORKFLOW_TOOL, workflow_arguments, workflow_reply, split_reply, strip_chat_mentions
+from domp_query_bridge import QUERY_TOOL, QUERY_REPLY_PREFIX, query_candidate, query_followup, query_analysis_content, query_arguments, query_tool_call, query_reply, query_reply_chunks, query_memory_turn, owner_query_config, execution_details_requested, explicit_pending_analysis, query_clarification_candidate
 from domp_execution_bridge import EXECUTION_TOOL, EXECUTION_REPLY_PREFIX, execution_candidate, execution_target, execute_target, execution_reply_chunks, owner_execution_config
+from domp_submission_bridge import SUBMISSION_TOOL, SUBMISSION_REPLY_PREFIX, SUBMISSION_PROMPT, submission_candidate, submission_arguments, submission_reply, submission_reply_chunks, owner_submission_config
 from daily_log import append_daily_log
 
 
@@ -3492,6 +3493,24 @@ def _fallback_mcp_reply(
 
 
 async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple[str, ...]:
+    if str(task.get("mcp_tool_name") or "") == SUBMISSION_TOOL and "_source_content" in task:
+        if not _ai_result_matches(task, result):
+            return (SUBMISSION_REPLY_PREFIX + "：未识别到足够明确的填报请求，未提交。",)
+        try:
+            arguments = submission_arguments(task.get("_source_content"), result)
+        except ValueError as exc:
+            return submission_reply_chunks(SUBMISSION_REPLY_PREFIX + "：" + str(exc))
+        context = task.get("_source_context") or {}
+        if not all(context.get(key) for key in ("owner_wxid", "chat_id", "sender", "message_id")):
+            return (SUBMISSION_REPLY_PREFIX + f"：已识别单号 {arguments['identifier']}；此为测试，未提交。",)
+        connection = _mcp_connection(str(task.get("mcp_connection_id") or ""))
+        if not connection or not bool(connection.get("enabled", True)):
+            return (SUBMISSION_REPLY_PREFIX + "：数据运维连接未启用，未提交。",)
+        try:
+            called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""), tool_name=SUBMISSION_TOOL, arguments=arguments)
+        except McpServiceError as exc:
+            return submission_reply_chunks(SUBMISSION_REPLY_PREFIX + f"：需求 {arguments['identifier']} 提交调用响应异常，结果待核对，请勿重复提交：{exc}")
+        return submission_reply_chunks(submission_reply(called.get("structured"), arguments["identifier"]))
     if str(task.get("mcp_tool_name") or "") == EXECUTION_TOOL:
         if not bool(result.get("matched")) or not _ai_result_matches(task, result):
             return (EXECUTION_REPLY_PREFIX + "：未识别到足够明确的执行指令，未执行。请说明：执行 41184。",)
@@ -3518,6 +3537,8 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
         return execution_reply_chunks(reply)
     if str(task.get("mcp_tool_name") or "") == QUERY_TOOL:
         if not bool(result.get("matched")):
+            if query_clarification_candidate(task.get("_source_content")):
+                return (QUERY_REPLY_PREFIX + "：暂时无法确定你的意思，请说明要查询哪类单据或任务，例如：有哪些待审核单子、有哪些待执行单子、查41184执行结果。需要执行时请明确单号和执行要求。",)
             return ()
         if not _ai_result_matches(task, result):
             return (QUERY_REPLY_PREFIX + "：查询意图未满足置信度要求，请重新说明。",)
@@ -3534,12 +3555,25 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
             return (QUERY_REPLY_PREFIX + "：数据运维连接未启用，未取得查询结果。",)
         payload = None
         try:
-            tool_name, tool_arguments = query_tool_call(arguments)
-            called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""), tool_name=tool_name, arguments=tool_arguments)
+            if arguments["query_type"] == "pending_maintenance":
+                payload = {"query_type": "pending_maintenance", "results": []}
+                for kind in ("pending_approvals", "pending_executions"):
+                    try:
+                        called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""),
+                            tool_name=QUERY_TOOL, arguments={"query_type": kind, "identifier": ""})
+                        part = called.get("structured")
+                        if not isinstance(part, dict) or part.get("query_type") != kind:
+                            raise McpServiceError("未取得该类别的结构化查询结果")
+                    except McpServiceError as exc:
+                        part = {"query_type": kind, "error": str(exc)}
+                    payload["results"].append(part)
+            else:
+                tool_name, tool_arguments = query_tool_call(arguments)
+                called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""), tool_name=tool_name, arguments=tool_arguments)
+                payload = called.get("structured")
         except McpServiceError as exc:
             reply = QUERY_REPLY_PREFIX + "：查询失败，处理情况、执行结果和数量未知：" + str(exc)
         else:
-            payload = called.get("structured")
             reply = query_reply(payload, include_sql=arguments["query_type"] == "execution" and execution_details_requested(task.get("_source_content")))
         context = task.get("_source_context") or {}
         if all(context.get(k) for k in ("owner_wxid", "chat_id", "sender")):
@@ -3854,6 +3888,21 @@ def _query_history_for(context, connection_id=""):
     return [t for t in (session or {}).get("turns", []) if t.get("connection_id", "") == connection_id]
 
 
+def _sql_chat_mention_names(message, chat_id, owner_wxid):
+    targets = _mention_targets(message)
+    if not targets or str(message.get("msgtype")) != "1" or not chat_id.endswith("@chatroom"):
+        return []
+    members = sqlite_cache.get_group_members(chat_id, owner_wxid=owner_wxid)
+    contacts = sqlite_cache.get_contacts(list(targets), owner_wxid=owner_wxid)
+    names = set(targets)
+    for target in targets:
+        for record in (members.get(target) or {}, contacts.get(target) or {}):
+            for data in (record, record.get("profile") or {}):
+                if isinstance(data, dict):
+                    names.update(str(data[key]) for key in ("name", "nickname", "nick_name", "NickName", "display_name", "remark") if data.get(key))
+    return list(names)
+
+
 async def _evaluate_ai_tasks(
     content: str,
     tasks: list[dict[str, Any]],
@@ -3862,9 +3911,14 @@ async def _evaluate_ai_tasks(
     image_data_url: str = "",
     source_context: dict[str, Any] | None = None,
 ) -> tuple[str, ...]:
+    if (source_context or {}).get("message_type") == "text":
+        content = strip_chat_mentions(content, source_context.get("mention_names") or [])
     enabled_tasks = [task for task in tasks if isinstance(task, dict) and bool(task.get("enabled"))]
     prepared = []
     for task in enabled_tasks:
+        if task.get("mcp_tool_name") == SUBMISSION_TOOL:
+            if not submission_candidate(content):
+                continue
         if task.get("mcp_tool_name") == EXECUTION_TOOL:
             if not execution_candidate(content):
                 continue
@@ -3879,13 +3933,17 @@ async def _evaluate_ai_tasks(
     # Skill is configured in the same group.
     has_query = any(t.get("mcp_tool_name") == QUERY_TOOL for t in prepared)
     has_execution = any(t.get("mcp_tool_name") == EXECUTION_TOOL for t in prepared)
-    enabled_tasks = ([next(t for t in prepared if t.get("mcp_tool_name") == EXECUTION_TOOL)] if has_execution else
+    has_submission = any(t.get("mcp_tool_name") == SUBMISSION_TOOL for t in prepared)
+    enabled_tasks = ([next(t for t in prepared if t.get("mcp_tool_name") == SUBMISSION_TOOL)] if has_submission else
+        [next(t for t in prepared if t.get("mcp_tool_name") == EXECUTION_TOOL)] if has_execution else
         [t for t in prepared if not has_query or t.get("mcp_tool_name") != WORKFLOW_TOOL])
     if not enabled_tasks:
         _smart_reply_log(f"[AI_REPLY] skipped message_id={message_id}: no enabled AI tasks")
         return ()
     if not ai_service.configured:
         _smart_reply_log(f"[AI_REPLY] skipped message_id={message_id}: AI service is not configured")
+        if has_submission:
+            return (SUBMISSION_REPLY_PREFIX + "：分析服务未配置，未提交。",)
         if has_execution:
             return (EXECUTION_REPLY_PREFIX + "：分析服务未配置，未执行。",)
         if any(task.get("mcp_tool_name") == QUERY_TOOL for task in enabled_tasks):
@@ -3898,6 +3956,9 @@ async def _evaluate_ai_tasks(
             return await ai_service.analyze(query_analysis_content(content, task.get("_query_history") or []), task)
         if task.get("mcp_tool_name") == QUERY_TOOL:
             history = task.get("_query_history") or []
+            explicit = explicit_pending_analysis(content)
+            if explicit:
+                return explicit
             if not history and query_followup(content) and not re.search(r"执行|审核|审批|影响|需求|任务|处理|受理|履历|SQL\s*(?:原文|脚本)|完整\s*SQL", content, re.I):
                 return {"matched": True, "confidence": 100, "result": "{}", "reply": ""}
             return await ai_service.analyze(query_analysis_content(content, history), task)
@@ -3922,7 +3983,9 @@ async def _evaluate_ai_tasks(
                 f"[AI_REPLY] task failed message_id={message_id} id={task.get('id', '')}: "
                 f"{type(result).__name__}: {result}"
             )
-            if task.get("mcp_tool_name") == EXECUTION_TOOL:
+            if task.get("mcp_tool_name") == SUBMISSION_TOOL:
+                replies.append(SUBMISSION_REPLY_PREFIX + "：填报意图分析失败，未提交。")
+            elif task.get("mcp_tool_name") == EXECUTION_TOOL:
                 replies.append(EXECUTION_REPLY_PREFIX + "：执行意图分析失败，未执行。")
             elif task.get("mcp_tool_name") == QUERY_TOOL:
                 replies.append(QUERY_REPLY_PREFIX + "：查询意图分析失败，未取得查询结果。")
@@ -3989,11 +4052,11 @@ async def _process_smart_reply_message_unlocked(
         return
     query_task = next((t for t in config_row.get("ai_tasks") or [] if t.get("enabled") and t.get("mcp_tool_name") == QUERY_TOOL), {})
     query_history = _query_history_for({"owner_wxid": owner_wxid, "chat_id": chat_id, "sender": str(message.get("fromid") or "")}, str(query_task.get("mcp_connection_id") or "")) if query_task else []
-    query_config = ((owner_execution_config(config_row, message, owner_wxid) or owner_query_config(config_row, message, owner_wxid, query_history)) if owner_wxid == self_wxid else None)
+    query_config = ((owner_submission_config(config_row, message, owner_wxid) or owner_execution_config(config_row, message, owner_wxid) or owner_query_config(config_row, message, owner_wxid, query_history)) if owner_wxid == self_wxid else None)
     if query_config is not None:
         config_row = query_config
         message = {**message, "isSender": 0, "sendorrecv": "2"}
-        self_wxid = ""  # Only the selected query/existing-demand Agent; no SQL submission Skill.
+        self_wxid = ""  # Only the selected Agent for this explicit request.
     message_id = str(message.get("id") or "-")
     _smart_reply_log(
         f"[SMART_REPLY] received message_id={message_id} chat={chat_id} "
@@ -4123,14 +4186,15 @@ async def _process_smart_reply_message_unlocked(
                 ai_tasks,
                 message_id=message_id,
                 image_data_url=image_data_url,
-                source_context={"owner_wxid": owner_wxid, "chat_id": chat_id, "sender": str(message.get("fromid") or ""), "message_id": str(message.get("id") or "")},
+                source_context={"owner_wxid": owner_wxid, "chat_id": chat_id, "sender": str(message.get("fromid") or ""), "message_id": str(message.get("id") or ""),
+                    "message_type": ai_message_type, "mention_names": _sql_chat_mention_names(message, chat_id, owner_wxid)},
             )
             decision = smart_reply_engine.reserve_ai_replies(
                 owner_wxid=owner_wxid,
                 chat_id=chat_id,
                 message=message,
                 replies=ai_replies,
-                conversation=bool(ai_replies) and all(reply.startswith((QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX)) for reply in ai_replies),
+                conversation=bool(ai_replies) and all(reply.startswith((QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, SUBMISSION_REPLY_PREFIX)) for reply in ai_replies),
             )
             if not decision.should_send:
                 _smart_reply_log(
@@ -4150,7 +4214,7 @@ async def _process_smart_reply_message_unlocked(
         use_no_src = bool(config_row.get("use_no_src"))
         workflow_reply_to_sender = any(
             isinstance(task, dict) and task.get("enabled") and task.get("mcp_enabled")
-            and task.get("mcp_tool_name") in {WORKFLOW_TOOL, QUERY_TOOL, EXECUTION_TOOL}
+            and task.get("mcp_tool_name") in {WORKFLOW_TOOL, QUERY_TOOL, EXECUTION_TOOL, SUBMISSION_TOOL}
             and task.get("message_type", "text") == {"1": "text", "49": "file"}.get(str(message.get("msgtype")))
             for task in config_row.get("ai_tasks") or []
         )

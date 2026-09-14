@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from domp_query_bridge import QUERY_TOOL, TASK_QUERY_TOOL, QUERY_PROMPT, QUERY_REPLY_PREFIX, query_candidate, query_arguments, query_tool_call, query_reply, query_reply_chunks
+from domp_query_bridge import QUERY_TOOL, TASK_QUERY_TOOL, QUERY_PROMPT, QUERY_REPLY_PREFIX, query_candidate, query_arguments, query_tool_call, query_reply, query_reply_chunks, explicit_pending_analysis, query_memory_turn
 from domp_execution_bridge import EXECUTION_TOOL, EXECUTION_PROMPT, execution_candidate
 from domp_bridge import WORKFLOW_TOOL
 from mcp_service import McpServiceError
@@ -18,6 +18,56 @@ TASK_RESULT = {'query_type':'task_processing','identifier':'xzsb-41198','found':
 
 
 class QueryBridgeTests(unittest.TestCase):
+    def test_semantic_gate_accepts_unlisted_typos_without_correcting_identifiers(self):
+        for source, kind, identifier in (
+            ('带审合的单子有多少', 'pending_approvals', ''),
+            ('还有待申批的吗', 'pending_approvals', ''),
+            ('有哪些代执形的单子', 'pending_executions', ''),
+            ('查41184执形结过', 'execution', '41184'),
+            ('查41198任物处里情况', 'task_processing', '41198'),
+        ):
+            self.assertTrue(query_candidate(source), source)
+            analysis = {'result': json.dumps({'query_type': kind, 'identifier': identifier})}
+            self.assertEqual({'query_type': kind, 'identifier': identifier}, query_arguments(source, analysis))
+        with self.assertRaisesRegex(ValueError, '不会自动纠正单号'):
+            query_arguments('查41l84执形结过', {'result': '{"query_type":"execution","identifier":"41184"}'}, [{'arguments': {'query_type': 'execution', 'identifier': '41184'}}])
+        self.assertTrue(query_candidate('把这些单子搞一下'))
+        with self.assertRaisesRegex(ValueError, '暂时无法确定'):
+            query_arguments('把这些单子搞一下', {'result': '{"needs_clarification":true,"identifier":""}'})
+
+    def test_pending_spelling_aliases_and_combined_question(self):
+        for source, kind in (
+            ('今天有没有代审核和待执行的单子', 'pending_maintenance'),
+            ('今天有待审批和代执行的单子吗', 'pending_maintenance'),
+            ('现在有没有代审核的单子', 'pending_approvals'),
+            ('有哪些代审批需求', 'pending_approvals'),
+            ('还有代执行的单子吗', 'pending_executions'),
+        ):
+            self.assertTrue(query_candidate(source), source)
+            self.assertFalse(execution_candidate(source), source)
+            analysis = explicit_pending_analysis(source)
+            self.assertEqual({'query_type': kind, 'identifier': ''}, query_arguments(source, analysis))
+        for source in ('代审核太多了', '帮我审核下，看看待执行单子', '执行一下待执行的单子', QUERY_REPLY_PREFIX + '\n目前待审核需求：0 条；待执行需求：1 条'):
+            self.assertIsNone(explicit_pending_analysis(source), source)
+        with self.assertRaisesRegex(ValueError, '暂不支持'):
+            query_arguments('今天新增的待审核和待执行单子有多少', explicit_pending_analysis('今天新增的待审核和待执行单子有多少'))
+
+    def test_combined_query_keeps_unknown_and_verified_execution_target(self):
+        payload = {'query_type': 'pending_maintenance', 'results': [
+            {'query_type': 'pending_approvals', 'error': '审核连接超时'},
+            {'query_type': 'pending_executions', 'count': 1, 'items': [{'identifier': '41184', 'work_num': '5400000000383893', 'work_id': '5400000000383894'}]},
+        ]}
+        reply = query_reply(payload)
+        self.assertIn('目前待审核需求：未知', reply)
+        self.assertIn('审核连接超时', reply)
+        self.assertIn('目前待执行需求：1 条', reply)
+        self.assertIn('包含以前提交的单据', reply)
+        turn = query_memory_turn('今天有没有代审核和待执行的单子', {'query_type': 'pending_maintenance', 'identifier': ''}, reply, payload=payload)
+        self.assertEqual(1, turn['execution_targets']['count'])
+        from domp_execution_bridge import context_execution_target
+        self.assertEqual('5400000000383893', context_execution_target([turn])['work_num'])
+        self.assertTrue(all(not query_candidate(chunk) for chunk in query_reply_chunks(reply)))
+
     def test_execution_detail_phrases_are_readonly_even_without_history(self):
         analysis={**ANALYZED,'result':'{"query_type":"execution","identifier":"41184"}'}
         for source in ('41184 的执行详情发我看看','41184执行详情','把41184的执行明细给我','把41184执行详情给我','41184 SQL脚本发我看看'):
@@ -130,6 +180,63 @@ class QueryGroupTests(unittest.IsolatedAsyncioTestCase):
             return {'structured':self.query_result if kwargs['tool_name'] in {QUERY_TOOL, TASK_QUERY_TOOL} else PAYLOAD}
         self.main.ai_service.analyze=analyze
         self.main.mcp_service.call_tool=call_tool
+
+    async def test_unlisted_typo_reaches_semantic_agent_and_ambiguous_intent_never_calls_tool(self):
+        self.query_analysis = {**ANALYZED, 'result': '{"query_type":"pending_executions","identifier":""}'}
+        self.query_result = {'query_type': 'pending_executions', 'count': 0, 'items': []}
+        await self.process(self.message(msg='有哪些代执形的单子'))
+        self.assertEqual('有哪些代执形的单子', self.analyzed_messages[-1])
+        self.assertEqual({'query_type': 'pending_executions', 'identifier': ''}, self.calls[-1]['arguments'])
+        self.query_analysis = {**ANALYZED, 'confidence': 100, 'result': '{"needs_clarification":true,"identifier":""}'}
+        await self.process(self.message(id='101', msg='把这些单子搞一下'))
+        self.assertIn('暂时无法确定', self.send.call_args.args[3])
+        self.assertEqual(1, len(self.calls))
+        self.query_analysis = {'matched': False, 'confidence': 99, 'result': '', 'reply': ''}
+        await self.process(self.message(id='103', msg='把这些单子搞一下'))
+        self.assertIn('暂时无法确定', self.send.call_args.args[3])
+        self.assertEqual(1, len(self.calls))
+        before = self.send.call_count
+        await self.process(self.message(id='102', msg='今天有没有新人'))
+        self.assertEqual(1, len(self.calls))
+        self.assertEqual(before, self.send.call_count)
+
+    async def test_combined_typo_query_reads_both_categories_for_sender_and_owner(self):
+        row = self.cache.get_smart_reply_config(self.chat, owner_wxid=self.owner)
+        row['ai_tasks'].append({**row['ai_tasks'][0], 'id': 'execute', 'instruction': EXECUTION_PROMPT, 'mcp_tool_name': EXECUTION_TOOL})
+        self.cache.upsert_smart_reply_config(row, owner_wxid=self.owner)
+        self.query_analysis = {'matched': False, 'confidence': 99, 'result': ''}
+        async def read(**kwargs):
+            self.calls.append(kwargs)
+            kind = kwargs['arguments']['query_type']
+            return {'structured': {'query_type': kind, 'count': 0 if kind == 'pending_approvals' else 1,
+                'items': [] if kind == 'pending_approvals' else [{'identifier': '41184', 'work_num': '5400000000383893', 'work_id': '5400000000383894'}]}}
+        self.main.mcp_service.call_tool = read
+        source = '今天有没有代审核和待执行的单子'
+        for index, sender in enumerate((self.sender, self.owner)):
+            await self.process(self.message(id=str(400 + index), msg=source, fromid=sender, isSender=int(sender == self.owner)))
+            self.assertEqual((self.chat, sender), self.send.call_args.args[:2])
+            self.assertIn('目前待审核需求：0 条', self.send.call_args.args[3])
+            self.assertIn('目前待执行需求：1 条', self.send.call_args.args[3])
+            self.assertIn('41184', self.send.call_args.args[3])
+        self.assertEqual([QUERY_TOOL] * 4, [call['tool_name'] for call in self.calls])
+        self.assertEqual(['pending_approvals', 'pending_executions'] * 2, [call['arguments']['query_type'] for call in self.calls])
+        self.assertEqual([], self.analyzed_messages)
+        self.assertEqual('pending_maintenance', self.cache.get_query_conversation(self.chat, self.sender, owner_wxid=self.owner)['turns'][-1]['arguments']['query_type'])
+
+    async def test_combined_query_keeps_first_result_when_second_connection_fails(self):
+        async def read(**kwargs):
+            self.calls.append(kwargs)
+            if kwargs['arguments']['query_type'] == 'pending_executions':
+                raise McpServiceError('执行查询超时')
+            return {'structured': {'query_type': 'pending_approvals', 'count': 2, 'items': []}}
+        self.main.mcp_service.call_tool = read
+        await self.process(self.message(msg='今天有没有代审核和待执行的单子'))
+        reply = self.send.call_args.args[3]
+        self.assertIn('目前待审核需求：2 条', reply)
+        self.assertIn('目前待执行需求：未知', reply)
+        self.assertIn('执行查询超时', reply)
+        self.assertNotIn('目前待执行需求：0 条', reply)
+        self.assertEqual([QUERY_TOOL, QUERY_TOOL], [call['tool_name'] for call in self.calls])
 
     async def test_allowed_sender_query_calls_only_read_tool_and_mentions_sender(self):
         await self.process(self.message(msg=QUERY))

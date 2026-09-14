@@ -12,10 +12,11 @@ sys.path.insert(0, str(ROOT / "backend"))
 from domp_bridge import PROMPT, WORKFLOW_TOOL
 from domp_query_bridge import QUERY_PROMPT, QUERY_TOOL
 from domp_execution_bridge import EXECUTION_PROMPT, EXECUTION_TOOL
+from domp_submission_bridge import SUBMISSION_PROMPT, SUBMISSION_TOOL
 from sqlite_cache import SqliteMessageCache
 
 
-def configure(owner, chat, db_path=None, *, add_query_agent=False, add_execution_agent=False):
+def configure(owner, chat, db_path=None, *, add_query_agent=False, add_execution_agent=False, add_submission_agent=False):
     cache = SqliteMessageCache(str(db_path) if db_path else None)
     row = cache.get_smart_reply_config(chat, owner_wxid=owner)
     if not row:
@@ -48,6 +49,16 @@ def configure(owner, chat, db_path=None, *, add_query_agent=False, add_execution
         for task in execution_tasks:
             task.update(name="数据运维执行 Agent", instruction=EXECUTION_PROMPT, mcp_tool_name=EXECUTION_TOOL,
                         mcp_arguments_template="{}", mcp_reply_template="{{mcp_text}}", max_parallel=1)
+    if add_submission_agent:
+        submission_tasks = [task for task in row.get("ai_tasks") or [] if task.get("mcp_tool_name") == SUBMISSION_TOOL]
+        if not submission_tasks:
+            template = next((task for task in tasks if task.get("message_type", "text") == "text"), tasks[0])
+            submission_task = {**template, "id": "domp_submission_agent_text", "skill_id": "domp_submission_agent_text", "message_type": "text", "enabled": True}
+            row["ai_tasks"].append(submission_task)
+            submission_tasks = [submission_task]
+        for task in submission_tasks:
+            task.update(name="数据运维填报 Agent", instruction=SUBMISSION_PROMPT, mcp_tool_name=SUBMISSION_TOOL,
+                mcp_arguments_template="{}", mcp_reply_template="{{mcp_text}}", max_parallel=1)
     # An authorized sender's text/TXT is the trigger; preserve per-type lists.
     row.update(mention_only=False, mention_message_types=[])
     cache.upsert_smart_reply_config(row, owner_wxid=owner)
@@ -60,5 +71,6 @@ if __name__ == "__main__":
     parser.add_argument("--chat", required=True)
     parser.add_argument("--add-query-agent", action="store_true")
     parser.add_argument("--add-execution-agent", action="store_true")
+    parser.add_argument("--add-submission-agent", action="store_true")
     args = parser.parse_args()
-    print(configure(args.owner, args.chat, add_query_agent=args.add_query_agent, add_execution_agent=args.add_execution_agent))
+    print(configure(args.owner, args.chat, add_query_agent=args.add_query_agent, add_execution_agent=args.add_execution_agent, add_submission_agent=args.add_submission_agent))

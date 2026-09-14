@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from domp_bridge import PROMPT, WORKFLOW_TOOL, workflow_arguments, workflow_reply
+from domp_bridge import PROMPT, WORKFLOW_TOOL, workflow_arguments, workflow_reply, strip_chat_mentions
 from mcp_service import McpServiceError
 from smart_reply import SmartReplyEngine
 from sqlite_cache import SqliteMessageCache
@@ -19,6 +19,14 @@ PAYLOAD = {"identifier": "40386", "work_num": "num-1", "submission": {"status": 
 
 
 class BridgeTests(unittest.TestCase):
+    def test_confirmed_mentions_at_both_edges_preserve_sql_and_unknown_at_values(self):
+        sql = '--41356\n' + SQL + ';\n' + SQL + ';'
+        for source in (sql + '\n@Aixed', sql + '\n@Aixed\u2005\n@Agent 12345\n', '@Aixed\u2005 ' + sql, '@Aixed\u2005 ' + sql + '\n@Aixed', '@Agent 12345\u2005 ' + sql):
+            self.assertEqual(sql, strip_chat_mentions(source, ['Aixed', 'Agent 12345']))
+        for source in (sql + '\n@Unknown', sql + '\n@Aixed123', sql + '\n@Aixed\n' + SQL + ';', sql.replace("'540199'", "'a@Aixed;原值'"), SQL.replace("'540199'", '@Aixed') + ';', SQL.replace('ab01', 'ab01@Aixed') + ';', SQL + " SET note='原文;\n@Aixed"):
+            self.assertEqual(source, strip_chat_mentions(source, ['Aixed']))
+        self.assertEqual(sql + '\n@Aixed', strip_chat_mentions(sql + '\n@Aixed', []))
+
     def test_raw_source_and_stable_message_key_cannot_be_changed_by_analysis(self):
         task = {"_source_context": {"owner_wxid": "owner", "chat_id": "room", "sender": "sender", "message_id": "100"}}
         args = workflow_arguments(SOURCE, ANALYSIS, task)
@@ -43,6 +51,25 @@ class BridgeTests(unittest.TestCase):
 
 
 class GroupWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wechat_mention_metadata_cleans_before_ai_and_mcp_but_txt_is_unchanged(self):
+        self.cache.upsert_group_members(self.chat, [{'wxid': self.owner, 'name': 'Aixed'}], owner_wxid=self.owner)
+        analyzed = []
+        async def analyze(content, task):
+            analyzed.append(content)
+            return self.analysis
+        self.main.ai_service.analyze = analyze
+        body = SOURCE + ';'
+        msgsource = '<msgsource><atuserlist><![CDATA[' + self.owner + ']]></atuserlist></msgsource>'
+        await self.process(self.message(msg='@Aixed\u2005 ' + body + '\n@Aixed', msgsource=msgsource))
+        self.assertEqual([body], analyzed)
+        self.assertEqual(body, self.calls[0]['arguments']['sql_text'])
+        await self.process(self.message(id='101', msg=body + '\n@Unknown', msgsource=msgsource))
+        self.assertEqual(body + '\n@Unknown', self.calls[-1]['arguments']['sql_text'])
+        task = self.cache.get_smart_reply_config(self.chat, owner_wxid=self.owner)['ai_tasks'][1]
+        context = {'owner_wxid': self.owner, 'chat_id': self.chat, 'sender': self.sender, 'message_id': '102', 'message_type': 'file', 'mention_names': ['Aixed']}
+        await self.main._evaluate_ai_tasks(body + '\n@Aixed', [task], source_context=context)
+        self.assertEqual(body + '\n@Aixed', self.calls[-1]['arguments']['sql_text'])
+
     async def test_non_sql_chat_does_not_invoke_mcp_or_reply(self):
         self.analysis = {"matched": False, "confidence": 99, "result": "没有 SQL"}
         await self.process(self.message(msg="已经处理，谢谢"))

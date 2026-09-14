@@ -20,7 +20,7 @@ EXECUTION_PROMPT = """你是数据运维执行 Agent，仅识别当前消息明�
 
 def execution_candidate(source):
     source = str(source or "").strip()
-    if len(source) > 300 or SQL_START.search(source) or any(p in source for p in (QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, "流程标识：")):
+    if len(source) > 300 or SQL_START.search(source) or any(p in source for p in (QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, "数据运维填报结果", "流程标识：")):
         return False
     if execution_question(source) or re.search(r"执行(?:的)?(?:结果|情况|状态|详情|明细|脚本|耗时|影响)|待执行|不要|别执行|不执行|不能|不用|停止|取消|如果|假如|明天|以后|计划|打算|能否|可以.*执行|怎么执行|如何执行|(?:他|她|别人|有人)说|转述|转发|引用|例如|比如|示例|假设|提示词", source):
         return False
@@ -36,7 +36,7 @@ def execution_candidate(source):
 
 def context_execution_target(history):
     last = history[-1] if history else {}
-    if (last.get("arguments") or {}).get("query_type") != "pending_executions":
+    if (last.get("arguments") or {}).get("query_type") not in {"pending_executions", "pending_maintenance"}:
         raise ValueError("当前没有明确待执行单据，请先查询待执行清单或说明：执行 41184。会话超过一周会重建。")
     targets = last.get("execution_targets")
     if targets is None:
