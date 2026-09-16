@@ -1,5 +1,6 @@
 import json
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 from domp_query_bridge import QUERY_TOOL, TASK_QUERY_TOOL, QUERY_PROMPT, QUERY_REPLY_PREFIX, query_candidate, query_arguments, query_tool_call, query_reply, query_reply_chunks, explicit_pending_analysis, query_memory_turn
@@ -46,11 +47,33 @@ class QueryBridgeTests(unittest.TestCase):
             self.assertTrue(query_candidate(source), source)
             self.assertFalse(execution_candidate(source), source)
             analysis = explicit_pending_analysis(source)
-            self.assertEqual({'query_type': kind, 'identifier': ''}, query_arguments(source, analysis))
+            expected={'query_type': kind, 'identifier': ''}
+            if '今天' in source:
+                expected.update(date_from='2026-09-15',date_to='2026-09-15',date_label='今天')
+            self.assertEqual(expected, query_arguments(source, analysis, today=date(2026,9,15)))
         for source in ('代审核太多了', '帮我审核下，看看待执行单子', '执行一下待执行的单子', QUERY_REPLY_PREFIX + '\n目前待审核需求：0 条；待执行需求：1 条'):
             self.assertIsNone(explicit_pending_analysis(source), source)
-        with self.assertRaisesRegex(ValueError, '暂不支持'):
-            query_arguments('今天新增的待审核和待执行单子有多少', explicit_pending_analysis('今天新增的待审核和待执行单子有多少'))
+        args=query_arguments('今天新增的待审核和待执行单子有多少', explicit_pending_analysis('今天新增的待审核和待执行单子有多少'),today=date(2026,9,15))
+        self.assertEqual(('2026-09-15','2026-09-15'),(args['date_from'],args['date_to']))
+
+    def test_pending_time_ranges_are_derived_from_current_text(self):
+        analysis={'result':json.dumps({'query_type':'pending_maintenance','identifier':''})}
+        cases=(
+            ('昨天的还有没审核执行的不','2026-09-14','2026-09-14'),
+            ('前天还有待审核的吗','2026-09-13','2026-09-13'),
+            ('上周待执行清单','2026-09-07','2026-09-13'),
+            ('本月待审核的有哪些','2026-09-01','2026-09-15'),
+            ('最近7天待审核和待执行','2026-09-09','2026-09-15'),
+            ('9月1日到9月10日待审核和待执行','2026-09-01','2026-09-10'),
+        )
+        for source,start,end in cases:
+            with self.subTest(source=source):
+                args=query_arguments(source,analysis,today=date(2026,9,15))
+                self.assertEqual((start,end),(args['date_from'],args['date_to']))
+                if args['query_type'] != 'pending_maintenance':
+                    self.assertEqual((QUERY_TOOL,{k:args[k] for k in ('query_type','identifier','date_from','date_to')}),query_tool_call(args))
+        with self.assertRaisesRegex(ValueError,'无效'):
+            query_arguments('2026年2月30日待审核有哪些', {'result':'{"query_type":"pending_approvals","identifier":""}'},today=date(2026,9,15))
 
     def test_combined_query_keeps_unknown_and_verified_execution_target(self):
         payload = {'query_type': 'pending_maintenance', 'results': [

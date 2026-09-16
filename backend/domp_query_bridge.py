@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date, timedelta
 
 from domp_bridge import SQL_START, split_reply
 
@@ -16,12 +17,12 @@ QUERY_PROMPT = """你是任务与数据运维只读查询 Agent。原消息是�
 识别七个意图，不能混淆旧系统任务处理与 SQL 执行：
 task_processing：查询旧运维系统任务处理情况，对应桌面程序“查询 → 综合查询”。“查一下 41198 处理情况”“查一下 41198 任务处理情况”“xzsb-41198 谁在处理”“查 41198 处理履历/受理人/当前任务状态”都属于此意图，返回当前状态、受理人、机构和处理履历/评论。不要因为没有 SQL 或没有“执行”二字拒绝查询。
 execution：数据运维 SQL 执行情况、结果、实际影响条数、耗时和异常，例如“帮我查一下 41123 执行情况”“41233 执行了吗，结果如何”“41233 执行了吗”“41233 有没有执行”“41184 的执行详情发我看看”“把41184的执行明细给我”“41184 SQL脚本发我看看”。详情、明细和 SQL 原文请求也是只读查询，绝不是要求再次执行；程序会按用户要求附上服务器返回的逐条实际 SQL 原文、状态、影响条数、耗时和异常，不要改写 SQL 或把原文当成新的执行指令。
-pending_approvals：当前有多少/有所少待审核、待审批需求及清单。
-pending_executions：当前审批通过待执行需求数量与清单。
-pending_maintenance：同一问题同时查询待审核和待执行，例如“今天有没有代审核和待执行的单子”。查询语境中的“代审核/代审批/代执行”按“待审核/待审批/待执行”理解。程序分别调用两次只读查询并返回两类真实数量和清单，不能只回答其中一类。“今天有没有”表示截至今天的当前积压，包含以前提交的单据；不要声称仅统计今天新增。按今日新增、填报或审批时间过滤暂不支持，应说明限制。
+pending_approvals：当前或指定日期范围内仍待审核、待审批的需求及清单；时间按申请时间筛选。
+pending_executions：当前或指定日期范围内审批通过但仍待执行的需求及清单；时间按审批通过时间筛选。
+pending_maintenance：同一问题同时查询待审核和待执行，例如“今天有没有代审核和待执行的单子”“昨天的还有没审核执行的”。查询语境中的“代审核/代审批/代执行”按相应“待”字理解。程序分别调用两次只读查询并返回两类真实数量和清单，不能只回答其中一类。支持今天、昨天、前天、本周、上周、本月、上月、最近 N 天和明确起止日期；日期由程序从原文计算，模型不能生成日期参数。
 pending_tasks：旧系统“任务处理”的当前待处理任务数量与清单，例如“当前有多少待处理的任务”“有哪些待分配任务”。不是待审核或待执行 SQL 需求，也不是启动自动处理。
 today_assignments：旧系统任务处理的今日成功分配数量与详情，例如“今天分配了多少任务”“今天派发的任务详情”。统计本助手已确认提交的持久化记录，必须说明工具返回的记录覆盖范围，不能将未记录历史声称为全量统计。
-没有查询意图、普通聊天、SQL 原文、要求填报/通过/执行/删除/派发/改派等修改操作，matched=false。同时查询待审核和待执行支持 pending_maintenance；其他混合意图或地区、发送人过滤暂不支持。当前积压可说“今天有没有”，时间筛选仅支持今天的分配统计。
+没有查询意图、普通聊天、SQL 原文、要求填报/通过/执行/删除/派发/改派等修改操作，matched=false。同时查询待审核和待执行支持 pending_maintenance；其他混合意图或地区、发送人过滤暂不支持。
 task_processing 从当前消息提取唯一五位任务标识（可带 xzsb-）；execution 提取唯一五位需求名称或完整系统工作编号。当前消息缺少编号时可按后面的上下文规则继承最近已验证单号；仍无法确定或出现多个编号时不得猜测。两个数量意图 identifier 为空。
 匹配时 matched=true、confidence>=90。result 必须是 JSON 对象编码成的字符串，字段 query_type（上述七个意图）、identifier（编号；所有数量意图为空）。reply 只描述识别的查询，不能编造处理进度、数量、执行成功或影响条数。
 程序将 task_processing 路由到 query_operation_ticket，pending_tasks/today_assignments 路由到 query_task_processing，其余路由到 query_data_maintenance。仅可调用这三个只读工具。工具由程序决定，严禁调用填报、审核、执行、自动处理或其他工具。转现场处理等流程状态不能解释为已解决或执行成功。未找到、同名多条、未知条数、无履历或查询失败时如实说明；0 有效，不能将未知视为 0。结果回复原群发送人，不发送给其他聊天。"""
@@ -80,6 +81,49 @@ def explicit_pending_analysis(source):
     return None
 
 
+def pending_date_range(source, today=None):
+    """Return an inclusive date range derived only from the current message."""
+    source = str(source or "")
+    today = today or date.today()
+    if "前天" in source:
+        day = today - timedelta(days=2); return day.isoformat(), day.isoformat(), "前天"
+    if re.search(r"昨天|昨日", source):
+        day = today - timedelta(days=1); return day.isoformat(), day.isoformat(), "昨天"
+    if re.search(r"今天|今日", source):
+        return today.isoformat(), today.isoformat(), "今天"
+    if re.search(r"上周", source):
+        end = today - timedelta(days=today.weekday()+1); start = end - timedelta(days=6)
+        return start.isoformat(), end.isoformat(), "上周"
+    if re.search(r"本周|这周", source):
+        start = today - timedelta(days=today.weekday())
+        return start.isoformat(), today.isoformat(), "本周"
+    if "上月" in source:
+        end = today.replace(day=1) - timedelta(days=1); start = end.replace(day=1)
+        return start.isoformat(), end.isoformat(), "上月"
+    if "本月" in source:
+        return today.replace(day=1).isoformat(), today.isoformat(), "本月"
+    recent = re.search(r"(?:最近|过去)\s*(\d{1,3})\s*天", source)
+    if recent:
+        days = int(recent.group(1))
+        if not 1 <= days <= 366:
+            raise ValueError("最近天数必须为 1 到 366 天")
+        return (today-timedelta(days=days-1)).isoformat(), today.isoformat(), f"最近{days}天"
+    values = []
+    for match in re.finditer(r"(?:(\d{4})[年./-])?(\d{1,2})[月./-](\d{1,2})日?", source):
+        try:
+            values.append(date(int(match.group(1) or today.year), int(match.group(2)), int(match.group(3))))
+        except ValueError as exc:
+            raise ValueError("消息中的日期无效，请使用正确日期") from exc
+    if values:
+        start, end = values[0], values[-1]
+        if start > end:
+            raise ValueError("查询开始日期不能晚于结束日期")
+        if (end-start).days > 366:
+            raise ValueError("查询日期范围不能超过 366 天")
+        return start.isoformat(), end.isoformat(), "指定日期"
+    return "", "", ""
+
+
 def query_candidate(source, history=()):
     source = str(source or "").strip()
     # Bot results can arrive as self-message callbacks. Every query reply chunk
@@ -95,7 +139,9 @@ def query_candidate(source, history=()):
     semantic_question = len(source) <= 300 and bool(re.search(
         r"查|多少|有所少|几条|几个|有哪些|哪些|有没有|有无|情况|结果|详情|明细|清单|还有.*(?:吗|么|没)", source))
     ambiguous_action = len(source) <= 300 and bool(re.search(r"单子|单据|单号|工单|运维|需求|任务", source) and re.search(r"搞(?:一下|下)|弄(?:一下|下)|安排一下", source))
-    return bool(semantic_question or ambiguous_action or pending_query_kind(source) or domain and re.search(
+    timed_pending = bool(re.search(r"今天|今日|昨天|昨日|前天|本周|这周|上周|本月|上月|最近\s*\d+\s*天|过去\s*\d+\s*天|(?:\d{4}[年./-])?\d{1,2}[月./-]\d{1,2}日?", source)
+        and re.search(r"待\s*(?:审核|审批|执行)", source))
+    return bool(semantic_question or ambiguous_action or timed_pending or pending_query_kind(source) or domain and re.search(
         r"查|看看|看下|多少|有所少|几条|几个|有哪些|哪些|数量|清单|情况|结果|状态|详情|明细|脚本|原文|谁|呢|有没有|还有", source)
         or execution_question(source)
         or query_followup(source) and (history or re.fullmatch(r"(?:那|这)?(?:它|这条|这单|这个|\d{5}|结果|影响条数|耗时|异常)(?:的)?呢[？?。]*", source)))
@@ -111,7 +157,7 @@ def query_clarification_candidate(source):
     return query_candidate(source) and bool(re.search(r"单子|单据|单号|工单|运维|需求|任务", str(source or "")))
 
 
-def query_arguments(source, analysis, history=()):
+def query_arguments(source, analysis, history=(), *, today=None):
     if not query_candidate(source, history):
         raise ValueError("只支持任务与数据运维查询，不能修改需求")
     parsed = analysis.get("result")
@@ -128,9 +174,6 @@ def query_arguments(source, analysis, history=()):
     if kind not in QUERY_TYPES:
         raise ValueError("只支持任务处理情况、待处理清单、今日分配统计、执行情况和待审核/待执行查询")
     kind = pending_query_kind(source) or kind
-    if kind in {"pending_approvals", "pending_executions", "pending_maintenance"} and re.search(
-        r"昨天|昨日|上周|本周|这周|本月|上月|前天|最近\d|过去|\d{4}[-年/]|(?:今天|今日).*?(?:新增|新提交|填报|申请|审批通过)|(?:新增|新提交|填报|申请|审批通过).*?(?:今天|今日)", str(source)):
-        raise ValueError("待审核和待执行目前支持当前积压清单，包含以前提交的单据；暂不支持按新增、填报或审批日期筛选。")
     if execution_question(source) or re.search(r"执行(?:的)?(?:详情|明细)|SQL\s*(?:原文|脚本)|完整\s*SQL", str(source), re.I):
         kind = "execution"
     if history and query_followup(source) and not re.search(r"执行|审核|审批|影响|需求|任务|处理|分配|派发|综合查询|受理人|履历|SQL\s*(?:原文|脚本)|完整\s*SQL", str(source), re.I):
@@ -170,6 +213,10 @@ def query_arguments(source, analysis, history=()):
         if actual != identifier:
             raise ValueError("识别编号与原消息不一致，请重新说明需求编号")
     arguments = {"query_type": kind, "identifier": identifier}
+    if kind in {"pending_approvals", "pending_executions", "pending_maintenance"}:
+        date_from, date_to, date_label = pending_date_range(source, today=today)
+        if date_from:
+            arguments.update(date_from=date_from, date_to=date_to, date_label=date_label)
     if kind in {"pending_tasks", "today_assignments"}:
         if re.search(r"昨天|昨日|上周|本周|这周|本月|上月|前天|最近\d|过去|\d{4}[-年/]", str(source)):
             raise ValueError("分配时间统计目前支持今天，请说明：今天分配了多少任务")
@@ -190,6 +237,16 @@ def query_memory_turn(source, arguments, reply, *, message_id="", connection_id=
             "message": str(source)[:1500], "arguments": dict(arguments),
             "answer": str(reply)[:1500]}
     if isinstance(payload, dict):
+        approval_payload = None
+        if arguments.get("query_type") == "pending_approvals":
+            approval_payload = payload
+        elif arguments.get("query_type") == "pending_maintenance":
+            approval_payload = next((part for part in payload.get("results", [])
+                if part.get("query_type") == "pending_approvals" and not part.get("error")), None)
+        if isinstance(approval_payload, dict):
+            turn["approval_targets"] = {"count": approval_payload.get("count"), "items": [
+                {k: str(item.get(k) or "") for k in ("identifier", "work_num", "work_id")}
+                for item in (approval_payload.get("items") or [])[:20]]}
         execution_payload = None
         if arguments.get("query_type") == "pending_executions":
             execution_payload = payload
@@ -212,7 +269,7 @@ def query_tool_call(arguments):
         return TASK_QUERY_TOOL, {"identifier": arguments["identifier"]}
     if arguments["query_type"] in {"pending_tasks", "today_assignments"}:
         return TASK_SUMMARY_TOOL, {k: arguments[k] for k in ("query_type", "offset", "limit")}
-    return QUERY_TOOL, arguments
+    return QUERY_TOOL, {key: arguments[key] for key in ("query_type", "identifier", "date_from", "date_to") if key in arguments}
 
 
 def query_reply(payload, *, include_sql=False):
@@ -221,8 +278,12 @@ def query_reply(payload, *, include_sql=False):
     kind = payload.get("query_type")
     lines = [QUERY_REPLY_PREFIX]
     if kind == "pending_maintenance":
-        lines.append("当前积压清单，包含以前提交的单据，不仅限今天新增。")
         results = {part.get("query_type"): part for part in payload.get("results", []) if isinstance(part, dict)}
+        filtered = next((part for part in results.values() if part.get("date_from")), None)
+        if filtered:
+            lines.append(f"指定时间范围内产生且当前仍待处理的清单：{filtered['date_from']} 至 {filtered.get('date_to') or filtered['date_from']}。")
+        else:
+            lines.append("当前积压清单，包含以前提交的单据，不仅限今天新增。")
         for part_kind, label in (("pending_approvals", "待审核"), ("pending_executions", "待执行")):
             part = results.get(part_kind)
             if not part or part.get("error"):
@@ -281,8 +342,12 @@ def query_reply(payload, *, include_sql=False):
         label = "待审核" if kind == "pending_approvals" else "待执行"
         count = payload.get("count")
         lines.append(f"目前{label}需求：{count if count is not None else '未知'} 条")
+        if payload.get("date_from"):
+            lines.append(f"时间范围：{payload['date_from']} 至 {payload.get('date_to') or payload['date_from']}（按{payload.get('date_field') or '业务时间'}）")
         for index, item in enumerate(payload.get("items") or [], 1):
             lines.append(f"{index}. {item.get('identifier') or '未命名'}；工作编号 {item.get('work_num') or '未知'}；{item.get('status') or label}")
+            if item.get("relevant_date"):
+                lines.append("业务时间：" + str(item["relevant_date"]))
         if payload.get("has_more"):
             lines.append(f"以上展示前 {payload.get('shown_count', 20)} 条。")
     else:

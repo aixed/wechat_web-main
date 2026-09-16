@@ -40,10 +40,12 @@ from pb_parser import parse_raw_pb
 from smart_reply import SmartReplyEngine, _mention_targets
 from ai_service import AiService, AiServiceError
 from mcp_service import McpService, McpServiceError
-from domp_bridge import WORKFLOW_TOOL, workflow_arguments, workflow_reply, split_reply, strip_chat_mentions
+from domp_bridge import SQL_START, WORKFLOW_TOOL, workflow_arguments, workflow_reply, split_reply, strip_chat_mentions
 from domp_query_bridge import QUERY_TOOL, QUERY_REPLY_PREFIX, query_candidate, query_followup, query_analysis_content, query_arguments, query_tool_call, query_reply, query_reply_chunks, query_memory_turn, owner_query_config, execution_details_requested, explicit_pending_analysis, query_clarification_candidate
-from domp_execution_bridge import EXECUTION_TOOL, EXECUTION_REPLY_PREFIX, execution_candidate, execution_target, execute_target, execution_reply_chunks, owner_execution_config
+from domp_execution_bridge import EXECUTION_TOOL, EXECUTION_REPLY_PREFIX, execution_candidate, execution_target, execute_target, execution_reply_chunks, owner_execution_config, approval_execution_candidate, approval_execution_targets, approve_execute_targets
+from domp_approval_bridge import APPROVAL_TOOL, APPROVAL_REPLY_PREFIX, approval_candidate, approval_target, approve_target, approval_reply_chunks, owner_approval_config
 from domp_submission_bridge import SUBMISSION_TOOL, SUBMISSION_REPLY_PREFIX, SUBMISSION_PROMPT, submission_candidate, submission_arguments, submission_reply, submission_reply_chunks, owner_submission_config
+from domp_unified_bridge import UNIFIED_SKILL_NAME, is_unified_task, submission_workflow_identifier, unified_candidate, unified_route, owner_unified_config
 from daily_log import append_daily_log
 
 
@@ -3493,6 +3495,15 @@ def _fallback_mcp_reply(
 
 
 async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple[str, ...]:
+    if is_unified_task(task) and not task.get("_unified_routed"):
+        if not bool(result.get("matched")):
+            return ()
+        try:
+            tool_name, routed_result = unified_route(task.get("_source_content"), result)
+        except ValueError as exc:
+            return (UNIFIED_SKILL_NAME + "：" + str(exc),)
+        routed_task = {**task, "mcp_tool_name": tool_name, "_unified_routed": True}
+        return await _mcp_task_reply(routed_task, routed_result)
     if str(task.get("mcp_tool_name") or "") == SUBMISSION_TOOL and "_source_content" in task:
         if not _ai_result_matches(task, result):
             return (SUBMISSION_REPLY_PREFIX + "：未识别到足够明确的填报请求，未提交。",)
@@ -3511,13 +3522,35 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
         except McpServiceError as exc:
             return submission_reply_chunks(SUBMISSION_REPLY_PREFIX + f"：需求 {arguments['identifier']} 提交调用响应异常，结果待核对，请勿重复提交：{exc}")
         return submission_reply_chunks(submission_reply(called.get("structured"), arguments["identifier"]))
+    if str(task.get("mcp_tool_name") or "") == APPROVAL_TOOL:
+        if not bool(result.get("matched")) or not _ai_result_matches(task, result):
+            return (APPROVAL_REPLY_PREFIX + "：未识别到足够明确的审核指令，未审核。请说明：审核数据运维单 41366。",)
+        context = task.get("_source_context") or {}
+        history = _query_history_for(context, str(task.get("mcp_connection_id") or ""))
+        try:
+            action, target = approval_target(task.get("_source_content"), result, history)
+        except ValueError as exc:
+            return approval_reply_chunks(APPROVAL_REPLY_PREFIX + "：" + str(exc))
+        connection = _mcp_connection(str(task.get("mcp_connection_id") or ""))
+        if not connection or not bool(connection.get("enabled", True)):
+            return (APPROVAL_REPLY_PREFIX + "：数据运维连接未启用，未审核。",)
+        async def call_tool(name, arguments):
+            return await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""), tool_name=name, arguments=arguments)
+        try:
+            dry_run = not all(context.get(key) for key in ("owner_wxid", "chat_id", "sender", "message_id"))
+            reply = await approve_target(action, target, call_tool, dry_run=dry_run)
+        except (ValueError, McpServiceError) as exc:
+            return approval_reply_chunks(APPROVAL_REPLY_PREFIX + "：未完成审核请求：" + str(exc))
+        return approval_reply_chunks(reply)
     if str(task.get("mcp_tool_name") or "") == EXECUTION_TOOL:
         if not bool(result.get("matched")) or not _ai_result_matches(task, result):
             return (EXECUTION_REPLY_PREFIX + "：未识别到足够明确的执行指令，未执行。请说明：执行 41184。",)
         context = task.get("_source_context") or {}
         history = _query_history_for(context, str(task.get("mcp_connection_id") or ""))
+        batch = approval_execution_candidate(task.get("_source_content"))
         try:
-            target = execution_target(task.get("_source_content"), result, history)
+            target = (approval_execution_targets(task.get("_source_content"), result, history) if batch else
+                execution_target(task.get("_source_content"), result, history))
         except ValueError as exc:
             return (EXECUTION_REPLY_PREFIX + "：" + str(exc),)
         connection = _mcp_connection(str(task.get("mcp_connection_id") or ""))
@@ -3526,8 +3559,12 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
         async def call_tool(name, arguments):
             return await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""), tool_name=name, arguments=arguments)
         try:
-            reply, work_num = await execute_target(target, call_tool,
-                dry_run=not all(context.get(k) for k in ("owner_wxid", "chat_id", "sender", "message_id")))
+            dry_run = not all(context.get(k) for k in ("owner_wxid", "chat_id", "sender", "message_id"))
+            if batch:
+                reply = await approve_execute_targets(target, call_tool, dry_run=dry_run)
+                work_num = ""
+            else:
+                reply, work_num = await execute_target(target, call_tool, dry_run=dry_run)
         except (ValueError, McpServiceError) as exc:
             return execution_reply_chunks(EXECUTION_REPLY_PREFIX + "：未完成执行请求：" + str(exc))
         if work_num and all(context.get(k) for k in ("owner_wxid", "chat_id", "sender")):
@@ -3559,8 +3596,10 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
                 payload = {"query_type": "pending_maintenance", "results": []}
                 for kind in ("pending_approvals", "pending_executions"):
                     try:
+                        part_arguments = {"query_type": kind, "identifier": ""}
+                        part_arguments.update({key: arguments[key] for key in ("date_from", "date_to") if key in arguments})
                         called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""),
-                            tool_name=QUERY_TOOL, arguments={"query_type": kind, "identifier": ""})
+                            tool_name=QUERY_TOOL, arguments=part_arguments)
                         part = called.get("structured")
                         if not isinstance(part, dict) or part.get("query_type") != kind:
                             raise McpServiceError("未取得该类别的结构化查询结果")
@@ -3888,6 +3927,53 @@ def _query_history_for(context, connection_id=""):
     return [t for t in (session or {}).get("turns", []) if t.get("connection_id", "") == connection_id]
 
 
+_RECENT_SQL_FILE_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+async def _recent_sql_workflow_content(source, context):
+    """Bind an explicit combined request to the sender's recent, exact-id TXT."""
+    identifier = submission_workflow_identifier(source)
+    if not identifier or not context or not all(context.get(key) for key in ("owner_wxid", "chat_id", "sender")):
+        return "", "not_combined_or_missing_context"
+    try:
+        current_timestamp = int(context.get("message_timestamp") or time.time())
+    except (TypeError, ValueError):
+        current_timestamp = int(time.time())
+    messages = sqlite_cache.get_messages(
+        context["chat_id"], limit=100, before=current_timestamp + 1,
+        owner_wxid=context["owner_wxid"],
+    )
+    filename_pattern = re.compile(
+        rf"^(?:(?:需求|xzsb-)\s*)?{re.escape(identifier)}(?:\s*\(\d+\))?\.txt$",
+        re.I,
+    )
+    last_reason = "matching_txt_not_found"
+    for message in reversed(messages):
+        try:
+            message_timestamp = int(message.get("timestamp") or message.get("time_unix") or 0)
+        except (TypeError, ValueError):
+            message_timestamp = 0
+        if message_timestamp and current_timestamp - message_timestamp > _RECENT_SQL_FILE_MAX_AGE_SECONDS:
+            break
+        if (message_timestamp > current_timestamp or str(message.get("msgtype") or "") != "49"
+                or str(message.get("fromid") or "") != str(context["sender"])):
+            continue
+        local_name = os.path.basename(str(message.get("file_path") or "").replace("\\", "/"))
+        title_match = re.search(r"<title>(.*?)</title>", str(message.get("msg") or ""), re.I | re.S)
+        xml_name = html.unescape(title_match.group(1).strip()) if title_match else ""
+        if not any(filename_pattern.fullmatch(name.strip()) for name in (xml_name, local_name) if name):
+            continue
+        content, reason = await _smart_reply_file_ai_content(message, ["txt"])
+        if not content:
+            last_reason = reason
+            continue
+        if not SQL_START.search(content):
+            last_reason = "matching_txt_has_no_sql"
+            continue
+        return f"操作要求：填报运维单 {identifier}，审核通过后执行。\n{content}", "ok"
+    return "", last_reason
+
+
 def _sql_chat_mention_names(message, chat_id, owner_wxid):
     targets = _mention_targets(message)
     if not targets or str(message.get("msgtype")) != "1" or not chat_id.endswith("@chatroom"):
@@ -3914,11 +4000,26 @@ async def _evaluate_ai_tasks(
     if (source_context or {}).get("message_type") == "text":
         content = strip_chat_mentions(content, source_context.get("mention_names") or [])
     enabled_tasks = [task for task in tasks if isinstance(task, dict) and bool(task.get("enabled"))]
+    combined_identifier = submission_workflow_identifier(content)
+    if combined_identifier and any(is_unified_task(task) for task in enabled_tasks):
+        content, reason = await _recent_sql_workflow_content(content, source_context or {})
+        if not content:
+            return (UNIFIED_SKILL_NAME + f"：未找到同一发送人 24 小时内编号为 {combined_identifier} 的可读取 TXT SQL（{reason}），未填报、审核或执行。请先发送该 TXT，再发送本指令。",)
     prepared = []
     for task in enabled_tasks:
+        if is_unified_task(task):
+            history = _query_history_for(source_context, str(task.get("mcp_connection_id") or ""))
+            if not unified_candidate(content, history, message_type=str(task.get("message_type") or "text")):
+                continue
+            prepared.append({**task, "_query_history": history})
+            continue
         if task.get("mcp_tool_name") == SUBMISSION_TOOL:
             if not submission_candidate(content):
                 continue
+        if task.get("mcp_tool_name") == APPROVAL_TOOL:
+            if not approval_candidate(content):
+                continue
+            task = {**task, "_query_history": _query_history_for(source_context, str(task.get("mcp_connection_id") or ""))}
         if task.get("mcp_tool_name") == EXECUTION_TOOL:
             if not execution_candidate(content):
                 continue
@@ -3931,10 +4032,14 @@ async def _evaluate_ai_tasks(
         prepared.append(task)
     # A query follow-up stays in the read-only Agent, even when a SQL workflow
     # Skill is configured in the same group.
+    has_unified = any(is_unified_task(t) for t in prepared)
     has_query = any(t.get("mcp_tool_name") == QUERY_TOOL for t in prepared)
+    has_approval = any(t.get("mcp_tool_name") == APPROVAL_TOOL for t in prepared)
     has_execution = any(t.get("mcp_tool_name") == EXECUTION_TOOL for t in prepared)
     has_submission = any(t.get("mcp_tool_name") == SUBMISSION_TOOL for t in prepared)
-    enabled_tasks = ([next(t for t in prepared if t.get("mcp_tool_name") == SUBMISSION_TOOL)] if has_submission else
+    enabled_tasks = ([next(t for t in prepared if is_unified_task(t))] if has_unified else
+        [next(t for t in prepared if t.get("mcp_tool_name") == SUBMISSION_TOOL)] if has_submission else
+        [next(t for t in prepared if t.get("mcp_tool_name") == APPROVAL_TOOL)] if has_approval else
         [next(t for t in prepared if t.get("mcp_tool_name") == EXECUTION_TOOL)] if has_execution else
         [t for t in prepared if not has_query or t.get("mcp_tool_name") != WORKFLOW_TOOL])
     if not enabled_tasks:
@@ -3944,15 +4049,28 @@ async def _evaluate_ai_tasks(
         _smart_reply_log(f"[AI_REPLY] skipped message_id={message_id}: AI service is not configured")
         if has_submission:
             return (SUBMISSION_REPLY_PREFIX + "：分析服务未配置，未提交。",)
+        if has_approval:
+            return (APPROVAL_REPLY_PREFIX + "：分析服务未配置，未审核。",)
         if has_execution:
             return (EXECUTION_REPLY_PREFIX + "：分析服务未配置，未执行。",)
+        if has_unified:
+            return (UNIFIED_SKILL_NAME + "：分析服务未配置，未调用数据运维工具。",)
         if any(task.get("mcp_tool_name") == QUERY_TOOL for task in enabled_tasks):
             return (QUERY_REPLY_PREFIX + "：分析服务未配置，未取得查询结果。",)
         if any(task.get("mcp_tool_name") == WORKFLOW_TOOL for task in enabled_tasks):
             return ("SQL 分析服务未配置，未启动数据运维流程。",)
         return ()
     async def _analyze_task(task: dict[str, Any]) -> dict[str, Any]:
-        if task.get("mcp_tool_name") == EXECUTION_TOOL:
+        if is_unified_task(task):
+            explicit = explicit_pending_analysis(content)
+            if explicit:
+                parsed = json.loads(explicit["result"])
+                parsed.update(intent="query", sql_purpose="", risk_level="", risk_notes=[], needs_clarification=False)
+                return {**explicit, "result": json.dumps(parsed, ensure_ascii=False)}
+            history = task.get("_query_history") or []
+            analysis_content = content if SQL_START.search(content) else query_analysis_content(content, history)
+            return await ai_service.analyze(analysis_content, task)
+        if task.get("mcp_tool_name") in {APPROVAL_TOOL, EXECUTION_TOOL}:
             return await ai_service.analyze(query_analysis_content(content, task.get("_query_history") or []), task)
         if task.get("mcp_tool_name") == QUERY_TOOL:
             history = task.get("_query_history") or []
@@ -3985,6 +4103,10 @@ async def _evaluate_ai_tasks(
             )
             if task.get("mcp_tool_name") == SUBMISSION_TOOL:
                 replies.append(SUBMISSION_REPLY_PREFIX + "：填报意图分析失败，未提交。")
+            elif is_unified_task(task):
+                replies.append(UNIFIED_SKILL_NAME + "：意图分析失败，未调用数据运维工具。")
+            elif task.get("mcp_tool_name") == APPROVAL_TOOL:
+                replies.append(APPROVAL_REPLY_PREFIX + "：审核意图分析失败，未审核。")
             elif task.get("mcp_tool_name") == EXECUTION_TOOL:
                 replies.append(EXECUTION_REPLY_PREFIX + "：执行意图分析失败，未执行。")
             elif task.get("mcp_tool_name") == QUERY_TOOL:
@@ -4001,7 +4123,8 @@ async def _evaluate_ai_tasks(
                     f"[MCP_REPLY] task failed message_id={message_id} id={task.get('id', '')} "
                     f"tool={task.get('mcp_tool_name') or 'auto'}: {exc}"
                 )
-                task_replies = ((EXECUTION_REPLY_PREFIX + "：执行请求结果待核对，请查询单据执行情况，不要重复执行。",) if task.get("mcp_tool_name") == EXECUTION_TOOL else _ai_result_replies(task, result))
+                task_replies = ((APPROVAL_REPLY_PREFIX + "：审核请求结果待核对，请查询单据状态，不要重复审核。",) if task.get("mcp_tool_name") == APPROVAL_TOOL else
+                    (EXECUTION_REPLY_PREFIX + "：执行请求结果待核对，请查询单据执行情况，不要重复执行。",) if task.get("mcp_tool_name") == EXECUTION_TOOL else _ai_result_replies(task, result))
             _smart_reply_log(
                 f"[MCP_REPLY] task completed message_id={message_id} id={task.get('id', '')} "
                 f"tool={task.get('mcp_tool_name') or 'auto'} replies={len(task_replies)}"
@@ -4050,9 +4173,11 @@ async def _process_smart_reply_message_unlocked(
     config_row = sqlite_cache.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
     if not config_row:
         return
-    query_task = next((t for t in config_row.get("ai_tasks") or [] if t.get("enabled") and t.get("mcp_tool_name") == QUERY_TOOL), {})
+    query_task = next((t for t in config_row.get("ai_tasks") or [] if t.get("enabled") and (t.get("mcp_tool_name") == QUERY_TOOL or is_unified_task(t))), {})
     query_history = _query_history_for({"owner_wxid": owner_wxid, "chat_id": chat_id, "sender": str(message.get("fromid") or "")}, str(query_task.get("mcp_connection_id") or "")) if query_task else []
-    query_config = ((owner_submission_config(config_row, message, owner_wxid) or owner_execution_config(config_row, message, owner_wxid) or owner_query_config(config_row, message, owner_wxid, query_history)) if owner_wxid == self_wxid else None)
+    query_config = ((owner_unified_config(config_row, message, owner_wxid, query_history)
+        or owner_submission_config(config_row, message, owner_wxid) or owner_approval_config(config_row, message, owner_wxid)
+        or owner_execution_config(config_row, message, owner_wxid) or owner_query_config(config_row, message, owner_wxid, query_history)) if owner_wxid == self_wxid else None)
     if query_config is not None:
         config_row = query_config
         message = {**message, "isSender": 0, "sendorrecv": "2"}
@@ -4155,7 +4280,7 @@ async def _process_smart_reply_message_unlocked(
                     f"[SMART_REPLY] skipped file message_id={message_id} chat={chat_id} "
                     f"sender={message.get('fromid', '')} reason={file_reason}"
                 )
-                if not any(task.get("enabled") and task.get("mcp_enabled") and task.get("mcp_tool_name") == WORKFLOW_TOOL for task in ai_tasks):
+                if not any(task.get("enabled") and task.get("mcp_enabled") and (task.get("mcp_tool_name") == WORKFLOW_TOOL or is_unified_task(task)) for task in ai_tasks):
                     return
                 reason_labels = {"input_too_large": "TXT 超过完整分析的长度限制", "oversized_file": "TXT 文件过大", "decode_failed": "TXT 编码无法识别", "missing_file": "TXT 文件未下载成功", "invalid_file_content": "TXT 包含无效字符"}
                 decision = smart_reply_engine.reserve_ai_replies(owner_wxid=owner_wxid, chat_id=chat_id, message=message,
@@ -4187,14 +4312,15 @@ async def _process_smart_reply_message_unlocked(
                 message_id=message_id,
                 image_data_url=image_data_url,
                 source_context={"owner_wxid": owner_wxid, "chat_id": chat_id, "sender": str(message.get("fromid") or ""), "message_id": str(message.get("id") or ""),
-                    "message_type": ai_message_type, "mention_names": _sql_chat_mention_names(message, chat_id, owner_wxid)},
+                    "message_type": ai_message_type, "message_timestamp": message.get("timestamp") or message.get("time_unix") or int(time.time()),
+                    "mention_names": _sql_chat_mention_names(message, chat_id, owner_wxid)},
             )
             decision = smart_reply_engine.reserve_ai_replies(
                 owner_wxid=owner_wxid,
                 chat_id=chat_id,
                 message=message,
                 replies=ai_replies,
-                conversation=bool(ai_replies) and all(reply.startswith((QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, SUBMISSION_REPLY_PREFIX)) for reply in ai_replies),
+                conversation=bool(ai_replies) and all(reply.startswith((QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, SUBMISSION_REPLY_PREFIX, APPROVAL_REPLY_PREFIX)) for reply in ai_replies),
             )
             if not decision.should_send:
                 _smart_reply_log(
@@ -4214,7 +4340,7 @@ async def _process_smart_reply_message_unlocked(
         use_no_src = bool(config_row.get("use_no_src"))
         workflow_reply_to_sender = any(
             isinstance(task, dict) and task.get("enabled") and task.get("mcp_enabled")
-            and task.get("mcp_tool_name") in {WORKFLOW_TOOL, QUERY_TOOL, EXECUTION_TOOL, SUBMISSION_TOOL}
+            and (task.get("mcp_tool_name") in {WORKFLOW_TOOL, QUERY_TOOL, APPROVAL_TOOL, EXECUTION_TOOL, SUBMISSION_TOOL} or is_unified_task(task))
             and task.get("message_type", "text") == {"1": "text", "49": "file"}.get(str(message.get("msgtype")))
             for task in config_row.get("ai_tasks") or []
         )

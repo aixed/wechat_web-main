@@ -1,8 +1,9 @@
 import json
 import unittest
+from datetime import date, timedelta
 from unittest.mock import patch
 
-from domp_execution_bridge import EXECUTION_TOOL, EXECUTION_PROMPT, EXECUTION_REPLY_PREFIX, execution_candidate, execution_target, execute_target, execution_reply_chunks
+from domp_execution_bridge import EXECUTION_TOOL, EXECUTION_PROMPT, EXECUTION_REPLY_PREFIX, execution_candidate, execution_target, execute_target, execution_reply_chunks, approval_execution_candidate, approval_execution_targets, approve_execute_targets
 from domp_query_bridge import QUERY_TOOL, QUERY_REPLY_PREFIX, TASK_SUMMARY_TOOL, query_arguments, query_tool_call, query_memory_turn, query_reply
 from mcp_service import McpServiceError
 import test_domp_query_bridge as fixtures
@@ -10,6 +11,7 @@ import test_domp_query_bridge as fixtures
 ITEM = {"work_id":"5400000000383894", "work_num":"5400000000383893", "work_name":"41184", "work_status":"2"}
 PENDING = {"query_type":"pending_executions", "count":1, "items":[{**ITEM,"identifier":"41184","status":"通过"}]}
 EXEC_ANALYSIS = {"matched":True,"confidence":98,"result":'{"action":"execute","identifier":""}'}
+BATCH_ANALYSIS = {"matched":True,"confidence":98,"result":'{"action":"approve_execute_all","identifier":""}'}
 EXEC_RESULT = {"status":"执行成功", "complete":True,"affected_rows_total":4,"exceptions":[],
     "details":[{"status":"执行成功","affected_rows":4,"elapsed_seconds":0.06,"exception":""},
                {"status":"执行成功","affected_rows":0,"elapsed_seconds":0.01,"exception":""}]}
@@ -20,7 +22,73 @@ def history(payload=PENDING):
     return [query_memory_turn("查一下待执行的任务有多少", args, query_reply(payload), connection_id="local_mcp", payload=payload)]
 
 
+def approval_history(items=None, count=None):
+    items = items or [{**ITEM, "identifier": "41184", "status": "待审批"}]
+    payload = {"query_type": "pending_approvals", "count": len(items) if count is None else count, "items": items}
+    return [query_memory_turn("查一下待审核的数据运维单", {"query_type": "pending_approvals", "identifier": ""},
+        query_reply(payload), connection_id="local_mcp", payload=payload)]
+
+
 class ExecutionBridgeTests(unittest.IsolatedAsyncioTestCase):
+    def test_batch_approval_execution_requires_explicit_action_and_verified_complete_targets(self):
+        for source in ("都审核执行一下", "全部审批并执行", "把上面的单子都审核后执行"):
+            self.assertTrue(approval_execution_candidate(source), source)
+            self.assertTrue(execution_candidate(source), source)
+            targets = approval_execution_targets(source, BATCH_ANALYSIS, approval_history())
+            self.assertEqual(ITEM["work_num"], targets[0]["work_num"])
+        for source in ("都执行一下", "都审核一下", "可以都审核执行吗", "不要都审核执行", "例如都审核执行一下"):
+            self.assertFalse(approval_execution_candidate(source), source)
+        with self.assertRaises(ValueError):
+            approval_execution_targets("都审核执行一下", BATCH_ANALYSIS, [])
+        with self.assertRaises(ValueError):
+            approval_execution_targets("都审核执行一下", BATCH_ANALYSIS, approval_history(count=21))
+        with self.assertRaises(ValueError):
+            approval_execution_targets("都审核执行一下", EXEC_ANALYSIS, approval_history())
+        legacy = approval_history(); legacy[0].pop("approval_targets")
+        self.assertEqual(ITEM["work_num"], approval_execution_targets("都审核执行一下", BATCH_ANALYSIS, legacy)[0]["work_num"])
+
+    async def test_batch_revalidates_then_approves_and_executes_each_target_once(self):
+        second = {"work_id": "5400000000383900", "work_num": "5400000000383899", "work_name": "41185", "identifier": "41185", "work_status": "0"}
+        items = [{**ITEM, "identifier": "41184"}, second]
+        targets = approval_execution_targets("都审核执行一下", BATCH_ANALYSIS, approval_history(items))
+        calls = []
+        async def call(name, args):
+            calls.append((name, args))
+            if name == QUERY_TOOL:
+                return {"structured": {"query_type": "pending_approvals", "count": 2, "items": items}}
+            if name == "approve_data_maintenance":
+                return {"structured": {**args, "status": "审核通过"}}
+            return {"structured": EXEC_RESULT if args["work_num"] == ITEM["work_num"] else
+                {"status": "执行成功", "complete": True, "affected_rows_total": 0, "details": [], "exceptions": []}}
+        reply = await approve_execute_targets(targets, call)
+        self.assertEqual([QUERY_TOOL, "approve_data_maintenance", EXECUTION_TOOL,
+                          "approve_data_maintenance", EXECUTION_TOOL], [name for name, _ in calls])
+        self.assertIn("批量目标：2 条", reply)
+        self.assertIn("影响条数合计：4", reply)
+        self.assertIn("影响条数合计：0", reply)
+
+    async def test_batch_stale_or_dry_run_never_writes_and_uncertain_approval_is_not_executed(self):
+        targets = approval_execution_targets("都审核执行一下", BATCH_ANALYSIS, approval_history())
+        calls = []
+        async def stale(name, args):
+            calls.append(name); return {"structured": {"query_type": "pending_approvals", "count": 0, "items": []}}
+        with self.assertRaises(ValueError):
+            await approve_execute_targets(targets, stale)
+        self.assertEqual([QUERY_TOOL], calls)
+        calls.clear()
+        async def present(name, args):
+            calls.append(name)
+            if name == QUERY_TOOL:
+                return {"structured": {"query_type": "pending_approvals", "count": 1, "items": [{**ITEM, "identifier": "41184"}]}}
+            raise McpServiceError("审核超时")
+        self.assertIn("仅查询", await approve_execute_targets(targets, present, dry_run=True))
+        self.assertEqual([QUERY_TOOL], calls)
+        calls.clear()
+        reply = await approve_execute_targets(targets, present)
+        self.assertEqual([QUERY_TOOL, "approve_data_maintenance"], calls)
+        self.assertIn("审核：待核对", reply)
+        self.assertIn("执行：未开始", reply)
+
     def test_commands_queries_and_legacy_stable_target(self):
         for source in ("执行下并告诉我结果","执行一下","帮我执行41184","41184 执行下","把这单执行一下",
                        "兄弟，帮我执行下 41184","老师，麻烦把数据运维单 41184 执行一下", "@助手 帮我执行下41184", "41184，麻烦执行一下"):
@@ -93,6 +161,7 @@ class ExecutionGroupTests(unittest.IsolatedAsyncioTestCase):
             self.calls.append(kwargs)
             name=kwargs["tool_name"]
             if name=="list_data_maintenance_executions":return {"structured":{"items":[ITEM]}}
+            if name=="approve_data_maintenance":return {"structured":{**kwargs["arguments"],"status":"审核通过"}}
             if name==EXECUTION_TOOL:return {"structured":EXEC_RESULT}
             return {"structured":self.query_result}
         self.main.ai_service.analyze=analyze;self.main.mcp_service.call_tool=call_tool
@@ -110,6 +179,43 @@ class ExecutionGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SQL 2：执行成功，影响 0 条",reply);self.assertIn("异常详情：无",reply)
         await self.process(self.message(id="102",msg=reply,fromid=self.owner,isSender=1))
         self.assertEqual(3,len(self.calls))
+
+    async def test_pending_approval_followup_routes_to_pinned_batch_approval_and_execution(self):
+        self.query_analysis={**fixtures.ANALYZED,"result":'{"query_type":"pending_approvals","identifier":""}'}
+        self.query_result={"query_type":"pending_approvals","count":1,"items":[{**ITEM,"identifier":"41184","status":"待审批"}]}
+        await self.process(self.message(msg="查一下待审核的数据运维单",fromid=self.owner,isSender=1))
+        self.exec_analysis=BATCH_ANALYSIS
+        await self.process(self.message(id="151",msg="都审核执行一下",fromid=self.owner,isSender=1))
+        self.assertEqual([QUERY_TOOL, QUERY_TOOL, "approve_data_maintenance", EXECUTION_TOOL],
+            [call["tool_name"] for call in self.calls])
+        reply=self.send.call_args.args[3]
+        self.assertIn("审核：审核通过",reply)
+        self.assertIn("执行：执行成功",reply)
+        self.assertIn("影响条数合计：4",reply)
+
+    async def test_allowed_sender_yesterday_query_then_batch_is_supported(self):
+        self.query_analysis={**fixtures.ANALYZED,"result":'{"query_type":"pending_maintenance","identifier":""}'}
+        yesterday=(date.today()-timedelta(days=1)).isoformat()
+        approval={"query_type":"pending_approvals","date_from":yesterday,"date_to":yesterday,"date_field":"申请时间",
+            "count":1,"items":[{**ITEM,"identifier":"41184","status":"待审批"}]}
+        execution={"query_type":"pending_executions","date_from":yesterday,"date_to":yesterday,"date_field":"审批通过时间","count":0,"items":[]}
+        async def call_tool(**kwargs):
+            self.calls.append(kwargs); name=kwargs["tool_name"]
+            if name==QUERY_TOOL:
+                kind=kwargs["arguments"]["query_type"]
+                return {"structured":approval if kind=="pending_approvals" else execution}
+            if name=="approve_data_maintenance":return {"structured":{**kwargs["arguments"],"status":"审核通过"}}
+            if name==EXECUTION_TOOL:return {"structured":EXEC_RESULT}
+            raise AssertionError(name)
+        self.main.mcp_service.call_tool=call_tool
+        await self.process(self.message(msg="昨天的还有没审核执行的不@Aixed"))
+        self.assertTrue(all(call["arguments"].get("date_from")==yesterday for call in self.calls[:2]))
+        self.exec_analysis=BATCH_ANALYSIS
+        await self.process(self.message(id="181",msg="都审核执行一下@Aixed"))
+        self.assertEqual([QUERY_TOOL,QUERY_TOOL,QUERY_TOOL,"approve_data_maintenance",EXECUTION_TOOL],
+            [call["tool_name"] for call in self.calls])
+        self.assertIn("审核：审核通过",self.send.call_args.args[3])
+        self.assertIn("执行：执行成功",self.send.call_args.args[3])
 
     async def test_reported_greeting_command_passes_owner_gate_and_validates_current_ticket(self):
         self.exec_analysis={**EXEC_ANALYSIS,"result":'{"action":"execute","identifier":"41184"}'}
