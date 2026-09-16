@@ -14,10 +14,15 @@ PAYLOAD = {'identifier': '41356', 'submitted': True, 'work_num': '54000000003839
 
 class SubmissionBridgeTests(unittest.TestCase):
     def test_explicit_submission_phrases_and_original_identifier(self):
-        for source in ('提交数据运维填报单 41356', '提交运维单 41356', '帮我提交数据运维单41356', '老师，麻烦把运维单41356提交一下', '提交运维单 xzsb-41356'):
+        for source in ('提交数据运维填报单 41356', '提交运维单 41356', '帮我提交数据运维单41356',
+                       '老师，麻烦把运维单41356提交一下', '提交运维单 xzsb-41356',
+                       '能不能帮我提交运维单41356', '可以帮我把运维单41356提交一下吗'):
             self.assertTrue(submission_candidate(source), source)
             self.assertEqual({'identifier': '41356', 'force': False}, submission_arguments(source, ANALYSIS))
-        for source in ('41356提交了吗', '查一下41356提交结果', '不要提交运维单41356', '明天提交运维单41356', '他说帮我提交运维单41356', '如何提交运维单41356', '提交运维单41356并执行', '提交运维单41356并审核', '需求41356 UPDATE t SET a=1 WHERE id=1', '重新提交运维单41356', '我已提交运维单41356'):
+        for source in ('41356提交了吗', '查一下41356提交结果', '不要提交运维单41356', '明天提交运维单41356',
+                       '他说帮我提交运维单41356', '如何提交运维单41356', '提交运维单41356并执行',
+                       '提交运维单41356并审核', '需求41356 UPDATE t SET a=1 WHERE id=1', '重新提交运维单41356',
+                       '我已提交运维单41356', '41356能不能提交', '“提交运维单41356”这句话能识别吗'):
             self.assertFalse(submission_candidate(source), source)
         for source, analysis in (('提交运维单41356和41357', ANALYSIS), ('提交运维单5400000000383911', ANALYSIS), ('提交运维单41356', {**ANALYSIS, 'result': '{"action":"submit","identifier":"41357"}'}), ('提交运维单41356', {**ANALYSIS, 'result': '{"action":"execute","identifier":"41356"}'})):
             with self.assertRaises(ValueError):

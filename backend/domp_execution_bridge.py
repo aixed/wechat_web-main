@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 import re
 
-from domp_bridge import SQL_START, split_reply
+from domp_bridge import (SQL_START, split_reply, write_capability_question,
+    write_meta_discussion)
 from domp_query_bridge import QUERY_TOOL, QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, execution_question, query_reply
 from mcp_service import McpServiceError
 
@@ -24,7 +25,9 @@ def approval_execution_candidate(source):
     if len(source) > 300 or SQL_START.search(source) or any(p in source for p in
         (QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, "数据运维填报结果", "流程标识：")):
         return False
-    if re.search(r"不要|别|不(?:要|用|能)?(?:审核|审批|执行)|停止|取消|如果|假如|明天|以后|计划|打算|能否|能不能|可以.*(?:吗|么|不)|是否|怎么|如何|(?:他|她|别人|有人)说|转述|转发|引用|例如|比如|示例|假设|提示词", source):
+    if write_meta_discussion(source) or write_capability_question(source):
+        return False
+    if re.search(r"不要|别|不(?:要|用|能)?\s*(?:审核|审批|执行)|停止|取消|如果|假如|明天|以后|计划|打算|怎么|如何|(?:他|她|别人|有人)说|转述|转发|引用|例如|比如|示例|假设|提示词", source):
         return False
     return bool(re.search(r"全部|所有|都|上面(?:的)?(?:这些)?|这些", source)
         and re.search(r"审核|审批", source) and re.search(r"执行", source))
@@ -36,7 +39,9 @@ def execution_candidate(source):
         return True
     if len(source) > 300 or SQL_START.search(source) or any(p in source for p in (QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, "数据运维填报结果", "流程标识：")):
         return False
-    if execution_question(source) or re.search(r"执行(?:的)?(?:结果|情况|状态|详情|明细|脚本|耗时|影响)|待执行|不要|别执行|不执行|不能|不用|停止|取消|如果|假如|明天|以后|计划|打算|能否|可以.*执行|怎么执行|如何执行|(?:他|她|别人|有人)说|转述|转发|引用|例如|比如|示例|假设|提示词", source):
+    if write_meta_discussion(source) or write_capability_question(source):
+        return False
+    if execution_question(source) or re.search(r"执行(?:的)?(?:结果|情况|状态|详情|明细|脚本|耗时|影响)|待执行|不要|别\s*执行|不\s*执行|不能\s*(?:再|直接)?\s*执行|不用\s*(?:再|帮我|帮忙)?\s*执行|停止|取消|如果|假如|明天|以后|计划|打算|怎么执行|如何执行|(?:他|她|别人|有人)说|转述|转发|引用|例如|比如|示例|假设|提示词", source):
         return False
     # Route clear requests inside natural speech, including greetings and
     # mentions. The model still confirms the action, and IDs are validated

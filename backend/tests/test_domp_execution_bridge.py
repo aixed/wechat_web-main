@@ -31,7 +31,8 @@ def approval_history(items=None, count=None):
 
 class ExecutionBridgeTests(unittest.IsolatedAsyncioTestCase):
     def test_batch_approval_execution_requires_explicit_action_and_verified_complete_targets(self):
-        for source in ("都审核执行一下", "全部审批并执行", "把上面的单子都审核后执行"):
+        for source in ("都审核执行一下", "全部审批并执行", "把上面的单子都审核后执行",
+                       "能不能帮我把上面的单子都审核后执行"):
             self.assertTrue(approval_execution_candidate(source), source)
             self.assertTrue(execution_candidate(source), source)
             targets = approval_execution_targets(source, BATCH_ANALYSIS, approval_history())
@@ -91,10 +92,12 @@ class ExecutionBridgeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_commands_queries_and_legacy_stable_target(self):
         for source in ("执行下并告诉我结果","执行一下","帮我执行41184","41184 执行下","把这单执行一下",
-                       "兄弟，帮我执行下 41184","老师，麻烦把数据运维单 41184 执行一下", "@助手 帮我执行下41184", "41184，麻烦执行一下"):
+                       "兄弟，帮我执行下 41184","老师，麻烦把数据运维单 41184 执行一下", "@助手 帮我执行下41184",
+                       "41184，麻烦执行一下", "能不能帮我执行41184", "可以帮我把41184执行一下吗"):
             self.assertTrue(execution_candidate(source),source)
         for source in ("41233 执行了吗，结果如何","执行结果如何","待执行呢","不要执行41184","如果41184执行下","明天执行41184",
-                       "兄弟，帮我查一下41184执行结果","兄弟，帮我看看41184有没有执行","兄弟，不要帮我执行41184", "他说帮我执行41184", "我已经执行41184"):
+                       "兄弟，帮我查一下41184执行结果","兄弟，帮我看看41184有没有执行","兄弟，不要帮我执行41184", "他说帮我执行41184",
+                       "我已经执行41184", "41184能不能执行", "‘执行41184’这句话能识别吗"):
             self.assertFalse(execution_candidate(source),source)
         target=execution_target("执行下并告诉我结果",EXEC_ANALYSIS,history())
         self.assertEqual(ITEM["work_num"],target["work_num"])

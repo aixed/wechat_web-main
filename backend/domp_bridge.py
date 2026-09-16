@@ -8,6 +8,37 @@ import re
 WORKFLOW_TOOL = "process_data_maintenance"
 SQL_START = re.compile(r"\b(?:UPDATE|SELECT|INSERT|DELETE|MERGE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|BEGIN|DECLARE|CALL|EXECUTE)\b", re.I)
 
+_POLITE_WRITE_REQUEST = re.compile(
+    r"(?:能不能|能否|可否|可不可以|是否可以|可以不可以|可以)?\s*"
+    r"(?:帮我|帮忙|替我|麻烦(?:你|您)?|劳驾(?:你|您)?|请(?:你|您)?|把|将)",
+    re.I,
+)
+_WRITE_CAPABILITY_QUESTION = re.compile(
+    r"能否|可否|能不能|可不可以|是否(?:可以|能够|能)?|可以.{0,40}(?:吗|么|不)[？?。!！]*$",
+    re.I,
+)
+_WRITE_META_DISCUSSION = re.compile(
+    r"提示词|prompt|(?:识别|理解|支持|触发).{0,30}(?:吗|么|规则|指令|说法|请求)|"
+    r"(?:这|那|这个|那个)(?:句|段|句话|说法|指令|请求|消息).{0,40}(?:识别|理解|支持|触发|处理)",
+    re.I | re.S,
+)
+
+
+def polite_write_request(source):
+    """Return whether a question-shaped phrase still directly asks us to act."""
+    return bool(_POLITE_WRITE_REQUEST.search(str(source or "")))
+
+
+def write_capability_question(source):
+    """Separate capability questions from polite imperative write requests."""
+    source = str(source or "")
+    return bool(_WRITE_CAPABILITY_QUESTION.search(source)) and not polite_write_request(source)
+
+
+def write_meta_discussion(source):
+    """Reject tests or discussions about wording before any write-intent model runs."""
+    return bool(_WRITE_META_DISCUSSION.search(str(source or "")))
+
 def _ends_with_sql_semicolon(source):
     state, quote, last, index = "normal", "", "", 0
     while index < len(source):

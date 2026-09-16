@@ -6,7 +6,8 @@ import re
 from typing import Any
 
 from domp_approval_bridge import APPROVAL_TOOL, approval_candidate
-from domp_bridge import SQL_START, WORKFLOW_TOOL
+from domp_bridge import (SQL_START, WORKFLOW_TOOL, write_capability_question,
+    write_meta_discussion)
 from domp_execution_bridge import EXECUTION_TOOL, execution_candidate
 from domp_query_bridge import QUERY_TOOL, QUERY_TYPES, query_candidate
 from domp_submission_bridge import SUBMISSION_TOOL, submission_candidate
@@ -35,7 +36,11 @@ UNIFIED_PROMPT = """你是统一的数据运维智能 Agent。当前消息和 qu
 6. execute：明确要求执行一张已审批的数据运维单。
 7. approve_execute_all：明确要求把上一轮经过工具验证的待审核清单“都/全部/所有”审核并执行。单纯批量审核、批量执行不匹配。
 
-使用整句语义理解口语、称呼、空格以及同音/近音/形近错别字，例如“代审核”理解为“待审核”；但绝不能纠正、补全或猜数字单号。询问“执行了吗/结果/详情”是 query，不是 execute；“待执行”也是 query。只有“帮我执行/审核/提交”这类明确当前写操作才选择写入 intent；否定、条件、未来计划、示例、转述、“能不能/如何”以及“搞一下/安排一下”等不明确写入请求不得触发写操作。
+使用整句语义判断用户是在下达当前操作指令，还是询问、讨论或引用操作。允许理解称呼、空格、语气词、礼貌问法，以及常见同音、近音、形近错别字，例如“代审核”可理解为“待审核”；但任何数字编号必须保持原样，绝不能纠正、补全、推测或从相似编号中选择。
+
+判断写操作以“明确动作 + 明确对象或可合法承接的上下文 + 当前执行意愿”为准，不按单个词机械拦截。“帮我执行41323”“能不能帮我执行41323”“麻烦把41323审核并执行”“41323审核执行安排一下”本质上是在请求当前操作，应识别为对应写操作 intent。“41323能执行吗”“如何执行41323”“执行需要什么条件”是在询问能力、方法或条件，不触发写操作；“执行了吗/结果/详情”和“待执行”属于 query。
+
+含明确否定、假设、未来计划、示例、引用或转述的内容不得触发写操作。如果用户是在询问某句话能否被识别、要求解释规则、提供测试样例或修改 Prompt，即使样例含“提交、审核、执行”等操作词，也不得触发写操作。“搞一下”“处理一下”“安排一下”等模糊表达，只有同一句已经出现明确操作动作，或允许使用的历史上下文能唯一确定动作时，才触发写操作；否则使用 intent="query"、needs_clarification=true。
 
 输入可能含 current_message 和 query_history。历史仅来自同一账号、同一聊天、同一发送人七天内最多十二轮的工具结果，只能承接省略语：如先问待审核再问“待执行呢”，或待审核清单唯一时再说“审核和执行一下”。当前消息的新编号和意图优先；不得从多项历史任意挑编号，不得用历史 SQL 触发写入。当前消息已明确要求执行、审核或批量审核执行时，即使缺少可用单号/清单，也要输出相应写操作 intent 且 identifier 为空，由程序提示缺少上下文，不能改成 query。只有业务问题本身存在多种合理含义时，才使用 intent="query"、needs_clarification=true。
 
@@ -47,7 +52,9 @@ def submission_workflow_identifier(source: str) -> str:
     source = str(source or "").strip()
     if not source or len(source) > 300 or SQL_START.search(source):
         return ""
-    if re.search(r"不要|别|不(?:要|用|能)?|停止|取消|如果|假如|明天|以后|计划|打算|能否|能不能|可以.*(?:吗|么)|是否|怎么|如何|例如|比如|示例|假设|转述|转发|引用", source):
+    if write_meta_discussion(source) or write_capability_question(source):
+        return ""
+    if re.search(r"不要|别(?:再)?|不(?:要|用|能)?\s*(?:提交|填报|上报|审核|审批|执行)|停止|取消|如果|假如|明天|以后|计划|打算|怎么|如何|例如|比如|示例|假设|转述|转发|引用", source):
         return ""
     if not (re.search(r"提交|填报|上报", source) and re.search(r"审核|审批", source) and re.search(r"执行", source)):
         return ""

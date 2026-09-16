@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 import re
 
-from domp_bridge import SQL_START, split_reply
+from domp_bridge import (SQL_START, split_reply, write_capability_question,
+    write_meta_discussion)
 
 SUBMISSION_TOOL = "submit_data_maintenance"
 SUBMISSION_REPLY_PREFIX = "数据运维填报结果"
@@ -20,7 +21,9 @@ def submission_candidate(source):
     if len(source) > 300 or SQL_START.search(source) or any(marker in source for marker in
         (SUBMISSION_REPLY_PREFIX, "数据运维查询结果", "数据运维执行结果", "流程标识：")):
         return False
-    if re.search(r"审核|审批|执行|不要|不用|不提交|别提交|停止|取消|如果|假如|明天|以后|计划|打算|能否|能不能|可以|怎么|如何|已经|已提交|是否|有没有|提交(?:了|过)?(?:吗|没)|提交(?:的)?(?:情况|结果|状态)|(?:他|她|别人|有人)说|转述|转发|引用|例如|比如|示例|假设|提示词|强制|force|重新提交|重复提交", source, re.I):
+    if write_meta_discussion(source) or write_capability_question(source):
+        return False
+    if re.search(r"审核|审批|执行|不要|不用\s*(?:再|帮我|帮忙)?\s*(?:提交|填报|上报)|不\s*(?:提交|填报|上报)|别\s*(?:提交|填报|上报)|停止|取消|如果|假如|明天|以后|计划|打算|怎么|如何|已经|已提交|有没有|提交(?:了|过)?(?:吗|没)|提交(?:的)?(?:情况|结果|状态)|(?:他|她|别人|有人)说|转述|转发|引用|例如|比如|示例|假设|提示词|强制|force|重新提交|重复提交", source, re.I):
         return False
     domain = r"(?:数据\s*运维(?:需求|填报)?(?:单|申请|需求)?|运维(?:单|需求)|填报单)"
     request = r"(?:^|[，,。；;]|帮我|帮忙|替我|麻烦(?:你|您)?|劳驾(?:你|您)?|请(?:你|您)?)\s*"

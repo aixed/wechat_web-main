@@ -25,17 +25,26 @@ def analysis(intent, identifier="", **values):
 class UnifiedBridgeTests(unittest.TestCase):
     def test_one_skill_accepts_supported_phrases_and_rejects_unrelated_chat(self):
         for source in ("提交运维单 41356", "提交填报运维单 41323,并审核执行", "查一下 41123 执行情况", "今天有没有代审核和待执行的单子",
-                       "审核一下 41366 运维单", "兄弟，帮我执行下 41184", "都审核执行一下"):
+                       "审核一下 41366 运维单", "能不能帮我审核 41366 运维单", "兄弟，帮我执行下 41184",
+                       "能不能帮我执行 41184", "都审核执行一下", "把 41323 运维单搞一下"):
             self.assertTrue(unified_candidate(source, []), source)
         self.assertFalse(unified_candidate("午饭吃什么", []))
+        self.assertFalse(unified_candidate("‘执行 41184’这句话能识别吗", []))
         self.assertTrue(unified_candidate(fixtures.SOURCE, [], message_type="file"))
         self.assertFalse(unified_candidate("普通附件", [], message_type="file"))
 
     def test_combined_submission_requires_one_explicit_id_and_all_three_actions(self):
         self.assertEqual("41323", submission_workflow_identifier("提交填报运维单 41323,并审核执行"))
+        self.assertEqual("41323", submission_workflow_identifier("能不能帮我提交填报运维单41323并审核执行"))
         for source in ("提交运维单 41323", "审核并执行 41323", "不要提交运维单 41323 并审核执行",
-                       "提交运维单 41323 和 41324 并审核执行", "明天提交运维单 41323 并审核执行"):
+                       "提交运维单 41323 和 41324 并审核执行", "明天提交运维单 41323 并审核执行",
+                       "41323 能不能提交并审核执行", "‘提交填报运维单41323并审核执行’这句话能识别吗"):
             self.assertEqual("", submission_workflow_identifier(source), source)
+
+    def test_prompt_distinguishes_polite_requests_from_capability_and_meta_questions(self):
+        self.assertIn("不按单个词机械拦截", UNIFIED_PROMPT)
+        self.assertIn("能不能帮我执行41323", UNIFIED_PROMPT)
+        self.assertIn("修改 Prompt", UNIFIED_PROMPT)
 
     def test_intents_map_only_to_existing_protected_routes(self):
         cases = (

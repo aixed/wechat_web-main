@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 import re
 
-from domp_bridge import SQL_START, split_reply
+from domp_bridge import (SQL_START, split_reply, write_capability_question,
+    write_meta_discussion)
 from domp_execution_bridge import EXECUTION_TOOL, _batch_result_lines
 from domp_query_bridge import QUERY_TOOL, QUERY_REPLY_PREFIX
 from mcp_service import McpServiceError
@@ -26,7 +27,9 @@ def approval_candidate(source):
         return False
     if re.search(r"全部|所有|批量|都(?:要|给|去|来|审核|审批|执行)|上面(?:的)?(?:这些)?|这些(?:单|需求)", source):
         return False
-    if re.search(r"不要|别|不(?:要|用|能)?(?:审核|审批|执行)|停止|取消|如果|假如|明天|以后|计划|打算|能否|能不能|可以.*(?:吗|么|不)|是否|怎么|如何|(?:他|她|别人|有人)说|转述|转发|引用|例如|比如|示例|假设|提示词", source):
+    if write_meta_discussion(source) or write_capability_question(source):
+        return False
+    if re.search(r"不要|别|不(?:要|用|能)?\s*(?:审核|审批|执行)|停止|取消|如果|假如|明天|以后|计划|打算|怎么|如何|(?:他|她|别人|有人)说|转述|转发|引用|例如|比如|示例|假设|提示词", source):
         return False
     if re.search(r"(?:审核|审批)(?:了|过)?(?:吗|没|没有)|(?:审核|审批)(?:的)?(?:结果|情况|状态|详情)|待(?:审核|审批)|查(?:询|一下)?.*(?:审核|审批)", source):
         return False

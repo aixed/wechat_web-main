@@ -27,10 +27,12 @@ def approval_history():
 class ApprovalBridgeTests(unittest.IsolatedAsyncioTestCase):
     def test_natural_approval_phrases_and_query_guards(self):
         for source in ("审核一下 41366 运维单", "帮我审批数据运维单41366", "把这张运维单审核通过",
-                       "审核和执行一下运维单", "审核并执行 41366", "把这张单审批后执行"):
+                       "审核和执行一下运维单", "审核并执行 41366", "把这张单审批后执行",
+                       "能不能帮我审核41366", "可以帮我把41366审核并执行吗"):
             self.assertTrue(approval_candidate(source), source)
         for source in ("查一下今天待审核的运维单", "41366审核了吗", "审核结果如何", "不要审核41366",
-                       "明天审核41366", "例如审核一下41366", "都审核执行一下", "全部审批并执行"):
+                       "明天审核41366", "例如审核一下41366", "都审核执行一下", "全部审批并执行",
+                       "41366能不能审核", "‘审核41366’这句话能识别吗"):
             self.assertFalse(approval_candidate(source), source)
 
     def test_explicit_and_context_targets_are_program_verified(self):
