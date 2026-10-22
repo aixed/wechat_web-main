@@ -193,6 +193,9 @@ class SqliteMessageCache:
                 );
                 CREATE INDEX IF NOT EXISTS idx_query_conversations_created
                     ON query_conversations (created_at);
+                CREATE TABLE IF NOT EXISTS media_blob_owners (
+                    owner_wxid TEXT NOT NULL, media_id TEXT NOT NULL,
+                    PRIMARY KEY(owner_wxid, media_id));
                 """
             )
             smart_reply_columns = {
@@ -936,13 +939,15 @@ class SqliteMessageCache:
             owner_wxid=owner_wxid,
         )
 
-    def put_media_blob(self, data: bytes, mime_type: str = "", filename: str = "") -> str:
+    def put_media_blob(self, data: bytes, mime_type: str = "", filename: str = "", *, owner_wxid: str = "") -> str:
         if not data:
             return ""
         digest = hashlib.sha256(data).hexdigest()
         media_id = f"blob_{digest}"
         now = int(time.time())
         with self._lock, self._connect() as conn:
+            if owner_wxid:
+                conn.execute('INSERT OR IGNORE INTO media_blob_owners VALUES(?,?)', (owner_wxid, media_id))
             conn.execute(
                 """
                 INSERT INTO media_blobs (media_id, mime_type, filename, size, data, created_at)
@@ -962,6 +967,35 @@ class SqliteMessageCache:
                 ),
             )
         return media_id
+
+    def delete_account_data(self, owner_wxid: str) -> dict[str, int]:
+        """Purge one WeChat owner in a transaction, keeping other owners and shared blobs."""
+        if not owner_wxid:
+            return {}
+        counts = {}
+        def blobs(value):
+            if isinstance(value, dict):
+                return set().union(*(blobs(v) for v in value.values())) if value else set()
+            if isinstance(value, list):
+                return set().union(*(blobs(v) for v in value)) if value else set()
+            return {value} if isinstance(value, str) and value.startswith('blob_') else set()
+        with self._lock, self._connect() as conn:
+            candidates = {r[0] for r in conn.execute('SELECT media_id FROM media_blob_owners WHERE owner_wxid=?', (owner_wxid,))}
+            for row in conn.execute('SELECT message_json FROM messages WHERE owner_wxid=?', (owner_wxid,)):
+                candidates.update(blobs(json.loads(row[0])))
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+            for table in tables:
+                quoted = '"' + table.replace('"', '""') + '"'
+                columns = {r[1] for r in conn.execute(f'PRAGMA table_info({quoted})')}
+                column = 'owner_wxid' if 'owner_wxid' in columns else 'owner' if table == 'offline_city_confirmations' else ''
+                if column:
+                    counts[table] = conn.execute(f'DELETE FROM {quoted} WHERE "{column}"=?', (owner_wxid,)).rowcount
+            retained = {r[0] for r in conn.execute('SELECT media_id FROM media_blob_owners')}
+            for row in conn.execute('SELECT message_json FROM messages'):
+                retained.update(blobs(json.loads(row[0])))
+            counts['media_blobs'] = sum(conn.execute('DELETE FROM media_blobs WHERE media_id=?', (blob,)).rowcount for blob in candidates - retained)
+        self._history_owners.discard(owner_wxid)
+        return counts
 
     def get_media_blob(self, media_id: str) -> dict[str, Any] | None:
         if not media_id:

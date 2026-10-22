@@ -69,14 +69,14 @@ class SubmissionGroupTests(unittest.IsolatedAsyncioTestCase):
             ('提交数据运维填报单 41356', self.sender), ('提交运维单 41356', self.sender),
             ('提交数据运维填报单 41356', self.owner), ('提交运维单 41356', self.owner),
         )):
-            await self.process(self.message(id=str(500 + index), msg=source, fromid=sender, isSender=int(sender == self.owner)))
+            await self.process(self.message(id=str(500 + index), msg=("@空气 " + (source) if sender == self.owner else (source)), fromid=sender, isSender=int(sender == self.owner), atuserlist=[self.owner] if sender == self.owner else []))
             self.assertEqual((self.chat, sender), self.send.call_args.args[:2])
             self.assertIn('需求编号：5400000000383911', self.send.call_args.args[3])
         self.assertEqual([SUBMISSION_TOOL] * 4, [call['tool_name'] for call in self.calls])
         self.assertTrue(all(call['arguments'] == {'identifier': '41356', 'force': False} for call in self.calls))
         self.assertEqual([SUBMISSION_TOOL] * 4, [kind for _, kind in self.analyzed_messages])
         reply = self.send.call_args.args[3]
-        await self.process(self.message(id='504', msg=reply, fromid=self.owner, isSender=1))
+        await self.process(self.message(id='504', msg="@空气 " + (reply), fromid=self.owner, isSender=1, atuserlist=[self.owner]))
         self.assertEqual(4, len(self.calls))
 
     async def test_denied_sender_test_mode_and_uncertain_response_do_not_write(self):

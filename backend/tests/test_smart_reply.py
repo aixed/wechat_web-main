@@ -802,7 +802,7 @@ class SmartReplyRequestTests(unittest.TestCase):
         try:
             self.main.config.MCP_CONNECTIONS = [{
                 "id": "local_mcp",
-                "url": "http://127.0.0.1:8765/mcp",
+                "url": "http://127.0.0.1:5222/mcp",
                 "enabled": True,
             }]
             normalized = self.normalize(ai_tasks=[{
@@ -1204,6 +1204,9 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
             mcp_results.append(result)
             return ("需求 40386 保存并提交成功，需求编号：5400000000382472",)
 
+        async def fake_send_at(*_args, **_kwargs):
+            return {"SendAtMsg": "1"}
+
         async def fake_send_text(wxid, text):
             sent.append((wxid, text))
             return {"SendTextMsg": "1"}
@@ -1216,6 +1219,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
         old_ai_service = main.ai_service
         old_mcp_task_reply = main._mcp_task_reply
         old_send_text = main.wechat_api.send_text
+        old_send_at = main.wechat_api.send_at
         old_broadcast = main.manager.broadcast
         old_local_sent = main._broadcast_local_sent_for_agent
         try:
@@ -1224,6 +1228,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
             main.ai_service = FakeAiService()
             main._mcp_task_reply = fake_mcp_task_reply
             main.wechat_api.send_text = fake_send_text
+            main.wechat_api.send_at = fake_send_at
             main.manager.broadcast = noop
             main._broadcast_local_sent_for_agent = noop
             cache.upsert_smart_reply_config(
@@ -1267,6 +1272,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
             main.ai_service = old_ai_service
             main._mcp_task_reply = old_mcp_task_reply
             main.wechat_api.send_text = old_send_text
+            main.wechat_api.send_at = old_send_at
             main.manager.broadcast = old_broadcast
             main._broadcast_local_sent_for_agent = old_local_sent
             temp_dir.cleanup()

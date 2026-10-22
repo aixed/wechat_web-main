@@ -17,6 +17,8 @@ import hashlib
 import zlib
 import json as _json
 import protocol_api
+import hook_login
+import access_store
 from daily_log import append_daily_log
 from config import (
     AGENT_WS_ENABLED,
@@ -73,11 +75,14 @@ def _is_query_db_endpoint(endpoint: str) -> bool:
 
 @contextmanager
 def use_agent(agent_id: str | None):
+    access_store.require_account(agent_id) if agent_id else None
     token = _CURRENT_AGENT_ID.set(str(agent_id or ""))
+    runtime_token = access_store.current_account.set(str(agent_id or ""))
     try:
         yield
     finally:
         _CURRENT_AGENT_ID.reset(token)
+        access_store.current_account.reset(runtime_token)
 
 
 @contextmanager
@@ -251,8 +256,14 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
 
     use_agent_ws = _use_agent_ws_transport()
     agent_id = _CURRENT_AGENT_ID.get() or ""
+    if access_store.current_user.get():
+        access_store.require_account(agent_id)
+    hook_instance = hook_login.http_instance(agent_id) if IS_HOOK and not use_agent_ws and agent_id else None
+    if access_store.current_user.get() and IS_HOOK and not use_agent_ws and not hook_instance and agent_id != 'default':
+        raise ConnectionError('该用户的微信尚未启动，请先启动微信')
+    http_base_url = f"http://{hook_instance['host']}:{hook_instance['port']}" if hook_instance else HOOK_BASE_URL
     request_json = _protocol_payload(endpoint, json, agent_id)
-    full_url = f"agent-ws://{agent_id or 'active'}/{endpoint.lstrip('/')}" if use_agent_ws else f"{HOOK_BASE_URL}{endpoint}"
+    full_url = f"agent-ws://{agent_id or 'active'}/{endpoint.lstrip('/')}" if use_agent_ws else f"{http_base_url}{endpoint}"
     query_db_call = _is_query_db_endpoint(endpoint)
 
     if not bypass_circuit_breaker and _circuit_open():
@@ -295,7 +306,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
                     request=httpx.Request("POST", f"http://agent.local/{route}"),
                 )
             else:
-                r = await client.post(endpoint, json=request_json, timeout=timeout)
+                r = await client.post(full_url if hook_instance else endpoint, json=request_json, timeout=timeout)
             ms = int((time.time() - t0) * 1000)
             body_preview = _truncate(r.text if r.text else "(empty)", 1200).replace("\n", " ")
             _log(f"[API #{rid}] ← {transport} {full_url} status={r.status_code} time={ms}ms len={len(r.text)} body={body_preview}")
@@ -673,10 +684,17 @@ async def forward_all_msg(msgsvrid: str, wxid: str) -> dict:
     return safe_json(r)
 
 
-async def send_file(wxid: str, filepath: str, file_data: str | None = None) -> dict:
+async def send_file(wxid: str, filepath: str, file_data: str | None = None, *, filename: str = "") -> dict:
     """Send file."""
     if IS_HOOK:
-        body = _attach_file_data({"toid": wxid, "filepath": filepath}, "filepath", file_data)
+        # Named reports must use the normal client send path as well. The
+        # no-source endpoint uploads remotely without a local attachment card.
+        if IS_LOCAL_HOOK and filename and not file_data:
+            # The local client can read the shared path. Passing fileData makes
+            # Hook stage a randomly named file and loses the report title.
+            body = {"toid": wxid, "filepath": filepath, "fileData": ""}
+        else:
+            body = _attach_file_data({"toid": wxid, "filepath": filepath}, "filepath", file_data)
         r = await _post("/SendFileMsg", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
     else:
         r = await _post("/sendfileuploadmsg", json={
@@ -686,11 +704,21 @@ async def send_file(wxid: str, filepath: str, file_data: str | None = None) -> d
     return safe_json(r)
 
 
-async def send_file_no_src(wxid: str, filepath: str, file_data: str | None = None) -> dict:
+async def send_file_no_src(wxid: str, filepath: str, file_data: str | None = None, *, filename: str = "") -> dict:
     """Send a file through the lower-level no-source endpoint."""
     if not IS_HOOK:
         return {"error": "SendFileMsg_NoSrc is only supported in hook mode"}
     body = _attach_file_data({"toid": wxid, "filepath": filepath}, "filepath", file_data)
+    if filename:
+        name = os.path.basename(filename.replace("\\", "/"))
+        body.update(fileName=name, fileExt=os.path.splitext(name)[1].lstrip("."))
+        if body.get("fileData"):
+            blob = bytes.fromhex(body["fileData"])
+        else:
+            with open(filepath, "rb") as source:
+                blob = source.read()
+        body.update(clientmsgid=os.urandom(16).hex(), filemd5=hashlib.md5(blob).hexdigest(),
+            filetotallen=len(blob), action=1, version=1, laninfo="")
     r = await _post("/SendFileMsg_NoSrc", json=body, timeout=180.0 if IS_LOCAL_HOOK else 300.0)
     return safe_json(r)
 

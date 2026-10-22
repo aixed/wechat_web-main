@@ -17,6 +17,8 @@ wechat_mode: 1
 local_hook_host: "127.0.0.1"
 local_hook_api_port: 30001
 local_hook_mgr_port: 29999
+# 微信安装目录；留空时管理器读取本机注册表，也可在“启动微信”面板填写。
+local_hook_wechat_path: ""
 
 # --- remote_hook 远程客户端 Hook ---
 # agent_ws_enabled=true 时通过下方 /agent 长连接调用 DLL；
@@ -24,6 +26,8 @@ local_hook_mgr_port: 29999
 remote_hook_host: "127.0.0.1"
 remote_hook_api_port: 30001
 remote_hook_mgr_port: 29999
+# 远程管理器所在机器上的微信安装目录。
+remote_hook_wechat_path: ""
 
 # --- remote_protocol 远程协议 ---
 remote_protocol_host: "127.0.0.1"
@@ -98,9 +102,12 @@ ai_max_concurrency: 3
 
 # 数据运维完整流程可能包含多个登录、填报、审核和执行请求。
 mcp_timeout_seconds: 600
+# MCP 服务地址直接修改下方 url，填写完整的 http(s)://主机:端口/mcp。
+# 修改 config.yaml 后重启后端，或打开「AI 与 MCP 设置」重新加载即可生效。
+# id 是智能回复任务引用的连接标识，修改地址时保留原 id。
 mcp_connections:
   - id: local_mcp
     name: 养老保险全国统筹数据安全运维管理
-    url: http://127.0.0.1:8765/mcp
-    token: ""
+    url: http://59.217.45.7:5222/mcp
+    token: "" # 数据运维 MCP 必填，与服务器 settings.local.json 的 api_token 一致；不会打包进浏览器 JS。
     enabled: true

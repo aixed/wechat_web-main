@@ -137,10 +137,12 @@ npm run lint
 
 - `wechat_mode`：微信使用方式，`1`=本地 Hook，`2`=远程客户端 Hook（客户端 DLL 主动连本后端 WS/WSS），`3`=远程服务器协议。旧配置 `login` 仍兼容，可选 `local_hook`、`remote_hook`、`remote_protocol`。
 - `*_host` / `*_api_port` / `*_mgr_port`：不同模式下的服务地址和端口。
+- 本地/远程 Hook 的账号页使用“启动微信”，通过对应 `*_host:*_mgr_port`（默认 `29999`）调用 `/StartWechat`，填写新接口端口、RDV 和微信目录（`*_wechat_path`，留空读取管理器注册表）。Hook 按返回的进程 ID 及接口端口查询 `/IsLoginStatus`、`/GetLoginQRCode`，不使用协议 `session_id`。远程 Hook 启用长连接时额外传入 `RemoteWS`，本地 Hook 使用 HTTP 回调。协议模式独立保留“扫码上号 / 老号登录”。
 - `ip`：部署机器的 IP 或域名，作为相关网络配置的默认主机值。
 - `server_host` / `server_port`：后端主服务监听地址和端口；DLL 直连 `ws://公网IP:5000/agent` 时用 `server_host: "0.0.0.0"`，只走前端或 Nginx 代理时可用 `127.0.0.1`。
 - `web_access_key`：Web 前端和 `/api/*` 接口访问密钥；首次启动未配置时默认使用 `admin`，建议在本地 `config.yaml` 中改成自己的值。不要提交真实值，也可通过环境变量 `WECHAT_WEB_ACCESS_KEY` 配置。
 - `hook_api_concurrency`：Hook/API 并发数；本地 Hook 默认 `20`，使同一条消息命中的多条规则回复可并发提交；远程 Hook/远程协议默认 `10`。修改后需重启后端。
+- `mcp_connections[].url`：MCP 服务完整地址，默认 `http://59.217.45.7:5222/mcp`。可直接修改 `config.yaml` 中该连接的 `url`，保留原 `id`；重启后端或打开「AI 与 MCP 设置」重新加载后生效。未配置 `mcp_connections` 时，使用环境变量 `MCP_URL` 或默认地址；显式配置 `mcp_connections: []` 可关闭全部连接。
 - `QueryDB` 历史查询：不再使用旧的全局查询锁；同一账号的同一个数据库文件最多并发 `4` 路，第 5 个请求最多等待 `10` 秒，超时返回空结果并在日志中记录 `pooled connection unavailable`。
 - `frontend_host` / `frontend_port`：前端开发服务器监听地址和端口，由 Vite 直接读取 `config.yaml`。Windows 的 `start-all.bat` 会从 `frontend_port` 开始检查最多 10 个连续端口，将首个空闲端口回写到 `config.yaml`，并在页面可访问后自动打开 `http://127.0.0.1:<frontend_port>`。
 - `agent_ws_enabled`：仅远程 Hook（`wechat_mode: 2`）使用。启用后，远程客户端 DLL 主动连接本后端的 `/agent` WebSocket，Hook API 调用通过该长连接发送；本地 Hook（`wechat_mode: 1`）始终直连本机 HTTP 接口，不使用 RemoteWS。

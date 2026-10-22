@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
 import re
 import threading
 import time
@@ -189,7 +190,60 @@ class SmartReplyEngine:
         self.cooldown = max(0.0, float(cooldown))
         self._seen: OrderedDict[tuple[str, str, str, str], float] = OrderedDict()
         self._last_sent: dict[tuple[str, str], float] = {}
+        self._reply_echoes: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+        self._ai_messages: OrderedDict[tuple[str, str, str, str, str], float] = OrderedDict()
         self._lock = threading.RLock()
+
+    @staticmethod
+    def _reply_echo_key(owner_wxid, chat_id, content):
+        normalized = str(content or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        return owner_wxid, chat_id, hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def remember_reply(self, owner_wxid, chat_id, content, *, now=None):
+        """Register before sending so a synchronous callback cannot start a loop."""
+        timestamp = time.monotonic() if now is None else now
+        key = self._reply_echo_key(owner_wxid, chat_id, content)
+        with self._lock:
+            self._reply_echoes[key] = timestamp
+            self._reply_echoes.move_to_end(key)
+            while len(self._reply_echoes) > self.dedup_limit:
+                self._reply_echoes.popitem(last=False)
+
+    def is_reply_echo(self, owner_wxid, chat_id, content, *, now=None):
+        timestamp = time.monotonic() if now is None else now
+        candidates = [str(content or "").strip()]
+        if str(chat_id).endswith("@chatroom"):
+            # SendAtMsg prepends the recipient's visible nickname. Do not strip
+            # the owner's actual @空气 command when comparing callback bodies.
+            prefix = re.match(r"^@([^\r\n]+?)\u2005[ \t]*|^@([^\s]+)[ \t]+", candidates[0])
+            if prefix and (prefix.group(1) or prefix.group(2)).strip() != "空气":
+                candidates.append(candidates[0][prefix.end():])
+        with self._lock:
+            while self._reply_echoes and timestamp - next(iter(self._reply_echoes.values())) > self.dedup_ttl:
+                self._reply_echoes.popitem(last=False)
+            return any(self._reply_echo_key(owner_wxid, chat_id, value) in self._reply_echoes for value in candidates)
+
+    def claim_ai_message(self, owner_wxid, chat_id, message, *, now=None):
+        """Reject repeated callbacks before AI or confirmation state can change.
+
+        Hook's synthetic IDs use second precision, so include the content as
+        well as the ID. Two different messages in one second must both run.
+        """
+        message_id = str(message.get("id") or "")
+        if not message_id:
+            return True
+        timestamp = time.monotonic() if now is None else now
+        content_hash = self._reply_echo_key(owner_wxid, chat_id, message.get("msg"))[2]
+        key = (owner_wxid, chat_id, str(message.get("fromid") or ""), message_id, content_hash)
+        with self._lock:
+            while self._ai_messages and timestamp - next(iter(self._ai_messages.values())) > self.dedup_ttl:
+                self._ai_messages.popitem(last=False)
+            if key in self._ai_messages:
+                return False
+            self._ai_messages[key] = timestamp
+            while len(self._ai_messages) > self.dedup_limit:
+                self._ai_messages.popitem(last=False)
+        return True
 
     def evaluate(
         self,
@@ -199,6 +253,7 @@ class SmartReplyEngine:
         self_wxid: str,
         message: dict[str, Any],
         config: dict[str, Any] | None,
+        mention_verified: bool = False,
         now: float | None = None,
     ) -> SmartReplyDecision:
         if not config or not bool(config.get("enabled")):
@@ -266,6 +321,7 @@ class SmartReplyEngine:
         if (
             chat_id.endswith("@chatroom")
             and message_category in mention_message_types
+            and not mention_verified
             and not _mentions_self(message, self_wxid)
         ):
             return SmartReplyDecision(reason="mention_required")
@@ -403,9 +459,9 @@ class SmartReplyEngine:
         if not sender or not content:
             return SmartReplyDecision(reason="empty_message")
         current = time.monotonic() if now is None else float(now)
-        # Conversational read-only queries may repeat wording after another
-        # turn. Keep callback de-duplication by message ID and allow immediate
-        # follow-ups; the normal rule/workflow cooldown remains unchanged.
+        # Queries and offline confirmation turns may repeat wording after
+        # another turn. Keep callback de-duplication by message ID and content,
+        # and allow immediate follow-ups.
         message_id = str(message.get("id") or "")
         dedup_content = f"query_message:{message_id}:{content}" if conversation and message_id else content
         dedup_key = (str(owner_wxid or ""), chat_id, sender, dedup_content)

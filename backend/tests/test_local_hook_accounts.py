@@ -6,6 +6,9 @@ import main
 
 class LocalHookAccountTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        registry = patch.object(main.hook_login, 'instances', return_value=[])
+        registry.start()
+        self.addCleanup(registry.stop)
         self.old_app_state = main.app_state
         self.old_active_agent_id = main._active_agent_id
         self.old_last_seen_at = main._local_hook_last_seen_at

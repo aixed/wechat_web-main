@@ -9,10 +9,57 @@ import httpx
 import yaml
 
 import config
-from mcp_service import McpService
+from mcp_service import McpService, McpServiceError
 
 
 class McpServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deployment_endpoint_requires_token_before_network_request(self):
+        service = McpService(timeout_seconds=5)
+        await service._client.aclose()
+        requests = []
+        service._client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(500)
+        ))
+        try:
+            for host in ("59.217.45.7", "10.11.0.37"):
+                with self.assertRaisesRegex(McpServiceError, "需要 Bearer Token"):
+                    await service.discover(url=f"http://{host}:5222/mcp")
+        finally:
+            await service.close()
+        self.assertEqual([], requests)
+
+    async def test_invalid_token_reports_authentication_error_without_echoing_token(self):
+        service = McpService(timeout_seconds=5)
+        await service._client.aclose()
+        service._client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(401, text="upstream body")
+        ))
+        try:
+            with self.assertRaisesRegex(McpServiceError, "调用令牌缺失或无效") as caught:
+                await service.discover(url="http://59.217.45.7:5222/mcp", token="private-test-token")
+            self.assertNotIn("private-test-token", str(caught.exception))
+        finally:
+            await service.close()
+
+    async def test_history_statistics_extend_only_the_readonly_tool_timeout(self):
+        timeouts = {}
+        def handler(request):
+            payload = json.loads(request.content)
+            result = {"protocolVersion": "2025-03-26", "capabilities": {}, "serverInfo": {"name": "test", "version": "1"}}
+            if payload.get("method") == "tools/call":
+                timeouts[payload["params"]["name"]] = request.extensions["timeout"]["read"]
+                result = {"content": [{"type": "text", "text": "{}"}]}
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload.get("id"), "result": result})
+        service = McpService(timeout_seconds=120)
+        await service._client.aclose()
+        service._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=120)
+        try:
+            for tool in ("query_operation_tickets", "process_data_maintenance"):
+                await service.call_tool(url="http://test/mcp", tool_name=tool, arguments={})
+        finally:
+            await service.close()
+        self.assertEqual({"query_operation_tickets": 1800, "process_data_maintenance": 120}, timeouts)
+
     async def test_discovers_tools_and_preserves_session_header(self):
         requests: list[httpx.Request] = []
 
@@ -60,7 +107,7 @@ class McpServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("test-server", result["server"]["name"])
         self.assertEqual("submit_data_maintenance", result["tools"][0]["name"])
-        self.assertEqual("Bearer secret", requests[0].headers["Authorization"])
+        self.assertTrue(all(request.headers["Authorization"] == "Bearer secret" for request in requests))
         self.assertEqual("session-1", requests[1].headers["Mcp-Session-Id"])
         self.assertEqual("session-1", requests[2].headers["Mcp-Session-Id"])
 
@@ -168,7 +215,7 @@ class McpSmartReplyTests(unittest.IsolatedAsyncioTestCase):
             config.MCP_CONNECTIONS = [{
                 "id": "local_mcp",
                 "name": "本地 MCP",
-                "url": "http://127.0.0.1:8765/mcp",
+                "url": "http://127.0.0.1:5222/mcp",
                 "token": "",
                 "enabled": True,
             }]
@@ -275,7 +322,7 @@ class McpSmartReplyTests(unittest.IsolatedAsyncioTestCase):
             config.MCP_CONNECTIONS = [{
                 "id": "local_mcp",
                 "name": "本地 MCP",
-                "url": "http://127.0.0.1:8765/mcp",
+                "url": "http://127.0.0.1:5222/mcp",
                 "token": "",
                 "enabled": True,
             }]
@@ -313,7 +360,7 @@ class McpConfigTests(unittest.TestCase):
                     "mcp_connections": [{
                         "id": "local_mcp",
                         "name": "Local",
-                        "url": "http://127.0.0.1:8765/mcp",
+                        "url": "http://127.0.0.1:5222/mcp",
                         "token": "saved-token",
                         "enabled": True,
                     }],
@@ -332,7 +379,7 @@ class McpConfigTests(unittest.TestCase):
                     mcp_connections=[{
                         "id": "local_mcp",
                         "name": "Updated",
-                        "url": "http://127.0.0.1:8765/mcp",
+                        "url": "http://127.0.0.1:5222/mcp",
                         "token": "",
                         "enabled": True,
                     }],

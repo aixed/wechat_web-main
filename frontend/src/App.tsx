@@ -3,12 +3,14 @@ import { useWebSocket } from "./useWebSocket";
 import SessionList, { type SessionMenuAction } from "./components/SessionList";
 import ChatArea from "./components/ChatArea";
 import SmartReplyManager from "./components/SmartReplyManager";
+import HookLoginPanel from "./components/HookLoginPanel";
 import {
   activateAccount,
   batchGetContactBrief,
   broadcastMixedUpload,
   clearActiveAgentId,
   clearAccessKey,
+  deleteHookAccount,
   getActiveAgentId,
   getAccessKey,
   getAccounts,
@@ -26,6 +28,7 @@ import {
   getGroupMemberNames,
   getMultiAccountBroadcastTargets,
   loginWithKey,
+  logoutHookAccount,
   markAsRead,
   markSessionUnread,
   multiAccountBroadcastFileUploadStream,
@@ -46,6 +49,7 @@ import {
   terminateProtocolSession,
   unmuteSession,
   unpinChat,
+  userStorageKey,
 } from "./api";
 import type { BroadcastContentOrder, GlobalSearchEntry, GlobalSearchResult, InitialSetupMode, ProtocolProxyConfig, ProtocolRdvMappingEntry } from "./api";
 import type { ContactProfile, Session, ChatMessage, SmartReplyConfig, SmartReplyTarget, WSMessage, WeChatAccount } from "./types";
@@ -55,7 +59,7 @@ import { DEFAULT_AVATAR_URL } from "./avatar";
 type ViewMode = "chats" | "contacts" | "broadcast" | "smart-reply";
 type MobileTab = "chats" | "contacts" | "me" | "broadcast" | "smart-reply";
 type PortalTheme = "dark" | "light";
-type AccountPortalTool = "broadcast" | "qr-login" | "old-login";
+type AccountPortalTool = "broadcast" | "qr-login" | "old-login" | "hook-start";
 type AccountPortalSource = "hook" | "protocol";
 type ProtocolLoginPhase = "idle" | "starting" | "waiting" | "scanned" | "success" | "error";
 type ProtocolLoginForm = {
@@ -90,7 +94,7 @@ type ParsedAppRoute = { accountWxid: string; route: AppRoute };
 const PORTAL_THEME_STORAGE = "wechat_web_portal_theme";
 const SIDE_PANEL_WIDTH_STORAGE = "wechat_web_side_panel_width";
 const PROTOCOL_LOGIN_FORM_STORAGE = "wechat_protocol_login_form";
-const PROTOCOL_RDV_RULE_TEXT = "RDV 必填：自定义取值范围（十六进制）10000000~7fffffff";
+const PROTOCOL_RDV_RULE_TEXT = "RDV 必填：自定义取值范围（十六进制）01000000~7fffffff";
 const PROTOCOL_ACCOUNT_POLL_INTERVAL_MS = 10_000;
 const PROTOCOL_QRCODE_CHECK_INTERVAL_MS = 10_000;
 const PROTOCOL_QRCODE_CACHE_GRACE_MS = 2_000;
@@ -105,12 +109,13 @@ const MOBILE_SWIPE_MAX_DRAG_PX = 120;
 const BACKEND_UNAVAILABLE_MESSAGE = "后端服务正在启动或暂时不可用，请稍后重试。";
 
 function accountPortalSourceFromPayload(data: any, accounts: WeChatAccount[]): AccountPortalSource {
+  if (data?.source === "hook") return "hook";
   if (data?.source === "protocol") return "protocol";
   return accounts.some((account) => account.source === "protocol") ? "protocol" : "hook";
 }
 
 function defaultAccountPortalTool(source: AccountPortalSource): AccountPortalTool {
-  return source === "protocol" ? "qr-login" : "broadcast";
+  return source === "protocol" ? "qr-login" : "hook-start";
 }
 
 function backendUnavailableText(data: unknown): string {
@@ -251,9 +256,9 @@ function normalizeProtocolRdv(value: string): string {
 
 function validateProtocolRdv(value: string): string {
   const rdv = normalizeProtocolRdv(value);
-  if (!/^[0-9a-f]{8}$/.test(rdv)) return "RDV 必须是 10000000 到 7fffffff 范围内的 8 位十六进制";
+  if (!/^[0-9a-f]{8}$/.test(rdv)) return "RDV 必须是 01000000 到 7fffffff 范围内的 8 位十六进制";
   const numeric = Number.parseInt(rdv, 16);
-  if (numeric < 0x10000000 || numeric > 0x7fffffff) return "RDV 必须是 10000000 到 7fffffff 范围内的 8 位十六进制";
+  if (numeric < 0x01000000 || numeric > 0x7fffffff) return "RDV 必须是 01000000 到 7fffffff 范围内的 8 位十六进制";
   return "";
 }
 
@@ -264,7 +269,7 @@ function randomProtocolRdv(): string {
   } else {
     bytes[0] = Math.floor(Math.random() * 0xffffffff);
   }
-  const value = 0x10000000 + (bytes[0] % 0x70000000);
+  const value = 0x01000000 + (bytes[0] % 0x7f000000);
   return value.toString(16).padStart(8, "0");
 }
 
@@ -1564,7 +1569,7 @@ export default function App() {
   const [routeAccountWxid, setRouteAccountWxid] = useState(() => initialRouteAccountWxid);
   const [accounts, setAccounts] = useState<WeChatAccount[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(false);
-  const [accountPortalSource, setAccountPortalSource] = useState<AccountPortalSource>("protocol");
+  const [accountPortalSource, setAccountPortalSource] = useState<AccountPortalSource>("hook");
   const [accountManagerOpen, setAccountManagerOpen] = useState(false);
   const [protocolLoginAccount, setProtocolLoginAccount] = useState<WeChatAccount | null>(null);
   const [localProtocolAccounts, setLocalProtocolAccounts] = useState<WeChatAccount[]>([]);
@@ -1759,7 +1764,7 @@ export default function App() {
       const localHttpAccount = data?.transport === "http"
         ? rows.find((account) => account.transport === "http")
         : undefined;
-      if (localHttpAccount && savedActiveAgentId && savedActiveAgentId !== localHttpAccount.id) {
+      if (localHttpAccount && savedActiveAgentId && !rows.some((account) => account.id === savedActiveAgentId)) {
         clearActiveAgentId();
         setSelectedAccountId("");
         setRouteAccount("");
@@ -3525,7 +3530,9 @@ export default function App() {
     muted: false,
   } as Session : null);
   const activeMsgs = activeChat ? (chatMessages[activeChat] || []) : [];
-  const managedAccounts = mergeProtocolAccounts(accounts, localProtocolAccounts, hiddenProtocolSessionIds);
+  const managedAccounts = accountPortalSource === "protocol"
+    ? mergeProtocolAccounts(accounts, localProtocolAccounts, hiddenProtocolSessionIds)
+    : accounts.filter((account) => account.source !== "protocol");
 
   if (setupChecking) {
     return <AccessLoading message="正在检查配置" />;
@@ -4169,7 +4176,7 @@ function AccessGate({
       <form onSubmit={submit} className="w-[360px] max-w-[calc(100vw-40px)]">
         <div className="text-[24px] font-medium mb-[22px]">访问密钥</div>
         <div className="mb-[14px] text-[13px] leading-[20px] text-[#9a9a9a]">
-          默认 key 为 admin。首次配置时可修改 web_access_key。
+          首次输入新密钥会创建独立用户。请保存好密钥，下次凭同一密钥管理自己的微信。
         </div>
         <input
           value={key}
@@ -4538,8 +4545,8 @@ function AccountPortal({
   useEffect(() => {
     if (!account) return;
     setLoginAccount(account);
-    setTool(hasProtocolSession(account) ? "qr-login" : "old-login");
-  }, [account]);
+    setTool(source === "hook" ? "hook-start" : hasProtocolSession(account) ? "qr-login" : "old-login");
+  }, [account, source]);
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
@@ -4557,7 +4564,16 @@ function AccountPortal({
   }, [contextMenu]);
   const portalAccounts = accounts;
   const protocolAccounts = portalAccounts.filter(isProtocolAccountTabVisible);
-  const displayedLoginAccount = refreshedProtocolAccount(loginAccount, protocolAccounts) || loginAccount;
+  const displayedLoginAccount = source === 'hook'
+    ? portalAccounts.find((item) => item.id === loginAccount?.id) || loginAccount
+    : refreshedProtocolAccount(loginAccount, protocolAccounts) || loginAccount;
+  const [hookStartRequested, setHookStartRequested] = useState(false);
+  const handleToolChange = (nextTool: AccountPortalTool) => {
+    if (nextTool === 'hook-start') {
+      setLoginAccount(null); setLoginPanelNonce((value) => value + 1); setHookStartRequested(true);
+    }
+    setTool(nextTool);
+  };
   const handleAddProtocolLogin = () => {
     setLoginAccount(null);
     setTool("qr-login");
@@ -4569,22 +4585,36 @@ function AccountPortal({
       return;
     }
     setLoginAccount(account);
-    setTool(hasProtocolSession(account) ? "qr-login" : "old-login");
+    setHookStartRequested(false);
+    setTool(source === "hook" ? "hook-start" : hasProtocolSession(account) ? "qr-login" : "old-login");
   };
   const handleProtocolSessionStarted = (account: WeChatAccount, previousSessionId = "") => {
     setLoginAccount(account);
     onSessionStarted(account, previousSessionId);
   };
   const openProtocolContextMenu = (account: WeChatAccount, event: MouseEvent<HTMLButtonElement>) => {
-    if (!hasProtocolSession(account)) return;
+    if (account.source !== 'hook' && !hasProtocolSession(account)) return;
     event.preventDefault();
     const menuWidth = 210;
-    const menuHeight = 92;
+    const menuHeight = account.source === 'hook' ? 132 : 92;
     setContextMenu({
       account,
       x: Math.min(event.clientX, Math.max(8, window.innerWidth - menuWidth - 8)),
       y: Math.min(event.clientY, Math.max(8, window.innerHeight - menuHeight - 8)),
     });
+  };
+  const handleHookAction = async (account: WeChatAccount, action: 'logout' | 'delete') => {
+    setContextMenu(null);
+    if (action === 'delete' && !window.confirm(`确定删除微信「${accountDisplayName(account)}」吗？\n\n将关闭该微信进程，并永久清除该微信在本项目本地数据库中的聊天记录、联系人、智能回复配置、附件数据和启动参数。此操作无法撤销。`)) return;
+    setTerminatingSessionIds((prev) => new Set(prev).add(account.id));
+    try {
+      const data = await (action === 'delete' ? deleteHookAccount(account.id) : logoutHookAccount(account.id));
+      if (!data.ok) throw new Error(data.error || data.detail || '操作失败');
+      if (getActiveAgentId() === account.id) clearActiveAgentId();
+      setLoginAccount(null); setHookStartRequested(false); setLoginPanelNonce((value) => value + 1);
+      onRefresh();
+    } catch (err) { window.alert(err instanceof Error ? err.message : '操作失败'); }
+    finally { setTerminatingSessionIds((prev) => { const next = new Set(prev); next.delete(account.id); return next; }); }
   };
   const handleTerminateAccount = async (account: WeChatAccount) => {
     const sessionId = protocolSessionId(account);
@@ -4661,7 +4691,7 @@ function AccountPortal({
       )}
     </div>
   );
-  const contextSessionId = protocolSessionId(contextMenu?.account);
+  const contextSessionId = contextMenu?.account.source === 'hook' ? contextMenu.account.id : protocolSessionId(contextMenu?.account);
   const contextTerminating = Boolean(contextSessionId && terminatingSessionIds.has(contextSessionId));
   const contextMenuNode = contextMenu && (
     <div
@@ -4671,16 +4701,17 @@ function AccountPortal({
     >
       <div className={`px-[12px] pb-[6px] text-[11px] leading-[16px] border-b ${dark ? "border-[#333] text-[#8f8f8f]" : "border-[#eee] text-[#777]"}`}>
         <div className="truncate">{contextMenu.account.rdv ? `RDV ${contextMenu.account.rdv}` : "微信实例"}</div>
-        <div className="font-mono truncate" title={contextSessionId}>Session {contextSessionId.slice(0, 12)}</div>
+        <div className="font-mono truncate" title={contextSessionId}>{contextMenu.account.source === 'hook' ? `Port ${contextMenu.account.start_port || contextMenu.account.api_port || contextMenu.account.server_port}` : `Session ${contextSessionId.slice(0, 12)}`}</div>
       </div>
       <button
         type="button"
         disabled={contextTerminating}
-        onClick={() => handleTerminateAccount(contextMenu.account)}
+        onClick={() => contextMenu.account.source === 'hook' ? void handleHookAction(contextMenu.account, 'logout') : void handleTerminateAccount(contextMenu.account)}
         className={`w-full h-[34px] px-[12px] text-left text-[13px] disabled:opacity-60 disabled:cursor-not-allowed ${dark ? "hover:bg-[#2c2c2c] text-[#ff9a9a]" : "hover:bg-[#f6f6f6] text-[#c53030]"}`}
       >
-        {contextTerminating ? "正在结束..." : "结束微信实例"}
+        {contextTerminating ? "正在处理…" : contextMenu.account.source === 'hook' ? '退出登录' : "结束微信实例"}
       </button>
+      {contextMenu.account.source === 'hook' && <button type="button" disabled={contextTerminating} onClick={() => void handleHookAction(contextMenu.account, 'delete')} className={`w-full h-[34px] px-[12px] text-left text-[13px] text-[#ef7777] disabled:opacity-60 ${dark ? 'hover:bg-[#2c2c2c]' : 'hover:bg-[#f6f6f6]'}`}>删除</button>}
     </div>
   );
 
@@ -4774,14 +4805,14 @@ function AccountPortal({
           {loading && portalAccounts.length === 0 && <div className="text-[#777] text-[14px]">正在读取微信连接...</div>}
           {portalAccounts.length === 0 && !loading && (
             <div className="text-[#777] text-[14px] leading-[24px]">
-              暂无连接的微信。可在右侧扫码上号或使用老号登录。
+              {source === "hook" ? "暂无连接的微信。请在右侧启动微信并完成登录。" : "暂无连接的微信。可在右侧扫码上号或使用老号登录。"}
             </div>
           )}
           <div className="space-y-[12px]">
             {portalAccounts.map((account) => {
               const meta = accountStatusMeta(account, dark);
               const handleClick = () => {
-                if (account.source === "protocol" && !isLoggedInAccount(account)) {
+                if (!isLoggedInAccount(account)) {
                   handleAccountForLogin(account);
                   return;
                 }
@@ -4793,11 +4824,12 @@ function AccountPortal({
                 type="button"
                 onClick={handleClick}
                 onContextMenu={(event) => {
-                  if (account.source !== "protocol" || !hasProtocolSession(account)) return;
                   openProtocolContextMenu(account, event);
                 }}
                 className={`w-full min-h-[100px] rounded-[6px] border p-[14px] flex items-center gap-[14px] text-left active:opacity-90 ${
-                  dark ? "bg-[#1b1b1b] hover:bg-[#242424] border-[#2b2b2b]" : "bg-white hover:bg-[#f7f7f7] border-[#e3e3e3]"
+                  displayedLoginAccount?.id === account.id && tool === 'hook-start'
+                    ? dark ? 'bg-[#163322] border-[#07c160] ring-1 ring-[#07c160]' : 'bg-[#e7f8ed] border-[#07c160] ring-1 ring-[#07c160]'
+                    : dark ? "bg-[#1b1b1b] hover:bg-[#242424] border-[#2b2b2b]" : "bg-white hover:bg-[#f7f7f7] border-[#e3e3e3]"
                 }`}
               >
                 <AccountAvatar account={account} />
@@ -4839,33 +4871,15 @@ function AccountPortal({
       </div>
       <div className="flex-1 min-w-0 min-h-0 h-full overflow-hidden">
         <div className={`h-full min-h-0 flex flex-col ${dark ? "bg-[#111111]" : "bg-[#f4f4f4]"}`}>
-          <AccountPortalToolTabs active={tool} dark={dark} source={source} onChange={setTool} onAdd={handleAddProtocolLogin} />
+          <AccountPortalToolTabs active={tool} dark={dark} source={source} onChange={handleToolChange} onAdd={handleAddProtocolLogin} />
           <div className="flex-1 min-h-0 overflow-hidden">
             {tool === "broadcast" && <MultiAccountBroadcastPanel accounts={portalAccounts} theme={theme} />}
-            {tool === "qr-login" && (
-              <ProtocolLoginPanel
-                key={`qr:${accountStableKey(displayedLoginAccount) || loginPanelNonce}`}
-                mode="qr"
-                theme={theme}
-                onRefresh={onRefresh}
-                account={displayedLoginAccount || undefined}
-                onSessionStarted={handleProtocolSessionStarted}
-                onEnterAccount={onSelectAccount}
-                onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
-              />
-            )}
-            {tool === "old-login" && (
-              <ProtocolLoginPanel
-                key={`old:${accountStableKey(displayedLoginAccount) || loginPanelNonce}`}
-                mode="old"
-                theme={theme}
-                onRefresh={onRefresh}
-                account={displayedLoginAccount || undefined}
-                onSessionStarted={handleProtocolSessionStarted}
-                onEnterAccount={onSelectAccount}
-                onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
-              />
-            )}
+            {tool === "hook-start" && source === "hook" && <HookLoginPanel key={`hook:${displayedLoginAccount?.id || loginPanelNonce}`} theme={theme} onRefresh={onRefresh} onEnterAccount={onSelectAccount} account={displayedLoginAccount || undefined} autoStartNew={hookStartRequested} onInstanceSelected={(id) => {
+              setHookStartRequested(false);
+              const owned = portalAccounts.find((item) => item.id === id);
+              if (owned) setLoginAccount(owned);
+              else { setLoginAccount({ id, source: 'hook', login_status: '0', connected: true } as WeChatAccount); onRefresh(); }
+            }} />}
           </div>
         </div>
       </div>
@@ -4895,8 +4909,7 @@ function AccountPortalToolTabs({
       ]
     : [
         { id: "broadcast", label: "多号群发" },
-        { id: "qr-login", label: "扫码上号" },
-        { id: "old-login", label: "老号登录" },
+        { id: "hook-start", label: "启动微信" },
       ];
   return (
     <div className={`h-[56px] px-[24px] border-b flex items-center gap-[8px] ${dark ? "border-[#242424]" : "border-[#dedede]"}`}>
@@ -5049,7 +5062,7 @@ function ProtocolLoginPanel({
       };
     };
     try {
-      return formFromSaved(JSON.parse(window.localStorage.getItem(PROTOCOL_LOGIN_FORM_STORAGE) || "{}"));
+      return formFromSaved(JSON.parse(window.localStorage.getItem(userStorageKey(PROTOCOL_LOGIN_FORM_STORAGE)) || "{}"));
     } catch {
       return formFromSaved({});
     }
@@ -5132,11 +5145,11 @@ function ProtocolLoginPanel({
   const saveForm = (next: ProtocolLoginForm, settingsSaved?: boolean) => {
     let previous: ProtocolLoginStorage = {};
     try {
-      previous = JSON.parse(window.localStorage.getItem(PROTOCOL_LOGIN_FORM_STORAGE) || "{}");
+      previous = JSON.parse(window.localStorage.getItem(userStorageKey(PROTOCOL_LOGIN_FORM_STORAGE)) || "{}");
     } catch {
       previous = {};
     }
-    window.localStorage.setItem(PROTOCOL_LOGIN_FORM_STORAGE, JSON.stringify({
+    window.localStorage.setItem(userStorageKey(PROTOCOL_LOGIN_FORM_STORAGE), JSON.stringify({
       ...next,
       settingsSaved: settingsSaved ?? Boolean(previous.settingsSaved),
     }));
@@ -5241,7 +5254,7 @@ function ProtocolLoginPanel({
     options: { force?: boolean } = {},
   ) => {
     if (!targetSessionId || fetchingQrRef.current) return;
-    const cached = PROTOCOL_QRCODE_CACHE[targetSessionId];
+    const cached = PROTOCOL_QRCODE_CACHE[userStorageKey(targetSessionId)];
     if (!options.force && cached?.qrSrc && (!cached.expiresAt || cached.expiresAt > Date.now() + PROTOCOL_QRCODE_CACHE_GRACE_MS)) {
       setQrSrc(cached.qrSrc);
       setExpiresAt(cached.expiresAt);
@@ -5262,7 +5275,7 @@ function ProtocolLoginPanel({
       const nextExpiresAt = seconds ? Date.now() + seconds * 1000 : 0;
       setQrSrc(nextQr);
       setExpiresAt(nextExpiresAt);
-      PROTOCOL_QRCODE_CACHE[targetSessionId] = {
+      PROTOCOL_QRCODE_CACHE[userStorageKey(targetSessionId)] = {
         qrSrc: nextQr,
         expiresAt: nextExpiresAt,
       };
@@ -5913,6 +5926,7 @@ function MobileAccountPortal({
   onLogout: () => void;
 }) {
   const [tool, setTool] = useState<AccountPortalTool | null>(null);
+  useEffect(() => { setTool(null); }, [source]);
   const dark = theme === "dark";
   const preferredTool = defaultAccountPortalTool(source);
   const toolButtons: Array<{ id: AccountPortalTool; label: string }> = source === "protocol"
@@ -5923,8 +5937,7 @@ function MobileAccountPortal({
       ]
     : [
         { id: "broadcast", label: "多号群发" },
-        { id: "qr-login", label: "扫码上号" },
-        { id: "old-login", label: "老号登录" },
+        { id: "hook-start", label: "启动微信" },
       ];
   const statusMeta = (account: WeChatAccount) => accountStatusMeta(account, dark);
   const displayName = (account: WeChatAccount) =>
@@ -5945,7 +5958,16 @@ function MobileAccountPortal({
     );
   }
 
-  if (tool === "qr-login" || tool === "old-login") {
+  if (source === "hook" && tool === "hook-start") {
+    return <MobileSwipeFrame dark={dark} onBack={() => setTool(null)}>
+      <div className="h-dvh flex flex-col">
+        <MobileTopBar dark={dark} title="启动微信" leftLabel="返回" onLeft={() => setTool(null)} />
+        <div className="flex-1 min-h-0"><HookLoginPanel theme={theme} onRefresh={onRefresh} onEnterAccount={onSelectAccount} /></div>
+      </div>
+    </MobileSwipeFrame>;
+  }
+
+  if (source === "protocol" && (tool === "qr-login" || tool === "old-login")) {
     return (
       <MobileSwipeFrame dark={dark} onBack={() => setTool(null)}>
         <MobileProtocolLoginPage
@@ -5991,7 +6013,7 @@ function MobileAccountPortal({
           {loading && accounts.length === 0 && <div className="text-center text-[#888] text-[14px] mt-[40px]">正在读取微信连接...</div>}
           {!loading && accounts.length === 0 && (
             <div className="text-center text-[#888] text-[14px] leading-[24px] mt-[44px]">
-              暂无连接的微信<br />可扫码上号或使用老号登录
+              暂无连接的微信<br />{source === "hook" ? "请启动微信并完成登录" : "可扫码上号或使用老号登录"}
             </div>
           )}
           <div className="space-y-[12px]">

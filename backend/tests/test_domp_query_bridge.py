@@ -3,7 +3,7 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
-from domp_query_bridge import QUERY_TOOL, TASK_QUERY_TOOL, QUERY_PROMPT, QUERY_REPLY_PREFIX, query_candidate, query_arguments, query_tool_call, query_reply, query_reply_chunks, explicit_pending_analysis, query_memory_turn
+from domp_query_bridge import QUERY_TOOL, TASK_QUERY_TOOL, RANGE_QUERY_TOOL, QUERY_PROMPT, QUERY_REPLY_PREFIX, PROBLEM_QUERY_REPLY_PREFIX, query_candidate, query_arguments, query_tool_call, query_reply, query_reply_chunks, explicit_pending_analysis, query_memory_turn
 from domp_execution_bridge import EXECUTION_TOOL, EXECUTION_PROMPT, execution_candidate
 from domp_bridge import WORKFLOW_TOOL
 from mcp_service import McpServiceError
@@ -19,6 +19,61 @@ TASK_RESULT = {'query_type':'task_processing','identifier':'xzsb-41198','found':
 
 
 class QueryBridgeTests(unittest.TestCase):
+    def test_year_to_date_and_explicit_dates_override_previous_today(self):
+        analysis = {"result": {"query_type": "problem_tickets", "identifier": ""}}
+        history = [{"arguments": {"query_type": "problem_tickets", "date_from": "2026-10-21",
+            "date_to": "2026-10-21", "date_label": "今天", "time_range": "today"}}]
+        for source in ("统计一下今年以来的运维平台问题数量 发表格给我", "统计一下今年以来的运维平台单子数量",
+                "统计一下从2026年1月1日到2026年10月21日的运维平台单子数量",
+                "统计一下从2026-01-01 至 2026-10-21的运维平台单子数量",
+                "今天帮我查2026年1月1日到2026年10月21日全部运维单",
+                "统计今年以来所有运维单", "查年初至今运维平台单据数量"):
+            with self.subTest(source=source):
+                self.assertTrue(query_candidate(source))
+                args = query_arguments(source, analysis, history, today=date(2026, 10, 21))
+                self.assertEqual(("2026-01-01", "2026-10-21"), (args["date_from"], args["date_to"]))
+                self.assertNotIn("time_range", args)
+                tool, sent = query_tool_call(args)
+                self.assertEqual(RANGE_QUERY_TOOL, tool)
+                expected = {"date_from": "2026-01-01", "date_to": "2026-10-21", "incomplete_only": False}
+                if "数量" in source and "表格" not in source:
+                    expected["count_only"] = True
+                self.assertEqual(expected, sent)
+
+    def test_explicit_dates_are_forwarded_even_with_a_stale_history_alias(self):
+        args = {"query_type": "problem_tickets", "time_range": "today", "date_from": "2026-01-01",
+            "date_to": "2026-10-21", "incomplete_only": False}
+        self.assertEqual((RANGE_QUERY_TOOL, {"date_from": "2026-01-01", "date_to": "2026-10-21", "incomplete_only": False}), query_tool_call(args))
+
+    def test_date_to_today_and_calendar_year_are_not_rolling_year(self):
+        analysis = {"result": {"query_type": "problem_tickets"}}
+        for source in ("查询本年度问题平台单子数量", "统计从2026年1月1日至今天运维单数量"):
+            args = query_arguments(source, analysis, today=date(2026, 10, 21))
+            self.assertEqual(("2026-01-01", "2026-10-21"), (args["date_from"], args["date_to"]))
+        rolling = query_arguments("查最近一年运维单数量", analysis, today=date(2026, 10, 21))
+        self.assertEqual("2025-10-22", rolling["date_from"])
+        next_year = query_arguments("查今年以来问题平台单子数量", analysis, today=date(2027, 1, 1))
+        self.assertEqual(("2027-01-01", "2027-01-01"), (next_year["date_from"], next_year["date_to"]))
+
+    def test_format_followups_inherit_only_same_conversation_scope(self):
+        history = [{"arguments": {"query_type": "problem_tickets", "identifier": "", "date_from": "2026-09-01",
+            "date_to": "2026-09-30", "date_label": "上月", "incomplete_only": True}}]
+        for text in ("整理为表格发我", "导出 Excel", "把刚才的结果整理成表格给我", "发个表格"):
+            with self.subTest(text=text):
+                self.assertTrue(query_candidate(text, history))
+                args = query_arguments(text, {"result": {"query_type": "execution"}}, history)
+                self.assertEqual("problem_tickets", args["query_type"])
+                self.assertEqual("2026-09-01", args["date_from"])
+                self.assertEqual("2026-09-30", args["date_to"])
+                self.assertTrue(args["incomplete_only"])
+                with self.assertRaises(ValueError):
+                    query_arguments(text, {"result": {"query_type": "problem_tickets"}})
+
+    def test_last_calendar_month_is_not_all_history(self):
+        source = "统计一下上个月问题平台提了多少单子"
+        args = query_arguments(source, {"result": {"query_type": "problem_tickets"}}, today=date(2026, 10, 16))
+        self.assertEqual(("2026-09-01", "2026-09-30"), (args["date_from"], args["date_to"]))
+
     def test_semantic_gate_accepts_unlisted_typos_without_correcting_identifiers(self):
         for source, kind, identifier in (
             ('带审合的单子有多少', 'pending_approvals', ''),
@@ -153,6 +208,55 @@ class QueryBridgeTests(unittest.TestCase):
         self.assertFalse(query_candidate(reply))
         self.assertNotIn('影响条数',reply)
 
+    def test_problem_platform_range_queries_default_away_from_data_platform(self):
+        analysis = {'result': json.dumps({'query_type': 'problem_tickets', 'identifier': ''})}
+        cases = (
+            ('查一下最近一个月问题平台运维单处理情况', '2026-08-15', '2026-09-15', '最近一个月', False),
+            ('查最近一个月到上一周未处理的问题平台单子', '2026-08-15', '2026-09-13', '最近一个月至上一周', True),
+            ('查最近一个月到上周的问题平台单子', '2026-08-15', '2026-09-13', '最近一个月至上一周', False),
+            ('今天问题平台还有那些未完成的单子', '2026-09-15', '2026-09-15', '今天', True),
+            ('查最近一年运维单状态', '2025-09-16', '2026-09-15', '最近一年', False),
+            ('查有史以来能查到的所有单据', '', '', '全部历史', False),
+        )
+        for source, start, end, label, incomplete in cases:
+            with self.subTest(source=source):
+                self.assertTrue(query_candidate(source))
+                args = query_arguments(source, analysis, today=date(2026, 9, 15))
+                self.assertEqual('problem_tickets', args['query_type'])
+                self.assertEqual((start, end, label, incomplete), (args['date_from'], args['date_to'], args['date_label'], args['incomplete_only']))
+                tool, tool_args = query_tool_call(args)
+                self.assertEqual(RANGE_QUERY_TOOL, tool)
+                self.assertEqual(incomplete, tool_args['incomplete_only'])
+                self.assertNotIn('offset', tool_args)
+                self.assertNotIn('limit', tool_args)
+        reply = query_reply({'query_type': 'problem_tickets', 'range_label': '今天', 'date_from': '2026-09-15', 'date_to': '2026-09-15', 'incomplete_only': True, 'excluded_statuses': ['完成待验证', '关闭(归档)', '验证不通过', '科长意见给出', '提出'], 'count': 1, 'offset': 0, 'shown_count': 1, 'has_more': False, 'items': [{'identifier': 'xzsb-41418', 'problem_id': '54000000533488', 'status': '转现场处理', 'summary': '个人账户金额不一致', 'submitted_at': '2026-09-15'}]})
+        self.assertTrue(reply.startswith(PROBLEM_QUERY_REPLY_PREFIX))
+        self.assertIn('标识ID：xzsb-41418；问题ID：54000000533488；状态：转现场处理', reply)
+        self.assertIn('已排除：完成待验证、关闭(归档)、验证不通过', reply)
+        self.assertIn('科长意见给出、提出', reply)
+        self.assertFalse(query_candidate(reply))
+
+    def test_large_problem_platform_range_reply_is_a_short_progress_summary(self):
+        items = [
+            {'identifier': f'xzsb-{41400 + index}', 'summary': f'问题 {index}',
+             'status': '转现场处理' if index % 2 else '完成待验证',
+             'submitted_at': '2026-09-15', 'assignee': '徐国发'}
+            for index in range(11)
+        ]
+        reply = query_reply({
+            'query_type': 'problem_tickets', 'range_label': '最近一个月',
+            'count': 11, 'items': items,
+        })
+        self.assertIn('符合条件：11 条', reply)
+        self.assertIn('当前处理进度：完成待验证 6 条；转现场处理 5 条', reply)
+        self.assertIn('完整明细已整理为表格文件发送', reply)
+        self.assertNotIn('xzsb-41400', reply)
+
+    def test_explicit_data_word_does_not_fall_back_to_problem_range(self):
+        analysis = {'result': json.dumps({'query_type': 'problem_tickets', 'identifier': ''})}
+        with self.assertRaisesRegex(ValueError, '已明确选择数据平台'):
+            query_arguments('查最近一个月数据运维处理情况', analysis, today=date(2026, 9, 15))
+
     def test_natural_query_and_strict_readonly_arguments(self):
         self.assertTrue(query_candidate(QUERY))
         self.assertTrue(query_candidate('目前有所少待审核的需求'))
@@ -221,7 +325,7 @@ class QueryGroupTests(unittest.IsolatedAsyncioTestCase):
         before = self.send.call_count
         await self.process(self.message(id='102', msg='今天有没有新人'))
         self.assertEqual(1, len(self.calls))
-        self.assertEqual(before, self.send.call_count)
+        self.assertEqual(before + 1, self.send.call_count)
 
     async def test_combined_typo_query_reads_both_categories_for_sender_and_owner(self):
         row = self.cache.get_smart_reply_config(self.chat, owner_wxid=self.owner)
@@ -236,7 +340,7 @@ class QueryGroupTests(unittest.IsolatedAsyncioTestCase):
         self.main.mcp_service.call_tool = read
         source = '今天有没有代审核和待执行的单子'
         for index, sender in enumerate((self.sender, self.owner)):
-            await self.process(self.message(id=str(400 + index), msg=source, fromid=sender, isSender=int(sender == self.owner)))
+            await self.process(self.message(id=str(400 + index), msg=("@空气 " + (source) if sender == self.owner else (source)), fromid=sender, isSender=int(sender == self.owner), atuserlist=[self.owner] if sender == self.owner else []))
             self.assertEqual((self.chat, sender), self.send.call_args.args[:2])
             self.assertIn('目前待审核需求：0 条', self.send.call_args.args[3])
             self.assertIn('目前待执行需求：1 条', self.send.call_args.args[3])
@@ -277,7 +381,7 @@ class QueryGroupTests(unittest.IsolatedAsyncioTestCase):
         self.query_result={'query_type':'execution','identifier':'41184','work_num':'5400000000383893','execution':{'status':'执行成功','complete':True,'affected_rows_total':1,
             'details':[{'sql':sql,'status':'执行成功','affected_rows':1,'elapsed_seconds':'.08','exception':''}],'exceptions':[]}}
         for index,source in enumerate(('41184 的执行详情发我看看','把41184执行详情给我','41184 SQL脚本发我看看','详情呢')):
-            await self.process(self.message(id=str(300+index),msg=source,fromid=self.owner,isSender=1,sendorrecv='1'))
+            await self.process(self.message(id=str(300+index),msg="@空气 " + (source),fromid=self.owner,isSender=1,sendorrecv='1', atuserlist=[self.owner]))
             self.assertIn(sql,self.send.call_args.args[3])
         self.assertEqual([QUERY_TOOL]*4,[c['tool_name'] for c in self.calls])
         self.assertEqual((self.chat,self.owner),self.send.call_args.args[:2])
@@ -289,7 +393,7 @@ class QueryGroupTests(unittest.IsolatedAsyncioTestCase):
         self.query_analysis={**ANALYZED,'result':json.dumps({'query_type':'execution','identifier':'41233'})}
         self.query_result={'query_type':'execution','identifier':'41233','found':True,'work_num':'num-41233','execution':{'status':'执行成功','complete':True,'affected_rows_total':0,'details':[{'status':'执行成功','affected_rows':0,'elapsed_seconds':'0.01','exception':''}],'exceptions':[]}}
         for index,source in enumerate(('41233 执行了吗，结果如何','41233 执行了吗')):
-            await self.process(self.message(id=str(200+index),msg=source,fromid=self.owner,isSender=1,sendorrecv='1'))
+            await self.process(self.message(id=str(200+index),msg="@空气 " + (source),fromid=self.owner,isSender=1,sendorrecv='1', atuserlist=[self.owner]))
         self.assertEqual([QUERY_TOOL,QUERY_TOOL],[c['tool_name'] for c in self.calls])
         self.assertTrue(all(c['arguments']=={'query_type':'execution','identifier':'41233'} for c in self.calls))
         self.assertIn('执行结果：执行成功',self.send.call_args.args[3])
@@ -300,22 +404,22 @@ class QueryGroupTests(unittest.IsolatedAsyncioTestCase):
         self.query_analysis={**ANALYZED,'result':json.dumps({'query_type':'task_processing','identifier':'41198'})}
         self.query_result=TASK_RESULT
         for index,source in enumerate(('查一下 41198 处理情况','查一下 41198 任务处理情况')):
-            await self.process(self.message(id=str(200+index),msg=source,fromid=self.owner,isSender=1,sendorrecv='1'))
+            await self.process(self.message(id=str(200+index),msg="@空气 " + (source),fromid=self.owner,isSender=1,sendorrecv='1', atuserlist=[self.owner]))
         self.assertEqual([TASK_QUERY_TOOL,TASK_QUERY_TOOL],[c['tool_name'] for c in self.calls])
         self.assertTrue(all(c['arguments']=={'identifier':'41198'} for c in self.calls))
-        self.assertEqual(2,self.send.call_count)
+        self.assertEqual(4,self.send.call_count)
         self.assertEqual((self.chat,self.owner),self.send.call_args.args[:2])
         self.assertIn('受理人评论：请处理',self.send.call_args.args[3])
-        await self.process(self.message(id='202',msg=self.send.call_args.args[3],fromid=self.owner,isSender=1,sendorrecv='1'))
+        await self.process(self.message(id='202',msg="@空气 " + (self.send.call_args.args[3]),fromid=self.owner,isSender=1,sendorrecv='1', atuserlist=[self.owner]))
         self.assertEqual(2,len(self.calls))
 
     async def test_owner_can_query_but_own_sql_and_bot_reply_do_not_trigger(self):
-        await self.process(self.message(msg=QUERY,fromid=self.owner,isSender=1,sendorrecv='1'))
+        await self.process(self.message(msg="@空气 " + (QUERY),fromid=self.owner,isSender=1,sendorrecv='1', atuserlist=[self.owner]))
         self.assertEqual(QUERY_TOOL,self.calls[0]['tool_name'])
         reply=self.send.call_args.args[3]
-        await self.process(self.message(id='101',msg=reply,fromid=self.owner,isSender=1,sendorrecv='1'))
-        await self.process(self.message(id='102',fromid=self.owner,isSender=1,sendorrecv='1'))
-        self.assertEqual(1,len(self.calls)); self.send.assert_called_once()
+        await self.process(self.message(id='101',msg="@空气 " + (reply),fromid=self.owner,isSender=1,sendorrecv='1', atuserlist=[self.owner]))
+        await self.process(self.message(id='102',fromid=self.owner,isSender=1,sendorrecv='1', atuserlist=[self.owner]))
+        self.assertEqual(1,len(self.calls)); self.assertEqual(2, self.send.call_count)
 
     async def test_original_sql_stays_on_workflow_and_unlisted_sender_cannot_query(self):
         await self.process(self.message())
@@ -340,39 +444,39 @@ class QueryGroupTests(unittest.IsolatedAsyncioTestCase):
         self.main.smart_reply_engine.cooldown=30
         self.query_analysis={**ANALYZED,'result':json.dumps({'query_type':'pending_approvals','identifier':''})}
         self.query_result={'query_type':'pending_approvals','count':0,'items':[]}
-        await self.process(self.message(msg='有哪些待审批',fromid=self.owner,isSender=1))
+        await self.process(self.message(msg="@空气 " + ('有哪些待审批'),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.query_analysis={**ANALYZED,'result':json.dumps({'query_type':'pending_executions','identifier':''})}
         self.query_result={'query_type':'pending_executions','count':2,'items':[]}
-        await self.process(self.message(id='101',msg='待执行呢',fromid=self.owner,isSender=1))
+        await self.process(self.message(id='101',msg="@空气 " + ('待执行呢'),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.assertEqual(['pending_approvals','pending_executions'],[c['arguments']['query_type'] for c in self.calls])
         context=json.loads(self.analyzed_messages[-1])
         self.assertEqual('待执行呢',context['current_message'])
         self.assertEqual('pending_approvals',context['query_history'][-1]['arguments']['query_type'])
         self.assertIn('目前待执行需求：2 条',self.send.call_args.args[3])
-        self.assertEqual(2,self.send.call_count)
+        self.assertEqual(4,self.send.call_count)
 
     async def test_sender_history_is_not_shared_and_new_identifier_wins(self):
         self.query_analysis={**ANALYZED,'result':json.dumps({'query_type':'task_processing','identifier':'41198'})}
         self.query_result=TASK_RESULT
-        await self.process(self.message(msg='查41198任务处理情况',fromid=self.owner,isSender=1))
+        await self.process(self.message(msg="@空气 " + ('查41198任务处理情况'),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         await self.process(self.message(id='101',msg='那它呢'))
         self.assertEqual(1,len(self.calls))
         self.assertIn('没有可承接',self.send.call_args.args[3])
         self.query_analysis={**ANALYZED,'result':json.dumps({'query_type':'execution','identifier':'41199'})}
-        await self.process(self.message(id='102',msg='那41199呢',fromid=self.owner,isSender=1))
+        await self.process(self.message(id='102',msg="@空气 " + ('那41199呢'),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.assertEqual(TASK_QUERY_TOOL,self.calls[-1]['tool_name'])
         self.assertEqual({'identifier':'41199'},self.calls[-1]['arguments'])
 
     async def test_expired_followup_does_not_inherit_ticket_and_new_query_starts_session(self):
         self.query_analysis={**ANALYZED,'result':json.dumps({'query_type':'task_processing','identifier':'41198'})}
         self.query_result=TASK_RESULT
-        await self.process(self.message(msg='查41198任务处理情况',fromid=self.owner,isSender=1))
+        await self.process(self.message(msg="@空气 " + ('查41198任务处理情况'),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         first=self.cache.get_query_conversation(self.chat,self.owner,owner_wxid=self.owner)
         with patch('sqlite_cache.time.time',return_value=first['created_at']+7*86400):
-            await self.process(self.message(id='101',msg='那它呢',fromid=self.owner,isSender=1))
+            await self.process(self.message(id='101',msg="@空气 " + ('那它呢'),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
             self.assertEqual(1,len(self.calls))
             self.assertIn('没有可承接',self.send.call_args.args[3])
-            await self.process(self.message(id='102',msg='查41198任务处理情况',fromid=self.owner,isSender=1))
+            await self.process(self.message(id='102',msg="@空气 " + ('查41198任务处理情况'),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
             second=self.cache.get_query_conversation(self.chat,self.owner,owner_wxid=self.owner)
         self.assertNotEqual(first['session_id'],second['session_id'])
         self.assertEqual(1,len(second['turns']))

@@ -172,8 +172,9 @@ function defaultMcpReplyTemplate(toolName: string): string {
   return "{{mcp_text}}";
 }
 
-function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
+function makeDraft(target: SmartReplyTarget, selfWxid = ""): SmartReplyConfig {
   const isGroup = target.wxid.endsWith("@chatroom");
+  const privateSender = target.wxid === "filehelper" ? selfWxid : target.wxid;
   return {
     chat_id: target.wxid,
     chat_name: target.name || target.wxid,
@@ -184,8 +185,8 @@ function makeDraft(target: SmartReplyTarget): SmartReplyConfig {
     use_no_src: false,
     message_types: ["text"],
     file_types: ["txt"],
-    target_senders: isGroup ? [] : [target.wxid],
-    target_senders_by_type: { text: isGroup ? [] : [target.wxid] },
+    target_senders: isGroup ? [] : [privateSender].filter(Boolean),
+    target_senders_by_type: { text: isGroup ? [] : [privateSender].filter(Boolean) },
     rules: [makeRule("text")],
     ai_tasks: [],
     reply_count: 0,
@@ -230,14 +231,18 @@ function flattenTargetSenders(
   return Array.from(new Set(Object.values(sendersByType).flatMap((senders) => senders || [])));
 }
 
-function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
+function cloneConfig(config: SmartReplyConfig, selfWxid = ""): SmartReplyConfig {
   const isGroup = config.chat_id.endsWith("@chatroom");
+  const isFilehelper = config.chat_id === "filehelper";
+  const privateSenders = isFilehelper
+    ? [selfWxid || config.target_senders?.[0]].filter((value): value is string => Boolean(value))
+    : [config.chat_id];
   const configuredMessageTypes: SmartReplyMessageType[] = config.message_types?.length
     ? [...config.message_types]
     : ["text"];
   const legacyRuleTypes = configuredMessageTypes.filter((value) => value === "text" || value === "image");
   const legacyAiTypes = configuredMessageTypes.filter((value) => value === "text" || value === "image" || value === "file");
-  const legacyTargetSenders = isGroup ? [...(config.target_senders || [])] : [config.chat_id];
+  const legacyTargetSenders = isGroup ? [...(config.target_senders || [])] : privateSenders;
   const rawSendersByType = config.target_senders_by_type && typeof config.target_senders_by_type === "object"
     ? config.target_senders_by_type
     : {};
@@ -251,7 +256,7 @@ function cloneConfig(config: SmartReplyConfig): SmartReplyConfig {
   const targetSendersByType = Object.fromEntries(senderMessageTypes.map((messageType) => {
     const configuredSenders = rawSendersByType[messageType];
     const senders = Array.isArray(configuredSenders) ? configuredSenders : legacyTargetSenders;
-    return [messageType, isGroup ? Array.from(new Set(senders)) : [config.chat_id]];
+    return [messageType, isGroup ? Array.from(new Set(senders)) : privateSenders];
   })) as Partial<Record<SmartReplyMessageType, string[]>>;
   const rules = dedupeLegacyItems(config.rules || [], ["id", "message_type"]).flatMap((rule) => {
     if (rule.message_type) return [{ ...rule }];
@@ -359,6 +364,12 @@ function formatTriggeredAt(timestamp?: number): string {
     minute: "2-digit",
     hour12: false,
   }).format(new Date(timestamp * 1000));
+}
+
+function isSqlWorkflowTask(task: SmartReplyAiTask): boolean {
+  return task.enabled && task.mcp_enabled && task.message_type === "text"
+    && (task.skill_id === "domp_unified_agent" || task.id.startsWith("domp_unified_agent_")
+      || task.mcp_tool_name === "process_data_maintenance");
 }
 
 export default function SmartReplyManager({
@@ -561,7 +572,7 @@ export default function SmartReplyManager({
   }, [mcpToolsByConnection, mcpToolsLoading]);
 
   const openConfig = useCallback((config: SmartReplyConfig) => {
-    const cloned = cloneConfig(config);
+    const cloned = cloneConfig(config, normalizedSelfWxid);
     const preference = readViewPreference(config.chat_id);
     const preferredMessageType = MESSAGE_TYPE_OPTIONS.some(
       (option) => option.value === preference.message_type,
@@ -584,13 +595,13 @@ export default function SmartReplyManager({
       setMemberQuery("");
       setMembersLoading(false);
     }
-  }, [applyMessageViewPreference, loadMembers]);
+  }, [applyMessageViewPreference, loadMembers, normalizedSelfWxid]);
 
   const openTarget = useCallback((target: SmartReplyTarget, rows = configs) => {
     const existing = rows.find((config) => config.chat_id === target.wxid);
-    openConfig(existing || makeDraft(target));
+    openConfig(existing || makeDraft(target, normalizedSelfWxid));
     setPickerOpen(false);
-  }, [configs, openConfig]);
+  }, [configs, openConfig, normalizedSelfWxid]);
 
   useEffect(() => {
     let cancelled = false;
@@ -604,7 +615,7 @@ export default function SmartReplyManager({
         setConfigs(rows);
         if (initialTarget?.wxid) {
           const existing = rows.find((config) => config.chat_id === initialTarget.wxid);
-          openConfig(existing || makeDraft(initialTarget));
+          openConfig(existing || makeDraft(initialTarget, normalizedSelfWxid));
         } else if (rows.length > 0) {
           openConfig(rows[0]);
         } else {
@@ -620,7 +631,7 @@ export default function SmartReplyManager({
     return () => {
       cancelled = true;
     };
-  }, [initialTarget, openConfig]);
+  }, [initialTarget, openConfig, normalizedSelfWxid]);
 
   useEffect(() => {
     let cancelled = false;
@@ -728,7 +739,7 @@ export default function SmartReplyManager({
         return;
       }
       const saved = data.config as SmartReplyConfig;
-      setDraft(cloneConfig(saved));
+      setDraft(cloneConfig(saved, normalizedSelfWxid));
       setConfigs((prev) => [saved, ...prev.filter((config) => config.chat_id !== saved.chat_id)]);
       setNotice("已保存");
       window.setTimeout(() => setNotice(""), 1800);
@@ -1014,12 +1025,6 @@ export default function SmartReplyManager({
     const selected = new Set(currentTargetSenders);
     if (selected.has(wxid)) selected.delete(wxid);
     else {
-      if (normalizedSelfWxid && wxid === normalizedSelfWxid) {
-        const confirmed = window.confirm(
-          `“${wxid}”是当前登录账号。自己的消息会被系统过滤，通常不需要加入目标发送人。仍要选中吗？`,
-        );
-        if (!confirmed) return;
-      }
       selected.add(wxid);
     }
     updateTargetSenders(Array.from(selected));
@@ -1034,7 +1039,7 @@ export default function SmartReplyManager({
     if (!targetSendersByType[messageType]) {
       targetSendersByType[messageType] = draft.chat_id.endsWith("@chatroom")
         ? [...currentTargetSenders]
-        : [draft.chat_id];
+        : [draft.chat_id === "filehelper" ? normalizedSelfWxid : draft.chat_id].filter(Boolean);
     }
     updateDraft({
       message_types: MESSAGE_TYPE_OPTIONS
@@ -1096,10 +1101,28 @@ export default function SmartReplyManager({
 
   const availablePickerTargets = useMemo(() => {
     const query = pickerQuery.trim().toLocaleLowerCase();
-    return availableTargets
+    return [{ wxid: "filehelper", name: "文件传输助手" }, ...availableTargets.filter((target) => target.wxid !== "filehelper")]
       .filter((target) => !query || target.name.toLocaleLowerCase().includes(query) || target.wxid.toLocaleLowerCase().includes(query))
       .slice(0, 300);
   }, [availableTargets, pickerQuery]);
+
+  const sqlWorkflowSources = configs.filter((config) => config.chat_id !== "filehelper"
+    && config.enabled && config.ai_tasks.some(isSqlWorkflowTask));
+
+  const copyFilehelperWorkflow = (sourceChat: string) => {
+    if (!draft || draft.chat_id !== "filehelper") return;
+    const source = sqlWorkflowSources.find((config) => config.chat_id === sourceChat);
+    if (!source) return;
+    const tasks = cloneConfig(source).ai_tasks.filter(isSqlWorkflowTask);
+    const senders = [normalizedSelfWxid].filter(Boolean);
+    updateDraft({ enabled: true, message_types: ["text"], rules: [], ai_tasks: tasks,
+      mention_only: false, mention_message_types: [], use_no_src: false,
+      target_senders: senders, target_senders_by_type: { text: senders } });
+    setActiveMessageType("text");
+    setTextReplyMode("ai");
+    setNotice("已复制数据运维配置，请保存后使用");
+    setError("");
+  };
 
   const aiTestPanel = textReplyMode === "ai" && currentAiTasks.length > 0 ? (
     <div data-ai-test-panel className={`border-y ${dark ? "border-[#303030]" : "border-[#ddd]"}`}>
@@ -1213,6 +1236,10 @@ export default function SmartReplyManager({
             className={`ml-[7px] min-w-0 flex-1 bg-transparent outline-none text-[13px] ${dark ? "text-[#ddd] placeholder:text-[#666]" : "text-[#222] placeholder:text-[#888]"}`}
           />
         </div>
+        <button type="button" onClick={() => openTarget({ wxid: "filehelper", name: "文件传输助手" })}
+          className="mt-[8px] text-[12px] text-[#07c160] hover:underline">
+          配置文件传输助手任务
+        </button>
       </div>
       <div className="pane-scroll flex-1 min-h-0 overflow-y-auto">
         {loading ? (
@@ -1307,6 +1334,23 @@ export default function SmartReplyManager({
               <Toggle checked={draft.enabled} onChange={(enabled) => updateDraft({ enabled })} />
             </div>
           </section>
+
+          {draft.chat_id === "filehelper" && (
+            <section className={`py-[20px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
+              <h2 className="text-[15px] font-medium">本人 @空气 数据运维任务</h2>
+              <p className={`mt-[7px] text-[13px] leading-[21px] ${dark ? "text-[#aaa]" : "text-[#666]"}`}>
+                当前账号向文件传输助手发送 @空气、单号和 SQL 后，系统按用途及风险检查、填报、审核、执行的顺序处理，并在这里返回结果。
+                四位线下单会先匹配并确认市、县或区，确认和修改时也需要 @空气。
+              </p>
+              <select aria-label="复制数据运维任务配置" value="" onChange={(event) => copyFilehelperWorkflow(event.target.value)}
+                className={`mt-[12px] max-w-full h-[36px] rounded-[5px] px-[10px] text-[13px] ${dark ? "bg-[#262626] text-[#ddd]" : "bg-[#eee] text-[#333]"}`}>
+                <option value="">选择已有聊天的数据运维配置</option>
+                {sqlWorkflowSources.map((source) => <option key={source.chat_id} value={source.chat_id}>{source.chat_name}</option>)}
+              </select>
+              {sqlWorkflowSources.length === 0 && <p className="mt-[7px] text-[12px] text-[#888]">可在下方添加数据运维 Agent 并选择 MCP 连接。</p>}
+              <p className={`mt-[8px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>仅处理本人明确 @空气 的指令，结果消息不会继续触发任务。保存后生效。</p>
+            </section>
+          )}
 
           <section className={`py-[24px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
             <div className="flex items-center justify-between gap-[18px]">
@@ -1512,8 +1556,8 @@ export default function SmartReplyManager({
                   {MESSAGE_TYPE_OPTIONS.find((option) => option.value === activeMessageType)?.label} · 已选择 {currentTargetSenders.length} 人
                 </div>
                 {selfSelected && (
-                  <div role="alert" className={`mt-[5px] text-[12px] ${dark ? "text-[#d4a657]" : "text-[#a76b00]"}`}>
-                    当前登录账号已被选中，建议取消以避免误配置。
+                  <div className={`mt-[5px] text-[12px] ${dark ? "text-[#999]" : "text-[#777]"}`}>
+                    本人的数据运维指令仍需明确 @空气，普通消息不触发。
                   </div>
                 )}
               </div>
@@ -2219,6 +2263,19 @@ function normalizeMcpConnections(settings: AiSettings | null): McpConnection[] {
   }));
 }
 
+function mcpTokenRequired(connection: McpConnection): boolean {
+  try {
+    const url = new URL(connection.url.trim());
+    return ["59.217.45.7", "10.11.0.37"].includes(url.hostname) && url.port === "5222";
+  } catch {
+    return false;
+  }
+}
+
+function mcpTokenMissing(connection: McpConnection): boolean {
+  return mcpTokenRequired(connection) && !connection.token?.trim() && !connection.token_configured;
+}
+
 function AiSettingsDialog({
   dark,
   settings,
@@ -2302,6 +2359,10 @@ function AiSettingsDialog({
       setMcpFeedback((prev) => ({ ...prev, [connection.id]: { kind: "error", message: "请填写连接名称和 MCP 地址" } }));
       return;
     }
+    if (mcpTokenMissing(connection)) {
+      setMcpFeedback((prev) => ({ ...prev, [connection.id]: { kind: "error", message: "请填写与服务器 api_token 一致的 Bearer Token" } }));
+      return;
+    }
     setValidatingConnectionId(connection.id);
     setMcpFeedback((prev) => {
       const next = { ...prev };
@@ -2372,6 +2433,11 @@ function AiSettingsDialog({
     const incompleteConnection = mcpConnections.find((connection) => !connection.name.trim() || !connection.url.trim());
     if (incompleteConnection) {
       setMcpFeedback((prev) => ({ ...prev, [incompleteConnection.id]: { kind: "error", message: "请完整填写该 MCP 连接后再保存" } }));
+      return;
+    }
+    const unauthenticatedConnection = mcpConnections.find((connection) => connection.enabled && mcpTokenMissing(connection));
+    if (unauthenticatedConnection) {
+      setMcpFeedback((prev) => ({ ...prev, [unauthenticatedConnection.id]: { kind: "error", message: "请填写与服务器 api_token 一致的 Bearer Token 后再保存" } }));
       return;
     }
     setSavingSettings(true);
@@ -2706,7 +2772,7 @@ function AiSettingsDialog({
                           <input
                             value={connection.url}
                             onChange={(event) => updateMcpConnection(connection.id, { url: event.target.value })}
-                            placeholder="http://127.0.0.1:8765/mcp"
+                            placeholder="http://59.217.45.7:5222/mcp"
                             autoComplete="off"
                             className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
                           />
@@ -2716,8 +2782,8 @@ function AiSettingsDialog({
                           <input
                             type="password"
                             value={connection.token || ""}
-                            onChange={(event) => updateMcpConnection(connection.id, { token: event.target.value, token_configured: Boolean(event.target.value.trim()) })}
-                            placeholder="可选"
+                            onChange={(event) => updateMcpConnection(connection.id, { token: event.target.value })}
+                            placeholder={connection.token_configured ? "已配置，留空保留" : (mcpTokenRequired(connection) ? "请输入服务器 api_token" : "可选")}
                             autoComplete="new-password"
                             className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
                           />

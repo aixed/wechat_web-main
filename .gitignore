@@ -5,6 +5,10 @@ config.yaml
 
 # Hook API capture containing real account data - keep local only
 PC微信协议_3.9.10.16_go.postman_collection.json
+PCWeChat_391016.postman_collection.json
+
+# Temporary OCR images derived from local screenshots
+.codex_image_ocr/
 
 # Logs
 *.log

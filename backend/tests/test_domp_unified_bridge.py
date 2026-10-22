@@ -131,8 +131,8 @@ class UnifiedGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("影响条数合计：0", self.send.call_args.args[3])
         self.calls.clear()
         self.current_analysis = analysis("execute", "41184")
-        await self.process(self.message(id="101", msg="兄弟，帮我执行下 41184",
-                                        fromid=self.owner, isSender=1, sendorrecv="1"))
+        await self.process(self.message(id="101", msg="@空气 " + ("兄弟，帮我执行下 41184"),
+                                        fromid=self.owner, isSender=1, sendorrecv="1", atuserlist=[self.owner]))
         self.assertEqual(["list_data_maintenance_executions", EXECUTION_TOOL], [call["tool_name"] for call in self.calls])
         self.assertIn("影响条数合计：3", self.send.call_args.args[3])
         self.assertEqual((self.chat, self.owner), self.send.call_args.args[:2])
@@ -167,6 +167,23 @@ class UnifiedGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("操作要求：填报运维单 41323，审核通过后执行。", submitted)
         self.assertIn("文件名：41323.txt", submitted)
         self.assertTrue(submitted.endswith(sql))
+
+    async def test_combined_text_request_uses_same_senders_recent_matching_chat_sql(self):
+        sql = "UPDATE EINP_BASICINFO.ab01 SET aab034='540224' WHERE aab001=540100279605"
+        self.cache.upsert_group_members(self.chat, [{"wxid": "member-aixed", "name": "Aixed"}], owner_wxid=self.owner)
+        self.cache.upsert_messages(self.chat, [{
+            "id": "chat-41323", "msgtype": "1", "timestamp": 100,
+            "fromid": self.sender, "sendorrecv": "2", "isSender": 0,
+            "msg": "需求 41323\n" + sql + "; @Aixed",
+        }], owner_wxid=self.owner)
+        self.current_analysis = analysis("sql_workflow", "41323", sql_purpose="调整指定单位经办机构", risk_level="medium")
+        await self.process(self.message(id="combined-chat-41323", timestamp=101,
+            msg="提交填报运维单 41323，并审核执行"))
+        self.assertEqual(WORKFLOW_TOOL, self.calls[-1]["tool_name"])
+        submitted = self.calls[-1]["arguments"]["sql_text"]
+        self.assertIn("操作要求：填报运维单 41323，审核通过后执行。", submitted)
+        self.assertIn("聊天内容：", submitted)
+        self.assertTrue(submitted.endswith(sql + ";"))
 
     async def test_combined_text_request_never_uses_another_senders_txt(self):
         path = Path(self.temp.name) / "41323.txt"

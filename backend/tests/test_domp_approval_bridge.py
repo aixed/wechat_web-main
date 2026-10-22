@@ -127,8 +127,8 @@ class ApprovalGroupTests(unittest.IsolatedAsyncioTestCase):
     async def test_reported_explicit_approval_routes_only_approval_agent(self):
         self.query_result = PENDING
         for index, sender in enumerate((self.sender, self.owner)):
-            await self.process(self.message(id=str(880 + index), msg="审核一下 41366 运维单",
-                fromid=sender, isSender=int(sender == self.owner)))
+            await self.process(self.message(id=str(880 + index), msg=("@空气 " + ("审核一下 41366 运维单") if sender == self.owner else ("审核一下 41366 运维单")),
+                fromid=sender, isSender=int(sender == self.owner), atuserlist=[self.owner] if sender == self.owner else []))
             self.assertIn("审核：审核通过", self.send.call_args.args[3])
             self.assertNotIn("执行：", self.send.call_args.args[3])
             self.assertEqual(APPROVAL_TOOL, self.analyzed_messages[-1][1])

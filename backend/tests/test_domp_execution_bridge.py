@@ -172,23 +172,23 @@ class ExecutionGroupTests(unittest.IsolatedAsyncioTestCase):
     async def test_reported_owner_two_steps_route_to_single_execution_and_reply_effects(self):
         self.query_analysis={**fixtures.ANALYZED,"result":'{"query_type":"pending_executions","identifier":""}'}
         self.query_result=PENDING
-        await self.process(self.message(msg="查一下待执行的任务有多少",fromid=self.owner,isSender=1))
-        await self.process(self.message(id="101",msg="执行下并告诉我结果",fromid=self.owner,isSender=1))
+        await self.process(self.message(msg="@空气 " + ("查一下待执行的任务有多少"),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
+        await self.process(self.message(id="101",msg="@空气 " + ("执行下并告诉我结果"),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.assertEqual([QUERY_TOOL,"list_data_maintenance_executions",EXECUTION_TOOL],[c["tool_name"] for c in self.calls])
         self.assertEqual({k:ITEM[k] for k in ("work_id","work_num")},self.calls[-1]["arguments"])
         self.assertEqual((self.chat,self.owner),self.send.call_args.args[:2])
         reply=self.send.call_args.args[3]
         self.assertIn("执行结果：执行成功",reply);self.assertIn("影响条数合计：4",reply)
         self.assertIn("SQL 2：执行成功，影响 0 条",reply);self.assertIn("异常详情：无",reply)
-        await self.process(self.message(id="102",msg=reply,fromid=self.owner,isSender=1))
+        await self.process(self.message(id="102",msg="@空气 " + (reply),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.assertEqual(3,len(self.calls))
 
     async def test_pending_approval_followup_routes_to_pinned_batch_approval_and_execution(self):
         self.query_analysis={**fixtures.ANALYZED,"result":'{"query_type":"pending_approvals","identifier":""}'}
         self.query_result={"query_type":"pending_approvals","count":1,"items":[{**ITEM,"identifier":"41184","status":"待审批"}]}
-        await self.process(self.message(msg="查一下待审核的数据运维单",fromid=self.owner,isSender=1))
+        await self.process(self.message(msg="@空气 " + ("查一下待审核的数据运维单"),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.exec_analysis=BATCH_ANALYSIS
-        await self.process(self.message(id="151",msg="都审核执行一下",fromid=self.owner,isSender=1))
+        await self.process(self.message(id="151",msg="@空气 " + ("都审核执行一下"),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.assertEqual([QUERY_TOOL, QUERY_TOOL, "approve_data_maintenance", EXECUTION_TOOL],
             [call["tool_name"] for call in self.calls])
         reply=self.send.call_args.args[3]
@@ -223,7 +223,7 @@ class ExecutionGroupTests(unittest.IsolatedAsyncioTestCase):
     async def test_reported_greeting_command_passes_owner_gate_and_validates_current_ticket(self):
         self.exec_analysis={**EXEC_ANALYSIS,"result":'{"action":"execute","identifier":"41184"}'}
         for index,source in enumerate(("兄弟，帮我执行下 41184", "老师，麻烦把数据运维单 41184 执行一下", "@助手 帮我执行下41184")):
-            await self.process(self.message(id=str(200+index),msg=source,fromid=self.owner,isSender=1,sendorrecv="1"))
+            await self.process(self.message(id=str(200+index),msg="@空气 " + (source),fromid=self.owner,isSender=1,sendorrecv="1", atuserlist=[self.owner]))
         self.assertEqual(["list_data_maintenance_executions",EXECUTION_TOOL]*3,[c["tool_name"] for c in self.calls])
         self.assertTrue(all(c["arguments"]=={k:ITEM[k] for k in ("work_id","work_num")} for c in self.calls if c["tool_name"]==EXECUTION_TOOL))
         self.assertEqual((self.chat,self.owner),self.send.call_args.args[:2])
@@ -235,18 +235,18 @@ class ExecutionGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([],self.calls);self.assertIn("没有明确待执行",self.send.call_args.args[3])
         await self.process(self.message(id="101",msg="执行41184",fromid="not_allowed"))
         self.assertEqual([],self.calls)
-        await self.process(self.message(id="102",fromid=self.owner,isSender=1))
+        await self.process(self.message(id="102",fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.assertEqual([],self.calls) # Owner's raw SQL is still excluded.
 
     async def test_expired_context_does_not_execute(self):
         session=self.cache.append_query_turn(self.chat,self.owner,history()[0],owner_wxid=self.owner)
         with patch("sqlite_cache.time.time",return_value=session["created_at"]+7*86400):
-            await self.process(self.message(msg="执行下",fromid=self.owner,isSender=1))
+            await self.process(self.message(msg="@空气 " + ("执行下"),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.assertEqual([],self.calls);self.assertIn("超过一周",self.send.call_args.args[3])
 
     async def test_status_question_stays_readonly_with_execution_agent_enabled(self):
         self.query_analysis={**fixtures.ANALYZED,"result":'{"query_type":"execution","identifier":"41233"}'}
-        await self.process(self.message(msg="41233 执行了吗，结果如何",fromid=self.owner,isSender=1))
+        await self.process(self.message(msg="@空气 " + ("41233 执行了吗，结果如何"),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.assertEqual([QUERY_TOOL],[c["tool_name"] for c in self.calls])
 
 
@@ -264,7 +264,7 @@ class TaskSummaryGroupTests(unittest.IsolatedAsyncioTestCase):
         for index,(source,kind) in enumerate((("当前有多少待处理的任务","pending_tasks"),("今天分配了多少任务","today_assignments"),("详情呢","today_assignments"))):
             self.query_analysis={**fixtures.ANALYZED,"result":json.dumps({"query_type":kind,"identifier":""})}
             self.query_result={"query_type":kind,"date":"2026-09-14","count":1,"items":[{"identifier":"xzsb-41198","summary":"测试", "assignee":"张三","assigned_at":"2026-09-14T10:00:00+08:00","result":"已提交并从待处理列表移除"}],"coverage_note":"历史范围"}
-            await self.process(self.message(id=str(index),msg=source,fromid=self.owner,isSender=1))
+            await self.process(self.message(id=str(index),msg="@空气 " + (source),fromid=self.owner,isSender=1, atuserlist=[self.owner]))
         self.assertEqual([TASK_SUMMARY_TOOL]*3,[c["tool_name"] for c in self.calls])
         self.assertEqual(["pending_tasks","today_assignments","today_assignments"],[c["arguments"]["query_type"] for c in self.calls])
         self.assertIn("指派人员：张三",self.send.call_args.args[3]); self.assertIn("历史范围",self.send.call_args.args[3])

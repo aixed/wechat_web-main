@@ -26,11 +26,15 @@ import subprocess
 import importlib
 import hashlib
 import mimetypes
+import tempfile
+import zipfile
 import xml.etree.ElementTree as ET
 from typing import Any
 
 import config
+import access_store
 import protocol_api
+import hook_login
 import wechat_api
 from agent_ws import agent_manager
 from ws_manager import manager
@@ -39,13 +43,19 @@ from sqlite_cache import SqliteMessageCache
 from pb_parser import parse_raw_pb
 from smart_reply import SmartReplyEngine, _mention_targets
 from ai_service import AiService, AiServiceError
-from mcp_service import McpService, McpServiceError
+from mcp_service import McpService, McpServiceError, requires_bearer_token
 from domp_bridge import SQL_START, WORKFLOW_TOOL, workflow_arguments, workflow_reply, split_reply, strip_chat_mentions
-from domp_query_bridge import QUERY_TOOL, QUERY_REPLY_PREFIX, query_candidate, query_followup, query_analysis_content, query_arguments, query_tool_call, query_reply, query_reply_chunks, query_memory_turn, owner_query_config, execution_details_requested, explicit_pending_analysis, query_clarification_candidate
+from domp_quote import sql_quote
+from domp_offline_bridge import OfflineConfirmationStore, CITY_PROMPT, city_input, confirmation_message, offline_analysis_task, is_offline_confirmation_prompt
+from domp_city_selection import (CITY_SELECTION_PREFIX, city_selection_failure, selection_options,
+    selection_number, selection_message)
+from domp_query_bridge import QUERY_TOOL, QUERY_REPLY_PREFIX, PROBLEM_QUERY_REPLY_PREFIX, query_candidate, query_followup, query_export_followup, query_analysis_content, query_arguments, query_tool_call, query_reply, query_reply_chunks, query_memory_turn, owner_query_config, execution_details_requested, explicit_pending_analysis, explicit_problem_range_analysis, query_clarification_candidate
 from domp_execution_bridge import EXECUTION_TOOL, EXECUTION_REPLY_PREFIX, execution_candidate, execution_target, execute_target, execution_reply_chunks, owner_execution_config, approval_execution_candidate, approval_execution_targets, approve_execute_targets
 from domp_approval_bridge import APPROVAL_TOOL, APPROVAL_REPLY_PREFIX, approval_candidate, approval_target, approve_target, approval_reply_chunks, owner_approval_config
 from domp_submission_bridge import SUBMISSION_TOOL, SUBMISSION_REPLY_PREFIX, SUBMISSION_PROMPT, submission_candidate, submission_arguments, submission_reply, submission_reply_chunks, owner_submission_config
-from domp_unified_bridge import UNIFIED_SKILL_NAME, is_unified_task, submission_workflow_identifier, unified_candidate, unified_route, owner_unified_config
+from domp_unified_bridge import UNIFIED_SKILL_NAME, is_unified_task, submission_workflow_identifier, unified_candidate, unified_route, owner_unified_config, owner_filehelper_config
+from domp_identifier import identifiers_in
+from query_progress import progress_text, update_progress
 from daily_log import append_daily_log
 
 
@@ -156,7 +166,7 @@ def _save_callback_base64_to_cache(data_b64: str, msg_id: str, media_kind: str, 
         _log(f"[CALLBACK_BASE64] Skip too-large {media_kind}: {len(blob)} bytes")
         return None, len(blob)
 
-    cb_dir = os.path.join(_IMG_CACHE_DIR, "callback", media_kind)
+    cb_dir = os.path.join(_scoped_dir(_IMG_CACHE_DIR), "callback", media_kind)
     os.makedirs(cb_dir, exist_ok=True)
     safe_id = "".join(c for c in (msg_id or "") if c.isalnum() or c in ("_", "-", "."))[:80] or f"cb_{int(time.time())}"
     ext = _detect_callback_file_ext(blob, default_ext)
@@ -199,14 +209,14 @@ async def _register_cdn_pending(key: str, existing_fut: asyncio.Future = None) -
         loop = asyncio.get_event_loop()
         existing_fut = loop.create_future()
     async with _pending_cdn_lock:
-        _pending_cdn_images[key] = existing_fut
+        _bucket('_pending_cdn_images', _pending_cdn_images)[key] = existing_fut
     return existing_fut
 
 
 async def _fulfill_cdn_pending(key: str, file_path: str) -> bool:
     """Try to fulfill a pending CDN download. Returns True if matched."""
     async with _pending_cdn_lock:
-        fut = _pending_cdn_images.pop(key, None)
+        fut = _bucket('_pending_cdn_images', _pending_cdn_images).pop(key, None)
     if fut and not fut.done():
         fut.set_result(file_path)
         return True
@@ -217,9 +227,9 @@ async def _fulfill_all_cdn_pending(file_path: str):
     """Fulfill ALL pending CDN downloads with this file path (best-effort).
     Called when an img_base64 arrives and we can't match by specific ID."""
     async with _pending_cdn_lock:
-        keys = list(_pending_cdn_images.keys())
+        keys = list(_bucket('_pending_cdn_images', _pending_cdn_images).keys())
         for key in keys:
-            fut = _pending_cdn_images.pop(key, None)
+            fut = _bucket('_pending_cdn_images', _pending_cdn_images).pop(key, None)
             if fut and not fut.done():
                 fut.set_result(file_path)
 
@@ -227,7 +237,7 @@ async def _fulfill_all_cdn_pending(file_path: str):
 async def _cleanup_cdn_pending(key: str):
     """Remove a pending entry (e.g. on timeout)."""
     async with _pending_cdn_lock:
-        _pending_cdn_images.pop(key, None)
+        _bucket('_pending_cdn_images', _pending_cdn_images).pop(key, None)
 
 
 # ─── App State ──────────────────────────────────────────────────────
@@ -260,6 +270,7 @@ _active_agent_id = ""
 _account_runtimes: dict[str, dict] = {}
 _self_wxid_to_agent_id: dict[str, str] = {}
 _ACCOUNT_LOCK = asyncio.Lock()
+_PROTOCOL_OWNERSHIP_LOCK = asyncio.Lock()
 _ACCOUNT_CARD_REFRESH_FAST_INTERVAL_SEC = 1.0
 _ACCOUNT_CARD_REFRESH_LOGGED_IN_INTERVAL_SEC = 10.0
 _account_card_refresh_at: dict[str, float] = {}
@@ -274,7 +285,7 @@ _SESSION_CONTACT_HYDRATING_OWNERS: set[str] = set()
 _CONTACT_HYDRATION_PROGRESS: dict[str, dict] = {}
 _RDV_MAPPING_PATH = os.path.join(os.path.dirname(__file__), "rdv_wxid_mapping.json")
 _OLD_RDV_MAPPING_PATH = r"D:\xweixin\前端\backend\rdv_wxid_mapping.json"
-_RDV_MIN = int("10000000", 16)
+_RDV_MIN = int("01000000", 16)
 _RDV_MAX = int("7fffffff", 16)
 _RDV_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 _PROTOCOL_ACCOUNT_PROFILE_CACHE: dict[str, tuple[dict, float]] = {}
@@ -310,20 +321,92 @@ def _runtime_for(agent_id: str) -> dict:
         _account_runtimes[key] = {
             "app_state": _new_app_state(),
             "message_store": MessageStore(),
-            "sqlite_cache": sqlite_cache,
+            "sqlite_cache": _user_cache(access_store.owner(key)),
         }
+    if key == 'default':
+        _account_runtimes[key].update(app_state=app_state, message_store=message_store, sqlite_cache=sqlite_cache)
     return _account_runtimes[key]
 
 
 def _activate_runtime(agent_id: str) -> str:
-    global app_state, message_store, sqlite_cache, _active_agent_id
-    selected = str(agent_id or agent_manager.active_id() or _active_agent_id or "default")
-    runtime = _runtime_for(selected)
-    app_state = runtime["app_state"]
-    message_store = runtime["message_store"]
-    sqlite_cache = runtime["sqlite_cache"]
-    _active_agent_id = selected
+    selected = str(agent_id or access_store.current_account.get() or "default")
+    _runtime_for(selected)
+    access_store.current_account.set(selected)
     return selected
+
+
+_user_caches: dict[str, SqliteMessageCache] = {}
+
+
+def _user_cache(user_id):
+    if not user_id or user_id == access_store.legacy_user():
+        return sqlite_cache
+    if user_id not in _user_caches:
+        os.makedirs(os.path.join(_SQLITE_CACHE_DIR, 'users'), exist_ok=True)
+        _user_caches[user_id] = SqliteMessageCache(os.path.join(_SQLITE_CACHE_DIR, 'users', user_id + '.sqlite3'))
+    return _user_caches[user_id]
+
+
+def _current_agent_id():
+    return access_store.current_account.get() or _active_agent_id
+
+
+def _state():
+    account = access_store.current_account.get()
+    return _runtime_for(account)['app_state'] if account else app_state
+
+
+def _messages():
+    account = access_store.current_account.get()
+    return _runtime_for(account)['message_store'] if account else message_store
+
+
+def _cache():
+    account = access_store.current_account.get()
+    return _user_cache(access_store.owner(account) or access_store.current_user.get())
+
+
+def _bucket(name, fallback):
+    account = access_store.current_account.get()
+    return _runtime_for(account).setdefault(name, {}) if account and access_store.owner(account) else fallback
+
+
+def _scoped_dir(base):
+    account = access_store.current_account.get()
+    user = access_store.owner(account) or access_store.current_user.get()
+    path = os.path.join(base, 'users', user, _safe_runtime_id(account)) if user and user != access_store.legacy_user() else base
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _wechat_files_base():
+    profile = access_store.profile(access_store.current_account.get(), access_store.owner(access_store.current_account.get()))
+    if profile and profile.get('rdv'):
+        return os.path.join(os.environ.get('APPDATA', ''), 'WxDirDataPath', profile['rdv'], 'WeChat Files')
+    return _WECHAT_FILES_BASE
+
+
+def _require_owned_path(path):
+    if not access_store.current_user.get() or not path:
+        return
+    path = os.path.normcase(os.path.realpath(path))
+    bases = [_UPLOAD_DIR, _IMG_CACHE_DIR, _MEDIA_CACHE_DIR, _VOICE_CACHE_DIR, _AVATAR_CACHE_DIR, _STICKER_CACHE_DIR]
+    user = access_store.current_user.get()
+    def within(root):
+        try:
+            return os.path.commonpath([path, os.path.normcase(os.path.realpath(root))]) == os.path.normcase(os.path.realpath(root))
+        except ValueError:
+            return False
+    for base in bases:
+        if within(os.path.join(base, 'users')):
+            if within(os.path.join(base, 'users', user)):
+                return
+            raise HTTPException(403, '不能访问其他密钥用户的文件')
+        if user == access_store.legacy_user() and within(base):
+            return
+    if access_store.current_account.get() and within(_wechat_files_base()):
+        return
+    raise HTTPException(403, '此文件不属于当前密钥用户')
 
 
 def _agent_id_for_self_wxid(wxid: str) -> str:
@@ -441,13 +524,13 @@ def _validate_protocol_rdv(raw: str) -> str:
     if not _RDV_RE.fullmatch(rdv):
         raise HTTPException(
             status_code=400,
-            detail="RDV 必须是 10000000 到 7fffffff 范围内的 8 位十六进制",
+            detail="RDV 必须是 01000000 到 7fffffff 范围内的 8 位十六进制",
         )
     value = int(rdv, 16)
     if value < _RDV_MIN or value > _RDV_MAX:
         raise HTTPException(
             status_code=400,
-            detail="RDV 必须是 10000000 到 7fffffff 范围内的 8 位十六进制",
+            detail="RDV 必须是 01000000 到 7fffffff 范围内的 8 位十六进制",
         )
     return rdv
 
@@ -483,7 +566,9 @@ def _protocol_start_port_from_payload(data: dict) -> Any:
 
 
 def _protocol_scope_key() -> str:
-    return f"{config.HOOK_HOST}:{config.HOOK_PORT}"
+    base = f"{config.HOOK_HOST}:{config.HOOK_PORT}"
+    user = access_store.current_user.get()
+    return f'{base}:user:{user}' if user and user != access_store.legacy_user() else base
 
 
 def _empty_rdv_mapping_doc() -> dict:
@@ -759,7 +844,7 @@ def _protocol_account_from_identity(session_id: str, item: dict, identity: dict)
         "login_status": status,
         "login_message": _protocol_message_from_session(item, status),
         "login_status_updated_at": updated_at,
-        "active": session_id == _active_agent_id,
+        "active": session_id == _current_agent_id(),
         "source": "protocol",
         "session_id": session_id,
         "protocol_state": str(item.get("state") or "").strip().lower(),
@@ -847,6 +932,9 @@ async def _list_protocol_accounts() -> dict:
     items = sessions_raw.get("sessions") if isinstance(sessions_raw, dict) else []
     if not isinstance(items, list):
         items = []
+    if access_store.current_user.get():
+        items = [item for item in items if isinstance(item, dict) and access_store.owns(item.get('session_id'))]
+        sessions_raw = {'sessions': items, 'ok': bool(sessions_raw.get('ok', True))}
     visible_items = _dedupe_protocol_session_tabs([
         item
         for item in items
@@ -860,7 +948,7 @@ async def _list_protocol_accounts() -> dict:
         for item in visible_items
     )) if visible_items else []
     accounts.sort(key=lambda row: (row.get("login_status") != "3", row.get("connected_at") or 0), reverse=False)
-    active_id = _active_agent_id if any(row.get("id") == _active_agent_id for row in accounts) else ""
+    active_id = _current_agent_id() if any(row.get("id") == _current_agent_id() for row in accounts) else ""
     return {
         "active_id": active_id,
         "accounts": accounts,
@@ -888,7 +976,7 @@ async def _activate_protocol_account(session_id: str) -> dict:
             "upstream": profile_raw,
         }
     _activate_runtime(session_id)
-    app_state["self_info"] = profile_raw
+    _state()["self_info"] = profile_raw
     identity = _self_identity_from_response(profile_raw, agent_id=session_id)
     wxid = identity["wxid"]
     if wxid:
@@ -897,8 +985,8 @@ async def _activate_protocol_account(session_id: str) -> dict:
         _put_self_info_field("selfwxid", wxid)
     owner_wxid = _contact_owner_wxid(wxid)
     _load_session_cache_into_state(owner_wxid)
-    app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
-    app_state["initialized"] = True
+    _state()["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+    _state()["initialized"] = True
     item = {
         "session_id": session_id,
         "state": "logged_in",
@@ -927,6 +1015,7 @@ def _login_status_from_response(data: dict) -> dict[str, str]:
 async def _probe_local_hook_account() -> dict[str, Any]:
     """Probe the configured local Hook HTTP port and build its account card."""
     global _local_hook_last_seen_at
+    state = _state() if _current_agent_id() == _LOCAL_HOOK_ACCOUNT_ID else _runtime_for(_LOCAL_HOOK_ACCOUNT_ID)["app_state"]
 
     async with _LOCAL_HOOK_PROBE_LOCK:
         probe_started_at = time.perf_counter()
@@ -943,7 +1032,7 @@ async def _probe_local_hook_account() -> dict[str, Any]:
         except Exception as exc:
             probe_error = f"{type(exc).__name__}: {exc}"
 
-        profile_raw = app_state.get("self_info") if isinstance(app_state.get("self_info"), dict) else {}
+        profile_raw = state.get("self_info") if isinstance(state.get("self_info"), dict) else {}
         cached_identity = _self_identity_from_response(
             profile_raw,
             agent_id=_LOCAL_HOOK_ACCOUNT_ID,
@@ -979,12 +1068,12 @@ async def _probe_local_hook_account() -> dict[str, Any]:
                 ):
                     raise ValueError("empty profile response")
                 profile_raw = fetched_profile
-                app_state["self_info"] = fetched_profile
+                state["self_info"] = fetched_profile
                 _agent_self_profile_refreshed.add(_LOCAL_HOOK_ACCOUNT_ID)
                 profile_wxid = str(fetched_identity.get("wxid") or parsed["wxid"] or "").strip()
                 profile_avatar = str(fetched_identity.get("avatar") or "").strip()
                 if profile_wxid and profile_avatar:
-                    app_state.setdefault("avatar_urls", {})[profile_wxid] = profile_avatar
+                    state.setdefault("avatar_urls", {})[profile_wxid] = profile_avatar
                 _log(f"[LOCAL_HOOK] GetSelfProfile loaded wxid={profile_wxid or '-'}")
             except Exception as exc:
                 probe_error = probe_error or f"GetSelfProfile {type(exc).__name__}: {exc}"
@@ -998,6 +1087,11 @@ async def _probe_local_hook_account() -> dict[str, Any]:
         wxid = str(identity.get("wxid") or parsed["wxid"] or "").strip()
         nickname = str(identity.get("nickname") or parsed["nickname"] or ("" if wxid else "本地微信")).strip()
         if wxid:
+            local_owner = access_store.owner(_LOCAL_HOOK_ACCOUNT_ID)
+            if local_owner and not access_store.claim('wxid:' + wxid, local_owner):
+                raise HTTPException(403, '该微信已属于另一密钥用户，请使用原密钥登录')
+            _remember_hook_identity({'id': 'default', 'port': config.HOOK_PORT, 'rdv': config.RDV,
+                'pid': '', 'transport': 'http', 'host': config.HOOK_HOST, 'mode': config.LOGIN_MODE}, 'default', wxid, local_owner, identity)
             _self_wxid_to_agent_id[wxid] = _LOCAL_HOOK_ACCOUNT_ID
 
         status = parsed["status"] if port_alive else ""
@@ -1030,11 +1124,11 @@ async def _probe_local_hook_account() -> dict[str, Any]:
             "connected_at": _LOCAL_HOOK_STARTED_AT,
             "last_seen_at": _local_hook_last_seen_at,
             "pending": 0,
-            "initialized": bool(status == "3" and app_state.get("initialized")),
+            "initialized": bool(status == "3" and state.get("initialized")),
             "login_status": status,
             "login_message": login_message,
             "login_status_updated_at": checked_at,
-            "active": _active_agent_id == _LOCAL_HOOK_ACCOUNT_ID,
+            "active": _current_agent_id() == _LOCAL_HOOK_ACCOUNT_ID,
             "source": "hook",
         }
 
@@ -1143,9 +1237,9 @@ def _put_self_info_field(key: str, value: str) -> None:
     value = str(value or "").strip()
     if not value:
         return
-    if not isinstance(app_state.get("self_info"), dict):
-        app_state["self_info"] = {"data": {}}
-    self_info = app_state["self_info"]
+    if not isinstance(_state().get("self_info"), dict):
+        _state()["self_info"] = {"data": {}}
+    self_info = _state()["self_info"]
     data = self_info.get("data")
     if isinstance(data, dict):
         if not data.get(key):
@@ -1203,11 +1297,11 @@ async def _refresh_agent_account_brief(agent_id: str, wxid: str = "") -> dict:
         await agent_manager.update_account(agent_id, wxid=wxid, nickname=name, avatar=avatar)
         if name:
             _put_self_info_field("nickname", name)
-            message_store.set_contact(wxid, name=name, avatar=avatar)
+            _messages().set_contact(wxid, name=name, avatar=avatar)
         if avatar:
             _put_self_info_field("head_big", avatar)
-            app_state.setdefault("avatar_urls", {})[wxid] = avatar
-            message_store.set_contact(wxid, name=name, avatar=avatar)
+            _state().setdefault("avatar_urls", {})[wxid] = avatar
+            _messages().set_contact(wxid, name=name, avatar=avatar)
 
     return {"name": name, "avatar": avatar}
 
@@ -1290,7 +1384,7 @@ _CONTACT_LABEL_LOCK = asyncio.Lock()
 
 
 def _get_self_wxid() -> str:
-    self_info = app_state.get("self_info")
+    self_info = _state().get("self_info")
     if not isinstance(self_info, dict):
         return ""
     data = self_info.get("data", {})
@@ -1313,7 +1407,7 @@ def _contact_owner_wxid(self_wxid: str = "") -> str:
     owner = str(self_wxid or _get_self_wxid() or "").strip()
     if owner:
         return owner
-    agent_id = str(_active_agent_id or agent_manager.active_id() or "").strip()
+    agent_id = str(_current_agent_id() or agent_manager.active_id() or "").strip()
     agent = agent_manager.get_agent(agent_id) if agent_id else None
     agent_wxid = str((agent or {}).get("wxid") or (agent or {}).get("account_id") or "").strip()
     if agent_wxid and agent_wxid != agent_id:
@@ -1328,7 +1422,7 @@ def _contact_cache_key(wxid: str, owner_wxid: str = "") -> str:
 def _protocol_history_available(owner_wxid: str = "") -> bool:
     if not config.IS_PROTOCOL:
         return True
-    return sqlite_cache.has_message_history(owner_wxid=_contact_owner_wxid(owner_wxid))
+    return _cache().has_message_history(owner_wxid=_contact_owner_wxid(owner_wxid))
 
 
 def _format_preview(msg_type: str, content: str) -> str:
@@ -1599,11 +1693,11 @@ def _cached_recalled_text(chat_id: str, msg_id: str, timestamp: int = 0) -> str:
 
     messages: list[dict] = []
     try:
-        messages.extend(message_store.get_messages(chat_id))
+        messages.extend(_messages().get_messages(chat_id))
     except Exception:
         pass
     try:
-        messages.extend(sqlite_cache.get_messages(
+        messages.extend(_cache().get_messages(
             chat_id,
             200,
             owner_wxid=_contact_owner_wxid(),
@@ -1646,7 +1740,7 @@ def _cached_recalled_text(chat_id: str, msg_id: str, timestamp: int = 0) -> str:
 
 
 def _store_message_and_session(chat_id: str, msg: dict) -> dict:
-    message_store.add_message(chat_id, msg)
+    _messages().add_message(chat_id, msg)
     preview = _format_preview(str(msg.get("msgtype", "")), str(msg.get("msg", "") or ""))
     # For group chats, prefix the preview with the sender's nickname
     if "@chatroom" in chat_id:
@@ -1656,7 +1750,7 @@ def _store_message_and_session(chat_id: str, msg: dict) -> dict:
             sender_wxid = str(msg.get("fromid", "") or "")
             if sender_wxid:
                 sender_name = (
-                    message_store.get_contact(sender_wxid).get("name", "")
+                    _messages().get_contact(sender_wxid).get("name", "")
                     or _CONTACT_BRIEF_CACHE.get(_contact_cache_key(sender_wxid), {}).get("name", "")
                     or sender_wxid
                 )
@@ -1664,14 +1758,14 @@ def _store_message_and_session(chat_id: str, msg: dict) -> dict:
     msg_timestamp = int(msg.get("time_unix") or msg.get("timestamp") or int(time.time()))
     time_str = _time_to_hhmm(str(msg.get("time", "") or ""))
     is_recv = str(msg.get("sendorrecv", "")) == "2"
-    snapshot = message_store.update_session(
+    snapshot = _messages().update_session(
         chat_id,
         last_msg=preview,
         last_time=time_str,
         unread_delta=1 if is_recv else 0,
         last_timestamp=msg_timestamp,
     )
-    app_state["last_messages"][chat_id] = {
+    _state()["last_messages"][chat_id] = {
         "content": str(msg.get("msg", "") or ""),
         "type": str(msg.get("msgtype", "") or "1"),
         "is_sender": 1 if str(msg.get("sendorrecv", "")) == "1" else 0,
@@ -1679,10 +1773,10 @@ def _store_message_and_session(chat_id: str, msg: dict) -> dict:
     }
     try:
         owner_wxid = _contact_owner_wxid()
-        sqlite_cache.upsert_messages(chat_id, [msg], owner_wxid=owner_wxid)
-        sqlite_cache.upsert_session_preview(
+        _cache().upsert_messages(chat_id, [msg], owner_wxid=owner_wxid)
+        _cache().upsert_session_preview(
             chat_id,
-            nickname=message_store.get_contact(chat_id).get("name", ""),
+            nickname=_messages().get_contact(chat_id).get("name", ""),
             content=preview,
             msg_type=str(msg.get("msgtype", "") or "1"),
             timestamp=msg_timestamp,
@@ -1824,12 +1918,12 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
     is_group = "@chatroom" in wxid
     existing_messages: list[dict] = []
     try:
-        existing_messages.extend(message_store.get_messages(wxid))
+        existing_messages.extend(_messages().get_messages(wxid))
     except Exception:
         pass
     try:
         existing_messages.extend(
-            sqlite_cache.get_messages(wxid, 200, owner_wxid=_contact_owner_wxid())
+            _cache().get_messages(wxid, 200, owner_wxid=_contact_owner_wxid())
         )
     except Exception:
         pass
@@ -1840,7 +1934,7 @@ def _normalize_history_rows(wxid: str, rows: list[dict]) -> list[dict]:
     ]
     if row_timestamps:
         try:
-            existing_messages.extend(sqlite_cache.get_media_messages(
+            existing_messages.extend(_cache().get_media_messages(
                 wxid,
                 min(row_timestamps) - 120,
                 max(row_timestamps) + 120,
@@ -1902,7 +1996,7 @@ def _sync_session_preview_from_message(wxid: str, msg: dict, *, owner_wxid: str 
         return
     owner = _contact_owner_wxid(owner_wxid)
     msg_timestamp = int(msg.get("timestamp") or msg.get("time_unix") or 0)
-    current_last = (app_state.get("last_messages") or {}).get(wxid) or {}
+    current_last = (_state().get("last_messages") or {}).get(wxid) or {}
     current_time = int(current_last.get("time") or 0)
     if msg_timestamp and current_time and msg_timestamp < current_time:
         return
@@ -1915,7 +2009,7 @@ def _sync_session_preview_from_message(wxid: str, msg: dict, *, owner_wxid: str 
             sender_wxid = str(msg.get("fromid", "") or "").strip()
             if sender_wxid:
                 sender_name = (
-                    message_store.get_contact(sender_wxid).get("name", "")
+                    _messages().get_contact(sender_wxid).get("name", "")
                     or _CONTACT_BRIEF_CACHE.get(_contact_cache_key(sender_wxid, owner), {}).get("name", "")
                     or sender_wxid
                 )
@@ -1927,11 +2021,11 @@ def _sync_session_preview_from_message(wxid: str, msg: dict, *, owner_wxid: str 
         "is_sender": 1 if str(msg.get("sendorrecv", "") or "") == "1" or int(msg.get("isSender") or 0) == 1 else 0,
         "time": msg_timestamp,
     }
-    app_state["last_messages"][wxid] = last_message
-    sqlite_cache.upsert_last_messages({wxid: last_message}, owner_wxid=owner)
-    sqlite_cache.upsert_session_preview(
+    _state()["last_messages"][wxid] = last_message
+    _cache().upsert_last_messages({wxid: last_message}, owner_wxid=owner)
+    _cache().upsert_session_preview(
         wxid,
-        nickname=message_store.get_contact(wxid).get("name", ""),
+        nickname=_messages().get_contact(wxid).get("name", ""),
         content=preview,
         msg_type=str(msg.get("msgtype", "") or "1"),
         timestamp=msg_timestamp,
@@ -1944,7 +2038,7 @@ def _sync_session_preview_from_message(wxid: str, msg: dict, *, owner_wxid: str 
 # ─── Startup / Shutdown ────────────────────────────────────────────
 
 async def _run_protocol_backend_initialization(session_id: str | None = None) -> bool:
-    selected = _activate_runtime(session_id or _active_agent_id or "default")
+    selected = _activate_runtime(session_id or _current_agent_id() or "default")
     if not session_id:
         _log("=" * 60)
         _log(f"WeChat Backend starting...  [mode={config.LOGIN_MODE}]")
@@ -1959,10 +2053,10 @@ async def _run_protocol_backend_initialization(session_id: str | None = None) ->
     profile_raw = await _protocol_profile_for_session(selected, force=True)
     if not _protocol_profile_logged_in(profile_raw):
         _log(f"[PROTO_INIT] session not logged in: {profile_raw}")
-        app_state["initialized"] = False
+        _state()["initialized"] = False
         return False
 
-    app_state["self_info"] = profile_raw
+    _state()["self_info"] = profile_raw
     identity = _self_identity_from_response(profile_raw, agent_id=selected)
     wxid = identity["wxid"]
     if wxid:
@@ -1971,9 +2065,9 @@ async def _run_protocol_backend_initialization(session_id: str | None = None) ->
         _put_self_info_field("selfwxid", wxid)
 
     owner_wxid = _contact_owner_wxid(wxid)
-    app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+    _state()["contacts"] = _contacts_snapshot_from_db(owner_wxid)
     _load_session_cache_into_state(owner_wxid)
-    app_state["initialized"] = True
+    _state()["initialized"] = True
     _log(f"[PROTO_INIT] active wxid={wxid or '-'} protocol cache ready")
     return True
 
@@ -2008,7 +2102,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
             await asyncio.sleep(2)
     else:
         _log("[INIT 0] ⚠ API not reachable after 30s, skip initialization")
-        app_state["initialized"] = False
+        _state()["initialized"] = False
         await agent_manager.update_account(selected_agent, initialized=False, login_message="接口未就绪")
         _initializing_agents.discard(selected_agent)
         return False
@@ -2016,7 +2110,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
 
     if str(login_status.get("status") or "") != "3":
         _log(f"[INIT 0] ⏸ WeChat not logged in; skip initialization. status={login_status.get('status') or '?'} msg={login_status.get('message') or '-'}")
-        app_state["initialized"] = False
+        _state()["initialized"] = False
         await agent_manager.update_account(selected_agent, initialized=False)
         _initializing_agents.discard(selected_agent)
         return False
@@ -2024,10 +2118,10 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
     # Phase 1 — run sequentially to avoid concurrent Hook access (Hook is NOT thread-safe)
     try:
         _log("[INIT 1/7] Loading self info...")
-        app_state["self_info"] = await wechat_api.get_self_info()
+        _state()["self_info"] = await wechat_api.get_self_info()
         existing_agent = agent_manager.get_agent(selected_agent) or {}
         identity = _self_identity_from_response(
-            app_state["self_info"] if isinstance(app_state["self_info"], dict) else {},
+            _state()["self_info"] if isinstance(_state()["self_info"], dict) else {},
             agent_id=selected_agent,
             current_wxid=str(existing_agent.get("wxid") or existing_agent.get("account_id") or ""),
         )
@@ -2059,7 +2153,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
 
     try:
         _log("[INIT 1/7] Configuring pic download path...")
-        await wechat_api.configure_pic_download_path(r"C:\Users\Administrator\Desktop\pic")
+        await wechat_api.configure_pic_download_path(_scoped_dir(_IMG_CACHE_DIR))
         _log("[INIT 1/7] ✓ Pic download path configured")
     except Exception as e:
         _log(f"[INIT 1/7] ✗ Pic download path config failed: {e}")
@@ -2073,8 +2167,8 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
 
     try:
         owner_wxid = _contact_owner_wxid()
-        cached_contact_count = sqlite_cache.count_contacts(owner_wxid=owner_wxid)
-        app_state["contacts"] = _contacts_snapshot_from_db(owner_wxid)
+        cached_contact_count = _cache().count_contacts(owner_wxid=owner_wxid)
+        _state()["contacts"] = _contacts_snapshot_from_db(owner_wxid)
         _log(f"[INIT 1/7] ✓ Contact init skipped during login; loaded {cached_contact_count} cached contacts")
     except Exception as e:
         _log(f"[INIT 1/7] ✗ local contacts load failed: {e}")
@@ -2094,7 +2188,7 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         owner_wxid = _contact_owner_wxid()
         _log("[INIT 2/4] Loading contacts from local SQLite cache...")
         contacts_snapshot = _contacts_snapshot_from_db(owner_wxid)
-        app_state["contacts"] = contacts_snapshot
+        _state()["contacts"] = contacts_snapshot
         friend_count = len(contacts_snapshot.get("friend") or [])
         room_count = len(contacts_snapshot.get("chatroom") or [])
         _log(f"[INIT 2/4] ✓ Cached contacts loaded: {friend_count} friends, {room_count} groups")
@@ -2102,15 +2196,15 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         _log(f"[INIT 2/4] ✗ contacts load failed: {e}")
 
     try:
-        app_state["sessions"] = app_state.get("sessions") or {"data": []}
+        _state()["sessions"] = _state().get("sessions") or {"data": []}
         _log("[INIT 3/7] ✓ Session DB load skipped until Chats view opens")
     except Exception as e:
         _log(f"[INIT 3/7] ✗ sessions load failed: {e}")
 
     # 4. Add self avatar explicitly
     avatar_urls: dict[str, str] = {}
-    if app_state["self_info"] and isinstance(app_state["self_info"], dict):
-        si = app_state["self_info"]
+    if _state()["self_info"] and isinstance(_state()["self_info"], dict):
+        si = _state()["self_info"]
         # self_info may be {data: {...}} or flat dict
         si_data = si.get("data", {}) if isinstance(si.get("data"), dict) else si
         self_head = (
@@ -2128,20 +2222,20 @@ async def _run_backend_initialization(agent_id: str | None = None) -> bool:
         _log("[INIT 4/7] ⊘ No self_info available")
 
     _log("[INIT 5/7] ✓ Session avatar batch skipped until sessions are requested")
-    app_state["avatar_urls"] = avatar_urls
+    _state()["avatar_urls"] = avatar_urls
 
-    app_state["last_messages"] = app_state.get("last_messages") or {}
+    _state()["last_messages"] = _state().get("last_messages") or {}
     _log("[INIT 6/7] ✓ Last-message and chat-history preload skipped")
 
     if config.AGENT_WS_ENABLED and not agent_manager.is_connected(selected_agent):
         _log("[INIT 7/7] Agent disconnected during initialization; will retry on next connection.")
-        app_state["initialized"] = False
+        _state()["initialized"] = False
         await agent_manager.update_account(selected_agent, initialized=False)
         _initializing_agents.discard(selected_agent)
         return False
 
     _log("[INIT 7/7] ✓ Initialization complete.")
-    app_state["initialized"] = True
+    _state()["initialized"] = True
     await agent_manager.update_account(selected_agent, initialized=True)
     _initializing_agents.discard(selected_agent)
     _log("=" * 60)
@@ -2203,7 +2297,7 @@ async def _start_runtime_after_config() -> dict[str, Any]:
     global _runtime_init_task
     await _cancel_runtime_init_task()
     reset_payload = _new_app_state()
-    app_state.update(reset_payload)
+    _state().update(reset_payload)
     _account_runtimes.clear()
     _self_wxid_to_agent_id.clear()
     _agent_login_status_seen.clear()
@@ -2271,6 +2365,7 @@ async def lifespan(app: FastAPI):
     await protocol_api.close()
     await ai_service.close()
     await mcp_service.close()
+    await hook_login.client.aclose()
     _log("[SHUTDOWN] Done.")
 
 
@@ -2288,15 +2383,16 @@ app.add_middleware(
 
 
 def _request_access_ok(request: Request) -> bool:
-    if not config.WEB_ACCESS_KEY:
-        return False
     key = (
         request.headers.get("X-Access-Key")
         or request.query_params.get("key")
         or request.cookies.get("wechat_web_key")
         or ""
     )
-    return str(key) == config.WEB_ACCESS_KEY
+    access_store.legacy_user()
+    user = access_store.login(key)
+    request.state.user_id = user
+    return bool(user)
 
 
 def _request_agent_id(request: Request) -> str:
@@ -2313,7 +2409,6 @@ def _is_public_http_path(path: str) -> bool:
             config.CALLBACK_PATH,
         }
         or path == config.AGENT_WS_PATH
-        or path.startswith("/uploads/")
     )
 
 
@@ -2322,20 +2417,56 @@ async def require_access_key(request: Request, call_next):
     if request.method.upper() == "OPTIONS":
         return await call_next(request)
     path = request.url.path
-    if path.startswith("/api/") and not _is_public_http_path(path):
+    if (path.startswith("/api/") or path.startswith('/uploads/')) and not _is_public_http_path(path):
         if not _request_access_ok(request):
-            from fastapi.responses import JSONResponse
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if not config.config_file_exists():
-            from fastapi.responses import JSONResponse
             return JSONResponse({"error": "setup_required"}, status_code=428)
+        access_store.migrate_hook(hook_login.instances())
+        user_token = access_store.current_user.set(request.state.user_id)
+        account_token = access_store.current_account.set('')
+        try:
+            return await _authorized_request(request, call_next)
+        except HTTPException as exc:
+            return JSONResponse({'error': exc.detail}, status_code=exc.status_code)
+        finally:
+            access_store.current_account.reset(account_token)
+            access_store.current_user.reset(user_token)
+    return await call_next(request)
+
+
+async def _authorized_request(request, call_next):
+    path = request.url.path
+    if config.IS_PROTOCOL and path.startswith(('/api/protocol/', '/api/accounts')):
+        await _migrate_protocol_ownership()
     agent_id = _request_agent_id(request)
-    if agent_id and config.IS_PROTOCOL:
-        _activate_runtime(agent_id)
-        with wechat_api.use_agent(agent_id):
-            return await call_next(request)
-    if agent_id and agent_manager.is_connected(agent_id):
-        await agent_manager.set_active(agent_id)
+    if agent_id:
+        access_store.require_account(agent_id)
+    if path.startswith("/api/protocol/") and not config.IS_PROTOCOL:
+        return JSONResponse({"ok": False, "error": "当前为 Hook 模式，请使用启动微信入口"}, status_code=409)
+    if (path.startswith('/api/ai/') or path.startswith('/api/mcp/')) and access_store.current_user.get() != access_store.legacy_user():
+        raise HTTPException(403, '只有原配置密钥用户可以管理服务器 AI/MCP 配置')
+    portal = path.startswith(('/api/accounts', '/api/hook/', '/api/protocol/')) or path == '/api/agent/status'
+    if not agent_id and not portal and not path.startswith(('/api/ai/', '/api/mcp/')):
+        candidates = access_store.account_ids()
+        agent_id = next(iter(candidates), '')
+        if not agent_id:
+            raise HTTPException(409, '请先启动并选择自己的微信账号')
+    if path.startswith('/uploads/'):
+        _require_owned_path(os.path.join(_UPLOAD_DIR, path[len('/uploads/'):]))
+    if request.method in {'POST', 'PUT'} and 'application/json' in request.headers.get('content-type', ''):
+        raw = await request.body()
+        try:
+            body = json.loads(raw) if raw else {}
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(400, '请求 JSON 格式无效') from exc
+        if isinstance(body, dict):
+            for field in ('path', 'local_path', 'img_path', 'voice_path', 'file_path', 'picpath', 'filepath', 'videopath', 'gifpath'):
+                if isinstance(body.get(field), str) and body[field]:
+                    # File routes validate after the selected account's context is installed.
+                    with wechat_api.use_agent(agent_id):
+                        _require_owned_path(body[field])
+    if agent_id:
         _activate_runtime(agent_id)
         with wechat_api.use_agent(agent_id):
             return await call_next(request)
@@ -2360,6 +2491,10 @@ class ActivateAccountRequest(BaseModel):
     agent_id: str
 
 
+class DeleteAccountRequest(BaseModel):
+    confirmed: bool = False
+
+
 class ProtocolStartWechatRequest(BaseModel):
     rdv: str
     callback_url: str = ""
@@ -2368,6 +2503,21 @@ class ProtocolStartWechatRequest(BaseModel):
     proxy_port: str = ""
     proxy_usr: str = ""
     proxy_pwd: str = ""
+
+
+class HookStartWechatRequest(BaseModel):
+    start_port: int | None = Field(default=None, ge=1, le=65535)
+    rdv: str = ""
+    wechat_path: str = ""
+    remote_ws: str = ""
+    instance_id: str = ""
+    restart: bool = False
+    new: bool = False
+    proxy: dict | None = None
+
+
+class HookQRCodeRequest(BaseModel):
+    refresh: bool = False
 
 
 class ProtocolSessionRequest(BaseModel):
@@ -2496,12 +2646,12 @@ class MultiBroadcastTargetsRequest(BaseModel):
 
 @app.post("/api/auth/login")
 async def auth_login(req: AuthLoginRequest):
-    if not config.WEB_ACCESS_KEY:
-        return {"ok": False, "error": "access key is not configured"}
-    if str(req.key or "") != config.WEB_ACCESS_KEY:
-        return {"ok": False}
+    access_store.migrate_hook(hook_login.instances())
+    user_id = access_store.login(req.key, create=True)
+    if not user_id:
+        return {"ok": False, 'error': '请输入非空密钥，最多 256 个字符'}
     setup_required = not config.config_file_exists()
-    return {"ok": True, "setup_required": setup_required, "config_exists": not setup_required}
+    return {"ok": True, 'user_id': user_id, "setup_required": setup_required, "config_exists": not setup_required}
 
 
 @app.get("/api/setup/status")
@@ -2553,29 +2703,55 @@ async def setup_initial_config(req: InitialSetupRequest):
 async def list_accounts():
     if config.IS_PROTOCOL:
         return await _list_protocol_accounts()
-    if config.IS_LOCAL_HOOK:
-        account = await _probe_local_hook_account()
+    if config.IS_LOCAL_HOOK or (config.IS_HOOK and not config.AGENT_WS_ENABLED):
+        account = None
+        if not access_store.current_user.get() or access_store.owns(_LOCAL_HOOK_ACCOUNT_ID):
+            with wechat_api.use_agent(_LOCAL_HOOK_ACCOUNT_ID):
+                account = await _probe_local_hook_account()
+        extras = await asyncio.gather(*(_probe_started_hook_account(record) for record in hook_login.instances()
+            if record["transport"] == "http" and record["id"] != _LOCAL_HOOK_ACCOUNT_ID
+            and (not access_store.current_user.get() or access_store.owns(record['id']))))
         return {
-            "active_id": _LOCAL_HOOK_ACCOUNT_ID if account.get("active") else "",
-            "accounts": [account],
+            "active_id": _current_agent_id(),
+            "accounts": [*([account] if account else []), *extras],
             "source": "hook",
             "transport": "http",
             "configured_endpoint": f"http://{config.HOOK_HOST}:{config.HOOK_PORT}",
         }
     _schedule_account_card_refresh()
     return {
-        "active_id": _active_agent_id or agent_manager.active_id(),
-        "accounts": agent_manager.agents(),
+        "active_id": _current_agent_id() or agent_manager.active_id(),
+        "accounts": _owned_agents(),
+        "source": "hook",
     }
 
 
 @app.post("/api/accounts/activate")
 async def activate_account(req: ActivateAccountRequest):
+    access_store.require_account(req.agent_id)
+    # The request header can still name the previously selected account.
+    # All probes/initialization must use the account selected in this request.
+    with wechat_api.use_agent(str(req.agent_id or "").strip()):
+        return await _activate_account(req)
+
+
+async def _activate_account(req: ActivateAccountRequest):
     agent_id = str(req.agent_id or "").strip()
     if config.IS_PROTOCOL:
         async with _ACCOUNT_LOCK:
             return await _activate_protocol_account(agent_id)
-    if config.IS_LOCAL_HOOK:
+    instance = hook_login.http_instance(agent_id)
+    if instance and agent_id != _LOCAL_HOOK_ACCOUNT_ID:
+        async with _ACCOUNT_LOCK:
+            account = await _probe_started_hook_account(instance)
+            if account.get("login_status") != "3":
+                return {"ok": False, "error": "微信尚未登录完成", "account": account}
+            _activate_runtime(agent_id)
+            with wechat_api.use_agent(agent_id):
+                if not _state().get("initialized") and not await _run_backend_initialization(agent_id):
+                    return {"ok": False, "error": "Hook 初始化未完成", "account": account}
+            return {"ok": True, "active_id": agent_id, "account": await _probe_started_hook_account(instance)}
+    if config.IS_LOCAL_HOOK or (config.IS_HOOK and not config.AGENT_WS_ENABLED):
         if agent_id != _LOCAL_HOOK_ACCOUNT_ID:
             return {"ok": False, "error": "unknown local Hook account"}
         async with _ACCOUNT_LOCK:
@@ -2594,7 +2770,7 @@ async def activate_account(req: ActivateAccountRequest):
                     "account": account,
                 }
             _activate_runtime(_LOCAL_HOOK_ACCOUNT_ID)
-            if not app_state.get("initialized"):
+            if not _state().get("initialized"):
                 ready = await _run_backend_initialization(_LOCAL_HOOK_ACCOUNT_ID)
                 if not ready:
                     account = await _probe_local_hook_account()
@@ -2628,9 +2804,248 @@ async def activate_account(req: ActivateAccountRequest):
     return {"ok": True, "active_id": agent_id, "account": agent_manager.get_agent(agent_id)}
 
 
+def _require_hook_login():
+    if not config.IS_HOOK:
+        raise HTTPException(status_code=409, detail="当前为协议模式，请使用扫码上号或老号登录")
+
+
+def _owned_agents():
+    agents = agent_manager.agents()
+    for agent in agents:
+        record = hook_login.instance_for_port(agent.get('server_port'))
+        owner = access_store.owner(record['id']) if record else None
+        if not owner and str(agent.get('server_port')) == str(config.HOOK_PORT):
+            owner = access_store.owner('default')
+        if owner:
+            access_store.claim(agent['id'], owner)
+    return [a for a in agents if not access_store.current_user.get() or access_store.owns(a['id'])]
+
+
+def _hook_login_instance(instance_id):
+    _require_hook_login()
+    access_store.require_account(instance_id)
+    record = hook_login.instance(instance_id)
+    if not record and instance_id == _LOCAL_HOOK_ACCOUNT_ID and not config.AGENT_WS_ENABLED:
+        record = {"id": instance_id, "host": config.HOOK_HOST, "port": config.HOOK_PORT,
+            "mode": config.LOGIN_MODE, "rdv": config.RDV, "transport": "http"}
+    if not record and agent_manager.is_connected(instance_id):
+        record = hook_login.instance_for_port((agent_manager.get_agent(instance_id) or {}).get("server_port"))
+    if not record:
+        raise HTTPException(status_code=404, detail="未找到此 Hook 启动实例，请重新读取账号")
+    return record
+
+
+def _remember_hook_identity(record, account_id, wxid, user_id, identity=None):
+    if not user_id or not wxid:
+        return
+    saved = access_store.profile(record['id'], user_id) or {**hook_login.defaults(), **record, 'profile_id': record['id']}
+    saved.update(wxid=wxid, wxids=sorted({*saved.get('wxids', []), wxid}),
+                 aliases=sorted({*saved.get('aliases', []), record['id'], account_id}))
+    for field in ('nickname', 'avatar'):
+        if (identity or {}).get(field):
+            saved[field] = identity[field]
+    access_store.save_profile(saved, user_id)
+    access_store.unretire('wxid:' + wxid)
+
+
+async def _probe_started_hook_account(record):
+    agent = hook_login.connected_agent(record) if record["transport"] == "ws" else None
+    account_id = str((agent or {}).get("id") or record["id"])
+    record_owner = access_store.owner(record['id'])
+    if record_owner:
+        access_store.claim(account_id, record_owner)
+    state = _runtime_for(account_id)["app_state"]
+    parsed = {"status": "", "message": "等待微信启动及 Hook 接口就绪", "wxid": "", "nickname": ""}
+    connected = False
+    identity = {}
+    try:
+        response = await hook_login.post(record, "/IsLoginStatus")
+        parsed = _login_status_from_response(response.json())
+        connected = True
+        if parsed["status"] == "3":
+            profile = state.get("self_info")
+            if not profile:
+                profile = (await hook_login.post(record, "/GetSelfProfile")).json()
+                state["self_info"] = profile
+            identity = _self_identity_from_response(profile, agent_id=account_id, current_wxid=parsed["wxid"])
+        else:
+            state["self_info"] = None
+            state["initialized"] = False
+    except (httpx.HTTPError, ConnectionError, TimeoutError, ValueError):
+        pass
+    wxid = str(identity.get("wxid") or parsed.get("wxid") or "")
+    if wxid and record_owner and not access_store.claim('wxid:' + wxid, record_owner):
+        raise HTTPException(403, '该微信已属于另一密钥用户，请使用原密钥登录')
+    if wxid:
+        _self_wxid_to_agent_id[wxid] = account_id
+        _remember_hook_identity(record, account_id, wxid, record_owner, identity)
+    remembered = access_store.profile(record['id'], record_owner) if record_owner else {}
+    return {"id": account_id, "account_id": wxid or account_id, "source": "hook", "wxid": wxid,
+        "nickname": identity.get("nickname") or parsed.get("nickname") or (remembered or {}).get('nickname') or "微信待登录",
+        "avatar": identity.get("avatar") or (remembered or {}).get('avatar') or "", "profile": identity.get("profile") or {},
+        "connected": connected, "port_alive": connected, "login_status": parsed["status"],
+        "login_message": '微信已退出，点击卡片重新启动' if not connected and (remembered or {}).get('stopped_at') else parsed["message"], "initialized": bool(state.get("initialized")),
+        "transport": record["transport"], "api_host": record["host"], "api_port": record["port"],
+        "start_port": record["port"], "server_port": str(record["port"]), "rdv": record["rdv"],
+        "peer": f"{record['host']}:{record['port']}", "active": _current_agent_id() == account_id}
+
+
+@app.get("/api/hook/login-settings")
+async def get_hook_login_settings(instance_id: str = ''):
+    _require_hook_login()
+    if access_store.current_user.get():
+        if instance_id and agent_manager.is_connected(instance_id):
+            instance_id = _hook_login_instance(instance_id)['id']
+        profile = hook_login.user_settings(instance_id)
+        if profile['id'] == 'default' and not profile.get('pid'):
+            # Adopt the original local instance once; its actual RDV takes precedence over old YAML defaults.
+            try:
+                response = await hook_login.client.post(config.MGR_BASE_URL + '/Get_WeChatProcessNumber', json={})
+                response.raise_for_status()
+                matches = [p for p in response.json().get('List', []) if str(p.get('Port')) == str(profile['port'])]
+                if len(matches) == 1:
+                    match = re.search(r'(?:^|[&\s])RDV=\"?([0-9a-f]{8})(?:\"|[&\s]|$)', str(matches[0].get('Par') or ''), re.I)
+                    if match:
+                        profile.update(rdv=match.group(1).lower(), pid=str(matches[0]['PID']))
+                        access_store.save_profile(profile)
+            except (httpx.HTTPError, ValueError, TypeError):
+                pass
+        return {"ok": True, **profile}
+    return {"ok": True, **hook_login.defaults()}
+
+
+@app.post("/api/hook/start-wechat")
+async def start_hook_wechat(req: HookStartWechatRequest):
+    _require_hook_login()
+    try:
+        if access_store.current_user.get():
+            record = await hook_login.start_for_user(instance_id=req.instance_id, restart=req.restart,
+                rdv=req.rdv, proxy=req.proxy, new=req.new)
+            if req.restart:
+                _account_runtimes.pop(record['id'], None)
+        else:
+            record = await hook_login.start(start_port=req.start_port, rdv=req.rdv,
+                wechat_path=req.wechat_path, remote_ws=req.remote_ws, proxy=req.proxy)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (httpx.HTTPError, OSError) as exc:
+        raise HTTPException(status_code=502, detail="管理器请求未确认成功，请检查管理服务及账号列表，勿连续重复启动。" + str(exc)) from exc
+    return {"ok": True, "instance_id": record["id"], "process_id": record["pid"],
+        "start_port": record["port"], "rdv": record["rdv"], "mode": record["mode"]}
+
+
+@app.get("/api/hook/instances/{instance_id}/status")
+async def hook_login_status(instance_id: str):
+    record = _hook_login_instance(instance_id)
+    return {"ok": True, "account": await _probe_started_hook_account(record)}
+
+
+@app.post("/api/hook/instances/{instance_id}/qrcode")
+async def hook_login_qrcode(instance_id: str, req: HookQRCodeRequest):
+    record = _hook_login_instance(instance_id)
+    try:
+        if req.refresh:
+            await hook_login.post(record, "/RefreshLoginQRCode")
+        response = await hook_login.post(record, "/GetLoginQRCode")
+        return {"ok": True, "qrcode": hook_login.qr_image(response)}
+    except (httpx.HTTPError, OSError, ValueError, ConnectionError, TimeoutError):
+        return {"ok": False, "error": "Hook 二维码尚未就绪，请稍后刷新或在微信窗口完成登录"}
+
+
+async def _cancel_account_work(account_ids):
+    current = asyncio.current_task()
+    tasks = {task for account_id in account_ids for task in _runtime_for(account_id).get('tasks', set())
+             if task is not current and not task.done()}
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _clear_account_runtime(account_id):
+    global app_state, message_store
+    _account_runtimes.pop(account_id, None)
+    if account_id == 'default':
+        app_state = _new_app_state()
+        message_store = MessageStore()
+
+
+async def _manage_hook_account(account_id, *, delete=False):
+    access_store.require_account(account_id)
+    # Resolve/adopt the original instance's actual RDV before verifying its process.
+    settings = await get_hook_login_settings(account_id)
+    async def after_stop(profile):
+        aliases = {account_id, profile['id'], *profile.get('aliases', [])}
+        await _cancel_account_work(aliases)
+        deleted = {}
+        if delete:
+            cache = _user_cache(access_store.current_user.get())
+            owners = {*aliases, *profile.get('wxids', []), *([profile['wxid']] if profile.get('wxid') else [])}
+            for alias in aliases:
+                info = _runtime_for(alias)['app_state'].get('self_info') or {}
+                wxid = _self_identity_from_response(info, agent_id=alias).get('wxid')
+                if wxid:
+                    owners.add(wxid)
+            for owner_wxid in owners:
+                deleted[owner_wxid] = cache.delete_account_data(owner_wxid)
+                _self_wxid_to_agent_id.pop(owner_wxid, None)
+                for brief_cache in (_CONTACT_BRIEF_CACHE, _CONTACT_PROFILE_CACHE):
+                    for key in list(brief_cache):
+                        if key.startswith(owner_wxid + '::'):
+                            brief_cache.pop(key, None)
+                _CONTACT_HYDRATION_PROGRESS.pop(owner_wxid, None)
+            profile['wxids'] = sorted(owners)
+            access_store.forget_profile(profile, aliases)
+            hook_login.forget(profile['id'])
+        for alias in aliases:
+            _clear_account_runtime(alias)
+        return deleted
+    try:
+        await hook_login.stop_for_user(settings['id'], after_stop=after_stop)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (httpx.HTTPError, OSError) as exc:
+        raise HTTPException(502, '微信管理器未确认操作成功，请稍后重试') from exc
+    return {'ok': True, 'account_id': account_id, 'deleted': delete}
+
+
+@app.post('/api/accounts/{account_id}/logout')
+async def logout_hook_account(account_id: str):
+    _require_hook_login()
+    return await _manage_hook_account(account_id)
+
+
+@app.delete('/api/accounts/{account_id}')
+async def delete_hook_account(account_id: str, req: DeleteAccountRequest):
+    _require_hook_login()
+    access_store.require_account(account_id)
+    if not req.confirmed:
+        raise HTTPException(400, '删除会永久清除这个微信的本地记录，请先确认删除警告')
+    return await _manage_hook_account(account_id, delete=True)
+
+
 @app.get("/api/protocol/health")
 async def get_protocol_health():
     return await protocol_api.health()
+
+
+async def _migrate_protocol_ownership():
+    marker = 'protocol_migrated:' + access_store.scope()
+    async with _PROTOCOL_OWNERSHIP_LOCK:
+        with access_store.connect() as db:
+            if db.execute('SELECT 1 FROM access_metadata WHERE name=?', (marker,)).fetchone():
+                return
+        response = await protocol_api.get_session_list()
+        if not isinstance(response, dict) or response.get('ok') is False:
+            raise HTTPException(502, '协议服务不可用，尚未完成原微信账号归属迁移')
+        user = access_store.legacy_user()
+        for item in response.get('sessions', []):
+            if isinstance(item, dict) and item.get('session_id'):
+                access_store.claim(item['session_id'], user)
+                if item.get('rdv'):
+                    access_store.claim('rdv:' + str(item['rdv']).lower(), user)
+        with access_store.connect() as db:
+            db.execute('INSERT OR IGNORE INTO access_metadata VALUES(?,?)', (marker, '1'))
 
 
 @app.get("/api/protocol/rdv-mapping")
@@ -2639,7 +3054,7 @@ async def get_protocol_rdv_mapping():
         "ok": True,
         "scope": _protocol_scope_key(),
         "mapping": _current_rdv_mapping(),
-        "rdv_rule": "自定义取值范围（十六进制）10000000~7fffffff",
+        "rdv_rule": "自定义取值范围（十六进制）01000000~7fffffff",
     }
 
 
@@ -2672,6 +3087,8 @@ async def delete_protocol_rdv_mapping(rdv: str):
 @app.post("/api/protocol/start-wechat")
 async def start_protocol_wechat(req: ProtocolStartWechatRequest):
     rdv = _validate_protocol_rdv(req.rdv)
+    if access_store.current_user.get() and not access_store.claim('rdv:' + rdv):
+        raise HTTPException(403, '此 RDV 已属于其他密钥用户')
     callback_url = str(req.callback_url or "").strip() or config.CALLBACK_URL
     data = await protocol_api.start_wechat(
         rdv=rdv,
@@ -2686,6 +3103,7 @@ async def start_protocol_wechat(req: ProtocolStartWechatRequest):
         session_id = _protocol_session_id_from_payload(data)
         start_port = _protocol_start_port_from_payload(data)
         if session_id:
+            access_store.claim(session_id)
             data["session_id"] = session_id
         if start_port not in (None, ""):
             data["start_port"] = start_port
@@ -2698,6 +3116,7 @@ async def start_protocol_wechat(req: ProtocolStartWechatRequest):
 @app.post("/api/protocol/get-qrcode")
 async def get_protocol_login_qrcode(req: ProtocolSessionRequest):
     session_id = str(req.session_id or "").strip()
+    access_store.require_account(session_id)
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id 不能为空")
     return await protocol_api.get_login_qrcode(session_id)
@@ -2706,6 +3125,7 @@ async def get_protocol_login_qrcode(req: ProtocolSessionRequest):
 @app.post("/api/protocol/get-login-status")
 async def get_protocol_login_status(req: ProtocolSessionRequest):
     session_id = str(req.session_id or "").strip()
+    access_store.require_account(session_id)
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id 不能为空")
     data = await protocol_api.get_login_status(session_id)
@@ -2735,6 +3155,7 @@ async def get_protocol_login_status(req: ProtocolSessionRequest):
 @app.post("/api/protocol/push-login-url")
 async def push_protocol_login_url(req: ProtocolPushLoginRequest):
     session_id = str(req.session_id or "").strip()
+    access_store.require_account(session_id)
     wxid = str(req.wxid or "").strip()
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id 不能为空")
@@ -2746,12 +3167,13 @@ async def push_protocol_login_url(req: ProtocolPushLoginRequest):
 @app.post("/api/protocol/get-profile")
 async def get_protocol_profile(req: ProtocolSessionRequest):
     session_id = str(req.session_id or "").strip()
+    access_store.require_account(session_id)
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id 不能为空")
     data = await _protocol_profile_for_session(session_id, force=True)
     if _protocol_profile_logged_in(data):
         _activate_runtime(session_id)
-        app_state["self_info"] = data
+        _state()["self_info"] = data
         identity = _self_identity_from_response(data, agent_id=session_id)
         wxid = identity["wxid"]
         if wxid:
@@ -2767,6 +3189,7 @@ async def get_protocol_profile(req: ProtocolSessionRequest):
 @app.post("/api/protocol/terminate")
 async def terminate_protocol_session(req: ProtocolSessionRequest):
     session_id = str(req.session_id or "").strip()
+    access_store.require_account(session_id)
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id 不能为空")
     _PROTOCOL_ACCOUNT_PROFILE_CACHE.pop(session_id, None)
@@ -2978,11 +3401,14 @@ def _normalize_mcp_connection_request(
         (item for item in config.MCP_CONNECTIONS if str(item.get("id") or "") == connection_id),
         {},
     )
+    token = str(req.token or "").strip() or str(existing.get("token") or "")
+    if req.enabled and requires_bearer_token(url) and not token.strip():
+        raise HTTPException(status_code=400, detail="数据运维 MCP 必须配置 Bearer Token，请填写服务器 api_token")
     return {
         "id": connection_id or f"mcp_connection_{index + 1}",
         "name": str(req.name or url or f"MCP 连接 {index + 1}").strip()[:80],
         "url": url,
-        "token": str(req.token or "").strip() or str(existing.get("token") or ""),
+        "token": token,
         "enabled": bool(req.enabled),
     }
 
@@ -3082,7 +3508,7 @@ async def analyze_ai_message(req: AiAnalyzeRequest):
     message = str(req.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
-    task = _normalize_ai_task(req.task)
+    task = offline_analysis_task(_normalize_ai_task(req.task), message)
     try:
         result = await ai_service.analyze(message, task)
     except AiServiceError as exc:
@@ -3095,6 +3521,9 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
     if not chat_id:
         raise HTTPException(status_code=400, detail="chat id is required")
     is_group = chat_id.endswith("@chatroom")
+    owner_wxid = _contact_owner_wxid()
+    if chat_id == "filehelper" and not owner_wxid:
+        raise HTTPException(status_code=400, detail="请先登录微信账号，再配置文件传输助手")
 
     message_types: list[str] = []
     for value in req.message_types:
@@ -3141,7 +3570,7 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
             *target_senders_by_type.keys(),
         ]))
         target_senders_by_type = {
-            message_type: [chat_id]
+            message_type: [owner_wxid if chat_id == "filehelper" else chat_id]
             for message_type in stored_message_types
         }
     else:
@@ -3248,8 +3677,7 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
     if not rules and not ai_tasks:
         raise HTTPException(status_code=400, detail="at least one keyword rule or AI task is required")
 
-    owner_wxid = _contact_owner_wxid()
-    cached_contact = sqlite_cache.get_contacts([chat_id], owner_wxid=owner_wxid).get(chat_id, {})
+    cached_contact = _cache().get_contacts([chat_id], owner_wxid=owner_wxid).get(chat_id, {})
     return {
         "chat_id": chat_id,
         "chat_name": str(req.chat_name or cached_contact.get("name") or chat_id).strip()[:200],
@@ -3270,13 +3698,13 @@ def _normalized_smart_reply_config(chat_id: str, req: SmartReplyConfigRequest) -
 @app.get("/api/smart-replies")
 async def list_smart_replies():
     owner_wxid = _contact_owner_wxid()
-    return {"configs": sqlite_cache.list_smart_reply_configs(owner_wxid=owner_wxid)}
+    return {"configs": _cache().list_smart_reply_configs(owner_wxid=owner_wxid)}
 
 
 @app.get("/api/smart-replies/{chat_id}")
 async def get_smart_reply(chat_id: str):
     owner_wxid = _contact_owner_wxid()
-    config_row = sqlite_cache.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
+    config_row = _cache().get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
     if config_row is None:
         raise HTTPException(status_code=404, detail="smart reply config not found")
     return {"config": config_row}
@@ -3285,7 +3713,7 @@ async def get_smart_reply(chat_id: str):
 @app.put("/api/smart-replies/{chat_id}")
 async def save_smart_reply(chat_id: str, req: SmartReplyConfigRequest):
     owner_wxid = _contact_owner_wxid()
-    config_row = sqlite_cache.upsert_smart_reply_config(
+    config_row = _cache().upsert_smart_reply_config(
         _normalized_smart_reply_config(chat_id, req),
         owner_wxid=owner_wxid,
     )
@@ -3296,7 +3724,7 @@ async def save_smart_reply(chat_id: str, req: SmartReplyConfigRequest):
 @app.delete("/api/smart-replies/{chat_id}")
 async def delete_smart_reply(chat_id: str):
     owner_wxid = _contact_owner_wxid()
-    deleted = sqlite_cache.delete_smart_reply_config(chat_id, owner_wxid=owner_wxid)
+    deleted = _cache().delete_smart_reply_config(chat_id, owner_wxid=owner_wxid)
     await manager.broadcast({"type": "smart_reply_updated", "data": {"chat_id": chat_id, "deleted": deleted}})
     return {"ok": True, "deleted": deleted}
 
@@ -3494,7 +3922,210 @@ def _fallback_mcp_reply(
     return _ensure_mcp_reply_values("\n".join(parts), identifier, work_num)
 
 
-async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple[str, ...]:
+def _xlsx_xml_text(value: Any) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def _xlsx_xml_attr(value: Any) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def _xlsx_inline_cell(reference: str, value: Any, style_id: int = 0) -> str:
+    text = _xlsx_xml_text(value)
+    style = f' s="{style_id}"' if style_id else ""
+    return (
+        f'<c r="{_xlsx_xml_attr(reference)}" t="inlineStr"{style}>'
+        f'<is><t xml:space="preserve">{text}</t></is></c>'
+    )
+
+
+def _problem_ticket_table_requested(source: Any) -> bool:
+    return bool(re.search(r"表格|图表|报表|xlsx|excel", str(source or ""), re.IGNORECASE))
+
+
+def _create_problem_ticket_table(payload: dict[str, Any], *, force: bool = False) -> dict[str, str] | None:
+    """Create a styled OOXML workbook without using a spreadsheet object model."""
+    items = [item for item in (payload.get("items") or []) if isinstance(item, dict)]
+    if len(items) <= 10 and not force:
+        return None
+
+    headers = ["ID标识", "概述", "状态", "填报时间", "信息中心处理时间", "受理人", "问题ID", "受理单位"]
+    rows = [
+        [
+            item.get("identifier") or item.get("id_identifier") or item.get("id") or "",
+            item.get("summary") or "",
+            item.get("status") or "",
+            item.get("submitted_at") or item.get("submit_time") or "",
+            item.get("info_center_processed_at") or {"not_found": "暂无记录", "missing_time": "时间缺失",
+                "error": "查询失败"}.get(item.get("info_center_time_status"), "未提供"),
+            item.get("assignee") or "",
+            item.get("problem_id") or item.get("iid") or "",
+            item.get("assignee_unit") or "",
+        ]
+        for item in items
+    ]
+    excluded = "、".join(str(item) for item in payload.get("excluded_statuses") or ()) or "无"
+    range_label = str(payload.get("range_label") or "指定范围")
+    period = (
+        f"{range_label}（{payload.get('date_from')} 至 {payload.get('date_to') or payload.get('date_from')}）"
+        if payload.get("date_from")
+        else f"{range_label}（平台当前账号可见的全部历史）"
+    )
+    title = "问题平台提单统计"
+    subtitle = f"筛选：{'未完成；已排除：' + excluded if payload.get('incomplete_only') else '全部状态'}；时间范围：{period}；共 {len(rows)} 条；信息中心处理时间取首次履历发起时间"
+
+    upload_dir = os.path.join(os.path.dirname(__file__), "_uploads", "smart_reply")
+    os.makedirs(upload_dir, exist_ok=True)
+    start = str(payload.get("date_from") or "")
+    end = str(payload.get("date_to") or start)
+    filename_range = (start if start == end else f"{start}至{end}") if start else "全部历史"
+    filename_range = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename_range)
+    filename = f"{filename_range}_问题平台提单统计.xlsx"
+    report_dir = tempfile.mkdtemp(prefix="problem_tickets_report_", dir=upload_dir)
+    filepath = os.path.join(report_dir, filename)
+
+    def row_xml(row_number: int, cells: list[str], styles: list[int], height: int) -> str:
+        parts = [f'<row r="{row_number}" ht="{height}" customHeight="1">']
+        for column_number, (value, style_id) in enumerate(zip(cells, styles), 1):
+            reference = f"{chr(64 + column_number)}{row_number}"
+            parts.append(_xlsx_inline_cell(reference, value, style_id))
+        parts.append("</row>")
+        return "".join(parts)
+
+    last_row = 4 + len(rows)
+    body_xml = []
+    for index, row in enumerate(rows, 5):
+        alt = index % 2 == 0
+        body_xml.append(row_xml(
+            index,
+            row,
+            [7 if alt else 6, 5 if alt else 4, 9 if alt else 8, 7 if alt else 6,
+             7 if alt else 6, 5 if alt else 4, 7 if alt else 6, 5 if alt else 4],
+            36,
+        ))
+
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>'''
+    root_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>'''
+    workbook = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <fileVersion appName="xl" lastEdited="7" lowestEdited="7" rupBuild="1"/>
+  <workbookPr defaultThemeVersion="164011"/>
+  <bookViews><workbookView xWindow="0" yWindow="0" windowWidth="24000" windowHeight="12000"/></bookViews>
+  <sheets><sheet name="问题平台运维单" sheetId="1" r:id="rId1"/></sheets>
+</workbook>'''
+    workbook_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    styles = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2">
+    <font><sz val="10"/><name val="Microsoft YaHei"/><family val="2"/></font>
+    <font><b/><sz val="14"/><name val="Microsoft YaHei"/><family val="2"/></font>
+  </fonts>
+  <fills count="5">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFD9EAF7"/><bgColor indexed="64"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFF3F7FB"/><bgColor indexed="64"/></patternFill></fill>
+  </fills>
+  <borders count="2">
+    <border><left/><right/><top/><bottom/><diagonal/></border>
+    <border><left style="thin"><color rgb="FFD9E2F3"/></left><right style="thin"><color rgb="FFD9E2F3"/></right><top style="thin"><color rgb="FFD9E2F3"/></top><bottom style="thin"><color rgb="FFD9E2F3"/></bottom><diagonal/></border>
+  </borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="10">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+    <xf numFmtId="0" fontId="1" fillId="2" borderId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="3" borderId="0" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="4" borderId="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="4" borderId="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="4" borderId="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+  </cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>'''
+    worksheet = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <dimension ref="A1:H{last_row}"/>
+  <sheetViews><sheetView showGridLines="0" workbookViewId="0"><pane ySplit="4" topLeftCell="A5" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A5" sqref="A5"/></sheetView></sheetViews>
+  <sheetFormatPr defaultRowHeight="20"/>
+  <cols>
+    <col min="1" max="1" width="19" customWidth="1"/>
+    <col min="2" max="2" width="44" customWidth="1"/>
+    <col min="3" max="3" width="19" customWidth="1"/>
+    <col min="4" max="4" width="24" customWidth="1"/>
+    <col min="5" max="5" width="24" customWidth="1"/>
+    <col min="6" max="6" width="18" customWidth="1"/>
+    <col min="7" max="7" width="24" customWidth="1"/>
+    <col min="8" max="8" width="30" customWidth="1"/>
+  </cols>
+  <sheetData>
+    {row_xml(1, [title], [1], 30)}
+    {row_xml(2, [subtitle], [2], 40)}
+    <row r="3" ht="8" customHeight="1"/>
+    {row_xml(4, headers, [3] * len(headers), 28)}
+    {''.join(body_xml)}
+  </sheetData>
+  <autoFilter ref="A4:H{last_row}"/>
+  <mergeCells count="2"><mergeCell ref="A1:H1"/><mergeCell ref="A2:H2"/></mergeCells>
+  <pageMargins left="0.3" right="0.3" top="0.5" bottom="0.5" header="0.2" footer="0.2"/>
+</worksheet>'''
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    core = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>问题平台运维单清单</dc:title><dc:creator>Aixed</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">{_xlsx_xml_text(now)}</dcterms:created></cp:coreProperties>'''
+    app = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Microsoft Excel Compatible OOXML</Application><DocSecurity>0</DocSecurity><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size="2" baseType="variant"><vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="1" baseType="lpstr"><vt:lpstr>问题平台运维单</vt:lpstr></vt:vector></TitlesOfParts></Properties>'''
+
+    try:
+        with zipfile.ZipFile(filepath, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, content in {
+                "[Content_Types].xml": content_types,
+                "_rels/.rels": root_rels,
+                "xl/workbook.xml": workbook,
+                "xl/_rels/workbook.xml.rels": workbook_rels,
+                "xl/styles.xml": styles,
+                "xl/worksheets/sheet1.xml": worksheet,
+                "docProps/core.xml": core,
+                "docProps/app.xml": app,
+            }.items():
+                archive.writestr(name, content.encode("utf-8"))
+    except Exception:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+        raise
+    return {"filepath": filepath, "filename": filename, "cleanup_dir": report_dir}
+
+
+async def _mcp_task_reply(
+    task: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    attachments_out: list[dict[str, str]] | None = None,
+) -> tuple[str, ...]:
+    if attachments_out is None and isinstance(task.get("_attachments_out"), list):
+        attachments_out = task["_attachments_out"]
     if is_unified_task(task) and not task.get("_unified_routed"):
         if not bool(result.get("matched")):
             return ()
@@ -3503,7 +4134,7 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
         except ValueError as exc:
             return (UNIFIED_SKILL_NAME + "：" + str(exc),)
         routed_task = {**task, "mcp_tool_name": tool_name, "_unified_routed": True}
-        return await _mcp_task_reply(routed_task, routed_result)
+        return await _mcp_task_reply(routed_task, routed_result, attachments_out=attachments_out)
     if str(task.get("mcp_tool_name") or "") == SUBMISSION_TOOL and "_source_content" in task:
         if not _ai_result_matches(task, result):
             return (SUBMISSION_REPLY_PREFIX + "：未识别到足够明确的填报请求，未提交。",)
@@ -3568,7 +4199,7 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
         except (ValueError, McpServiceError) as exc:
             return execution_reply_chunks(EXECUTION_REPLY_PREFIX + "：未完成执行请求：" + str(exc))
         if work_num and all(context.get(k) for k in ("owner_wxid", "chat_id", "sender")):
-            sqlite_cache.append_query_turn(context["chat_id"], context["sender"],
+            _cache().append_query_turn(context["chat_id"], context["sender"],
                 query_memory_turn(f"需求 {target['identifier']} 的执行请求结果", {"query_type": "execution", "identifier": work_num}, reply,
                     message_id=context.get("message_id", ""), connection_id=str(task.get("mcp_connection_id") or "")), owner_wxid=context["owner_wxid"])
         return execution_reply_chunks(reply)
@@ -3587,9 +4218,10 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
             arguments = query_arguments(task.get("_source_content"), result, history)
         except ValueError as exc:
             return (QUERY_REPLY_PREFIX + "：" + str(exc),)
+        query_prefix = PROBLEM_QUERY_REPLY_PREFIX if arguments.get("query_type") == "problem_tickets" else QUERY_REPLY_PREFIX
         connection = _mcp_connection(str(task.get("mcp_connection_id") or ""))
         if not connection or not bool(connection.get("enabled", True)):
-            return (QUERY_REPLY_PREFIX + "：数据运维连接未启用，未取得查询结果。",)
+            return (query_prefix + "：查询连接未启用，未取得结果。",)
         payload = None
         try:
             if arguments["query_type"] == "pending_maintenance":
@@ -3608,15 +4240,47 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
                     payload["results"].append(part)
             else:
                 tool_name, tool_arguments = query_tool_call(arguments)
-                called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""), tool_name=tool_name, arguments=tool_arguments)
+                progress_state = (task.get("_source_context") or {}).get("_query_progress")
+                call_options = {"url": str(connection.get("url") or ""), "token": str(connection.get("token") or ""),
+                    "tool_name": tool_name, "arguments": tool_arguments}
+                if isinstance(progress_state, dict):
+                    update_progress(progress_state, {"phase": "remote"})
+                if (arguments["query_type"] == "problem_tickets" and isinstance(progress_state, dict)
+                        and callable(getattr(mcp_service, "call_tool_with_progress", None))):
+                    called = await mcp_service.call_tool_with_progress(**call_options,
+                        progress_callback=lambda snapshot: update_progress(progress_state, snapshot))
+                else:
+                    called = await mcp_service.call_tool(**call_options)
                 payload = called.get("structured")
+                if arguments["query_type"] == "problem_tickets":
+                    if (not isinstance(payload, dict) or payload.get("query_type") != "problem_tickets"
+                            or any(str(payload.get(key) or "") != str(arguments.get(key) or "")
+                                for key in ("date_from", "date_to"))):
+                        raise McpServiceError("问题平台返回的日期范围与本次请求不一致，已停止生成表格，请重新查询。")
+                    payload = {**payload, "range_label": arguments["date_label"]}
         except McpServiceError as exc:
-            reply = QUERY_REPLY_PREFIX + "：查询失败，处理情况、执行结果和数量未知：" + str(exc)
+            payload = None
+            reply = query_prefix + "：查询失败，处理情况、执行结果和数量未知：" + str(exc)
         else:
             reply = query_reply(payload, include_sql=arguments["query_type"] == "execution" and execution_details_requested(task.get("_source_content")))
+            if (arguments["query_type"] == "problem_tickets" and isinstance(payload, dict)
+                    and not payload.get("count_only") and attachments_out is not None):
+                progress_state = (task.get("_source_context") or {}).get("_query_progress")
+                if isinstance(progress_state, dict):
+                    update_progress(progress_state, {"phase": "formatting"})
+                attachment = await asyncio.to_thread(_create_problem_ticket_table, payload,
+                    force=_problem_ticket_table_requested(task.get("_source_content")))
+                if attachment:
+                    attachments_out.append(attachment)
+                    if len(payload.get("items") or []) <= 10 and "完整明细已整理为表格文件发送" not in reply:
+                        reply += "\n完整明细已整理为表格文件发送。"
+                    _smart_reply_log(
+                        f"[MCP_REPLY] created problem query table file={attachment['filename']} "
+                        f"rows={len(payload.get('items') or [])}"
+                    )
         context = task.get("_source_context") or {}
         if all(context.get(k) for k in ("owner_wxid", "chat_id", "sender")):
-            sqlite_cache.append_query_turn(context["chat_id"], context["sender"],
+            _cache().append_query_turn(context["chat_id"], context["sender"],
                 query_memory_turn(task.get("_source_content"), arguments, query_reply(payload) if isinstance(payload, dict) else reply,
                     message_id=context.get("message_id", ""), connection_id=str(task.get("mcp_connection_id") or ""), payload=payload),
                 owner_wxid=context["owner_wxid"])
@@ -3633,15 +4297,25 @@ async def _mcp_task_reply(task: dict[str, Any], result: dict[str, Any]) -> tuple
         connection = _mcp_connection(str(task.get("mcp_connection_id") or ""))
         if not connection or not bool(connection.get("enabled", True)):
             return ("数据运维连接未启用，未启动流程。",)
+        if len(arguments["identifier"]) == 4 and not arguments["dry_run"]:
+            try:
+                return (await _prepare_offline_city_confirmation(task, arguments),)
+            except ValueError as exc:
+                return (f"线下单 {arguments['identifier']}：{exc}；未填报、审核或执行。",)
+        context = task.get("_source_context") or {}
+        pending = OfflineConfirmationStore(_cache().db_path).get(context)
+        if pending and pending.get("numbered_city_selection") and not arguments["dry_run"]:
+            return split_reply(selection_message(pending))
         try:
             called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""),
                 tool_name=WORKFLOW_TOOL, arguments=arguments)
         except McpServiceError as exc:
             return (f"需求 {arguments['identifier']} 数据运维流程未完成：{exc}\n结果待核对，请勿重新提交或执行。流程标识：{arguments['request_id']}",)
         reply = workflow_reply(called.get("structured"), arguments)
-        context = task.get("_source_context") or {}
+        if not arguments["dry_run"] and city_selection_failure(called.get("structured")):
+            return split_reply(await _prepare_workflow_city_selection(task, arguments, called["structured"]))
         if not arguments.get("dry_run") and all(context.get(k) for k in ("owner_wxid", "chat_id", "sender")):
-            sqlite_cache.append_query_turn(context["chat_id"], context["sender"],
+            _cache().append_query_turn(context["chat_id"], context["sender"],
                 query_memory_turn(f"需求 {arguments['identifier']} 的 SQL 流程结果", {"query_type": "execution", "identifier": arguments["identifier"]}, reply,
                     message_id=context.get("message_id", ""), connection_id=str(task.get("mcp_connection_id") or "")), owner_wxid=context["owner_wxid"])
         return split_reply(reply)
@@ -3920,18 +4594,302 @@ async def _smart_reply_image_data_url(
     return await asyncio.to_thread(_image_data_url_from_path, path)
 
 
+async def _offline_quote_image(context):
+    quote = sql_quote(context.get("source_message") or {})
+    if not quote or not quote["image"]:
+        return ""
+    image = quote["image"]
+    cached = _cache().get_message_by_id(image["id"], owner_wxid=context["owner_wxid"]) if image["id"] else None
+    if cached and str(cached.get("msgtype")) == "3":
+        image = {**cached, **{k: v for k, v in image.items() if v}}
+    if image.get("db_image_id"):
+        blob = _cache().get_media_blob(image["db_image_id"])
+        if blob and blob.get("data"):
+            if len(blob["data"]) > _SMART_REPLY_IMAGE_MAX_BYTES:
+                raise ValueError("引用图片超过 8 MiB，请重新提供原图")
+            return "data:" + str(blob.get("mime_type") or "image/png") + ";base64," + base64.b64encode(blob["data"]).decode("ascii")
+    local = str(image.get("img_path") or "")
+    if local:
+        data_url, reason = await asyncio.to_thread(_image_data_url_from_path, local)
+        if data_url:
+            return data_url
+    try:
+        with wechat_api.use_agent(str(context.get("agent_id") or "")), wechat_api.use_log_category("smart_reply"):
+            resolved = await _download_image_payload({"msg_id": image["id"], "msg_xml": image["msg"],
+                "bytes_extra_hex": image.get("bytesExtraHex") or "", "quoted": True}, str(context.get("agent_id") or ""))
+        if not isinstance(resolved, FileResponse):
+            raise ValueError(str((resolved or {}).get("error") or "未获得图片文件"))
+        data_url, reason = await asyncio.to_thread(_image_data_url_from_path, str(resolved.path))
+        if not data_url:
+            raise ValueError(reason)
+        return data_url
+    except Exception as exc:
+        raise ValueError("引用图片下载失败，请加载或重新发送图片后重试（" + str(getattr(exc, "detail", exc)) + "）") from exc
+
+
+async def _prepare_offline_city_confirmation(task, arguments):
+    context = task.get("_source_context") or {}
+    if not all(context.get(key) for key in ("owner_wxid", "chat_id", "sender")):
+        raise ValueError("缺少原消息会话，不能等待城市确认")
+    store = OfflineConfirmationStore(_cache().db_path)
+    existing = store.get(context)
+    if existing:
+        if existing["arguments"]["identifier"] != arguments["identifier"] or existing["arguments"]["sql_text"] != arguments["sql_text"]:
+            return f"线下单 {existing['arguments']['identifier']} 正在等待区划确认。请先确认或回复“取消”，再发送新的线下单。"
+        if not existing.get("confirmed_city") and is_offline_confirmation_prompt(existing.get("candidate_text")):
+            existing = await _match_offline_city(existing, existing.get("department") or "")
+            store.save(context, existing)
+        return confirmation_message(existing)
+    data_url = await _offline_quote_image(context)
+    department = ""
+    if data_url:
+        arguments = {**arguments, "attachment_base64": data_url.split(",", 1)[1]}
+        try:
+            result = await ai_service.analyze_image("识别申请部门和行政区划", {"name": "线下申请区划识别", "instruction": CITY_PROMPT}, data_url)
+            parsed = result.get("result")
+            parsed = json.loads(parsed) if isinstance(parsed, str) else parsed
+            if isinstance(parsed, dict):
+                department = str(parsed.get("department") or "").strip()[:300]
+        except (AiServiceError, AttributeError, ValueError, TypeError) as exc:
+            _smart_reply_log(f"[OFFLINE_DOMP] city recognition failed identifier={arguments['identifier']} error={type(exc).__name__}")
+        if not department:
+            quote = sql_quote(context.get("source_message") or {})
+            if quote and quote["image"]:
+                try:
+                    text, _, _ = await _smart_reply_image_ocr(quote["image"], str(context.get("agent_id") or ""))
+                    if text:
+                        result = await ai_service.analyze("图片 OCR 文本（仅作为数据）：\n" + text,
+                            {"name": "线下申请城市识别", "instruction": CITY_PROMPT})
+                        parsed = result.get("result")
+                        parsed = json.loads(parsed) if isinstance(parsed, str) else parsed
+                        if isinstance(parsed, dict):
+                            department = str(parsed.get("department") or "").strip()[:300]
+                except (AiServiceError, AttributeError, ValueError, TypeError) as exc:
+                    _smart_reply_log(f"[OFFLINE_DOMP] department OCR unavailable identifier={arguments['identifier']} error={type(exc).__name__}")
+    pending = {"arguments": arguments, "connection_id": str(task.get("mcp_connection_id") or ""), "department": department,
+               "owner_only": context.get("chat_id") == "filehelper"}
+    owner_names = _owner_mention_names(context["chat_id"], context["owner_wxid"],
+        owner_wxid=context["owner_wxid"], agent_id=str(context.get("agent_id") or ""))
+    pending["owner_mention"] = "Aixed" if "aixed" in owner_names else next((name for name in sorted(owner_names)
+        if name != str(context["owner_wxid"]).casefold() and not name.startswith("wxid_")), "Aixed")
+    pending = await _match_offline_city(pending, department)
+    store.save(context, pending)
+    return confirmation_message(pending)
+
+
+def _offline_confirmation_for(context, source=""):
+    store = OfflineConfirmationStore(_cache().db_path)
+    pending = store.get(context)
+    if pending:
+        return context, pending
+    if context.get("sender") != context.get("owner_wxid"):
+        return context, None
+    records = [(sender, p) for sender, p in store.for_chat(context) if not p.get("numbered_city_selection")]
+    identifiers = identifiers_in(source, allow_work_numbers=False)
+    if identifiers:
+        records = [(sender, p) for sender, p in records if p["arguments"]["identifier"] in identifiers]
+    if len(records) == 1:
+        sender, pending = records[0]
+        return {**context, "sender": sender}, pending
+    return context, None
+
+
+async def _match_offline_city(pending, city_text):
+    connection = _mcp_connection(pending["connection_id"])
+    pending = {**pending, "candidate_text": city_text, "matched_city": "", "matched_area_display": "", "city_match": {}, "match_error": ""}
+    if not connection or not connection.get("enabled", True):
+        pending["match_error"] = "数据运维连接未启用，请恢复后输入城市或县区"
+        return pending
+    try:
+        called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""),
+            tool_name="match_data_maintenance_city", arguments={"city_text": city_text})
+        matched = called.get("structured")
+        if not isinstance(matched, dict) or not any(isinstance(matched.get(key), list) for key in ("supported_areas", "supported_cities")):
+            raise ValueError("未取得系统支持的行政区划，请确认 MCP 服务已更新")
+        area = str(matched.get("area_name") or matched.get("city") or "")
+        if matched.get("matched") is True:
+            if isinstance(matched.get("supported_areas"), list):
+                supported = [record for record in matched["supported_areas"] if isinstance(record, dict)
+                    and record.get("area_name") == area and record.get("area_code") == matched.get("area_code")]
+                verified = len(supported) == 1
+            else:
+                verified = area in matched["supported_cities"]
+            if not area or not matched.get("area_code") or not verified:
+                raise ValueError("区划匹配结果未包含可核对的系统名称和编码")
+        pending.update(city_match=matched, matched_city=area if matched.get("matched") is True else "",
+            matched_area_display=str(matched.get("area_display") or area) if matched.get("matched") is True else "")
+    except (McpServiceError, ValueError) as exc:
+        pending["match_error"] = str(exc)
+    return pending
+
+
+async def _resume_offline_city_confirmation(source, context, pending, tasks):
+    if pending.get("numbered_city_selection"):
+        return await _resume_workflow_city_selection(source, context, pending, tasks)
+    store = OfflineConfirmationStore(_cache().db_path)
+    action, city_text = city_input(source, pending["arguments"]["identifier"])
+    if action == "cancel":
+        store.delete(context)
+        if pending.get("confirmed_city"):
+            return f"已结束线下单 {pending['arguments']['identifier']} 的本次会话等待。此前已发起流程，请查询结果；不能据此认定业务操作已取消。"
+        return f"已取消线下单 {pending['arguments']['identifier']}，未填报、审核或执行。"
+    if not action:
+        return confirmation_message(pending)
+    if pending.get("confirmed_city") and action == "input":
+        return "本单已经按 " + pending["confirmed_city"] + " 发起处理，不能改区划后重新提交。请先查询原流程结果。"
+    connection_id = pending["connection_id"]
+    if not any(task.get("mcp_connection_id") == connection_id and task.get("mcp_enabled") and (
+        is_unified_task(task) or task.get("mcp_tool_name") == WORKFLOW_TOOL) for task in tasks):
+        return "原线下单的自动处理配置已变化，请恢复原连接或取消后重新发送。未填报、审核或执行。"
+    connection = _mcp_connection(connection_id)
+    if not connection or not connection.get("enabled", True):
+        return "数据运维连接未启用，区划确认已保留，未启动流程。"
+    if action == "confirm" and not pending.get("confirmed_city") and is_offline_confirmation_prompt(pending.get("candidate_text")):
+        # Recover waiting records polluted by an automatic SendAtMsg callback.
+        # Show the restored target before accepting a fresh confirmation.
+        pending = await _match_offline_city(pending, pending.get("department") or "")
+        store.save(context, pending)
+        return confirmation_message(pending)
+    if action == "input" or not (pending.get("city_match") or {}).get("matched"):
+        pending = await _match_offline_city(pending, city_text if action == "input" else pending.get("candidate_text") or pending.get("department") or "")
+        store.save(context, pending)
+        return confirmation_message(pending)
+    if "supported_areas" not in pending["city_match"] and not pending.get("confirmed_city"):
+        # Old waiting records may have collapsed a county to its parent city.
+        previous_code = pending["city_match"].get("area_code")
+        pending = await _match_offline_city(pending, pending.get("candidate_text") or pending.get("department") or pending["matched_city"])
+        store.save(context, pending)
+        if not pending["city_match"].get("matched") or pending["city_match"].get("area_code") != previous_code:
+            return confirmation_message(pending)
+    city = pending["matched_city"]
+    arguments = {**pending["arguments"], "city": city}
+    store.save(context, {**pending, "confirmed_city": city})
+    try:
+        called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""),
+            tool_name=WORKFLOW_TOOL, arguments=arguments)
+    except McpServiceError as exc:
+        return f"线下单 {arguments['identifier']} 区划已确认为 {pending.get('matched_area_display') or city}。流程结果待核对：{exc}。请查询流程标识 {arguments['request_id']}，勿重复提交。"
+    reply = f"线下单行政区划：{pending.get('matched_area_display') or city}\n" + workflow_reply(called.get("structured"), arguments)
+    if city_selection_failure(called.get("structured")):
+        task = {"mcp_connection_id": connection_id, "_source_context": context}
+        store.delete(context)
+        return await _prepare_workflow_city_selection(task, arguments, called["structured"])
+    store.delete(context)
+    if isinstance(called.get("structured"), dict):
+        _cache().append_query_turn(context["chat_id"], context["sender"],
+            query_memory_turn(f"需求 {arguments['identifier']} 的 SQL 流程结果", {"query_type": "execution", "identifier": arguments["identifier"]}, reply,
+                message_id=context.get("message_id", ""), connection_id=connection_id), owner_wxid=context["owner_wxid"])
+    return reply
+
+
+async def _prepare_workflow_city_selection(task, arguments, payload):
+    context = task.get("_source_context") or {}
+    if not all(context.get(key) for key in ("owner_wxid", "chat_id", "sender")):
+        return workflow_reply(payload, arguments)
+    store = OfflineConfirmationStore(_cache().db_path)
+    existing = store.get(context)
+    if existing:
+        return selection_message(existing) if existing.get("numbered_city_selection") else confirmation_message(existing)
+    names = _owner_mention_names(context["chat_id"], context["owner_wxid"],
+        owner_wxid=context["owner_wxid"], agent_id=str(context.get("agent_id") or ""))
+    pending = {"numbered_city_selection": True, "arguments": arguments,
+        "connection_id": str(task.get("mcp_connection_id") or ""), "failure": payload,
+        "owner_only": context["chat_id"] == "filehelper",
+        "owner_mention": "Aixed" if "aixed" in names else next((name for name in sorted(names)
+            if name != str(context["owner_wxid"]).casefold() and not name.startswith("wxid_")), "Aixed")}
+    pending = await _refresh_workflow_city_options(pending)
+    store.save(context, pending)
+    return selection_message(pending)
+
+
+async def _refresh_workflow_city_options(pending):
+    # The selection list comes from a read-only platform catalog, never from AI.
+    matched = await _match_offline_city(pending, "")
+    options = selection_options(pending["failure"], (matched.get("city_match") or {}).get("supported_areas") or [])
+    return {**matched, "city_options": options}
+
+
+async def _resume_workflow_city_selection(source, context, pending, tasks):
+    store = OfflineConfirmationStore(_cache().db_path)
+    action, _ = city_input(source, pending["arguments"]["identifier"])
+    if action == "cancel":
+        store.delete(context)
+        return CITY_SELECTION_PREFIX + ("：已结束等待；此前已发起流程，请先查询结果。" if pending.get("confirmed_city")
+            else "：已取消，本次未填报、审核或执行。")
+    if pending.get("confirmed_city"):
+        return CITY_SELECTION_PREFIX + f"：已按 {pending['confirmed_city']} 发起处理，请查询需求 {pending['arguments']['identifier']} 的结果，勿重复提交。"
+    connection_id = pending["connection_id"]
+    if not any(task.get("mcp_connection_id") == connection_id and task.get("mcp_enabled") and task.get("enabled")
+        and (is_unified_task(task) or task.get("mcp_tool_name") == WORKFLOW_TOOL) for task in tasks):
+        return CITY_SELECTION_PREFIX + "：原流程配置已变化，未继续填报，请恢复原连接后再选择。"
+    connection = _mcp_connection(connection_id)
+    if not connection or not connection.get("enabled", True):
+        return CITY_SELECTION_PREFIX + "：数据运维连接未启用，已保留选项，未启动流程。"
+    number = selection_number(source, pending["arguments"]["identifier"])
+    options = pending.get("city_options") or []
+    if not options:
+        pending = await _refresh_workflow_city_options(pending)
+        store.save(context, pending)
+        return selection_message(pending)
+    if number is None:
+        return selection_message(pending)
+    if not 1 <= number <= len(options):
+        return f"{CITY_SELECTION_PREFIX}：编号无效，请选择 1—{len(options)}。\n" + selection_message(pending)
+    selected = options[number - 1]
+    verified = await _match_offline_city(pending, selected["area_name"])
+    match = verified.get("city_match") or {}
+    if not (match.get("matched") is True and match.get("area_name") == selected["area_name"]
+            and match.get("area_code") == selected["area_code"]):
+        # Keep published numbering stable on network errors; never retarget a number.
+        return CITY_SELECTION_PREFIX + "：所选区划暂未通过系统名称和编码校验，未填报，请稍后重新选择。\n" + selection_message(pending)
+    arguments = {**pending["arguments"], "city": selected["area_name"]}
+    pending = {**pending, "confirmed_city": selected["area_name"]}
+    store.save(context, pending)
+    try:
+        called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""),
+            tool_name=WORKFLOW_TOOL, arguments=arguments)
+    except McpServiceError:
+        return CITY_SELECTION_PREFIX + f"：已选择 {selected['area_name']}，流程结果待核对，请查询需求 {arguments['identifier']}，勿重复提交。"
+    payload = called.get("structured")
+    if city_selection_failure(payload):
+        pending = await _refresh_workflow_city_options({**pending, "failure": payload, "confirmed_city": ""})
+        store.save(context, pending)
+        return CITY_SELECTION_PREFIX + "：服务端未完成区划续办，请确认远程 MCP 已同步更新。\n" + selection_message(pending)
+    reply = CITY_SELECTION_PREFIX + f"：已选择 {selected['area_name']}。\n" + workflow_reply(payload, arguments)
+    if isinstance(payload, dict) and (payload.get("execution") or {}).get("complete"):
+        store.delete(context)
+    _cache().append_query_turn(context["chat_id"], context["sender"],
+        query_memory_turn(f"需求 {arguments['identifier']} 的 SQL 流程结果", {"query_type": "execution", "identifier": arguments["identifier"]}, reply,
+            message_id=context.get("message_id", ""), connection_id=connection_id), owner_wxid=context["owner_wxid"])
+    return reply
+
+
 def _query_history_for(context, connection_id=""):
     if not context or not all(context.get(k) for k in ("owner_wxid", "chat_id", "sender")):
         return []
-    session = sqlite_cache.get_query_conversation(context["chat_id"], context["sender"], owner_wxid=context["owner_wxid"])
+    session = _cache().get_query_conversation(context["chat_id"], context["sender"], owner_wxid=context["owner_wxid"])
     return [t for t in (session or {}).get("turns", []) if t.get("connection_id", "") == connection_id]
 
 
 _RECENT_SQL_FILE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
+def _recent_chat_sql_identifier(source: str) -> str:
+    """Read the explicit offline or old ticket id from the SQL header."""
+    source = str(source or "")
+    match = SQL_START.search(source)
+    if not match:
+        return ""
+    identifiers = identifiers_in(source[:match.start()], allow_work_numbers=False)
+    return next(iter(identifiers)) if len(identifiers) == 1 else ""
+
+
+_SQL_MENTION_REFRESH_TTL_SECONDS = 300.0
+_sql_mention_refresh_at: dict[tuple[str, str], float] = {}
+
+
 async def _recent_sql_workflow_content(source, context):
-    """Bind an explicit combined request to the sender's recent, exact-id TXT."""
+    """Bind an explicit combined request to recent, exact-id TXT or chat SQL."""
     identifier = submission_workflow_identifier(source)
     if not identifier or not context or not all(context.get(key) for key in ("owner_wxid", "chat_id", "sender")):
         return "", "not_combined_or_missing_context"
@@ -3939,7 +4897,7 @@ async def _recent_sql_workflow_content(source, context):
         current_timestamp = int(context.get("message_timestamp") or time.time())
     except (TypeError, ValueError):
         current_timestamp = int(time.time())
-    messages = sqlite_cache.get_messages(
+    messages = _cache().get_messages(
         context["chat_id"], limit=100, before=current_timestamp + 1,
         owner_wxid=context["owner_wxid"],
     )
@@ -3947,7 +4905,7 @@ async def _recent_sql_workflow_content(source, context):
         rf"^(?:(?:需求|xzsb-)\s*)?{re.escape(identifier)}(?:\s*\(\d+\))?\.txt$",
         re.I,
     )
-    last_reason = "matching_txt_not_found"
+    last_reason = "matching_sql_content_not_found"
     for message in reversed(messages):
         try:
             message_timestamp = int(message.get("timestamp") or message.get("time_unix") or 0)
@@ -3955,56 +4913,356 @@ async def _recent_sql_workflow_content(source, context):
             message_timestamp = 0
         if message_timestamp and current_timestamp - message_timestamp > _RECENT_SQL_FILE_MAX_AGE_SECONDS:
             break
-        if (message_timestamp > current_timestamp or str(message.get("msgtype") or "") != "49"
+        if (message_timestamp > current_timestamp
                 or str(message.get("fromid") or "") != str(context["sender"])):
             continue
-        local_name = os.path.basename(str(message.get("file_path") or "").replace("\\", "/"))
-        title_match = re.search(r"<title>(.*?)</title>", str(message.get("msg") or ""), re.I | re.S)
-        xml_name = html.unescape(title_match.group(1).strip()) if title_match else ""
-        if not any(filename_pattern.fullmatch(name.strip()) for name in (xml_name, local_name) if name):
+        msg_type = str(message.get("msgtype") or "")
+        quote = sql_quote(message)
+        if msg_type == "49" and quote is None:
+            local_name = os.path.basename(str(message.get("file_path") or "").replace("\\", "/"))
+            title_match = re.search(r"<title>(.*?)</title>", str(message.get("msg") or ""), re.I | re.S)
+            xml_name = html.unescape(title_match.group(1).strip()) if title_match else ""
+            if not any(filename_pattern.fullmatch(name.strip()) for name in (xml_name, local_name) if name):
+                continue
+            content, reason = await _smart_reply_file_ai_content(message, ["txt"])
+            if not content:
+                last_reason = reason
+                continue
+            if not SQL_START.search(content):
+                last_reason = "matching_txt_has_no_sql"
+                continue
+            return f"操作要求：填报运维单 {identifier}，审核通过后执行。\n{content}", "ok"
+
+        if msg_type != "1" and quote is None:
             continue
-        content, reason = await _smart_reply_file_ai_content(message, ["txt"])
-        if not content:
-            last_reason = reason
-            continue
+        sql_message = {**message, "msgtype": "1", "msg": quote["text"]} if quote else message
+        content = str(sql_message.get("msg") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        content = strip_chat_mentions(
+            content,
+            await _resolve_sql_chat_mention_names(
+                sql_message,
+                str(context["chat_id"]),
+                str(context["owner_wxid"]),
+            ),
+        )
         if not SQL_START.search(content):
-            last_reason = "matching_txt_has_no_sql"
             continue
-        return f"操作要求：填报运维单 {identifier}，审核通过后执行。\n{content}", "ok"
+        if _recent_chat_sql_identifier(content) != identifier:
+            last_reason = "matching_chat_sql_identifier_not_found"
+            continue
+        prefix = f"操作要求：填报运维单 {identifier}，审核通过后执行。\n聊天内容：\n"
+        if len(content) > max(0, _SMART_REPLY_AI_INPUT_MAX_CHARS - len(prefix)):
+            last_reason = "input_too_large"
+            continue
+        context["source_message"] = message
+        return prefix + content, "ok"
     return "", last_reason
+
+
+_SMART_REPLY_AGENT_MENTION_NAMES = frozenset({"空气"})
+_SMART_REPLY_AGENT_MENTION_PATTERN = re.compile(r"@空气(?=$|[\s\u2005,，:：])", re.I)
 
 
 def _sql_chat_mention_names(message, chat_id, owner_wxid):
     targets = _mention_targets(message)
-    if not targets or str(message.get("msgtype")) != "1" or not chat_id.endswith("@chatroom"):
+    if str(message.get("msgtype")) != "1" or not chat_id.endswith("@chatroom"):
         return []
-    members = sqlite_cache.get_group_members(chat_id, owner_wxid=owner_wxid)
-    contacts = sqlite_cache.get_contacts(list(targets), owner_wxid=owner_wxid)
-    names = set(targets)
-    for target in targets:
-        for record in (members.get(target) or {}, contacts.get(target) or {}):
-            for data in (record, record.get("profile") or {}):
-                if isinstance(data, dict):
-                    names.update(str(data[key]) for key in ("name", "nickname", "nick_name", "NickName", "display_name", "remark") if data.get(key))
+    members = _cache().get_group_members(chat_id, owner_wxid=owner_wxid)
+    if targets:
+        verified_targets = [target for target in targets if target in members]
+        contacts = _cache().get_contacts(verified_targets, owner_wxid=owner_wxid)
+        records = [
+            record
+            for target in verified_targets
+            for record in (members.get(target) or {}, contacts.get(target) or {})
+        ]
+        names = set(verified_targets)
+    else:
+        if "@" not in str(message.get("msg") or ""):
+            return []
+        records = list(members.values())
+        names = set()
+    for record in records:
+        for data in (record, record.get("profile") or {}):
+            if isinstance(data, dict):
+                names.update(
+                    str(data[key])
+                    for key in (
+                        "name", "nickname", "nick_name", "NickName", "display_name", "displayname",
+                        "DisplayName", "remark", "Remark", "markname", "MarkName",
+                    )
+                    if data.get(key)
+                )
+    names.update(_SMART_REPLY_AGENT_MENTION_NAMES)
     return list(names)
 
 
-async def _evaluate_ai_tasks(
+def _identity_aliases(record: dict[str, Any] | None) -> set[str]:
+    """Return wxid/name aliases from a cached contact or group-member row."""
+    if not isinstance(record, dict):
+        return set()
+    aliases: set[str] = set()
+    for data in (record, record.get("profile") or {}, record.get("data") or {}):
+        if not isinstance(data, dict):
+            continue
+        for key in (
+            "wxid", "userName", "username", "UserName", "name", "nickname", "nick_name", "NickName",
+            "display_name", "displayname", "DisplayName", "remark", "Remark", "markname", "MarkName",
+            "alias", "Alias", "account", "wechat_account",
+        ):
+            value = str(data.get(key) or "").strip()
+            if value:
+                aliases.add(value.casefold())
+    return aliases
+
+
+def _mentions_smart_reply_agent(
+    message: dict[str, Any],
+    chat_id: str,
+    self_wxid: str,
+    *,
+    owner_wxid: str,
+    agent_id: str,
+) -> bool:
+    """Require the assistant's @空气 trigger; group metadata verifies the target."""
+    if str(message.get("msgtype") or "") != "1":
+        return False
+    targets = {target.casefold() for target in _mention_targets(message)}
+    content = str(message.get("msg") or "")
+    explicitly_addressed = bool(_SMART_REPLY_AGENT_MENTION_PATTERN.search(content))
+    if SQL_START.search(content):
+        # @空气 inside a SQL literal/comment is data, not an owner command.
+        explicitly_addressed = strip_chat_mentions(content, _SMART_REPLY_AGENT_MENTION_NAMES) != content
+    if not chat_id.endswith("@chatroom"):
+        return explicitly_addressed
+    if not explicitly_addressed and not targets & _SMART_REPLY_AGENT_MENTION_NAMES:
+        return False
+    if not targets:
+        return True  # Some Hook callbacks only include the visible @ text.
+    identities = {str(value).strip() for value in (self_wxid, owner_wxid) if value}
+    aliases = {value.casefold() for value in identities} | _SMART_REPLY_AGENT_MENTION_NAMES
+    agent = agent_manager.get_agent(agent_id) if agent_id else None
+    agent_aliases = _identity_aliases(agent) | _SMART_REPLY_AGENT_MENTION_NAMES
+    aliases.update(agent_aliases)
+    members = _cache().get_group_members(chat_id, owner_wxid=owner_wxid)
+    contacts = _cache().get_contacts(list(identities), owner_wxid=owner_wxid)
+    for record in contacts.values():
+        aliases.update(_identity_aliases(record))
+    for wxid, member in members.items():
+        member_aliases = _identity_aliases(member)
+        if str(wxid).casefold() in aliases or member_aliases & _SMART_REPLY_AGENT_MENTION_NAMES:
+            aliases.add(str(wxid).casefold())
+            aliases.update(member_aliases)
+
+    # Real mention metadata takes precedence over literal @names in text.
+    return bool((targets - {"notify@all", "@all"}) & aliases)
+
+
+def _owner_mention_names(chat_id, self_wxid, *, owner_wxid, agent_id):
+    """Only aliases belonging to the logged-in account can address its owner."""
+    identities = {str(value).strip().casefold() for value in (self_wxid, owner_wxid) if value}
+    aliases = set(identities)
+    members = _cache().get_group_members(chat_id, owner_wxid=owner_wxid)
+    for wxid, member in members.items():
+        if str(wxid).casefold() in identities:
+            aliases.update(_identity_aliases(member))
+    contacts = _cache().get_contacts(list(identities), owner_wxid=owner_wxid)
+    for wxid, contact in contacts.items():
+        if str(wxid).casefold() in identities:
+            aliases.update(_identity_aliases(contact))
+    self_info = _state().get("self_info") if isinstance(_state(), dict) else None
+    agent = agent_manager.get_agent(agent_id) if agent_id else None
+    for record in (self_info, agent):
+        record_aliases = _identity_aliases(record)
+        if record_aliases & identities:
+            aliases.update(record_aliases)
+    return aliases
+
+
+def _mentions_owner_account(message, chat_id, self_wxid, *, owner_wxid, agent_id):
+    """Others must @ the actual logged-in account; metadata outranks text."""
+    identities = {str(value).strip().casefold() for value in (self_wxid, owner_wxid) if value}
+    targets = {target.casefold() for target in _mention_targets(message)}
+    if targets:
+        return bool((targets - {"notify@all", "@all"}) & identities)
+    if str(message.get("msgtype") or "") != "1":
+        return False
+    aliases = _owner_mention_names(chat_id, self_wxid, owner_wxid=owner_wxid, agent_id=agent_id)
+    content = str(message.get("msg") or "")
+    visible_names = {match.group(1) for name in aliases if name for match in re.finditer(
+        r"@(" + re.escape(name) + r")(?=$|[\s\u2005,，:：])", content, re.I)}
+    if SQL_START.search(content):
+        return strip_chat_mentions(content, visible_names) != content
+    return bool(visible_names)
+
+
+def _mentions_other_group_member(
+    message,
+    chat_id: str,
+    self_wxid: str,
+    *,
+    owner_wxid: str = "",
+    agent_id: str = "",
+) -> bool:
+    """Return whether a real group @ targets somebody outside the Agent identity.
+
+    ``atuserlist``/``msgsource`` is the authoritative target list. We never
+    infer a mention from every literal ``@`` in message text: SQL database
+    links and ordinary text can contain ``@`` too. Cached group-member and
+    Agent profile names are used to recognize targets such as ``@空气`` or
+    ``@Aixed`` even when the callback gives a wxid instead of the visible name.
+    """
+    if str(message.get("msgtype") or "") != "1" or not str(chat_id or "").endswith("@chatroom"):
+        return False
+    targets = {
+        str(target or "").strip().casefold()
+        for target in _mention_targets(message)
+        if str(target or "").strip()
+    }
+    if not targets:
+        return False
+
+    ignored_targets = {"notify@all", "@all"}
+    targets.difference_update(ignored_targets)
+    if not targets:
+        return False
+
+    self_id_values = {
+        str(value or "").strip()
+        for value in (self_wxid, owner_wxid)
+        if str(value or "").strip()
+    }
+    self_ids = {value.casefold() for value in self_id_values}
+    allowed_aliases = set(self_ids)
+    members = _cache().get_group_members(chat_id, owner_wxid=owner_wxid or self_wxid)
+    members_by_id = {
+        str(wxid or "").strip().casefold(): record
+        for wxid, record in members.items()
+        if str(wxid or "").strip()
+    }
+    sender_value = str(message.get("fromid") or "").strip()
+    participant_values = set(self_id_values)
+    if sender_value:
+        participant_values.add(sender_value)
+        allowed_aliases.add(sender_value.casefold())
+    contacts = _cache().get_contacts(list(participant_values), owner_wxid=owner_wxid or self_wxid)
+    self_info = _state().get("self_info") if isinstance(_state(), dict) else None
+    allowed_aliases.update(_identity_aliases(self_info))
+    for self_id in self_ids:
+        allowed_aliases.update(_identity_aliases(members_by_id.get(self_id) or {}))
+    if sender_value:
+        allowed_aliases.update(_identity_aliases(members_by_id.get(sender_value.casefold()) or {}))
+    for participant in participant_values:
+        allowed_aliases.update(_identity_aliases(contacts.get(participant) or {}))
+
+    # The Agent may have a different visible nickname from the logged-in
+    # account. Include both its registered identity and the corresponding
+    # cached group member aliases, so a target such as @空气 is allowed.
+    agent = agent_manager.get_agent(str(agent_id or "")) if agent_id else None
+    agent_aliases = _identity_aliases(agent) | _SMART_REPLY_AGENT_MENTION_NAMES
+    allowed_aliases.update(agent_aliases)
+    for wxid, member in members.items():
+        if _identity_aliases(member) & agent_aliases:
+            allowed_aliases.add(str(wxid).strip().casefold())
+
+    return any(target not in allowed_aliases for target in targets)
+
+
+async def _resolve_sql_chat_mention_names(message, chat_id, owner_wxid):
+    """Resolve visible @names from verified group members before SQL analysis."""
+    names = _sql_chat_mention_names(message, chat_id, owner_wxid)
+    content = str(message.get("msg") or "")
+    if str(message.get("msgtype")) != "1" or not chat_id.endswith("@chatroom") or "@" not in content:
+        return names
+    if strip_chat_mentions(content, names) != content:
+        return names
+
+    refresh_key = (str(owner_wxid or ""), str(chat_id or ""))
+    now = time.monotonic()
+    if now - _sql_mention_refresh_at.get(refresh_key, 0.0) < _SQL_MENTION_REFRESH_TTL_SECONDS:
+        return names
+    _sql_mention_refresh_at[refresh_key] = now
+    try:
+        detail = await wechat_api.get_chatroom_member_detail(chat_id)
+        raw_members = _extract_group_member_list(detail)
+        if raw_members:
+            await _cache_group_member_details(chat_id, raw_members, owner_wxid=owner_wxid)
+            names = _sql_chat_mention_names(message, chat_id, owner_wxid)
+    except Exception as exc:
+        _smart_reply_log(
+            f"[SMART_REPLY] group member resolution failed chat={chat_id} "
+            f"error={type(exc).__name__}: {exc}"
+        )
+    return names
+
+
+QUERY_PROGRESS_INTERVAL_SECONDS = 60.0
+
+
+async def _send_query_progress(context, message_id, text):
+    chat = context["chat_id"]
+    smart_reply_engine.remember_reply(context["owner_wxid"], chat, text)
+    try:
+        with wechat_api.use_agent(str(context.get("agent_id") or "")), wechat_api.use_log_category("smart_reply"):
+            if chat.endswith("@chatroom"):
+                sender = str(context.get("sender") or "")
+                member = _cache().get_group_members(chat, owner_wxid=context["owner_wxid"]).get(sender) or {}
+                nickname = str(member.get("nickname") or (context.get("source_message") or {}).get("fromname") or sender)
+                await wechat_api.send_at(chat, sender, nickname, text)
+            else:
+                await wechat_api.send_text(chat, text)
+    except Exception as exc:
+        _smart_reply_log(f"[SMART_REPLY] progress send failed message_id={message_id}: {type(exc).__name__}: {exc}")
+
+
+async def _evaluate_ai_tasks(content, tasks, *, message_id="-", image_data_url="", source_context=None, attachments_out=None):
+    context = source_context or {}
+    if context.get("message_type") == "text":
+        content = strip_chat_mentions(content, context.get("mention_names") or [])
+        if context.get("agent_mentioned") and not SQL_START.search(content):
+            for name in context.get("control_mention_names") or ["空气"]:
+                content = re.sub(r"@" + re.escape(name) + r"(?=$|[\s\u2005,，:：])", "", content, flags=re.I).strip()
+    enabled = (all(context.get(key) for key in ("chat_id", "owner_wxid", "sender"))
+        and not SQL_START.search(content) and (query_candidate(content) or query_export_followup(content))
+        and any(isinstance(task, dict) and task.get("enabled") and task.get("mcp_enabled") and
+                (is_unified_task(task) or task.get("mcp_tool_name") == QUERY_TOOL) for task in tasks))
+    state = {"phase": "analysis"}
+    started = time.monotonic()
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(QUERY_PROGRESS_INTERVAL_SECONDS)
+            await _send_query_progress(context, message_id, progress_text(state, time.monotonic() - started))
+    timer = asyncio.create_task(heartbeat()) if enabled else None
+    try:
+        return await _evaluate_ai_tasks_impl(content, tasks, message_id=message_id, image_data_url=image_data_url,
+            source_context={**context, "_query_progress": state} if enabled else source_context, attachments_out=attachments_out)
+    finally:
+        if timer:
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
+
+
+async def _evaluate_ai_tasks_impl(
     content: str,
     tasks: list[dict[str, Any]],
     *,
     message_id: str = "-",
     image_data_url: str = "",
     source_context: dict[str, Any] | None = None,
+    attachments_out: list[dict[str, str]] | None = None,
 ) -> tuple[str, ...]:
-    if (source_context or {}).get("message_type") == "text":
-        content = strip_chat_mentions(content, source_context.get("mention_names") or [])
     enabled_tasks = [task for task in tasks if isinstance(task, dict) and bool(task.get("enabled"))]
+    if source_context and all(source_context.get(k) for k in ("owner_wxid", "chat_id", "sender")) and any(
+        task.get("mcp_enabled") and (is_unified_task(task) or task.get("mcp_tool_name") == WORKFLOW_TOOL) for task in enabled_tasks
+    ):
+        pending_context, pending = _offline_confirmation_for(source_context, content)
+        if pending and source_context.get("agent_mentioned") and not SQL_START.search(content) and not re.search(r"查询|查一下|结果|详情|履历", content):
+            return split_reply(await _resume_offline_city_confirmation(content, pending_context, pending, enabled_tasks))
     combined_identifier = submission_workflow_identifier(content)
     if combined_identifier and any(is_unified_task(task) for task in enabled_tasks):
         content, reason = await _recent_sql_workflow_content(content, source_context or {})
         if not content:
-            return (UNIFIED_SKILL_NAME + f"：未找到同一发送人 24 小时内编号为 {combined_identifier} 的可读取 TXT SQL（{reason}），未填报、审核或执行。请先发送该 TXT，再发送本指令。",)
+            return (UNIFIED_SKILL_NAME + f"：未找到同一发送人 24 小时内编号为 {combined_identifier} 的可读取 TXT 或聊天 SQL（{reason}），未填报、审核或执行。请先发送包含完整 SQL 的 TXT 或聊天消息，再发送本指令。",)
     prepared = []
     for task in enabled_tasks:
         if is_unified_task(task):
@@ -4060,9 +5318,24 @@ async def _evaluate_ai_tasks(
         if any(task.get("mcp_tool_name") == WORKFLOW_TOOL for task in enabled_tasks):
             return ("SQL 分析服务未配置，未启动数据运维流程。",)
         return ()
+    # Acknowledge eligible MCP work before model analysis or remote calls.
+    # Callback deduplication has already claimed this message at this point.
+    context = source_context or {}
+    if any(task.get("mcp_enabled") and (task.get("mcp_tool_name") != WORKFLOW_TOOL or SQL_START.search(content)) for task in enabled_tasks) and context.get("chat_id") and context.get("owner_wxid"):
+        await _send_query_progress(context, message_id, "思考中...")
+
     async def _analyze_task(task: dict[str, Any]) -> dict[str, Any]:
+        task = offline_analysis_task(task, content)
+        history = task.get("_query_history") or []
+        if (is_unified_task(task) or task.get("mcp_tool_name") == QUERY_TOOL) and query_export_followup(content) and history:
+            previous = history[-1].get("arguments") or {}
+            if previous.get("query_type") == "problem_tickets":
+                parsed = {"query_type": "problem_tickets", "identifier": ""}
+                if is_unified_task(task):
+                    parsed["intent"] = "query"
+                return {"matched": True, "confidence": 100, "result": json.dumps(parsed), "reply": ""}
         if is_unified_task(task):
-            explicit = explicit_pending_analysis(content)
+            explicit = explicit_problem_range_analysis(content) or explicit_pending_analysis(content)
             if explicit:
                 parsed = json.loads(explicit["result"])
                 parsed.update(intent="query", sql_purpose="", risk_level="", risk_notes=[], needs_clarification=False)
@@ -4074,7 +5347,7 @@ async def _evaluate_ai_tasks(
             return await ai_service.analyze(query_analysis_content(content, task.get("_query_history") or []), task)
         if task.get("mcp_tool_name") == QUERY_TOOL:
             history = task.get("_query_history") or []
-            explicit = explicit_pending_analysis(content)
+            explicit = explicit_problem_range_analysis(content) or explicit_pending_analysis(content)
             if explicit:
                 return explicit
             if not history and query_followup(content) and not re.search(r"执行|审核|审批|影响|需求|任务|处理|受理|履历|SQL\s*(?:原文|脚本)|完整\s*SQL", content, re.I):
@@ -4117,6 +5390,8 @@ async def _evaluate_ai_tasks(
         if bool(task.get("mcp_enabled")):
             try:
                 mcp_task = {**task, "_source_content": content, "_source_context": source_context or {}}
+                if attachments_out is not None:
+                    mcp_task["_attachments_out"] = attachments_out
                 task_replies = await _mcp_task_reply(mcp_task, result)
             except McpServiceError as exc:
                 _smart_reply_log(
@@ -4170,17 +5445,87 @@ async def _process_smart_reply_message_unlocked(
     process_started_at = time.perf_counter()
     message_received_at = process_started_at if received_at is None else received_at
     queue_ms = max(0.0, (process_started_at - message_received_at) * 1000)
-    config_row = sqlite_cache.get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
+    config_row = _cache().get_smart_reply_config(chat_id, owner_wxid=owner_wxid)
     if not config_row:
         return
+    source_message = message
+    # Quote title is the sender's current SQL; quoted image text is never an instruction.
+    quote = sql_quote(message)
+    if quote and quote["text"].strip() and any(
+        task.get("enabled") and task.get("mcp_enabled") and (is_unified_task(task) or task.get("mcp_tool_name") in {
+            WORKFLOW_TOOL, QUERY_TOOL, SUBMISSION_TOOL, APPROVAL_TOOL, EXECUTION_TOOL})
+        for task in config_row.get("ai_tasks") or []
+    ):
+        message = {**message, "msgtype": "1", "msg": quote["text"]}
+    is_self = (
+        str(message.get("sendorrecv") or "") == "1"
+        or int(message.get("isSender") or 0) == 1
+        or str(message.get("fromid") or "") in {value for value in (self_wxid, owner_wxid) if value}
+    )
+    if is_self and (smart_reply_engine.is_reply_echo(owner_wxid, chat_id, message.get("msg"))
+            or is_offline_confirmation_prompt(message.get("msg"))):
+        _smart_reply_log(f"[SMART_REPLY] skipped message_id={message.get('id') or '-'} chat={chat_id} reason=automatic_reply_echo")
+        return
+    agent_mentioned = (_mentions_smart_reply_agent if is_self else _mentions_owner_account)(
+        message, chat_id, self_wxid, owner_wxid=owner_wxid, agent_id=agent_id)
+    control_mention_names = list(_SMART_REPLY_AGENT_MENTION_NAMES if is_self else _owner_mention_names(
+        chat_id, self_wxid, owner_wxid=owner_wxid, agent_id=agent_id))
+    protected_data_task = any(
+        task.get("enabled") and task.get("mcp_enabled") and (is_unified_task(task) or task.get("mcp_tool_name") in {
+            WORKFLOW_TOOL, QUERY_TOOL, SUBMISSION_TOOL, APPROVAL_TOOL, EXECUTION_TOOL}) for task in config_row.get("ai_tasks") or []
+    )
+    if protected_data_task and not agent_mentioned:
+        reason = "self_message_without_agent_mention" if is_self else "data_agent_without_owner_mention"
+        _smart_reply_log(f"[SMART_REPLY] skipped message_id={message.get('id') or '-'} chat={chat_id} reason={reason}")
+        return
+    owner_city_reply = False
+    if is_self and str(message.get("fromid") or "") == owner_wxid and any(
+        task.get("enabled") and task.get("mcp_enabled") and (is_unified_task(task) or task.get("mcp_tool_name") == WORKFLOW_TOOL)
+        for task in config_row.get("ai_tasks") or []
+    ):
+        city_text = _SMART_REPLY_AGENT_MENTION_PATTERN.sub("", str(message.get("msg") or "")).strip()
+        _, pending = _offline_confirmation_for({"owner_wxid": owner_wxid, "chat_id": chat_id, "sender": owner_wxid}, city_text)
+        owner_city_reply = bool(agent_mentioned and pending and city_input(city_text, pending["arguments"]["identifier"])[0])
+    # Owner-specific Agent routes below clear the self-sender flags. Enforce
+    # the mention requirement before any route can bypass the normal filter.
+    if is_self and not _mentions_smart_reply_agent(
+        message, chat_id, self_wxid, owner_wxid=owner_wxid, agent_id=agent_id,
+    ):
+        _smart_reply_log(
+            f"[SMART_REPLY] skipped message_id={message.get('id') or '-'} chat={chat_id} "
+            "reason=self_message_without_agent_mention"
+        )
+        return
+    if _mentions_other_group_member(
+        message,
+        chat_id,
+        self_wxid,
+        owner_wxid=owner_wxid,
+        agent_id=agent_id,
+    ):
+        _smart_reply_log(
+            f"[SMART_REPLY] skipped message_id={message.get('id') or '-'} chat={chat_id} "
+            "reason=mentioned_other_group_member"
+        )
+        return
+    owner_message = {
+        **message,
+        "msg": _SMART_REPLY_AGENT_MENTION_PATTERN.sub("", str(message.get("msg") or "")).strip(),
+    } if is_self else message
     query_task = next((t for t in config_row.get("ai_tasks") or [] if t.get("enabled") and (t.get("mcp_tool_name") == QUERY_TOOL or is_unified_task(t))), {})
     query_history = _query_history_for({"owner_wxid": owner_wxid, "chat_id": chat_id, "sender": str(message.get("fromid") or "")}, str(query_task.get("mcp_connection_id") or "")) if query_task else []
-    query_config = ((owner_unified_config(config_row, message, owner_wxid, query_history)
-        or owner_submission_config(config_row, message, owner_wxid) or owner_approval_config(config_row, message, owner_wxid)
-        or owner_execution_config(config_row, message, owner_wxid) or owner_query_config(config_row, message, owner_wxid, query_history)) if owner_wxid == self_wxid else None)
+    query_config = ((owner_filehelper_config(config_row, owner_message, owner_wxid, query_history)
+        or owner_unified_config(config_row, owner_message, owner_wxid, query_history)
+        or owner_submission_config(config_row, owner_message, owner_wxid) or owner_approval_config(config_row, owner_message, owner_wxid)
+        or owner_execution_config(config_row, owner_message, owner_wxid) or owner_query_config(config_row, owner_message, owner_wxid, query_history)) if owner_wxid == self_wxid else None)
+    if owner_city_reply:
+        query_config = {**config_row, "rules": [], "message_types": ["text"], "mention_only": False, "mention_message_types": [],
+            "target_senders_by_type": {"text": [owner_wxid]}, "ai_tasks": [task for task in config_row.get("ai_tasks") or []
+                if task.get("enabled") and task.get("mcp_enabled") and task.get("message_type", "text") == "text"
+                and (is_unified_task(task) or task.get("mcp_tool_name") == WORKFLOW_TOOL)]}
     if query_config is not None:
         config_row = query_config
-        message = {**message, "isSender": 0, "sendorrecv": "2"}
+        message = {**owner_message, "isSender": 0, "sendorrecv": "2"}
         self_wxid = ""  # Only the selected Agent for this explicit request.
     message_id = str(message.get("id") or "-")
     _smart_reply_log(
@@ -4194,7 +5539,10 @@ async def _process_smart_reply_message_unlocked(
         self_wxid=self_wxid,
         message=message,
         config=config_row,
+        # Reuse the verified owner @ check when Hook omits mention metadata.
+        mention_verified=protected_data_task and agent_mentioned,
     )
+    reply_attachments: list[dict[str, str]] = []
     if not decision.should_send:
         msg_type = str(message.get("msgtype") or "")
         ai_message_type = {"1": "text", "3": "image", "49": "file"}.get(msg_type, "")
@@ -4211,6 +5559,9 @@ async def _process_smart_reply_message_unlocked(
                 f"sender={message.get('fromid', '')} "
                 f"reason={decision.reason} msgtype={message.get('msgtype', '')} ai_tasks={len(ai_tasks or [])}"
             )
+            return
+        if not smart_reply_engine.claim_ai_message(owner_wxid, chat_id, message):
+            _smart_reply_log(f"[SMART_REPLY] skipped message_id={message_id} chat={chat_id} reason=duplicate_callback")
             return
         raw_content = ""
         image_data_url = ""
@@ -4300,6 +5651,14 @@ async def _process_smart_reply_message_unlocked(
                 f"reason=unsupported_async_message_type msgtype={msg_type}"
             )
             return
+        mention_names = _sql_chat_mention_names(message, chat_id, owner_wxid)
+        if ai_message_type == "text":
+            mention_names = await _resolve_sql_chat_mention_names(message, chat_id, owner_wxid)
+            if agent_mentioned:
+                mention_names = list(set(mention_names) | set(control_mention_names))
+                for name in control_mention_names:
+                    mention_names.extend(match.group(1) for match in re.finditer(
+                        r"@(" + re.escape(name) + r")(?=$|[\s\u2005,，:：])", raw_content, re.I))
         if not decision.should_send:
             _smart_reply_log(
                 f"[SMART_REPLY] evaluating AI message_id={message_id} chat={chat_id} "
@@ -4313,14 +5672,17 @@ async def _process_smart_reply_message_unlocked(
                 image_data_url=image_data_url,
                 source_context={"owner_wxid": owner_wxid, "chat_id": chat_id, "sender": str(message.get("fromid") or ""), "message_id": str(message.get("id") or ""),
                     "message_type": ai_message_type, "message_timestamp": message.get("timestamp") or message.get("time_unix") or int(time.time()),
-                    "mention_names": _sql_chat_mention_names(message, chat_id, owner_wxid)},
+                    "mention_names": mention_names, "control_mention_names": control_mention_names,
+                    "source_message": source_message, "agent_id": agent_id, "agent_mentioned": agent_mentioned},
+                attachments_out=reply_attachments,
             )
             decision = smart_reply_engine.reserve_ai_replies(
                 owner_wxid=owner_wxid,
                 chat_id=chat_id,
                 message=message,
                 replies=ai_replies,
-                conversation=bool(ai_replies) and all(reply.startswith((QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, SUBMISSION_REPLY_PREFIX, APPROVAL_REPLY_PREFIX)) for reply in ai_replies),
+                conversation=bool(ai_replies) and all(reply.startswith((QUERY_REPLY_PREFIX, EXECUTION_REPLY_PREFIX, SUBMISSION_REPLY_PREFIX, APPROVAL_REPLY_PREFIX,
+                    "线下单 ", "线下单行政区划：", CITY_SELECTION_PREFIX)) for reply in ai_replies),
             )
             if not decision.should_send:
                 _smart_reply_log(
@@ -4328,6 +5690,11 @@ async def _process_smart_reply_message_unlocked(
                     f"sender={message.get('fromid', '')} "
                     f"reason={decision.reason} replies={len(ai_replies)}"
                 )
+                for attachment in reply_attachments:
+                    try:
+                        os.remove(str(attachment.get("filepath") or ""))
+                    except OSError:
+                        pass
                 return
             _smart_reply_log(
                 f"[SMART_REPLY] AI reserved message_id={message_id} chat={chat_id} "
@@ -4346,32 +5713,64 @@ async def _process_smart_reply_message_unlocked(
         )
 
         async def _send_one(reply: str):
+            smart_reply_engine.remember_reply(owner_wxid, chat_id, reply)
             with wechat_api.use_agent(agent_id), wechat_api.use_log_category("smart_reply"):
                 if workflow_reply_to_sender and chat_id.endswith("@chatroom"):
                     sender = str(message.get("fromid") or "")
-                    member = sqlite_cache.get_group_members(chat_id, owner_wxid=owner_wxid).get(sender) or {}
-                    nickname = str(member.get("nickname") or message.get("fromname") or sender)
+                    member = _cache().get_group_members(chat_id, owner_wxid=owner_wxid).get(sender) or {}
+                    nickname = str(member.get("name") or member.get("nickname") or message.get("fromname") or sender)
                     return await wechat_api.send_at(chat_id, sender, nickname, reply)
                 if use_no_src:
                     return await wechat_api.send_text_no_src(chat_id, reply)
                 return await wechat_api.send_text(chat_id, reply)
 
         send_started_at = time.perf_counter()
+        attachment_results = []
+        for attachment in reply_attachments:
+            filepath = str(attachment.get("filepath") or "")
+            if not filepath:
+                continue
+            try:
+                with wechat_api.use_agent(agent_id), wechat_api.use_log_category("smart_reply"):
+                    attachment_results.append(await wechat_api.send_file(chat_id, filepath, filename=attachment.get("filename") or ""))
+            except Exception as exc:
+                attachment_results.append(exc)
+            # Hook accepts sends asynchronously. Keep the report on disk so
+            # the WeChat client can finish opening and transferring the file.
+        attachment_send_failed = False
+        for attachment, result in zip(reply_attachments, attachment_results):
+            if isinstance(result, BaseException) or not _send_result_ok(result):
+                attachment_send_failed = True
+                _smart_reply_log(
+                    f"[SMART_REPLY] table file send failed message_id={message_id} chat={chat_id} "
+                    f"file={attachment.get('filename') or attachment.get('filepath') or ''} result={result}"
+                )
+            else:
+                _smart_reply_log(
+                    f"[SMART_REPLY] table file sent message_id={message_id} chat={chat_id} "
+                    f"file={attachment.get('filename') or attachment.get('filepath') or ''}"
+                )
+        replies_to_send = decision.replies
+        if attachment_send_failed:
+            replies_to_send = tuple(
+                reply.replace("完整明细已整理为表格文件发送", "完整明细表格文件发送失败，请稍后重试")
+                for reply in replies_to_send
+            )
         if workflow_reply_to_sender:
             results = []
-            for reply in decision.replies:
+            for reply in replies_to_send:
                 try: results.append(await _send_one(reply))
                 except Exception as exc: results.append(exc)
         else:
             results = await asyncio.gather(
-                *(_send_one(reply) for reply in decision.replies),
+                *(_send_one(reply) for reply in replies_to_send),
                 return_exceptions=True,
             )
         send_finished_at = time.perf_counter()
         send_ms = (send_finished_at - send_started_at) * 1000
         total_ms = max(0.0, (send_finished_at - message_received_at) * 1000)
         sent_replies: list[str] = []
-        for reply, result in zip(decision.replies, results):
+        for reply, result in zip(replies_to_send, results):
             if isinstance(result, BaseException) or not _send_result_ok(result):
                 _smart_reply_log(
                     f"[SMART_REPLY] send failed message_id={message_id} chat={chat_id} "
@@ -4397,7 +5796,7 @@ async def _process_smart_reply_message_unlocked(
             f"queue_ms={queue_ms:.1f} evaluate_ms={evaluate_ms:.1f} "
             f"send_ms={send_ms:.1f} total_ms={total_ms:.1f}"
         )
-        updated = sqlite_cache.record_smart_reply_trigger(
+        updated = _cache().record_smart_reply_trigger(
             chat_id,
             owner_wxid=owner_wxid,
             disable=decision.disable_after_send,
@@ -4481,22 +5880,35 @@ async def _process_wechat_callback(
         _agent_id_for_self_wxid(self_wxid)
         or agent_manager.agent_id_for_wxid(self_wxid)
     )
+    hook_instance = hook_login.instance_for_port(data.get("ServerPort") or data.get("server_port")) if config.IS_HOOK else None
     callback_agent_id = str(
         (protocol_session_id if config.IS_PROTOCOL else "")
+        or (hook_instance["id"] if hook_instance and hook_instance['transport'] == 'http' else "")
         or mapped_agent_id
         or data.get("agent_id", "")
         or data.get("agentId", "")
         or ""
     )
+    if hook_instance and callback_agent_id and access_store.owner(hook_instance['id']):
+        access_store.claim(callback_agent_id, access_store.owner(hook_instance['id']))
+    if config.IS_HOOK and not callback_agent_id and str(data.get('ServerPort') or data.get('server_port')) == str(config.HOOK_PORT):
+        callback_agent_id = 'default'
     if not callback_agent_id and self_wxid:
         callback_agent_id = f"selfwxid_{self_wxid}"
         _log(f"[CALLBACK] selfwxid={self_wxid} has no agent mapping yet; using isolated runtime {callback_agent_id}")
     if not callback_agent_id and not self_wxid:
-        callback_agent_id = _active_agent_id or agent_manager.active_id()
+        callback_agent_id = _current_agent_id() or agent_manager.active_id()
     if callback_agent_id:
         _activate_runtime(callback_agent_id)
+        if access_store.retired(callback_agent_id) or access_store.retired('wxid:' + self_wxid):
+            return {'status': 'ok'}
+        task = asyncio.current_task()
+        if task:
+            tasks = _runtime_for(callback_agent_id).setdefault('tasks', set())
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
     if self_wxid:
-        _self_wxid_to_agent_id[self_wxid] = callback_agent_id or _active_agent_id or agent_manager.active_id()
+        _self_wxid_to_agent_id[self_wxid] = callback_agent_id or _current_agent_id() or agent_manager.active_id()
         _put_self_info_field("wxid", self_wxid)
         _put_self_info_field("selfwxid", self_wxid)
 
@@ -4528,8 +5940,8 @@ async def _process_wechat_callback(
     pending_keys_dbg: list[str] = []
     if has_embedded_media:
         async with _pending_cdn_lock:
-            has_pending_cdn = len(_pending_cdn_images) > 0
-            pending_keys_dbg = list(_pending_cdn_images.keys())
+            has_pending_cdn = len(_bucket('_pending_cdn_images', _pending_cdn_images)) > 0
+            pending_keys_dbg = list(_bucket('_pending_cdn_images', _pending_cdn_images).keys())
     if has_pending_cdn:
         _log(f"[CALLBACK] {len(pending_keys_dbg)} pending CDN downloads: {pending_keys_dbg}")
 
@@ -4597,10 +6009,10 @@ async def _process_wechat_callback(
                     await _fulfill_all_cdn_pending(saved)
                     # Also resolve inflight dedup futures
                     async with _inflight_cdn_lock:
-                        for k, ifut in list(_inflight_cdn_downloads.items()):
+                        for k, ifut in list(_bucket('_inflight_cdn_downloads', _inflight_cdn_downloads).items()):
                             if not ifut.done():
                                 ifut.set_result(saved)
-                        _inflight_cdn_downloads.clear()
+                        _bucket('_inflight_cdn_downloads', _inflight_cdn_downloads).clear()
         except Exception as e:
             _log(f"[CALLBACK_BASE64] decode error: {type(e).__name__}: {e}")
 
@@ -4724,6 +6136,10 @@ async def agent_websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/agent/status")
 async def agent_status():
+    if access_store.current_user.get():
+        payload = await list_accounts()
+        return {'enabled': config.AGENT_WS_ENABLED, 'accounts': payload.get('accounts', []),
+                'connected': any(a.get('connected') for a in payload.get('accounts', []))}
     if config.IS_LOCAL_HOOK:
         account = await _probe_local_hook_account()
         return {
@@ -4750,29 +6166,31 @@ async def agent_status():
 @app.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket):
     ws_key = str(websocket.query_params.get("key") or "")
-    if not config.WEB_ACCESS_KEY or ws_key != config.WEB_ACCESS_KEY:
+    access_store.legacy_user()
+    user_id = access_store.login(ws_key)
+    if not user_id:
         await websocket.close(code=1008, reason="unauthorized")
         return
     agent_id = str(websocket.query_params.get("agent_id") or "").strip()
-    if agent_id and config.IS_PROTOCOL:
-        _activate_runtime(agent_id)
-    elif agent_id and agent_manager.is_connected(agent_id):
-        await agent_manager.set_active(agent_id)
-        _activate_runtime(agent_id)
-    await manager.connect(websocket)
+    if not access_store.owns(agent_id, user_id):
+        await websocket.close(code=1008, reason='account forbidden')
+        return
+    access_store.current_user.set(user_id)
+    _activate_runtime(agent_id)
+    await manager.connect(websocket, user_id=user_id, account_id=agent_id)
 
     # Send initial state on connect
     await websocket.send_text(json.dumps({
         "type": "init",
         "data": {
-            "account_id": _active_agent_id or agent_manager.active_id(),
-            "self_info": app_state["self_info"],
-            "contacts": app_state["contacts"],
-            "sessions": app_state["sessions"],
-            "last_messages": app_state["last_messages"],
-            "avatar_urls": app_state.get("avatar_urls", {}),
-            "contact_profiles": sqlite_cache.get_contacts(owner_wxid=_contact_owner_wxid()),
-            "session_cache": message_store.get_sessions(),
+            "account_id": _current_agent_id() or agent_manager.active_id(),
+            "self_info": _state()["self_info"],
+            "contacts": _state()["contacts"],
+            "sessions": _state()["sessions"],
+            "last_messages": _state()["last_messages"],
+            "avatar_urls": _state().get("avatar_urls", {}),
+            "contact_profiles": _cache().get_contacts(owner_wxid=_contact_owner_wxid()),
+            "session_cache": _messages().get_sessions(),
         }
     }, ensure_ascii=False))
 
@@ -4795,9 +6213,9 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/api/self")
 async def get_self():
     """Return cached self info, or refresh from Hook."""
-    if not app_state["self_info"]:
-        app_state["self_info"] = await wechat_api.get_self_info()
-    return app_state["self_info"]
+    if not _state()["self_info"]:
+        _state()["self_info"] = await wechat_api.get_self_info()
+    return _state()["self_info"]
 
 
 # ─── REST API: Contacts ───────────────────────────────────────────
@@ -4852,7 +6270,7 @@ def _search_matches_contact(contact: dict, keyword: str) -> bool:
 
 
 def _cached_search_results(keyword: str, limit: int, owner_wxid: str) -> tuple[list[dict], list[dict], list[dict]]:
-    cached_contacts = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+    cached_contacts = _cache().get_contacts(owner_wxid=owner_wxid)
     matched = [
         contact for contact in cached_contacts.values()
         if _search_matches_contact(contact, keyword)
@@ -4866,7 +6284,7 @@ def _cached_search_results(keyword: str, limit: int, owner_wxid: str) -> tuple[l
         for contact in matched
         if contact.get("is_group")
     }
-    for member in sqlite_cache.search_group_members(keyword, limit * 4, owner_wxid=owner_wxid):
+    for member in _cache().search_group_members(keyword, limit * 4, owner_wxid=owner_wxid):
         gid = str(member.get("gid") or "")
         if not gid:
             continue
@@ -4881,10 +6299,10 @@ def _cached_search_results(keyword: str, limit: int, owner_wxid: str) -> tuple[l
             "account": str(member.get("wxid") or ""),
         })
 
-    message_hits = sqlite_cache.search_all_messages(keyword, limit, owner_wxid=owner_wxid)
+    message_hits = _cache().search_all_messages(keyword, limit, owner_wxid=owner_wxid)
     sessions_by_id = {
         str(row.get("strUsrName") or ""): row
-        for row in sqlite_cache.get_sessions(owner_wxid=owner_wxid)
+        for row in _cache().get_sessions(owner_wxid=owner_wxid)
     }
     messages = []
     for hit in message_hits:
@@ -4955,7 +6373,7 @@ async def search_local_data(q: str = "", limit: int = 30):
         f"WHERE {member_where} LIMIT {limit * 8}"
     )
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     with wechat_api.use_agent(agent_id):
         contact_payload, member_payload, native_message_hits = await asyncio.gather(
             wechat_api.query_db("MicroMsg.db", contact_sql, timeout=30.0),
@@ -5015,13 +6433,13 @@ async def search_local_data(q: str = "", limit: int = 30):
             "account": member_alias or (member_wxid if not member_wxid.startswith("wxid_") else ""),
         })
 
-    cached_contacts = sqlite_cache.get_contacts(
+    cached_contacts = _cache().get_contacts(
         [str(hit.get("wxid") or "") for hit in native_message_hits],
         owner_wxid=owner_wxid,
     )
     sessions_by_id = {
         str(row.get("strUsrName") or ""): row
-        for row in sqlite_cache.get_sessions(owner_wxid=owner_wxid)
+        for row in _cache().get_sessions(owner_wxid=owner_wxid)
     }
     messages: list[dict] = []
     for hit in native_message_hits[:limit]:
@@ -5050,7 +6468,7 @@ async def search_local_data(q: str = "", limit: int = 30):
 @app.get("/api/local-contacts")
 async def get_local_contacts():
     """Read the native local directory and merge ContactHeadImgUrl avatars."""
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     with wechat_api.use_agent(agent_id):
         contacts_raw = await wechat_api.get_friend_and_chatroom_list("0")
         avatars_raw = await wechat_api.query_db(
@@ -5091,7 +6509,7 @@ async def get_local_contacts():
             avatar_map[wxid] = avatar
 
     owner_wxid = _contact_owner_wxid()
-    cached = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+    cached = _cache().get_contacts(owner_wxid=owner_wxid)
     categories: dict[str, list[dict]] = {
         "groups": [], "official": [], "service": [], "openim": [], "friends": [],
     }
@@ -5182,7 +6600,7 @@ async def get_contact_detail(wxid: str):
 @app.get("/api/contacts/{wxid}/avatar")
 async def get_contact_avatar(wxid: str):
     """Return pre-loaded avatar URL for a contact."""
-    url = app_state.get("avatar_urls", {}).get(wxid, "")
+    url = _state().get("avatar_urls", {}).get(wxid, "")
     return {"wxid": wxid, "url": url}
 
 
@@ -5518,17 +6936,17 @@ async def _refresh_protocol_session_list(owner_wxid: str, account_id: str) -> di
         if isinstance(row, dict)
     ]
     merged_wxids = _normalize_wxids([*wxids, *cached_wxids])
-    contact_profiles = sqlite_cache.get_contacts(merged_wxids, owner_wxid=owner_wxid) if merged_wxids else {}
+    contact_profiles = _cache().get_contacts(merged_wxids, owner_wxid=owner_wxid) if merged_wxids else {}
     status_rows = _protocol_session_rows(wxids, contact_profiles, cached_rows)
     session_rows = _merge_protocol_session_rows(status_rows, cached_rows, contact_profiles)
     if session_rows:
-        sqlite_cache.upsert_sessions(session_rows, owner_wxid=owner_wxid)
+        _cache().upsert_sessions(session_rows, owner_wxid=owner_wxid)
 
     snapshot = {"data": session_rows}
     last_messages = _last_messages_from_session_rows(session_rows)
-    app_state["sessions"] = snapshot
-    app_state["last_messages"] = last_messages
-    app_state["session_list_loaded"] = True
+    _state()["sessions"] = snapshot
+    _state()["last_messages"] = last_messages
+    _state()["session_list_loaded"] = True
     _log(
         f"[REFRESH] protocol statusnotify recent={len(status_rows)} merged={len(session_rows)} "
         f"pinned={sum(1 for row in session_rows if row.get('pinned'))}"
@@ -5548,7 +6966,7 @@ async def _refresh_protocol_session_list(owner_wxid: str, account_id: str) -> di
 
 def _session_rows_from_cache(owner_wxid: str = "") -> list[dict]:
     owner_wxid = owner_wxid or _contact_owner_wxid()
-    return sqlite_cache.get_sessions(owner_wxid=owner_wxid)
+    return _cache().get_sessions(owner_wxid=owner_wxid)
 
 
 def _session_snapshot_from_cache(owner_wxid: str = "") -> dict:
@@ -5586,8 +7004,8 @@ def _load_session_cache_into_state(owner_wxid: str = "") -> tuple[dict, dict]:
     snapshot = _session_snapshot_from_cache(owner_wxid)
     rows = snapshot.get("data") or []
     last_messages = _last_messages_from_session_rows(rows)
-    app_state["sessions"] = snapshot
-    app_state["last_messages"] = {**(app_state.get("last_messages") or {}), **last_messages}
+    _state()["sessions"] = snapshot
+    _state()["last_messages"] = {**(_state().get("last_messages") or {}), **last_messages}
     return snapshot, last_messages
 
 
@@ -5994,7 +7412,7 @@ def _with_contact_hydration_progress(snapshot: dict, owner_wxid: str = "") -> di
 
 def _contacts_snapshot_from_db(owner_wxid: str = "") -> dict:
     owner_wxid = owner_wxid or _contact_owner_wxid()
-    cached = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+    cached = _cache().get_contacts(owner_wxid=owner_wxid)
     friends: list[dict] = []
     rooms: list[dict] = []
     for wxid, entry in cached.items():
@@ -6152,8 +7570,8 @@ async def _ensure_contact_label_map() -> dict[str, str]:
     """Return cached label map, refreshing from hook when stale."""
     now = time.time()
     async with _CONTACT_LABEL_LOCK:
-        cached = _CONTACT_LABEL_CACHE.get("map")
-        cached_ts = float(_CONTACT_LABEL_CACHE.get("ts", 0) or 0)
+        cached = _bucket('_CONTACT_LABEL_CACHE', _CONTACT_LABEL_CACHE).get("map")
+        cached_ts = float(_bucket('_CONTACT_LABEL_CACHE', _CONTACT_LABEL_CACHE).get("ts", 0) or 0)
         if isinstance(cached, dict) and cached and now - cached_ts <= _CONTACT_LABEL_CACHE_TTL_SEC:
             return {str(k): str(v) for k, v in cached.items()}
 
@@ -6166,9 +7584,9 @@ async def _ensure_contact_label_map() -> dict[str, str]:
 
     async with _CONTACT_LABEL_LOCK:
         if label_map:
-            _CONTACT_LABEL_CACHE["map"] = label_map
-            _CONTACT_LABEL_CACHE["ts"] = now
-        cached = _CONTACT_LABEL_CACHE.get("map")
+            _bucket('_CONTACT_LABEL_CACHE', _CONTACT_LABEL_CACHE)["map"] = label_map
+            _bucket('_CONTACT_LABEL_CACHE', _CONTACT_LABEL_CACHE)["ts"] = now
+        cached = _bucket('_CONTACT_LABEL_CACHE', _CONTACT_LABEL_CACHE).get("map")
         if isinstance(cached, dict):
             return {str(k): str(v) for k, v in cached.items()}
     return {}
@@ -6281,7 +7699,7 @@ def _contact_cache_needs_hydration(wxid: str, entry: dict | None) -> bool:
 def _contact_detail_missing_ids(owner_wxid: str = "", candidates: list[str] | None = None) -> list[str]:
     owner = owner_wxid or _contact_owner_wxid()
     candidate_list = [str(wxid or "").strip() for wxid in (candidates or []) if str(wxid or "").strip()] if candidates is not None else None
-    cached = sqlite_cache.get_contacts(candidate_list, owner_wxid=owner)
+    cached = _cache().get_contacts(candidate_list, owner_wxid=owner)
     missing: list[str] = []
     if candidate_list is None:
         for wxid, entry in cached.items():
@@ -6299,7 +7717,7 @@ def _contact_detail_missing_ids(owner_wxid: str = "", candidates: list[str] | No
 def _contact_account_category_missing_ids(owner_wxid: str = "", candidates: list[str] | None = None) -> list[str]:
     owner = owner_wxid or _contact_owner_wxid()
     candidate_list = [str(wxid or "").strip() for wxid in (candidates or []) if str(wxid or "").strip()] if candidates is not None else None
-    cached = sqlite_cache.get_contacts(candidate_list, owner_wxid=owner)
+    cached = _cache().get_contacts(candidate_list, owner_wxid=owner)
     missing: list[str] = []
     wxids = candidate_list if candidate_list is not None else list(cached.keys())
     for wxid in wxids:
@@ -6358,7 +7776,7 @@ def _cache_raw_contacts(contacts: dict, *, owner_wxid: str = "") -> tuple[int, i
             continue
         name = _contact_profile_name(c)
         avatar = _contact_profile_avatar(c)
-        message_store.set_contact(wxid, name=name, avatar=avatar)
+        _messages().set_contact(wxid, name=name, avatar=avatar)
         raw_contact_updates[wxid] = {
             "wxid": wxid,
             "name": name or wxid,
@@ -6367,7 +7785,7 @@ def _cache_raw_contacts(contacts: dict, *, owner_wxid: str = "") -> tuple[int, i
             "profile": dict(c),
         }
     if raw_contact_updates:
-        sqlite_cache.upsert_contacts(raw_contact_updates, owner_wxid=owner_wxid or _contact_owner_wxid())
+        _cache().upsert_contacts(raw_contact_updates, owner_wxid=owner_wxid or _contact_owner_wxid())
     return len(friend_list), len(room_list)
 
 
@@ -6377,7 +7795,7 @@ async def _broadcast_contact_profile_updates(updates: dict[str, dict], *, accoun
     await manager.broadcast({
         "type": "contact_profiles",
         "data": {
-            "account_id": account_id or _active_agent_id or agent_manager.active_id(),
+            "account_id": account_id or _current_agent_id() or agent_manager.active_id(),
             "members": updates,
         },
     })
@@ -6388,9 +7806,9 @@ async def _broadcast_contacts_snapshot(snapshot: dict, *, account_id: str = "", 
     await manager.broadcast({
         "type": "contacts_snapshot",
         "data": {
-            "account_id": account_id or _active_agent_id or agent_manager.active_id(),
+            "account_id": account_id or _current_agent_id() or agent_manager.active_id(),
             "contacts": snapshot,
-            "contact_profiles": sqlite_cache.get_contacts(owner_wxid=owner_wxid),
+            "contact_profiles": _cache().get_contacts(owner_wxid=owner_wxid),
             "hydration_progress": _CONTACT_HYDRATION_PROGRESS.get(owner_wxid) or {},
         },
     })
@@ -6401,7 +7819,7 @@ async def _broadcast_contact_hydration_progress(owner_wxid: str, account_id: str
     await manager.broadcast({
         "type": "contacts_hydration_progress",
         "data": {
-            "account_id": account_id or _active_agent_id or agent_manager.active_id(),
+            "account_id": account_id or _current_agent_id() or agent_manager.active_id(),
             "owner_wxid": owner_wxid,
             **(_CONTACT_HYDRATION_PROGRESS.get(owner_wxid) or {}),
         },
@@ -6415,7 +7833,7 @@ async def _cache_contact_profiles(profiles: list[dict], *, owner_wxid: str = "")
     updates: dict[str, dict] = {}
     async with _CONTACT_PROFILE_LOCK:
         async with _CONTACT_BRIEF_LOCK:
-            avatar_urls = app_state.setdefault("avatar_urls", {})
+            avatar_urls = _state().setdefault("avatar_urls", {})
             for profile in profiles:
                 if not isinstance(profile, dict):
                     continue
@@ -6431,10 +7849,10 @@ async def _cache_contact_profiles(profiles: list[dict], *, owner_wxid: str = "")
                 _CONTACT_BRIEF_CACHE[cache_key] = {"name": name, "avatar": avatar, "ts": now}
                 if avatar:
                     avatar_urls[wxid] = avatar
-                message_store.set_contact(wxid, name=name, avatar=avatar)
+                _messages().set_contact(wxid, name=name, avatar=avatar)
                 updates[wxid] = summary
             if updates:
-                sqlite_cache.upsert_contacts(updates, owner_wxid=owner_wxid)
+                _cache().upsert_contacts(updates, owner_wxid=owner_wxid)
     return updates
 
 
@@ -6607,11 +8025,11 @@ async def _fetch_and_cache_contact_details(
                 }
 
             if updates:
-                sqlite_cache.upsert_contacts(updates, owner_wxid=owner_wxid)
+                _cache().upsert_contacts(updates, owner_wxid=owner_wxid)
                 now = time.time()
                 async with _CONTACT_PROFILE_LOCK:
                     async with _CONTACT_BRIEF_LOCK:
-                        avatar_urls = app_state.setdefault("avatar_urls", {})
+                        avatar_urls = _state().setdefault("avatar_urls", {})
                         for wxid, payload in updates.items():
                             profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {"wxid": wxid}
                             cache_key = _contact_cache_key(wxid, owner_wxid)
@@ -6623,7 +8041,7 @@ async def _fetch_and_cache_contact_details(
                             }
                             if payload.get("avatar"):
                                 avatar_urls[wxid] = payload["avatar"]
-                            message_store.set_contact(wxid, name=payload.get("name", "") or wxid, avatar=payload.get("avatar", "") or "")
+                            _messages().set_contact(wxid, name=payload.get("name", "") or wxid, avatar=payload.get("avatar", "") or "")
 
             result.update(updates)
             batch_update_count = len(updates)
@@ -6655,7 +8073,7 @@ async def _fetch_and_cache_contact_details(
             if account_id:
                 _runtime_for(account_id)["app_state"]["contacts"] = snapshot
             else:
-                app_state["contacts"] = snapshot
+                _state()["contacts"] = snapshot
             await _broadcast_contacts_snapshot(snapshot, account_id=account_id, owner_wxid=owner_wxid)
             await _broadcast_contact_hydration_progress(owner_wxid, account_id)
     if broadcast_progress:
@@ -6705,7 +8123,7 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
             if account_id:
                 _runtime_for(account_id)["app_state"]["contacts"] = snapshot
             else:
-                app_state["contacts"] = snapshot
+                _state()["contacts"] = snapshot
             await _broadcast_contacts_snapshot(snapshot, account_id=account_id, owner_wxid=owner_wxid)
             _log(f"[CONTACTS] BatchGetContactBriefInfo hydration complete: owner={owner_wxid} ids={len(ids)}")
         except Exception as e:
@@ -6722,7 +8140,7 @@ def _schedule_contact_detail_hydration(owner_wxid: str, wxids: list[str], accoun
 def _schedule_session_contact_hydration(owner_wxid: str, wxids: list[str], account_id: str = "") -> None:
     self_wxid = str(_get_self_wxid() or "").strip()
     ids = _prioritize_wxids(wxids, owner_wxid, self_wxid)
-    cached = sqlite_cache.get_contacts(ids, owner_wxid=owner_wxid) if ids else {}
+    cached = _cache().get_contacts(ids, owner_wxid=owner_wxid) if ids else {}
     missing_ids = [wxid for wxid in ids if _contact_cache_missing_avatar(wxid, cached.get(wxid))]
     self_missing = [wxid for wxid in missing_ids if wxid == self_wxid]
     brief_ids = [wxid for wxid in missing_ids if wxid != self_wxid]
@@ -6848,20 +8266,20 @@ async def _refresh_contacts_incremental(
     hydrates details with /BatchGetContactBriefInfo in 100-id batches.
     """
     owner_wxid = _contact_owner_wxid()
-    account_id = _active_agent_id or agent_manager.active_id() or ""
-    if not app_state.get("contacts_loaded"):
-        cached_contacts = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
-        if cached_contacts and sqlite_cache.has_contact_init_done_v2(owner_wxid=owner_wxid):
-            app_state["contacts_loaded"] = True
+    account_id = _current_agent_id() or agent_manager.active_id() or ""
+    if not _state().get("contacts_loaded"):
+        cached_contacts = _cache().get_contacts(owner_wxid=owner_wxid)
+        if cached_contacts and _cache().has_contact_init_done_v2(owner_wxid=owner_wxid):
+            _state()["contacts_loaded"] = True
             _log(
                 f"[CONTACTS] restored completed InitContact state from SQLite: "
                 f"owner={owner_wxid} cached={len(cached_contacts)}"
             )
-    if app_state.get("contacts_loaded"):
+    if _state().get("contacts_loaded"):
         snapshot = _contacts_snapshot_from_db(owner_wxid)
-        app_state["contacts"] = snapshot
+        _state()["contacts"] = snapshot
         ids = (
-            list(sqlite_cache.get_contacts(owner_wxid=owner_wxid).keys())
+            list(_cache().get_contacts(owner_wxid=owner_wxid).keys())
             if force_details
             else _contact_detail_missing_ids(owner_wxid)
         )
@@ -6871,11 +8289,11 @@ async def _refresh_contacts_incremental(
 
     lock = _contact_init_lock(owner_wxid)
     async with lock:
-        if app_state.get("contacts_loaded"):
+        if _state().get("contacts_loaded"):
             snapshot = _contacts_snapshot_from_db(owner_wxid)
-            app_state["contacts"] = snapshot
+            _state()["contacts"] = snapshot
             ids = (
-                list(sqlite_cache.get_contacts(owner_wxid=owner_wxid).keys())
+                list(_cache().get_contacts(owner_wxid=owner_wxid).keys())
                 if force_details
                 else _contact_detail_missing_ids(owner_wxid)
             )
@@ -6883,7 +8301,7 @@ async def _refresh_contacts_incremental(
                 _schedule_contact_detail_hydration(owner_wxid, ids, account_id)
             return _with_contact_hydration_progress(snapshot, owner_wxid)
 
-        cached_before = sqlite_cache.get_contacts(owner_wxid=owner_wxid)
+        cached_before = _cache().get_contacts(owner_wxid=owner_wxid)
         try:
             _log("[CONTACTS] first directory open: calling InitContact")
             _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
@@ -6900,7 +8318,7 @@ async def _refresh_contacts_incremental(
             contacts = await wechat_api.init_contact()
         except Exception as e:
             snapshot = _contacts_snapshot_from_db(owner_wxid)
-            app_state["contacts"] = snapshot
+            _state()["contacts"] = snapshot
             _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
                 "active": False,
                 "phase": "InitContact",
@@ -6920,7 +8338,7 @@ async def _refresh_contacts_incremental(
         raw_entries = _all_raw_contact_entries(contacts)
         if not raw_entries:
             snapshot = _contacts_snapshot_from_db(owner_wxid)
-            app_state["contacts"] = snapshot
+            _state()["contacts"] = snapshot
             _CONTACT_HYDRATION_PROGRESS[owner_wxid] = {
                 "active": False,
                 "phase": "InitContact",
@@ -6939,10 +8357,10 @@ async def _refresh_contacts_incremental(
             return _with_contact_hydration_progress(snapshot, owner_wxid)
 
         friend_count, room_count = _cache_raw_contacts(contacts, owner_wxid=owner_wxid)
-        app_state["contacts_loaded"] = True
-        sqlite_cache.mark_contact_init_done_v2(owner_wxid=owner_wxid)
+        _state()["contacts_loaded"] = True
+        _cache().mark_contact_init_done_v2(owner_wxid=owner_wxid)
         snapshot = _contacts_snapshot_from_db(owner_wxid)
-        app_state["contacts"] = snapshot
+        _state()["contacts"] = snapshot
         _log(
             f"[CONTACTS] InitContact cached: friends={friend_count} groups={room_count} "
             f"entries={len(raw_entries)} cached_before={len(cached_before)}"
@@ -7002,12 +8420,12 @@ async def _ensure_contact_profiles(
     result: dict[str, dict] = {}
     missing: list[str] = []
     owner_wxid = _contact_owner_wxid()
-    account_id = _active_agent_id or agent_manager.active_id() or ""
-    db_cached = sqlite_cache.get_contacts(wxids, owner_wxid=owner_wxid)
+    account_id = _current_agent_id() or agent_manager.active_id() or ""
+    db_cached = _cache().get_contacts(wxids, owner_wxid=owner_wxid)
 
     async with _CONTACT_PROFILE_LOCK:
         async with _CONTACT_BRIEF_LOCK:
-            avatar_urls = app_state.get("avatar_urls", {}) or {}
+            avatar_urls = _state().get("avatar_urls", {}) or {}
             for wxid in wxids:
                 cache_key = _contact_cache_key(wxid, owner_wxid)
                 cached_profile = _CONTACT_PROFILE_CACHE.get(cache_key)
@@ -7027,7 +8445,7 @@ async def _ensure_contact_profiles(
                     now - float(cached_brief.get("ts", 0)) <= _CONTACT_BRIEF_CACHE_TTL_SEC
                 )
                 direct_avatar = avatar_urls.get(wxid, "")
-                store_contact = message_store.get_contact(wxid)
+                store_contact = _messages().get_contact(wxid)
                 name = (
                     (cached_brief or {}).get("name", "")
                     or store_contact.get("name", "")
@@ -7061,7 +8479,7 @@ async def _ensure_contact_profiles(
                         _CONTACT_PROFILE_CACHE[cache_key] = {"profile": db_profile, "ts": now}
                         _CONTACT_BRIEF_CACHE[cache_key] = {"name": db_name, "avatar": db_avatar, "ts": now}
                         avatar_urls[wxid] = db_avatar
-                        message_store.set_contact(wxid, name=db_name, avatar=db_avatar)
+                        _messages().set_contact(wxid, name=db_name, avatar=db_avatar)
                         if not force_refresh:
                             continue
 
@@ -7137,7 +8555,7 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
     owner_wxid = _contact_owner_wxid()
     members: dict[str, dict] = {}
     missing: list[str] = []
-    db_cached = sqlite_cache.get_contacts(wxids, owner_wxid=owner_wxid)
+    db_cached = _cache().get_contacts(wxids, owner_wxid=owner_wxid)
 
     # 1) Serve from cache or preloaded avatar_urls
     async with _CONTACT_BRIEF_LOCK:
@@ -7150,7 +8568,7 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
             for k in expired[:2000]:
                 _CONTACT_BRIEF_CACHE.pop(k, None)
 
-        avatar_urls = app_state.get("avatar_urls", {}) or {}
+        avatar_urls = _state().get("avatar_urls", {}) or {}
         for wxid in wxids:
             cache_key = _contact_cache_key(wxid, owner_wxid)
             cached = _CONTACT_BRIEF_CACHE.get(cache_key)
@@ -7215,7 +8633,7 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
                 if found_in_batch:
                     contact_updates: dict[str, dict] = {}
                     async with _CONTACT_BRIEF_LOCK:
-                        avatar_urls = app_state.get("avatar_urls", {}) or {}
+                        avatar_urls = _state().get("avatar_urls", {}) or {}
                         for wxid, entry in found_in_batch.items():
                             if not entry.get("avatar") and avatar_urls.get(wxid):
                                 entry["avatar"] = avatar_urls[wxid]
@@ -7239,7 +8657,7 @@ async def post_contacts_brief_batch(req: BriefBatchRequest):
                                 "ts": now,
                             }
                     if contact_updates:
-                        sqlite_cache.upsert_contacts(contact_updates, owner_wxid=owner_wxid)
+                        _cache().upsert_contacts(contact_updates, owner_wxid=owner_wxid)
             except Exception as e:
                 _log(f"[BRIEF] batch brief info failed ({len(batch)}): {e}")
 
@@ -7289,7 +8707,7 @@ async def get_sessions(request: Request):
             for row in session_list
             if isinstance(row, dict)
         ]
-        contact_profiles = sqlite_cache.get_contacts(profile_wxids, owner_wxid=owner_wxid) if profile_wxids else {}
+        contact_profiles = _cache().get_contacts(profile_wxids, owner_wxid=owner_wxid) if profile_wxids else {}
         return {
             "sessions": raw_sessions,
             "last_messages": last_messages,
@@ -7300,7 +8718,7 @@ async def get_sessions(request: Request):
         await agent_manager.set_active(agent_id)
         _activate_runtime(agent_id)
         _load_session_cache_into_state(_contact_owner_wxid())
-    return app_state["sessions"] or {}
+    return _state()["sessions"] or {}
 
 
 @app.get("/api/sessions/refresh")
@@ -7315,7 +8733,7 @@ async def refresh_sessions(request: Request):
         _activate_runtime(agent_id)
     owner_wxid = _contact_owner_wxid()
     if config.IS_PROTOCOL:
-        target_agent_id = agent_id or _active_agent_id or agent_manager.active_id() or ""
+        target_agent_id = agent_id or _current_agent_id() or agent_manager.active_id() or ""
         try:
             return await _refresh_protocol_session_list(owner_wxid, target_agent_id)
         except Exception as e:
@@ -7327,7 +8745,7 @@ async def refresh_sessions(request: Request):
                 for row in session_list
                 if isinstance(row, dict)
             ]
-            contact_profiles = sqlite_cache.get_contacts(profile_wxids, owner_wxid=owner_wxid) if profile_wxids else {}
+            contact_profiles = _cache().get_contacts(profile_wxids, owner_wxid=owner_wxid) if profile_wxids else {}
             return {
                 "sessions": raw_sessions,
                 "last_messages": last_messages,
@@ -7335,7 +8753,7 @@ async def refresh_sessions(request: Request):
                 "source": "protocol_sqlite_fallback",
                 "warning": str(e),
             }
-    target_agent_id = agent_id or _active_agent_id or agent_manager.active_id()
+    target_agent_id = agent_id or _current_agent_id() or agent_manager.active_id()
     if target_agent_id:
         _agent_polling_paused_until[target_agent_id] = time.time() + 20.0
     try:
@@ -7349,14 +8767,14 @@ async def refresh_sessions(request: Request):
             db_sessions = await _query_session_list_from_db()
         session_rows = db_sessions.get("data", []) if isinstance(db_sessions, dict) else []
         if session_rows:
-            sqlite_cache.upsert_sessions(session_rows, owner_wxid=owner_wxid)
+            _cache().upsert_sessions(session_rows, owner_wxid=owner_wxid)
             session_wxids = [
                 str(_row_value(row, "strUsrName", "StrUsrName", "UserName", "userName", "wxid") or "").strip()
                 for row in session_rows
                 if isinstance(row, dict)
             ]
             _schedule_session_contact_hydration(owner_wxid, session_wxids, target_agent_id or "")
-            app_state["session_list_loaded"] = True
+            _state()["session_list_loaded"] = True
             _log(f"[REFRESH] native Session table cached: {len(session_rows)} rows")
         else:
             _log("[REFRESH] native Session table returned empty; falling back to local cache")
@@ -7374,7 +8792,7 @@ async def refresh_sessions(request: Request):
         if isinstance(row, dict)
     ]
     profile_wxids = _prioritize_wxids(profile_wxids, owner_wxid, _get_self_wxid())
-    contact_profiles = sqlite_cache.get_contacts(profile_wxids, owner_wxid=owner_wxid) if profile_wxids else {}
+    contact_profiles = _cache().get_contacts(profile_wxids, owner_wxid=owner_wxid) if profile_wxids else {}
 
     total_ms = int((time.time() - t0) * 1000)
     _log(f"[REFRESH] ✓ {len(session_list)} sessions from local cache; no per-session MSG query — {total_ms}ms")
@@ -7394,16 +8812,16 @@ async def get_messages(wxid: str, limit: int = 20, db: str = "MSG0.db"):
     owner_wxid = _contact_owner_wxid()
     if config.IS_PROTOCOL:
         if not _protocol_history_available(owner_wxid):
-            existing = message_store.get_messages(wxid, limit)
+            existing = _messages().get_messages(wxid, limit)
             return {
                 "data": existing,
                 "source": "protocol_memory" if existing else "protocol_empty",
             }
-        cached = sqlite_cache.get_messages(wxid, limit, owner_wxid=owner_wxid)
+        cached = _cache().get_messages(wxid, limit, owner_wxid=owner_wxid)
         if cached:
-            message_store.add_history_no_flag(wxid, cached)
+            _messages().add_history_no_flag(wxid, cached)
             return {"data": cached, "source": "protocol_sqlite"}
-        existing = message_store.get_messages(wxid, limit)
+        existing = _messages().get_messages(wxid, limit)
         return {
             "data": existing,
             "source": "protocol_memory" if existing else "protocol_sqlite",
@@ -7418,25 +8836,25 @@ async def get_messages(wxid: str, limit: int = 20, db: str = "MSG0.db"):
         _log(f"[HISTORY] QueryDB latest failed for {wxid}: {type(e).__name__}: {e}")
 
     if normalized:
-        message_store.add_history(wxid, normalized)
+        _messages().add_history(wxid, normalized)
         try:
-            sqlite_cache.upsert_messages(wxid, normalized, mark_initialized=True, owner_wxid=owner_wxid)
+            _cache().upsert_messages(wxid, normalized, mark_initialized=True, owner_wxid=owner_wxid)
             _sync_session_preview_from_message(wxid, normalized[-1], owner_wxid=owner_wxid)
         except Exception as e:
             _log(f"[SQLITE_CACHE] history write failed for {wxid}: {type(e).__name__}: {e}")
         return {"data": normalized[-limit:], "source": "hook_db"}
 
-    cached = sqlite_cache.get_messages(wxid, limit, owner_wxid=owner_wxid)
+    cached = _cache().get_messages(wxid, limit, owner_wxid=owner_wxid)
     if cached:
-        message_store.add_history_no_flag(wxid, cached)
+        _messages().add_history_no_flag(wxid, cached)
         return {"data": cached, "source": "sqlite_fallback"}
 
-    existing = message_store.get_messages(wxid, limit)
+    existing = _messages().get_messages(wxid, limit)
     if existing:
         return {"data": existing, "source": "memory_fallback"}
 
     try:
-        sqlite_cache.mark_initialized(wxid, owner_wxid=owner_wxid)
+        _cache().mark_initialized(wxid, owner_wxid=owner_wxid)
     except Exception as e:
         _log(f"[SQLITE_CACHE] history init mark failed for {wxid}: {type(e).__name__}: {e}")
     return {"data": [], "source": "hook_db"}
@@ -7453,12 +8871,12 @@ async def get_older_messages(wxid: str, before: int = 0, limit: int = 100, db: s
     if config.IS_PROTOCOL:
         if not _protocol_history_available(owner_wxid):
             return {"data": [], "source": "protocol_empty"}
-        cached = sqlite_cache.get_messages(wxid, limit, before=before, owner_wxid=owner_wxid)
+        cached = _cache().get_messages(wxid, limit, before=before, owner_wxid=owner_wxid)
         if cached:
-            message_store.add_history_no_flag(wxid, cached)
+            _messages().add_history_no_flag(wxid, cached)
         return {"data": cached, "source": "protocol_sqlite"}
 
-    cached = sqlite_cache.get_messages(wxid, limit, before=before, owner_wxid=owner_wxid)
+    cached = _cache().get_messages(wxid, limit, before=before, owner_wxid=owner_wxid)
     # Older caches written before sender extraction was fixed may identify the
     # chatroom itself as the sender.  Do not serve those rows forever: re-query
     # the native DB so the real member wxid/profile can replace them.
@@ -7469,16 +8887,16 @@ async def get_older_messages(wxid: str, before: int = 0, limit: int = 100, db: s
         if isinstance(message, dict)
     )
     if cached and not unresolved_group_sender:
-        message_store.add_history_no_flag(wxid, cached)
+        _messages().add_history_no_flag(wxid, cached)
         return {"data": cached, "source": "sqlite"}
 
     history = await wechat_api.get_chat_history(wxid, limit, before_time=before, dbs=[db])
     rows = history.get("data", []) if isinstance(history, dict) else []
     normalized = _normalize_history_rows(wxid, rows)
     # Add to store so they persist in memory
-    message_store.add_history_no_flag(wxid, normalized)
+    _messages().add_history_no_flag(wxid, normalized)
     try:
-        sqlite_cache.upsert_messages(wxid, normalized, owner_wxid=owner_wxid)
+        _cache().upsert_messages(wxid, normalized, owner_wxid=owner_wxid)
     except Exception as e:
         _log(f"[SQLITE_CACHE] older-history write failed for {wxid}: {type(e).__name__}: {e}")
     return {"data": normalized, "source": "hook_db"}
@@ -7492,7 +8910,7 @@ async def query_messages(wxid: str, keyword: str, limit: int = 50, db: str = "MS
         if not _protocol_history_available(owner_wxid):
             return {"data": [], "source": "protocol_empty"}
         return {
-            "data": sqlite_cache.search_messages(wxid, keyword, limit, owner_wxid=owner_wxid),
+            "data": _cache().search_messages(wxid, keyword, limit, owner_wxid=owner_wxid),
             "source": "protocol_sqlite",
         }
     sql = (
@@ -7776,9 +9194,14 @@ async def _gather_broadcast_batches(items: list, send_one, batch_size: int = 100
 
 def _track_background_send(task: asyncio.Task, label: str) -> None:
     _background_send_tasks.add(task)
+    tasks = _runtime_for(_current_agent_id()).setdefault('tasks', set())
+    tasks.add(task)
 
     def _done(done: asyncio.Task) -> None:
         _background_send_tasks.discard(done)
+        tasks.discard(done)
+        if done.cancelled():
+            return
         try:
             done.result()
         except Exception as e:
@@ -7814,7 +9237,7 @@ async def _broadcast_local_sent_message(chat_id: str, msg_type: str, content: st
     await manager.broadcast({
         "type": "message_sent",
         "data": {
-            "account_id": _active_agent_id or agent_manager.active_id(),
+            "account_id": _current_agent_id() or agent_manager.active_id(),
             "chat_id": chat_id,
             "message": msg,
             "session_update": session_update,
@@ -7831,7 +9254,7 @@ async def _broadcast_local_sent_for_agent(
 ) -> None:
     if agent_id:
         async with _ACCOUNT_LOCK:
-            previous_agent = _active_agent_id or agent_manager.active_id() or ""
+            previous_agent = _current_agent_id() or agent_manager.active_id() or ""
             try:
                 _activate_runtime(agent_id)
                 await _broadcast_local_sent_message(chat_id, msg_type, content, extra)
@@ -7873,7 +9296,7 @@ def _send_queued_response(kind: str, wxid: str, **extra) -> dict:
 
 @app.post("/api/send/text")
 async def send_text(req: SendTextRequest):
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "text",
         agent_id,
@@ -7888,7 +9311,8 @@ async def send_text(req: SendTextRequest):
 
 @app.post("/api/send/image")
 async def send_image(req: SendImageRequest):
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _require_owned_path(req.picpath)
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "image",
         agent_id,
@@ -7903,7 +9327,8 @@ async def send_image(req: SendImageRequest):
 
 @app.post("/api/send/file")
 async def send_file(req: SendFileRequest):
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _require_owned_path(req.filepath)
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "file",
         agent_id,
@@ -7918,7 +9343,8 @@ async def send_file(req: SendFileRequest):
 
 @app.post("/api/send/video")
 async def send_video(req: SendVideoRequest):
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _require_owned_path(req.videopath)
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "video",
         agent_id,
@@ -7933,7 +9359,8 @@ async def send_video(req: SendVideoRequest):
 
 @app.post("/api/send/gif")
 async def send_gif(req: SendGifRequest):
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    _require_owned_path(req.gifpath)
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "gif",
         agent_id,
@@ -7948,7 +9375,7 @@ async def send_gif(req: SendGifRequest):
 
 @app.post("/api/send/quote")
 async def send_quote(req: SendQuoteRequest):
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "quote",
         agent_id,
@@ -7966,7 +9393,7 @@ async def send_quote(req: SendQuoteRequest):
 
 @app.post("/api/send/at")
 async def send_at(req: SendAtRequest):
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "at",
         agent_id,
@@ -7988,7 +9415,7 @@ app.mount("/uploads", StaticFiles(directory=_UPLOAD_DIR), name="uploads")
 async def broadcast_text(req: BroadcastTextRequest):
     """Broadcast text using NoSrc by default, or normal SendTextMsg when requested."""
     wxids = [w for w in req.wxids if w]
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     normal_mode = str(req.mode or "").lower() in {"normal", "src", "regular"}
     sem = asyncio.Semaphore(_send_api_parallelism(req.concurrency_limit))
 
@@ -8158,15 +9585,15 @@ async def broadcast_image_upload(
 
     ext = os.path.splitext(file.filename or "img.png")[1] or ".png"
     filename = f"broadcast_img_{int(time.time())}_{target_wxids[0]}{ext}"
-    filepath = os.path.join(_UPLOAD_DIR, filename)
+    filepath = os.path.join(_scoped_dir(_UPLOAD_DIR), filename)
     data = await file.read()
     with open(filepath, "wb") as f:
         f.write(data)
     _log(f"[BROADCAST] Saved image: {filepath} ({len(data)} bytes)")
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     if str(mode or "").lower() in {"normal", "src", "regular"}:
-        db_image_id = sqlite_cache.put_media_blob(data, file.content_type or "image/*", file.filename or filename)
+        db_image_id = _cache().put_media_blob(data, file.content_type or "image/*", file.filename or filename, owner_wxid=_contact_owner_wxid())
         results = await _send_image_file_no_src_to_targets(
             target_wxids,
             filepath,
@@ -8265,7 +9692,7 @@ async def broadcast_file_upload(
         return {"total": 0, "sent": 0, "failed": 0, "results": [], "error": "no targets"}
 
     safe_name = (file.filename or "file").replace("\\", "_").replace("/", "_")
-    upload_dir = os.path.join(_UPLOAD_DIR, f"broadcast_file_{int(time.time() * 1000)}")
+    upload_dir = os.path.join(_scoped_dir(_UPLOAD_DIR), f"broadcast_file_{int(time.time() * 1000)}")
     os.makedirs(upload_dir, exist_ok=True)
     filepath = os.path.join(upload_dir, safe_name)
     data = await file.read()
@@ -8273,7 +9700,7 @@ async def broadcast_file_upload(
         f.write(data)
     _log(f"[BROADCAST] Saved file: {filepath} ({len(data)} bytes)")
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     results = await _send_file_no_src_to_targets(
         target_wxids,
         filepath,
@@ -8311,7 +9738,7 @@ async def _store_mixed_uploads(images: list[UploadFile], attachment: UploadFile 
         data = await upload.read()
         original_name = os.path.basename(upload.filename or f"image_{index + 1}.png") or f"image_{index + 1}.png"
         ext = os.path.splitext(original_name)[1] or ".png"
-        filepath = os.path.join(_UPLOAD_DIR, f"mixed_{stamp}_{index + 1}{ext}")
+        filepath = os.path.join(_scoped_dir(_UPLOAD_DIR), f"mixed_{stamp}_{index + 1}{ext}")
         with open(filepath, "wb") as output:
             output.write(data)
         image_parts.append({
@@ -8327,7 +9754,7 @@ async def _store_mixed_uploads(images: list[UploadFile], attachment: UploadFile 
     if attachment is not None and attachment.filename:
         data = await attachment.read()
         safe_name = os.path.basename(attachment.filename).replace("\\", "_").replace("/", "_") or "file"
-        upload_dir = os.path.join(_UPLOAD_DIR, f"mixed_file_{stamp}")
+        upload_dir = os.path.join(_scoped_dir(_UPLOAD_DIR), f"mixed_file_{stamp}")
         os.makedirs(upload_dir, exist_ok=True)
         filepath = os.path.join(upload_dir, safe_name)
         with open(filepath, "wb") as output:
@@ -8352,7 +9779,7 @@ async def _prepare_mixed_parts_for_agent(
 ) -> list[dict]:
     prepared: list[dict] = []
     for image_part in image_parts:
-        db_image_id = sqlite_cache.put_media_blob(image_part["data"], image_part["mime"], image_part["name"])
+        db_image_id = _cache().put_media_blob(image_part["data"], image_part["mime"], image_part["name"], owner_wxid=_contact_owner_wxid())
         item = {**image_part, "db_image_id": db_image_id}
         if not normal_mode:
             try:
@@ -8454,7 +9881,7 @@ async def broadcast_mixed_upload(
     if not target_wxids or (not message and not image_parts and not file_part):
         return {"total": len(target_wxids), "sent": 0, "failed": 0, "results": [], "error": "no targets or content"}
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     normal_mode = str(mode or "").lower() in {"normal", "src", "regular"}
     attachments = await _prepare_mixed_parts_for_agent(agent_id, target_wxids[0], image_parts, file_part, normal_mode)
     parts = _mixed_content_order(order, bool(message), attachments)
@@ -8644,7 +10071,7 @@ async def _ensure_broadcast_contact_categories(contacts: dict | list, owner_wxid
                 account_id=account_id,
             )
         contacts = _contacts_snapshot_from_db(owner_wxid)
-        app_state["contacts"] = contacts
+        _state()["contacts"] = contacts
     return contacts
 
 
@@ -8656,15 +10083,15 @@ async def _ensure_account_contacts(agent_id: str):
             if not login_ok:
                 raise RuntimeError("wechat not logged in")
             owner_wxid = _contact_owner_wxid()
-            if app_state.get("contacts_loaded"):
+            if _state().get("contacts_loaded"):
                 cached_contacts = _contacts_snapshot_from_db(owner_wxid)
-                app_state["contacts"] = cached_contacts
+                _state()["contacts"] = cached_contacts
                 cached_contacts = await _ensure_broadcast_contact_categories(cached_contacts, owner_wxid, agent_id)
                 return cached_contacts
             with wechat_api.use_agent(agent_id):
                 await _refresh_contacts_incremental(list_type="0", init_if_empty=True, hydrate_details=False)
             contacts = _contacts_snapshot_from_db(owner_wxid)
-            app_state["contacts"] = contacts
+            _state()["contacts"] = contacts
             contacts = await _ensure_broadcast_contact_categories(contacts, owner_wxid, agent_id)
             return contacts
 
@@ -8675,12 +10102,12 @@ async def _ensure_account_contacts(agent_id: str):
             login_status = await _refresh_agent_login_status(agent_id)
             if str(login_status.get("status") or "") != "3":
                 raise RuntimeError(f"wechat not logged in: {login_status.get('message') or login_status.get('status') or 'unknown'}")
-            if not app_state.get("initialized"):
+            if not _state().get("initialized"):
                 await _run_backend_initialization(agent_id)
         owner_wxid = _contact_owner_wxid()
-        if app_state.get("contacts_loaded"):
+        if _state().get("contacts_loaded"):
             cached_contacts = _contacts_snapshot_from_db(owner_wxid)
-            app_state["contacts"] = cached_contacts
+            _state()["contacts"] = cached_contacts
             cached_contacts = await _ensure_broadcast_contact_categories(cached_contacts, owner_wxid, agent_id)
             counts = _contact_counts(cached_contacts)
             _log(
@@ -8692,7 +10119,7 @@ async def _ensure_account_contacts(agent_id: str):
         with wechat_api.use_agent(agent_id):
             await _refresh_contacts_incremental(list_type="0", init_if_empty=True, hydrate_details=False)
         contacts = _contacts_snapshot_from_db(owner_wxid)
-        app_state["contacts"] = contacts
+        _state()["contacts"] = contacts
         contacts = await _ensure_broadcast_contact_categories(contacts, owner_wxid, agent_id)
         counts = _contact_counts(contacts)
         _log(
@@ -8715,6 +10142,8 @@ async def _prepare_multi_account_targets(
     direct_targets: list[str],
     target_types: set[str],
 ) -> tuple[list[str], list[tuple[str, str]], dict[str, int], dict[str, dict[str, int]], list[dict]]:
+    for account_id in agent_ids or []:
+        access_store.require_account(account_id)
     if config.IS_PROTOCOL:
         accounts_payload = await _list_protocol_accounts()
         online_ids = [
@@ -8727,7 +10156,7 @@ async def _prepare_multi_account_targets(
     else:
         connected_agents = [a for a in (agent_ids or []) if agent_manager.is_connected(a)]
         if not connected_agents:
-            connected_agents = [a["id"] for a in agent_manager.agents() if a.get("id")]
+            connected_agents = [a["id"] for a in _owned_agents() if a.get("id")]
 
     total = 0
     account_targets: dict[str, int] = {}
@@ -9005,7 +10434,7 @@ async def multi_account_broadcast_image_upload(
             if not config.IS_PROTOCOL:
                 await agent_manager.set_active(agent_id)
             _activate_runtime(agent_id)
-            db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
+            db_image_id = _cache().put_media_blob(upload_bytes, upload_mime, upload_name, owner_wxid=_contact_owner_wxid())
         if normal_mode:
             send_results = await _send_image_file_no_src_to_targets(
                 agent_targets,
@@ -9213,7 +10642,7 @@ async def multi_account_broadcast_image_upload_stream(
                 if not config.IS_PROTOCOL:
                     await agent_manager.set_active(agent_id)
                 _activate_runtime(agent_id)
-                db_image_id = sqlite_cache.put_media_blob(upload_bytes, upload_mime, upload_name)
+                db_image_id = _cache().put_media_blob(upload_bytes, upload_mime, upload_name, owner_wxid=_contact_owner_wxid())
             if normal_mode:
                 sem = asyncio.Semaphore(_send_api_parallelism(concurrency_limit))
 
@@ -9345,7 +10774,7 @@ async def multi_account_broadcast_file_upload_stream(
     data = await file.read()
     original_name = (file.filename or "file").replace("\\", "/").split("/")[-1] or "file"
     safe_name = original_name.replace("\\", "_").replace("/", "_")
-    upload_dir = os.path.join(_UPLOAD_DIR, f"multi_broadcast_file_{int(time.time() * 1000)}")
+    upload_dir = os.path.join(_scoped_dir(_UPLOAD_DIR), f"multi_broadcast_file_{int(time.time() * 1000)}")
     os.makedirs(upload_dir, exist_ok=True)
     filepath = os.path.join(upload_dir, safe_name)
     with open(filepath, "wb") as f:
@@ -9441,7 +10870,7 @@ async def send_image_upload(wxid: str = Form(...), file: UploadFile = File(...))
     """Upload an image from the browser and send it via WeChat."""
     ext = os.path.splitext(file.filename or "img.png")[1] or ".png"
     filename = f"img_{int(time.time())}_{wxid}{ext}"
-    filepath = os.path.join(_UPLOAD_DIR, filename)
+    filepath = os.path.join(_scoped_dir(_UPLOAD_DIR), filename)
     data = await file.read()
     with open(filepath, "wb") as f:
         f.write(data)
@@ -9483,7 +10912,7 @@ async def send_image_upload(wxid: str = Form(...), file: UploadFile = File(...))
     except Exception as e:
         _log(f"[UPLOAD] Image compression skipped: {e}")
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "image-upload",
         agent_id,
@@ -9501,13 +10930,13 @@ async def send_file_upload(wxid: str = Form(...), file: UploadFile = File(...)):
     """Upload a file from the browser and send it via WeChat."""
     safe_name = (file.filename or "file").replace("\\", "_").replace("/", "_")
     filename = f"{int(time.time())}_{safe_name}"
-    filepath = os.path.join(_UPLOAD_DIR, filename)
+    filepath = os.path.join(_scoped_dir(_UPLOAD_DIR), filename)
     data = await file.read()
     with open(filepath, "wb") as f:
         f.write(data)
     _log(f"[UPLOAD] Saved file: {filepath} ({len(data)} bytes)")
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "file-upload",
         agent_id,
@@ -9525,13 +10954,13 @@ async def send_video_upload(wxid: str = Form(...), file: UploadFile = File(...))
     """Upload a video from the browser and send it via WeChat."""
     safe_name = (file.filename or "video.mp4").replace("\\", "_").replace("/", "_")
     filename = f"{int(time.time())}_{safe_name}"
-    filepath = os.path.join(_UPLOAD_DIR, filename)
+    filepath = os.path.join(_scoped_dir(_UPLOAD_DIR), filename)
     data = await file.read()
     with open(filepath, "wb") as f:
         f.write(data)
     _log(f"[UPLOAD] Saved video: {filepath} ({len(data)} bytes)")
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "video-upload",
         agent_id,
@@ -9585,8 +11014,8 @@ async def send_voice_upload(
         raise HTTPException(status_code=400, detail="Invalid voice recording")
     extension = os.path.splitext(file.filename or "recording.webm")[1] or ".webm"
     stem = f"voice_{int(time.time() * 1000)}_{_safe_media_filename_part(wxid, 'chat', 40)}"
-    input_path = os.path.join(_VOICE_CACHE_DIR, stem + extension)
-    silk_path = os.path.join(_VOICE_CACHE_DIR, stem + ".silk")
+    input_path = os.path.join(_scoped_dir(_VOICE_CACHE_DIR), stem + extension)
+    silk_path = os.path.join(_scoped_dir(_VOICE_CACHE_DIR), stem + ".silk")
     with open(input_path, "wb") as output:
         output.write(data)
     try:
@@ -9599,7 +11028,7 @@ async def send_voice_upload(
         except OSError:
             pass
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "voice-upload",
         agent_id,
@@ -9622,13 +11051,13 @@ async def send_gif_upload(wxid: str = Form(...), file: UploadFile = File(...)):
     """Upload a GIF/sticker file from the browser and send it via WeChat."""
     safe_name = (file.filename or "emoji.gif").replace("\\", "_").replace("/", "_")
     filename = f"{int(time.time())}_{safe_name}"
-    filepath = os.path.join(_UPLOAD_DIR, filename)
+    filepath = os.path.join(_scoped_dir(_UPLOAD_DIR), filename)
     data = await file.read()
     with open(filepath, "wb") as f:
         f.write(data)
     _log(f"[UPLOAD] Saved GIF: {filepath} ({len(data)} bytes)")
 
-    agent_id = _active_agent_id or agent_manager.active_id() or ""
+    agent_id = _current_agent_id() or agent_manager.active_id() or ""
     _queue_send_job(
         "gif-upload",
         agent_id,
@@ -9700,9 +11129,9 @@ async def get_message_struct(req: MessageStructRequest):
 async def mark_read(wxid: str):
     """Mark a chat as read: clear unread in store + broadcast to all frontends."""
     # Clear in our in-memory store
-    message_store.mark_read(wxid)
+    _messages().mark_read(wxid)
     try:
-        sqlite_cache.mark_session_read(wxid, owner_wxid=_contact_owner_wxid())
+        _cache().mark_session_read(wxid, owner_wxid=_contact_owner_wxid())
         _load_session_cache_into_state(_contact_owner_wxid())
     except Exception as e:
         _log(f"[MARK_READ] local session cache update failed for {wxid}: {e}")
@@ -9750,6 +11179,7 @@ async def unmute_session(req: SessionActionRequest):
 @app.get("/api/media/image")
 async def serve_image(path: str):
     """Serve a local image file (from Hook's auto-download path)."""
+    _require_owned_path(path)
     if os.path.exists(path):
         return FileResponse(path)
     return {"error": "File not found"}
@@ -9778,7 +11208,7 @@ def _persist_media_path(msg_id: str, msg_type: str, path: str) -> None:
     if not msg_id or not path:
         return
     try:
-        sqlite_cache.update_media_path_by_msg_id(
+        _cache().update_media_path_by_msg_id(
             str(msg_id),
             _media_path_field(msg_type),
             path,
@@ -9792,7 +11222,7 @@ def _cached_media_path(msg_id: str, msg_type: str) -> str:
     if not msg_id:
         return ""
     try:
-        cached = sqlite_cache.get_message_by_id(str(msg_id), owner_wxid=_contact_owner_wxid())
+        cached = _cache().get_message_by_id(str(msg_id), owner_wxid=_contact_owner_wxid())
     except Exception:
         return ""
     return str((cached or {}).get(_media_path_field(msg_type)) or "")
@@ -9801,6 +11231,7 @@ def _cached_media_path(msg_id: str, msg_type: str) -> str:
 @app.get("/api/media/file")
 async def serve_local_media(path: str, filename: str = "", download: bool = False):
     """Serve an already-known local media path through the authenticated backend."""
+    _require_owned_path(path)
     if not _nonempty_file(path):
         raise HTTPException(status_code=404, detail="File not found")
     return _media_file_response(path, filename, download=download)
@@ -9809,7 +11240,7 @@ async def serve_local_media(path: str, filename: str = "", download: bool = Fals
 @app.get("/api/media/db-image/{media_id}")
 async def serve_db_image(media_id: str):
     """Serve an image blob stored in the per-account SQLite cache."""
-    row = sqlite_cache.get_media_blob(media_id)
+    row = _cache().get_media_blob(media_id)
     if not row:
         return Response("not found", status_code=404)
     return Response(
@@ -9864,7 +11295,7 @@ def _image_file_response(path: str, msg_id: str = ""):
     response_path = _ensure_browser_image_file(path) or path
     if msg_id and path:
         try:
-            updated = sqlite_cache.update_image_path_by_msg_id(str(msg_id), response_path, owner_wxid=_contact_owner_wxid())
+            updated = _cache().update_image_path_by_msg_id(str(msg_id), response_path, owner_wxid=_contact_owner_wxid())
             if updated:
                 _log(f"[SQLITE_CACHE] image path cached for msg_id={msg_id}: {response_path}")
         except Exception as e:
@@ -10159,7 +11590,7 @@ async def _resolve_media_path(
     source_name = os.path.basename(str(params["filename"] or "media").replace("\\", "/"))
     extension = os.path.splitext(source_name)[1]
     cache_name = f"{msg_part}_{hashlib.sha256(params['fileid'].encode('utf-8')).hexdigest()[:12]}{extension}"
-    cache_path = os.path.abspath(os.path.join(_MEDIA_CACHE_DIR, cache_name))
+    cache_path = os.path.abspath(os.path.join(_scoped_dir(_MEDIA_CACHE_DIR), cache_name))
     if _nonempty_file(cache_path):
         _persist_media_path(msg_id, msg_type, cache_path)
         return cache_path, source_name
@@ -10202,6 +11633,7 @@ async def _resolve_media_path(
 @app.post("/api/media/resolve")
 async def resolve_media(request: Request):
     body = await request.json()
+    _require_owned_path(str(body.get('path') or ''))
     msg_type = str(body.get("msgtype", "") or "")
     path, filename = await _resolve_media_path(
         msg_id=str(body.get("msg_id", "") or ""),
@@ -10297,9 +11729,9 @@ def _decode_silk_to_wav(silk_data: bytes, msg_id: str = "") -> tuple[str, str]:
 
     digest = hashlib.sha256(silk_data).hexdigest()
     stem = f"{_safe_media_filename_part(msg_id, 'voice', 48)}_{digest[:16]}"
-    silk_path = os.path.join(_VOICE_CACHE_DIR, f"{stem}.silk")
-    pcm_path = os.path.join(_VOICE_CACHE_DIR, f"{stem}.pcm")
-    wav_path = os.path.join(_VOICE_CACHE_DIR, f"{stem}.wav")
+    silk_path = os.path.join(_scoped_dir(_VOICE_CACHE_DIR), f"{stem}.silk")
+    pcm_path = os.path.join(_scoped_dir(_VOICE_CACHE_DIR), f"{stem}.pcm")
+    wav_path = os.path.join(_scoped_dir(_VOICE_CACHE_DIR), f"{stem}.wav")
     if _nonempty_file(wav_path):
         return wav_path, silk_path
 
@@ -10336,7 +11768,7 @@ def _decode_silk_to_wav(silk_data: bytes, msg_id: str = "") -> tuple[str, str]:
 async def resolve_voice(request: Request):
     body = await request.json()
     msg_id = str(body.get("msg_id", "") or "")
-    cached = sqlite_cache.get_message_by_id(msg_id, owner_wxid=_contact_owner_wxid()) if msg_id else None
+    cached = _cache().get_message_by_id(msg_id, owner_wxid=_contact_owner_wxid()) if msg_id else None
     local_path = str(body.get("path", "") or (cached or {}).get("voice_path") or "")
     if _nonempty_file(local_path):
         if os.path.splitext(local_path)[1].lower() in {".wav", ".mp3", ".ogg", ".m4a", ".webm"}:
@@ -10463,7 +11895,7 @@ def _find_local_image(raw: bytes) -> tuple[list[bytes], list[bytes], str | None]
     # Check decoded .jpg files (same basename as Image .dat, but .jpg)
     for p in img_dat_paths:
         rel = p.decode('ascii', errors='replace')
-        dat_full = os.path.join(_WECHAT_FILES_BASE, rel)
+        dat_full = os.path.join(_wechat_files_base(), rel)
         jpg_full = os.path.splitext(dat_full)[0] + ".jpg"
         if os.path.exists(jpg_full) and os.path.getsize(jpg_full) > 0:
             return img_dat_paths, thumb_dat_paths, jpg_full
@@ -10474,11 +11906,11 @@ async def _try_decode_dat(dat_paths: list[bytes], label: str) -> str | None:
     """Try to decode .dat files via /DecodePic. Returns decoded path or None."""
     for p in dat_paths:
         rel = p.decode('ascii', errors='replace')
-        dat_full = os.path.join(_WECHAT_FILES_BASE, rel)
+        dat_full = os.path.join(_wechat_files_base(), rel)
         if not os.path.exists(dat_full):
             continue
         cache_name = os.path.splitext(os.path.basename(rel))[0]
-        decoded_path = os.path.join(_IMG_CACHE_DIR, f"{cache_name}.jpg")
+        decoded_path = os.path.join(_scoped_dir(_IMG_CACHE_DIR), f"{cache_name}.jpg")
         if os.path.exists(decoded_path) and os.path.getsize(decoded_path) > 0:
             return decoded_path
         try:
@@ -10539,6 +11971,51 @@ def _parse_img_xml_cdn_params(msg_xml: str) -> dict:
 
 @app.post("/api/media/download-image")
 async def download_image(request: Request):
+    try:
+        async with asyncio.timeout(110):
+            return await _download_image_payload(await request.json(), _request_agent_id(request))
+    except TimeoutError:
+        return {"error": "图片下载超时，请稍后点击重试"}
+
+
+async def _download_quoted_image_by_id(msg_id, cache_path, account_id):
+    """Use the documented svrid download API and cache only this image's result."""
+    key = f"quote:{account_id}:{msg_id}"
+    async with _inflight_cdn_lock:
+        future = _bucket('_inflight_cdn_downloads', _inflight_cdn_downloads).get(key)
+        owns = future is None or future.done()
+        if owns:
+            future = asyncio.get_running_loop().create_future()
+            _bucket('_inflight_cdn_downloads', _inflight_cdn_downloads)[key] = future
+    if not owns:
+        return await asyncio.wait_for(asyncio.shield(future), timeout=50)
+    path = ""
+    try:
+        async with _cdn_download_sem:
+            path = _cached_media_path(str(msg_id), "3")
+            if not _nonempty_file(path):
+                result = await wechat_api.down_file_or_pic(str(msg_id))
+                path = _cache_downloaded_image_file(_extract_download_save_path(result), cache_path)
+                if not path:
+                    for _ in range(40):
+                        path = _cached_media_path(str(msg_id), "3")
+                        if _nonempty_file(path):
+                            break
+                        await asyncio.sleep(0.25)
+        path = path if _nonempty_file(path) else ""
+        return path
+    except Exception as exc:
+        _log(f"[IMG_DL] quote svrid download failed msg_id={msg_id}: {type(exc).__name__}")
+        return ""
+    finally:
+        if not future.done():
+            future.set_result(path if _nonempty_file(path) else "")
+        async with _inflight_cdn_lock:
+            if _bucket('_inflight_cdn_downloads', _inflight_cdn_downloads).get(key) is future:
+                _bucket('_inflight_cdn_downloads', _inflight_cdn_downloads).pop(key, None)
+
+
+async def _download_image_payload(body: dict, account_id: str = ""):
     """Resolve a type-3 image.
 
     Local hook strategy:
@@ -10557,10 +12034,25 @@ async def download_image(request: Request):
       3. Wait for the callback to deliver the image
     """
     import hashlib
-    body = await request.json()
     bytes_extra_hex = body.get("bytes_extra_hex", "")
     msg_xml = body.get("msg_xml", "")
     msg_id = body.get("msg_id", "")  # MsgSvrID for matching callback
+    cached = _cache().get_message_by_id(str(msg_id), owner_wxid=_contact_owner_wxid()) if msg_id else None
+    if cached and str(cached.get("msgtype") or "") == "3":
+        cached_path = str(cached.get("img_path") or "")
+        if _nonempty_file(cached_path):
+            return _image_file_response(cached_path, str(msg_id))
+        msg_xml = msg_xml or str(cached.get("msg") or "")
+        bytes_extra_hex = bytes_extra_hex or str(cached.get("bytesExtraHex") or "")
+    # Quote image XML may contain only a placeholder; recover the original image.
+    parameters = _parse_img_xml_cdn_params(msg_xml)
+    if msg_id and not (parameters["decode_key"] and parameters["file_id"]):
+        try:
+            structure_xml, structure_type = _message_struct_content(await wechat_api.get_msg_struct(str(msg_id)))
+            if structure_xml and structure_type in {"", "3"} and "<img" in structure_xml:
+                msg_xml = structure_xml
+        except Exception as exc:
+            _log(f"[IMG_DL] original image structure unavailable msg_id={msg_id}: {type(exc).__name__}")
 
     raw = b""
     if bytes_extra_hex:
@@ -10575,18 +12067,23 @@ async def download_image(request: Request):
     file_id_hash = hashlib.md5(cdn_params["file_id"].encode("utf-8", errors="replace")).hexdigest()[:12]
     msg_part = _safe_media_filename_part(str(msg_id or ""), "nomsg", 64)
     download_filename = f"wximg_{msg_part}_{xml_hash[:12]}_{file_id_hash}.jpg"
-    cache_path = os.path.join(_IMG_CACHE_DIR, "cdn", download_filename)
-    legacy_cache_path = os.path.join(_IMG_CACHE_DIR, f"{xml_hash}.jpg")
+    cache_path = os.path.join(_scoped_dir(_IMG_CACHE_DIR), "cdn", download_filename)
+    legacy_cache_path = os.path.join(_scoped_dir(_IMG_CACHE_DIR), f"{xml_hash}.jpg")
     cache_candidates = (cache_path, legacy_cache_path)
 
     # Check the callback cache first. This is shared by Hook modes.
     if msg_id:
-        cb_dir = os.path.join(_IMG_CACHE_DIR, "callback")
+        cb_dir = os.path.join(_scoped_dir(_IMG_CACHE_DIR), "callback")
         safe_id = "".join(c for c in str(msg_id) if c.isalnum() or c in ("_", "-", "."))[:80]
         for ext in ("jpg", "png", "gif", "webp"):
             cached = os.path.join(cb_dir, f"{safe_id}.{ext}")
             if os.path.exists(cached) and os.path.getsize(cached) > 0:
                 return _image_file_response(cached, msg_id)
+
+    if body.get("quoted") and msg_id and config.IS_HOOK:
+        path = await _download_quoted_image_by_id(str(msg_id), cache_path, account_id)
+        if path:
+            return _image_file_response(path, str(msg_id))
 
     # Protocol mode: download and decrypt CDN data synchronously through the Go service.
     if config.IS_PROTOCOL:
@@ -10596,7 +12093,7 @@ async def download_image(request: Request):
         if not has_cdn_params:
             return {"error": "No CDN params in image XML for protocol download"}
 
-        account_id = _request_agent_id(request) or _active_agent_id or agent_manager.active_id() or ""
+        account_id = account_id or _current_agent_id() or agent_manager.active_id() or ""
         if not account_id:
             return {"error": "No active protocol session for image download"}
 
@@ -10639,7 +12136,7 @@ async def download_image(request: Request):
 
             # Also check callback cache by msgsvrid
             if msg_id:
-                cb_dir = os.path.join(_IMG_CACHE_DIR, "callback")
+                cb_dir = os.path.join(_scoped_dir(_IMG_CACHE_DIR), "callback")
                 safe_id = "".join(c for c in str(msg_id) if c.isalnum() or c in ("_", "-", "."))[:80]
                 for ext in ("jpg", "png", "gif", "webp"):
                     cached = os.path.join(cb_dir, f"{safe_id}.{ext}")
@@ -10648,7 +12145,7 @@ async def download_image(request: Request):
 
             # Reuse an in-flight remote Hook download for the same image.
             async with _inflight_cdn_lock:
-                existing = _inflight_cdn_downloads.get(xml_hash)
+                existing = _bucket('_inflight_cdn_downloads', _inflight_cdn_downloads).get(xml_hash)
                 if existing and not existing.done():
                     _log(f"[IMG_DL] Joining inflight download for {xml_hash[:12]}...")
                     shared_fut = existing
@@ -10670,7 +12167,7 @@ async def download_image(request: Request):
             loop = asyncio.get_event_loop()
             inflight_fut: asyncio.Future = loop.create_future()
             async with _inflight_cdn_lock:
-                _inflight_cdn_downloads[xml_hash] = inflight_fut
+                _bucket('_inflight_cdn_downloads', _inflight_cdn_downloads)[xml_hash] = inflight_fut
 
             # Register pending download so callback handler can fulfill it.
             # BOTH keys share the SAME Future so either match resolves the wait.
@@ -10724,13 +12221,13 @@ async def download_image(request: Request):
                 if msg_id:
                     await _cleanup_cdn_pending(f"msgsvrid:{msg_id}")
                 async with _inflight_cdn_lock:
-                    _inflight_cdn_downloads.pop(xml_hash, None)
+                    _bucket('_inflight_cdn_downloads', _inflight_cdn_downloads).pop(xml_hash, None)
                 if not inflight_fut.done():
                     inflight_fut.set_exception(asyncio.TimeoutError("CDN callback timed out"))
 
             # Last resort: check callback cache (callback may have arrived late)
             if msg_id:
-                cb_dir2 = os.path.join(_IMG_CACHE_DIR, "callback")
+                cb_dir2 = os.path.join(_scoped_dir(_IMG_CACHE_DIR), "callback")
                 safe_id2 = "".join(c for c in str(msg_id) if c.isalnum() or c in ("_", "-", "."))[:80]
                 for ext in ("jpg", "png", "gif", "webp"):
                     cached = os.path.join(cb_dir2, f"{safe_id2}.{ext}")
@@ -10870,7 +12367,7 @@ async def serve_sticker(md5: str, cdnurl: str = "", thumburl: str = ""):
 
     # 1. Check file cache
     for ext in ("gif", "png", "jpg", "webp"):
-        cached = os.path.join(_STICKER_CACHE_DIR, f"{safe_md5}.{ext}")
+        cached = os.path.join(_scoped_dir(_STICKER_CACHE_DIR), f"{safe_md5}.{ext}")
         if os.path.exists(cached) and os.path.getsize(cached) > 0:
             return FileResponse(cached, media_type=f"image/{ext}")
 
@@ -10882,7 +12379,7 @@ async def serve_sticker(md5: str, cdnurl: str = "", thumburl: str = ""):
         if len(blob) < 10:
             return None
         ext = _detect_image_ext(blob)
-        cache_path = os.path.join(_STICKER_CACHE_DIR, f"{safe_md5}.{ext}")
+        cache_path = os.path.join(_scoped_dir(_STICKER_CACHE_DIR), f"{safe_md5}.{ext}")
         with open(cache_path, "wb") as f:
             f.write(blob)
         _log(f"[STICKER] Cached from {source}: {safe_md5}.{ext} ({len(blob)}b)")
@@ -10935,7 +12432,7 @@ async def serve_sticker(md5: str, cdnurl: str = "", thumburl: str = ""):
             if resp.status_code == 200 and len(resp.content) > 100:
                 blob = resp.content
                 ext = _detect_image_ext(blob)
-                cache_path = os.path.join(_STICKER_CACHE_DIR, f"{safe_md5}.{ext}")
+                cache_path = os.path.join(_scoped_dir(_STICKER_CACHE_DIR), f"{safe_md5}.{ext}")
                 with open(cache_path, "wb") as f:
                     f.write(blob)
                 _log(f"[STICKER] Cached from {url_label}: {safe_md5}.{ext} ({len(blob)}b)")
@@ -10988,7 +12485,7 @@ async def serve_avatar(wxid: str):
     """Serve a cached avatar image for a wxid.
     If not cached yet, fetches via GetHeadIMG and caches to disk."""
     safe_name = "".join(c for c in wxid if c.isalnum() or c in "_-") + ".jpg"
-    cache_path = os.path.join(_AVATAR_CACHE_DIR, safe_name)
+    cache_path = os.path.join(_scoped_dir(_AVATAR_CACHE_DIR), safe_name)
 
     # Serve from cache
     if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
@@ -11019,7 +12516,7 @@ async def get_group_member_names(gid: str):
     Designed to be called on group enter for nickname resolution.
     Results are cached for 5 minutes to avoid repeated 3s+ API calls."""
     now = time.time()
-    cached = _GROUP_NAMES_CACHE.get(gid)
+    cached = _bucket('_GROUP_NAMES_CACHE', _GROUP_NAMES_CACHE).get(gid)
     if cached and (now - cached[1]) < _GROUP_NAMES_CACHE_TTL:
         _log(f"[GROUP_NAMES] {gid}: cache hit ({len(cached[0])} members)")
         return {"names": cached[0]}
@@ -11055,7 +12552,7 @@ async def get_group_member_names(gid: str):
                 _log(f"[GROUP_NAMES] fallback failed for {wxid}: {e}")
 
     if result:
-        _GROUP_NAMES_CACHE[gid] = (result, now)
+        _bucket('_GROUP_NAMES_CACHE', _GROUP_NAMES_CACHE)[gid] = (result, now)
     _log(f"[GROUP_NAMES] {gid}: resolved {len(result)} member names")
     return {"names": result}
 
@@ -11137,14 +12634,14 @@ def _frontend_group_members(members: dict[str, dict]) -> dict[str, dict]:
     }
 
 
-async def _cache_group_member_details(gid: str, raw_members: list[dict]) -> dict[str, dict]:
-    owner_wxid = _contact_owner_wxid()
+async def _cache_group_member_details(gid: str, raw_members: list[dict], *, owner_wxid: str = "") -> dict[str, dict]:
+    owner_wxid = owner_wxid or _contact_owner_wxid()
     now = time.time()
     normalized: dict[str, dict] = {}
     contact_updates: dict[str, dict] = {}
     async with _CONTACT_PROFILE_LOCK:
         async with _CONTACT_BRIEF_LOCK:
-            avatar_urls = app_state.setdefault("avatar_urls", {})
+            avatar_urls = _state().setdefault("avatar_urls", {})
             for member in raw_members:
                 entry = _normalize_group_member(member, gid)
                 wxid = str(entry.get("wxid") or "")
@@ -11157,7 +12654,7 @@ async def _cache_group_member_details(gid: str, raw_members: list[dict]) -> dict
                 _CONTACT_BRIEF_CACHE[cache_key] = {"name": name, "avatar": avatar, "ts": now}
                 if avatar:
                     avatar_urls[wxid] = avatar
-                message_store.set_contact(wxid, name=name, avatar=avatar)
+                _messages().set_contact(wxid, name=name, avatar=avatar)
                 contact_updates[wxid] = {
                     "wxid": wxid,
                     "name": name,
@@ -11167,8 +12664,8 @@ async def _cache_group_member_details(gid: str, raw_members: list[dict]) -> dict
                 }
 
     if normalized:
-        sqlite_cache.upsert_group_members(gid, list(normalized.values()), owner_wxid=owner_wxid)
-        sqlite_cache.upsert_contacts(contact_updates, owner_wxid=owner_wxid)
+        _cache().upsert_group_members(gid, list(normalized.values()), owner_wxid=owner_wxid)
+        _cache().upsert_contacts(contact_updates, owner_wxid=owner_wxid)
     return normalized
 
 
@@ -11221,7 +12718,7 @@ async def _fallback_group_member_details(gid: str) -> dict[str, dict]:
 async def get_group_member_details(gid: str, force: bool = False):
     """Fetch names + avatar URLs for all members of a group and cache by owner wxid."""
     owner_wxid = _contact_owner_wxid()
-    cached = sqlite_cache.get_group_members(gid, owner_wxid=owner_wxid)
+    cached = _cache().get_group_members(gid, owner_wxid=owner_wxid)
     if cached and not force and all(entry.get("avatar") for entry in cached.values()):
         _log(f"[GROUP_DETAILS] {gid}: cache hit ({len(cached)} members)")
         return {"members": _frontend_group_members(cached), "cached": True}

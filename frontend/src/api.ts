@@ -3,20 +3,41 @@ import type { AiProfile, McpConnection, SmartReplyAiTask, SmartReplyConfig } fro
 const BASE = "";  // Same origin via Vite proxy
 export const ACCESS_KEY_STORAGE = "wechat_web_access_key";
 export const ACTIVE_AGENT_STORAGE = "wechat_web_active_agent_id";
+const USER_ID_STORAGE = 'wechat_web_user_id';
+// Each tab keeps its credential; logging into another key in a second tab cannot switch this tab's API requests.
+if (window.sessionStorage.getItem(ACCESS_KEY_STORAGE) === null && window.localStorage.getItem(ACCESS_KEY_STORAGE)) {
+  window.sessionStorage.setItem(ACCESS_KEY_STORAGE, window.localStorage.getItem(ACCESS_KEY_STORAGE)!);
+  window.sessionStorage.setItem(USER_ID_STORAGE, window.localStorage.getItem(USER_ID_STORAGE) || '');
+}
+export const userStorageKey = (name: string) => `${name}:${window.sessionStorage.getItem(USER_ID_STORAGE) || 'unverified'}`;
 
 let activeAgentIdOverride = "";
 
-export const getAccessKey = () => window.localStorage.getItem(ACCESS_KEY_STORAGE) || "";
-export const setAccessKey = (key: string) => window.localStorage.setItem(ACCESS_KEY_STORAGE, key);
-export const clearAccessKey = () => window.localStorage.removeItem(ACCESS_KEY_STORAGE);
-export const getActiveAgentId = () => activeAgentIdOverride || window.localStorage.getItem(ACTIVE_AGENT_STORAGE) || "";
+export const getAccessKey = () => window.sessionStorage.getItem(ACCESS_KEY_STORAGE) || "";
+export const setAccessKey = (key: string) => {
+  if (key !== getAccessKey()) {
+    activeAgentIdOverride = "";
+    window.localStorage.removeItem('wechat_web_user_id');
+    window.sessionStorage.removeItem(USER_ID_STORAGE);
+  }
+  window.localStorage.setItem(ACCESS_KEY_STORAGE, key);
+  window.sessionStorage.setItem(ACCESS_KEY_STORAGE, key);
+};
+export const clearAccessKey = () => {
+  window.localStorage.removeItem(ACCESS_KEY_STORAGE);
+  window.localStorage.removeItem('wechat_web_user_id');
+  window.sessionStorage.setItem(ACCESS_KEY_STORAGE, '');
+  window.sessionStorage.removeItem(USER_ID_STORAGE);
+  activeAgentIdOverride = "";
+};
+export const getActiveAgentId = () => activeAgentIdOverride || window.localStorage.getItem(userStorageKey(ACTIVE_AGENT_STORAGE)) || "";
 export const setActiveAgentId = (agentId: string) => {
   activeAgentIdOverride = agentId;
-  window.localStorage.setItem(ACTIVE_AGENT_STORAGE, agentId);
+  window.localStorage.setItem(userStorageKey(ACTIVE_AGENT_STORAGE), agentId);
 };
 export const clearActiveAgentId = () => {
   activeAgentIdOverride = "";
-  window.localStorage.removeItem(ACTIVE_AGENT_STORAGE);
+  window.localStorage.removeItem(userStorageKey(ACTIVE_AGENT_STORAGE));
 };
 
 export const authQuery = () => {
@@ -59,12 +80,18 @@ export async function fetchJSON(url: string, options?: RequestInit, timeoutMs = 
   return res.json();
 }
 
-export const loginWithKey = (key: string) =>
-  fetchJSON("/api/auth/login", {
+export const loginWithKey = async (key: string) => {
+  const result = await fetchJSON("/api/auth/login", {
     method: "POST",
     body: JSON.stringify({ key }),
     headers: { "Content-Type": "application/json" },
   });
+  if (result.ok && result.user_id) {
+    window.localStorage.setItem(USER_ID_STORAGE, result.user_id);
+    window.sessionStorage.setItem(USER_ID_STORAGE, result.user_id);
+  }
+  return result;
+};
 
 export type InitialSetupMode = 1 | 2 | 3;
 
@@ -86,14 +113,39 @@ export const saveInitialSetup = (payload: InitialSetupPayload) =>
     body: JSON.stringify(payload),
   });
 
-export const getAccounts = () => fetchJSON("/api/accounts");
+export const getAccounts = async () => {
+  if (!window.sessionStorage.getItem(USER_ID_STORAGE) && getAccessKey()) await loginWithKey(getAccessKey());
+  return fetchJSON("/api/accounts");
+};
 export const activateAccount = (agentId: string) =>
   fetchJSON("/api/accounts/activate", {
     method: "POST",
     body: JSON.stringify({ agent_id: agentId }),
   });
 
+export const logoutHookAccount = (accountId: string) => fetchJSON(`/api/accounts/${encodeURIComponent(accountId)}/logout`, { method: 'POST' }, 60_000);
+export const deleteHookAccount = (accountId: string) => fetchJSON(`/api/accounts/${encodeURIComponent(accountId)}`, { method: 'DELETE', body: JSON.stringify({ confirmed: true }) }, 60_000);
+
 // ─── Protocol Login ───────────────────────────────────────────────
+
+export type HookStartWechatPayload = {
+  instance_id?: string;
+  rdv?: string;
+  restart?: boolean;
+  new?: boolean;
+  proxy?: { enabled: boolean; ip: string; port: string; username: string; password: string };
+};
+
+export const getHookLoginSettings = (instanceId = '') => fetchJSON(`/api/hook/login-settings${instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : ''}`);
+export const startHookWechat = (payload: HookStartWechatPayload) => fetchJSON("/api/hook/start-wechat", {
+  method: "POST", body: JSON.stringify(payload),
+}, 60_000);
+export const getHookLoginStatus = (instanceId: string) =>
+  fetchJSON(`/api/hook/instances/${encodeURIComponent(instanceId)}/status`);
+export const getHookLoginQRCode = (instanceId: string, refresh = false) =>
+  fetchJSON(`/api/hook/instances/${encodeURIComponent(instanceId)}/qrcode`, {
+    method: "POST", body: JSON.stringify({ refresh }),
+  });
 
 export type ProtocolProxyConfig = {
   Proxy_Type?: string;
@@ -654,12 +706,12 @@ export const getGifUrl = (msgXml: string) =>
     body: JSON.stringify({ msg_xml: msgXml }),
   });
 
-export const downloadImage = async (bytesExtraHex: string, msgXml: string, msgId?: string): Promise<string> => {
+export const downloadImage = async (bytesExtraHex: string, msgXml: string, msgId?: string, quoted = false): Promise<string> => {
   const res = await fetchWithTimeout("/api/media/download-image", {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ bytes_extra_hex: bytesExtraHex, msg_xml: msgXml, msg_id: msgId || "" }),
-  }, 60_000);
+    body: JSON.stringify({ bytes_extra_hex: bytesExtraHex, msg_xml: msgXml, msg_id: msgId || "", quoted }),
+  }, 120_000);
   if (!res.ok) return "";
   const contentType = res.headers.get("content-type") || "";
   if (contentType.startsWith("image") || contentType.includes("octet-stream")) {

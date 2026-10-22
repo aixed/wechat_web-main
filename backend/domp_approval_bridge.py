@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from domp_identifier import identifiers_in, is_ticket_identifier, BATCH_IDENTIFIER_PROMPT
 
 from domp_bridge import (SQL_START, split_reply, write_capability_question,
     write_meta_discussion)
@@ -15,9 +16,12 @@ APPROVAL_REPLY_PREFIX = "数据运维审核结果"
 APPROVAL_PROMPT = """你是数据运维审核 Agent，只识别当前消息明确要求审核已有数据运维单的指令。
 “审核一下 41366 运维单”“帮我审批数据运维单41366”“把这张运维单审核通过”属于只审核，输出 action="approve"；“审核和执行一下运维单”“审核并执行 41366”“把这张单审批后执行”属于单张审核后执行，输出 action="approve_execute"。
 输入可包含 current_message 和 query_history。历史仅为同一账号、同一群、同一发送人七天内经工具验证的查询结果；当前消息没有单号时，程序只允许承接最近一轮待审核清单中的唯一单据。模型不得从历史生成或猜测编号：当前消息没有明确编号时 identifier 必须为空。
-明确请求使用 matched=true、confidence>=90，result 为 JSON 对象编码成的字符串，字段为 action 和 identifier。当前消息有唯一编号时原样提取五位需求名称或完整工作编号；没有则为空。reply 不声称审核或执行成功。
+明确请求使用 matched=true、confidence>=90，result 为 JSON 对象编码成的字符串，字段为 action 和 identifier。当前消息有唯一编号时原样提取四位线下编号、五位需求名称或完整工作编号；没有则为空。reply 不声称审核或执行成功。
 待审核查询、审核了吗、审核结果如何、普通陈述、否定、未来计划、引用示例、SQL 原文、填报请求均不匹配。“都/全部/所有单据审核并执行”由批量流程处理，本 Agent 不匹配；单纯要求批量审核也不匹配。
 程序会先重新读取当前待审核清单并精确核对稳定 work_id、work_num。只审核仅调用 approve_data_maintenance；审核后执行只有在返回“审核通过”后才调用 execute_data_maintenance。MCP 端继续检查系统内申请 SQL 风险及防重记录，不 force、不重试写操作。回复真实审核状态；若执行则同时回复逐条影响行数、耗时和异常。页面 Skill 测试仅查询定位，不审核、不执行、不发送微信。"""
+
+
+APPROVAL_PROMPT += BATCH_IDENTIFIER_PROMPT
 
 
 def approval_candidate(source):
@@ -35,8 +39,8 @@ def approval_candidate(source):
         return False
     if not re.search(r"审核|审批", source):
         return False
-    forward = r"(?:审核|审批)(?:通过)?(?:一下|下)?\s*(?:(?:并|和|后)\s*执行(?:一下|下)?\s*)?(?:(?:数据\s*)?运维|需求|单据?|(?:xzsb-)?\d{5,32})"
-    reverse = r"(?:(?:数据\s*)?运维|需求|单据?|(?:xzsb-)?\d{5,32}).{0,40}(?:审核|审批)(?:通过|一下|下)?(?:\s*(?:并|和|后)\s*执行(?:一下|下)?)?"
+    forward = r"(?:审核|审批)(?:通过)?(?:一下|下)?\s*(?:(?:并|和|后)\s*执行(?:一下|下)?\s*)?(?:(?:数据\s*)?运维|需求|单据?|(?:xzsb-)?\d{4,32})"
+    reverse = r"(?:(?:数据\s*)?运维|需求|单据?|(?:xzsb-)?\d{4,32}).{0,40}(?:审核|审批)(?:通过|一下|下)?(?:\s*(?:并|和|后)\s*执行(?:一下|下)?)?"
     return bool(re.search(forward, source) or re.search(reverse, source))
 
 
@@ -52,7 +56,7 @@ def approval_target(source, analysis, history):
     expected_action = "approve_execute" if re.search(r"执行", str(source)) else "approve"
     if not isinstance(parsed, dict) or parsed.get("action") != expected_action:
         raise ValueError("未识别到明确且一致的审核动作，未处理。")
-    identifiers = set(re.findall(r"(?<!\d)(\d{5,32})(?!\d)", str(source)))
+    identifiers = identifiers_in(source, strict=True)
     if len(identifiers) > 1:
         raise ValueError("请指定唯一的需求编号，未审核。")
     model_identifier = re.sub(r"^xzsb-", "", str(parsed.get("identifier") or ""), flags=re.I)
@@ -98,7 +102,7 @@ async def approve_target(action, target, call_tool, *, dry_run=False):
     identifier = target["identifier"]
     matches = [item for item in pending["items"] if (
         str(item.get("work_num") or "") == pinned_num if pinned_num else
-        str(item.get("identifier") or item.get("work_name") or "") == identifier if len(identifier) == 5 else
+        str(item.get("identifier") or item.get("work_name") or "") == identifier if is_ticket_identifier(identifier) else
         identifier in {str(item.get("work_num") or ""), str(item.get("work_id") or "")})]
     if len(matches) > 1:
         raise ValueError("当前存在多条同名待审核需求，请提供完整工作编号。")

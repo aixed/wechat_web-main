@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from domp_identifier import identifiers_in, is_ticket_identifier, TICKET_PATTERN, BATCH_IDENTIFIER_PROMPT
 
 from domp_bridge import (SQL_START, split_reply, write_capability_question,
     write_meta_discussion)
@@ -18,6 +19,9 @@ EXECUTION_PROMPT = """你是数据运维执行 Agent，仅识别当前消息明�
 单号缺省时程序只允许最近一轮待执行查询中唯一单据，绑定其稳定工作编号，执行前重新核对当前清单；零条、多条、过期上下文或不明确目标需要补充单号。明确当前编号优先。
 “执行了吗/有没有执行/执行结果如何/执行成功了吗/待执行呢”是只读查询，matched=false。普通聊天、已经执行的陈述、引用或转述别人的指令、否定执行、未来计划、SQL 原文、单纯批量执行、单纯批量审核、填报指令均不匹配。只有同时明确“全部/都”和“审核/审批后执行”才允许批量流程。
 程序将单据执行精确传到 execute_data_maintenance；批量审核执行按固定目标依次调用 approve_data_maintenance 和 execute_data_maintenance。MCP 端检查实际申请 SQL 风险并防重。不能填报、force 或重试写操作。超时只做只读核对，未知条数保持未知，0 保留。回复原群发送人真实逐条审核、执行状态、影响条数、耗时和异常。"""
+
+
+EXECUTION_PROMPT += BATCH_IDENTIFIER_PROMPT
 
 
 def approval_execution_candidate(source):
@@ -49,7 +53,7 @@ def execution_candidate(source):
     request = r"(?:帮我|帮忙|替我|麻烦(?:你|您)?|劳驾(?:你|您)?|请(?:你|您)?)\s*"
     clause_start = r"(?:^|[，,。；;])\s*"
     modifiers = r"(?:(?:先|再|现在|尽快|马上|直接|把|将)\s*)*"
-    target = r"(?:(?:需求|单号|数据运维(?:单)?|单据)?\s*(?:xzsb-)?\d{5,32}\s*|(?:这|那)(?:条|单|个)(?:需求|单据)?\s*)?"
+    target = r"(?:(?:需求|单号|数据运维(?:单)?|单据)?\s*(?:xzsb-)?(?:" + TICKET_PATTERN + r"|\d{6,32})\s*|(?:这|那)(?:条|单|个)(?:需求|单据)?\s*)?"
     return bool(re.search(r"(?:" + clause_start + r"|" + request + r")" + modifiers + target + r"(?:的)?\s*(?:数据运维)?执行", source))
 
 
@@ -104,7 +108,7 @@ def context_execution_target(history):
         # Legacy sessions contain the program's canonical reply, not the model
         # output. Pin its work number; never substitute a fresh singleton.
         answer = str(last.get("answer") or "")
-        rows = re.findall(r"^\d+\. (\d{5})；工作编号 (\d{6,32})；[^\n]+$", answer, re.M)
+        rows = re.findall(r"^\d+\. (" + TICKET_PATTERN + r")；工作编号 (\d{6,32})；[^\n]+$", answer, re.M)
         if answer.startswith(QUERY_REPLY_PREFIX) and re.search(r"目前待执行需求：1 条(?:\n|$)", answer) and len(rows) == 1:
             targets = {"count": 1, "items": [{"identifier": rows[0][0], "work_num": rows[0][1]}]}
     if not isinstance(targets, dict) or targets.get("count") != 1 or len(targets.get("items") or []) != 1:
@@ -128,7 +132,7 @@ def execution_target(source, analysis, history):
             parsed = None
     if not isinstance(parsed, dict) or parsed.get("action") != "execute":
         raise ValueError("未识别到明确执行指令，请说明：执行 41184。")
-    ids = set(re.findall(r"(?<!\d)(\d{5,32})(?!\d)", str(source)))
+    ids = identifiers_in(source, strict=True)
     if len(ids) > 1:
         raise ValueError("请指定唯一的需求编号，不支持批量执行。")
     if ids:
@@ -167,7 +171,7 @@ async def execute_target(target, call_tool, *, dry_run=False):
         raise ValueError("未取得待执行清单，未执行。")
     matches = [item for item in pending["items"] if (
         str(item.get("work_num") or "") == pinned_num if pinned_num else
-        str(item.get("work_name") or "") == identifier if len(identifier) == 5 else
+        str(item.get("work_name") or "") == identifier if is_ticket_identifier(identifier) else
         str(item.get("work_num") or "") == identifier)]
     if len(matches) > 1:
         raise ValueError("当前存在多条同名需求，请指定完整工作编号，未执行。")

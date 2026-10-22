@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import uuid
 from typing import Any
 
 import httpx
@@ -10,6 +12,14 @@ import httpx
 
 class McpServiceError(RuntimeError):
     pass
+
+
+def requires_bearer_token(url: str) -> bool:
+    try:
+        parsed = httpx.URL(str(url or "").strip())
+    except (httpx.InvalidURL, ValueError):
+        return False
+    return parsed.host in {"59.217.45.7", "10.11.0.37"} and parsed.port == 5222
 
 
 def _sse_payloads(text: str) -> list[dict[str, Any]]:
@@ -79,6 +89,7 @@ def _structured_tool_result(result: dict[str, Any], text: str) -> Any:
 
 
 class McpService:
+    progress_poll_seconds = 5.0
     def __init__(self, *, timeout_seconds: float = 120) -> None:
         self.timeout_seconds = max(5.0, float(timeout_seconds))
         self._client = httpx.AsyncClient(timeout=self.timeout_seconds)
@@ -107,15 +118,24 @@ class McpService:
         token: str = "",
         session_id: str = "",
         request_id: int | None,
+        timeout_seconds: float | None = None,
     ) -> tuple[dict[str, Any], str]:
+        if requires_bearer_token(url) and not str(token or "").strip():
+            raise McpServiceError("数据运维 MCP 需要 Bearer Token，请在「AI 与 MCP 设置」填写与服务器 api_token 一致的调用令牌")
         try:
+            request_options = {"timeout": httpx.Timeout(timeout_seconds)} if timeout_seconds is not None else {}
             response = await self._client.post(
                 url,
                 headers=self._headers(token, session_id),
                 json=payload,
+                **request_options,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {401, 403}:
+                raise McpServiceError(
+                    f"MCP HTTP {exc.response.status_code}：调用令牌缺失或无效，请检查 Bearer Token 是否与服务器 api_token 一致"
+                ) from exc
             detail = exc.response.text.strip()[:500]
             raise McpServiceError(
                 f"MCP HTTP {exc.response.status_code}: {detail or exc.response.reason_phrase}"
@@ -205,6 +225,7 @@ class McpService:
             token=token,
             session_id=session_id,
             request_id=3,
+            timeout_seconds=1800 if normalized_tool == "query_operation_tickets" else None,
         )
         result = message.get("result")
         if not isinstance(result, dict):
@@ -217,3 +238,31 @@ class McpService:
             "structured": _structured_tool_result(result, text),
             "raw": result,
         }
+
+    async def call_tool_with_progress(self, *, url, tool_name, arguments, token="", progress_callback):
+        """Send the query once; independently poll its read-only progress record."""
+        if tool_name != "query_operation_tickets":
+            return await self.call_tool(url=url, tool_name=tool_name, arguments=arguments, token=token)
+        query_id = "query:" + uuid.uuid4().hex
+        pending = asyncio.create_task(self.call_tool(url=url, token=token, tool_name=tool_name,
+            arguments={**arguments, "query_id": query_id}))
+        try:
+            while not pending.done():
+                done, _ = await asyncio.wait({pending}, timeout=self.progress_poll_seconds)
+                if done:
+                    break
+                try:
+                    progress = await asyncio.wait_for(self.call_tool(url=url, token=token,
+                        tool_name="get_operation_ticket_query_progress", arguments={"query_id": query_id}),
+                        timeout=min(10.0, self.timeout_seconds))
+                    snapshot = progress.get("structured")
+                    if not isinstance(snapshot, dict) or snapshot.get("query_id") != query_id:
+                        raise McpServiceError("查询进度标识不一致")
+                except (McpServiceError, asyncio.TimeoutError) as exc:
+                    snapshot = {"phase": "unavailable", "status": "unavailable", "error": str(exc)}
+                progress_callback(snapshot)
+            return await pending
+        finally:
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)

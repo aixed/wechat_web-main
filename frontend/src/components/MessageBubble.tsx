@@ -33,13 +33,17 @@ function parseRefermsg(xml: string) {
     const title = doc.querySelector("title")?.textContent || "";
     const refermsg = doc.querySelector("refermsg");
     if (!refermsg) return { title, refer: null };
+    const contentNode = refermsg.querySelector("content");
+    const content = contentNode?.children.length
+      ? Array.from(contentNode.children).map((child) => new XMLSerializer().serializeToString(child)).join("")
+      : contentNode?.textContent || "";
     return {
       title,
       refer: {
         type: refermsg.querySelector("type")?.textContent || "",
         svrid: refermsg.querySelector("svrid")?.textContent || "",
         displayname: refermsg.querySelector("displayname")?.textContent || "",
-        content: refermsg.querySelector("content")?.textContent || "",
+        content,
       },
     };
   } catch {
@@ -539,46 +543,60 @@ function renderTextWithLinks(text: string, isSelf: boolean, mobile: boolean, dar
   return nodes.length > 0 ? nodes : replaceWechatEmojis(normalized);
 }
 
-function ChatImage({ message, onEnlarge, compact = false }: {
+function ChatImage({ message, onEnlarge, compact = false, quoted = false }: {
   message: ChatMessage;
   onEnlarge: (url: string) => void;
   compact?: boolean;
+  quoted?: boolean;
 }) {
   const [src, setSrc] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
+  const [retryToken, setRetryToken] = useState(0);
 
   useEffect(() => {
     if (message.db_image_id) {
       setSrc(getDbImageUrl(message.db_image_id));
+      setLoading(false);
+      setFailed(false);
       return;
     }
     if (message.img_path) {
       setSrc(getImageUrl(message.img_path));
+      setLoading(false);
+      setFailed(false);
       return;
     }
     // DB image: try local file via BytesExtraHex, then fall back to CDN /download.
     const hexData = message.bytesExtraHex || "";
     const msgXml = message.msg || "";
-    if (!hexData && !msgXml) {
+    if (!hexData && !msgXml && !message.id) {
       setFailed(true);
+      setLoading(false);
       return;
     }
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let objectUrl = "";
+    setSrc("");
     setLoading(true);
     setFailed(false);
-    downloadImage(hexData, msgXml, message.id).then((url) => {
-      if (cancelled) return;
+    downloadImage(hexData, msgXml, message.id, quoted).then((url) => {
+      if (cancelled) {
+        if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+        return;
+      }
       if (url) {
+        objectUrl = url;
         setSrc(url);
         setLoading(false);
       } else {
         // Download returned empty — schedule auto-retry if attempts remain
-        if (retryCount < IMAGE_RETRY_DELAYS.length) {
+        if (!quoted && retryCount < IMAGE_RETRY_DELAYS.length) {
           const delay = IMAGE_RETRY_DELAYS[retryCount];
           setLoading(true);
-          setTimeout(() => {
+          retryTimer = setTimeout(() => {
             if (!cancelled) setRetryCount((c) => c + 1);
           }, delay * 1000);
         } else {
@@ -588,9 +606,9 @@ function ChatImage({ message, onEnlarge, compact = false }: {
       }
     }).catch(() => {
       if (cancelled) return;
-      if (retryCount < IMAGE_RETRY_DELAYS.length) {
+      if (!quoted && retryCount < IMAGE_RETRY_DELAYS.length) {
         const delay = IMAGE_RETRY_DELAYS[retryCount];
-        setTimeout(() => {
+        retryTimer = setTimeout(() => {
           if (!cancelled) setRetryCount((c) => c + 1);
         }, delay * 1000);
       } else {
@@ -598,8 +616,12 @@ function ChatImage({ message, onEnlarge, compact = false }: {
         setLoading(false);
       }
     });
-    return () => { cancelled = true; };
-  }, [message.db_image_id, message.img_path, message.bytesExtraHex, message.msg, retryCount]);
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (objectUrl.startsWith("blob:")) URL.revokeObjectURL(objectUrl);
+    };
+  }, [message.id, message.db_image_id, message.img_path, message.bytesExtraHex, message.msg, retryCount, retryToken, quoted]);
 
   if (loading) {
     const retryMsg = retryCount > 0 ? ` (重试 ${retryCount}/${IMAGE_RETRY_DELAYS.length})` : "";
@@ -609,7 +631,7 @@ function ChatImage({ message, onEnlarge, compact = false }: {
     return (
       <div
         className="text-[#888] text-[13px] cursor-pointer hover:text-[#aaa]"
-        onClick={() => { setRetryCount(0); setFailed(false); setLoading(true); }}
+        onClick={() => { setRetryCount(0); setFailed(false); setLoading(true); setRetryToken((value) => value + 1); }}
         title="点击重试"
       >
         [图片加载失败 - 点击重试]
@@ -819,7 +841,7 @@ export default function MessageBubble({
 
           if (appType === "57") {
             const parsed = parseRefermsg(message.msg);
-            const quotedImage = parsed.refer?.type === "3" && Boolean(parsed.refer.content);
+            const quotedImage = parsed.refer?.type === "3";
             const quotedFile = parsed.refer?.content ? parseFileAppMessage(parsed.refer.content) : null;
             return (
               <div className="min-w-[220px] max-w-[420px]">
@@ -847,9 +869,10 @@ export default function MessageBubble({
                         <span className="font-medium shrink-0 self-start">{parsed.refer.displayname}:</span>
                         <ChatImage
                           compact
+                          quoted
                           message={{
                             ...message,
-                            id: parsed.refer.svrid || message.id,
+                            id: parsed.refer.svrid,
                             msgtype: "3",
                             msg: parsed.refer.content,
                             bytesExtraHex: "",

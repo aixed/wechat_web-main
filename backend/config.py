@@ -95,7 +95,8 @@ _prefix = LOGIN_MODE  # e.g. "local_hook", "remote_hook", "remote_protocol"
 
 HOOK_HOST = str(_cfg.get(f"{_prefix}_host", "127.0.0.1"))
 HOOK_PORT = int(_cfg.get(f"{_prefix}_api_port", 30001))
-MGR_PORT = int(_cfg.get(f"{_prefix}_mgr_port", 29998 if IS_HOOK else 29999))
+MGR_PORT = int(_cfg.get(f"{_prefix}_mgr_port", 29999))
+HOOK_WECHAT_PATH = str(_cfg.get(f"{_prefix}_wechat_path", _cfg.get("wechat_path", "")) or "")
 
 # ─── Public IP & RDV ──────────────────────────────────────────────
 
@@ -138,6 +139,7 @@ AI_API_KEY = ""
 AI_MODEL = ""
 AI_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("ai_timeout_seconds", 60)))
 AI_MAX_CONCURRENCY = max(1, min(20, int(_cfg.get("ai_max_concurrency", 3))))
+DEFAULT_MCP_URL = "http://59.217.45.7:5222/mcp"
 MCP_CONNECTIONS: list[dict[str, Any]] = []
 MCP_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("mcp_timeout_seconds", 600)))
 
@@ -225,10 +227,10 @@ def _resolve_mcp_connections(document: dict[str, Any]) -> list[dict[str, Any]]:
             if connection:
                 connections.append(connection)
     if not connections and raw_connections is None:
-        default_url = str(os.environ.get("MCP_URL") or "http://127.0.0.1:8765/mcp").strip().rstrip("/")
+        default_url = str(os.environ.get("MCP_URL") or DEFAULT_MCP_URL).strip().rstrip("/")
         connections.append({
             "id": "local_mcp",
-            "name": "本地 MCP",
+            "name": "远程 MCP",
             "url": default_url,
             "token": str(os.environ.get("MCP_TOKEN") or "").strip(),
             "enabled": True,
@@ -279,7 +281,7 @@ _apply_ai_settings(_cfg)
 
 
 def reload_ai_settings() -> dict:
-    """Reload AI settings from config.yaml without restarting the backend."""
+    """Reload AI and MCP settings from config.yaml without restarting the backend."""
     document = _load_yaml()
     return _apply_ai_settings(document)
 
@@ -545,8 +547,8 @@ def _load_initial_config_template() -> Any:
         "mcp_connections": [
             {
                 "id": "local_mcp",
-                "name": "本地 MCP",
-                "url": "http://127.0.0.1:8765/mcp",
+                "name": "远程 MCP",
+                "url": DEFAULT_MCP_URL,
                 "token": "",
                 "enabled": True,
             }
