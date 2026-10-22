@@ -9,10 +9,11 @@ function checked(data: any) {
   return data;
 }
 
-export default function HookLoginPanel({ theme, onRefresh, onEnterAccount, account, autoStartNew = false, onInstanceSelected }: {
+export default function HookLoginPanel({ theme, onRefresh, onEnterAccount, account, autoStartNew = false, autoSelectExisting = true, onInstanceSelected }: {
   theme: "dark" | "light"; onRefresh: () => void;
   onEnterAccount?: (account: WeChatAccount) => void; account?: WeChatAccount;
   autoStartNew?: boolean; onInstanceSelected?: (id: string) => void;
+  autoSelectExisting?: boolean;
 }) {
   const dark = theme === "dark";
   const [settings, setSettings] = useState<any>(null);
@@ -30,32 +31,46 @@ export default function HookLoginPanel({ theme, onRefresh, onEnterAccount, accou
   const startingRef = useRef(false);
   const autoStartRef = useRef(false);
   const qrRef = useRef('');
+  const qrGeneration = useRef(0);
   const selectedRef = useRef(onInstanceSelected);
   selectedRef.current = onInstanceSelected;
   qrRef.current = qr;
   refreshRef.current = onRefresh;
+  const clearQr = useCallback(() => {
+    qrGeneration.current += 1;
+    qrRef.current = '';
+    setQr(''); setQrBusy(false);
+  }, []);
+  useEffect(() => () => { qrGeneration.current += 1; }, []);
 
   useEffect(() => {
     let cancelled = false;
     setSettings(null);
+    clearQr();
+    if (!account && !autoStartNew && !autoSelectExisting) {
+      setInstanceId(''); setPhase('idle');
+      setStatus('请选择左侧微信，或点击上方“启动微信”。');
+      return;
+    }
     getHookLoginSettings(account?.id).then(checked).then((data) => {
       if (cancelled) return;
       setSettings(data);
       setForm({ rdv: data.rdv, proxy: { ...emptyForm.proxy, ...data.proxy } });
-      if (data.pid && !account && !autoStartNew) {
+      if (data.pid && !account && !autoStartNew && autoSelectExisting) {
         setInstanceId(data.id); setPhase("waiting"); selectedRef.current?.(data.id);
       }
     }).catch((err) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
-  }, [account?.id]);
+  }, [account?.id, autoStartNew, autoSelectExisting, clearQr]);
 
   useEffect(() => {
     if (!account || account.source !== "hook") return;
     setInstanceId(account.id);
     setReadyAccount(account.login_status === "3" ? account : null);
+    if (account.login_status === '3' || account.connected === false) clearQr();
     setPhase(account.login_status === "3" ? "success" : account.connected ? "waiting" : "idle");
     setStatus(account.login_status === "3" ? "微信已登录，可以进入聊天。" : account.connected ? "等待微信登录。" : "点击二维码区域重新启动此微信。");
-  }, [account?.id, account?.login_status, account?.connected]);
+  }, [account?.id, account?.login_status, account?.connected, clearQr]);
 
   useEffect(() => {
     if (!instanceId || phase !== "waiting") return;
@@ -68,14 +83,26 @@ export default function HookLoginPanel({ theme, onRefresh, onEnterAccount, accou
         if (cancelled) return;
         const current: WeChatAccount = data.account;
         if (current.login_status === "3") {
-          setReadyAccount(current); setPhase("success"); setStatus("微信已登录，可以进入聊天。"); setQr("");
+          setReadyAccount(current); setPhase("success"); setStatus("微信已登录，可以进入聊天。"); clearQr();
           refreshRef.current(); return;
+        }
+        if (!current.connected) {
+          const hadQr = Boolean(qrRef.current);
+          clearQr();
+          if (hadQr) {
+            setPhase('idle'); setReadyAccount(null);
+            setStatus('微信已退出，点击二维码区域重新启动。');
+            refreshRef.current(); return;
+          }
         }
         setStatus(current.login_message || "等待微信启动及 Hook 接口就绪。");
         if (current.connected && !qrRef.current && Date.now() - qrAttempt > 5_000) {
           qrAttempt = Date.now();
+          const generation = qrGeneration.current;
           const result = await getHookLoginQRCode(instanceId);
-          if (!cancelled && result.ok && result.qrcode) setQr(result.qrcode);
+          if (!cancelled && generation === qrGeneration.current && result.ok && result.qrcode) {
+            qrRef.current = result.qrcode; setQr(result.qrcode);
+          }
         }
       } catch (err) {
         if (!cancelled) setStatus(err instanceof Error ? err.message : "等待微信 Hook 接口连接。");
@@ -84,7 +111,7 @@ export default function HookLoginPanel({ theme, onRefresh, onEnterAccount, accou
     };
     void poll();
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [instanceId, phase]);
+  }, [instanceId, phase, clearQr]);
 
   const launch = async (restart = false, newAccount = false) => {
     if (startingRef.current || !settings) return;
@@ -92,7 +119,7 @@ export default function HookLoginPanel({ theme, onRefresh, onEnterAccount, accou
       setError("RDV 请填写 01000000—7fffffff 范围内的 8 位小写十六进制值。"); return;
     }
     startingRef.current = true;
-    setPhase("starting"); setError(""); setQr(""); setReadyAccount(null);
+    setPhase("starting"); setError(""); clearQr(); setReadyAccount(null);
     try {
       const data = checked(await startHookWechat({ instance_id: newAccount ? "" : settings.id, restart, new: newAccount,
         ...(restart ? { rdv: form.rdv.trim(), proxy: form.proxy } : {}) }));
@@ -115,12 +142,17 @@ export default function HookLoginPanel({ theme, onRefresh, onEnterAccount, accou
   }, [settings, autoStartNew]);
 
   const refreshQr = useCallback(async () => {
-    if (!instanceId || qrBusy) return;
+    if (!instanceId || phase !== 'waiting' || qrBusy) return;
+    const generation = qrGeneration.current;
     setQrBusy(true); setError("");
-    try { setQr(checked(await getHookLoginQRCode(instanceId, true)).qrcode || ""); }
-    catch (err) { setError(err instanceof Error ? err.message : "二维码暂未就绪"); }
-    finally { setQrBusy(false); }
-  }, [instanceId, qrBusy]);
+    try {
+      const data = checked(await getHookLoginQRCode(instanceId, true));
+      if (generation === qrGeneration.current) {
+        qrRef.current = data.qrcode || ''; setQr(data.qrcode || '');
+      }
+    } catch (err) { if (generation === qrGeneration.current) setError(err instanceof Error ? err.message : "二维码暂未就绪"); }
+    finally { if (generation === qrGeneration.current) setQrBusy(false); }
+  }, [instanceId, phase, qrBusy]);
 
   useEffect(() => {
     if (!instanceId || phase !== 'waiting') return;
@@ -156,7 +188,7 @@ export default function HookLoginPanel({ theme, onRefresh, onEnterAccount, accou
           <div className="flex gap-3"><button type="submit" disabled={phase === "starting"} className="flex-1 rounded bg-[#07c160] px-4 py-2 text-sm text-white disabled:opacity-50">{phase === "starting" ? "正在重新启动…" : "确定并重新启动"}</button><button type="button" disabled={phase === "starting"} onClick={() => setShowSettings(false)} className="rounded border border-[#666] px-4 py-2 text-sm">取消</button></div>
         </form> : <>
           <button type="button" aria-label={phase === 'idle' ? '启动此微信' : '刷新当前微信二维码'} title="点击刷新二维码，每 2 分钟自动刷新" disabled={!settings || phase === 'starting' || phase === 'success' || qrBusy} onClick={() => void (phase === 'idle' ? launch() : refreshQr())} className={`relative mx-auto flex h-[232px] w-[232px] items-center justify-center rounded disabled:cursor-default ${qr ? "bg-white p-2" : dark ? "bg-[#191919]" : "bg-[#f4f4f4]"}`}>
-            {qr ? <img src={qr} alt={`微信登录二维码 ${instanceId}`} className={`h-full w-full ${qrBusy ? 'opacity-40' : ''}`} /> : <span className="px-4 text-sm text-[#888]">{phase === "success" ? "微信已登录" : phase === "starting" || phase === "waiting" ? "二维码准备中…" : "点击启动微信"}</span>}
+            {phase === 'waiting' && qr ? <img src={qr} alt={`微信登录二维码 ${instanceId}`} className={`h-full w-full ${qrBusy ? 'opacity-40' : ''}`} /> : <span className="px-4 text-sm text-[#888]">{phase === "success" ? "微信已登录" : phase === "starting" || phase === "waiting" ? "二维码准备中…" : settings ? "点击启动微信" : "请选择或启动微信"}</span>}
             {qrBusy && <span className="absolute inset-0 flex items-center justify-center text-sm text-[#555]">正在刷新…</span>}
           </button>
           <p role="status" className={`text-center text-sm ${phase === "success" ? "text-[#07c160]" : "text-[#999]"}`}>{status}</p>

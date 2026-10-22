@@ -1084,6 +1084,12 @@ async def _probe_local_hook_account() -> dict[str, Any]:
             agent_id=_LOCAL_HOOK_ACCOUNT_ID,
             current_wxid=parsed["wxid"],
         )
+        if not port_alive or parsed['status'] != '3':
+            local_owner = access_store.owner(_LOCAL_HOOK_ACCOUNT_ID)
+            remembered = access_store.profile(_LOCAL_HOOK_ACCOUNT_ID, local_owner) if local_owner else None
+            for field in ('wxid', 'nickname', 'avatar'):
+                if not identity.get(field) and (remembered or {}).get(field):
+                    identity[field] = remembered[field]
         wxid = str(identity.get("wxid") or parsed["wxid"] or "").strip()
         nickname = str(identity.get("nickname") or parsed["nickname"] or ("" if wxid else "本地微信")).strip()
         if wxid:
@@ -1091,7 +1097,8 @@ async def _probe_local_hook_account() -> dict[str, Any]:
             if local_owner and not access_store.claim('wxid:' + wxid, local_owner):
                 raise HTTPException(403, '该微信已属于另一密钥用户，请使用原密钥登录')
             _remember_hook_identity({'id': 'default', 'port': config.HOOK_PORT, 'rdv': config.RDV,
-                'pid': '', 'transport': 'http', 'host': config.HOOK_HOST, 'mode': config.LOGIN_MODE}, 'default', wxid, local_owner, identity)
+                'pid': '', 'transport': 'http', 'host': config.HOOK_HOST, 'mode': config.LOGIN_MODE}, 'default', wxid, local_owner, identity,
+                logged_in=port_alive and parsed['status'] == '3')
             _self_wxid_to_agent_id[wxid] = _LOCAL_HOOK_ACCOUNT_ID
 
         status = parsed["status"] if port_alive else ""
@@ -2835,12 +2842,14 @@ def _hook_login_instance(instance_id):
     return record
 
 
-def _remember_hook_identity(record, account_id, wxid, user_id, identity=None):
+def _remember_hook_identity(record, account_id, wxid, user_id, identity=None, *, logged_in=False):
     if not user_id or not wxid:
         return
     saved = access_store.profile(record['id'], user_id) or {**hook_login.defaults(), **record, 'profile_id': record['id']}
     saved.update(wxid=wxid, wxids=sorted({*saved.get('wxids', []), wxid}),
                  aliases=sorted({*saved.get('aliases', []), record['id'], account_id}))
+    if logged_in:
+        saved['ever_logged_in'] = True
     for field in ('nickname', 'avatar'):
         if (identity or {}).get(field):
             saved[field] = identity[field]
@@ -2878,7 +2887,11 @@ async def _probe_started_hook_account(record):
         raise HTTPException(403, '该微信已属于另一密钥用户，请使用原密钥登录')
     if wxid:
         _self_wxid_to_agent_id[wxid] = account_id
-        _remember_hook_identity(record, account_id, wxid, record_owner, identity)
+        _remember_hook_identity(record, account_id, wxid, record_owner, identity, logged_in=connected and parsed['status'] == '3')
+    if record_owner and connected and parsed['status'] == '3':
+        saved = access_store.profile(record['id'], record_owner) or {**record, 'profile_id': record['id']}
+        saved['ever_logged_in'] = True
+        access_store.save_profile(saved, record_owner)
     remembered = access_store.profile(record['id'], record_owner) if record_owner else {}
     return {"id": account_id, "account_id": wxid or account_id, "source": "hook", "wxid": wxid,
         "nickname": identity.get("nickname") or parsed.get("nickname") or (remembered or {}).get('nickname') or "微信待登录",
@@ -2974,9 +2987,21 @@ async def _manage_hook_account(account_id, *, delete=False):
     access_store.require_account(account_id)
     # Resolve/adopt the original instance's actual RDV before verifying its process.
     settings = await get_hook_login_settings(account_id)
+    if not delete and not (settings.get('ever_logged_in') or settings.get('wxid') or settings.get('wxids')):
+        # A scan may have completed since the last browser poll. Observe it before
+        # deciding that this is a disposable instance which has never logged in.
+        await _probe_started_hook_account(_hook_login_instance(account_id))
+    removed = delete
+    had_login = False
+    stopped_aliases = set()
     async def after_stop(profile):
+        nonlocal removed, had_login, stopped_aliases
         aliases = {account_id, profile['id'], *profile.get('aliases', [])}
+        stopped_aliases = aliases
         await _cancel_account_work(aliases)
+        had_login = bool(profile.get('ever_logged_in') or profile.get('wxid') or profile.get('wxids') or any(
+            _extract_self_wxid(_runtime_for(alias)['app_state'].get('self_info') or {}) for alias in aliases))
+        removed = delete or not had_login
         deleted = {}
         if delete:
             cache = _user_cache(access_store.current_user.get())
@@ -2995,6 +3020,7 @@ async def _manage_hook_account(account_id, *, delete=False):
                             brief_cache.pop(key, None)
                 _CONTACT_HYDRATION_PROGRESS.pop(owner_wxid, None)
             profile['wxids'] = sorted(owners)
+        if removed:
             access_store.forget_profile(profile, aliases)
             hook_login.forget(profile['id'])
         for alias in aliases:
@@ -3006,7 +3032,8 @@ async def _manage_hook_account(account_id, *, delete=False):
         raise HTTPException(400, str(exc)) from exc
     except (httpx.HTTPError, OSError) as exc:
         raise HTTPException(502, '微信管理器未确认操作成功，请稍后重试') from exc
-    return {'ok': True, 'account_id': account_id, 'deleted': delete}
+    return {'ok': True, 'account_id': account_id, 'deleted': removed, 'ever_logged_in': had_login,
+            'removed_account_ids': sorted(stopped_aliases) if removed else []}
 
 
 @app.post('/api/accounts/{account_id}/logout')

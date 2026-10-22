@@ -274,6 +274,78 @@ class AccessUsersTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], cache.get_messages('room', owner_wxid='wxid_a'))
         self.assertEqual([], hook_login.instances())
 
+    def pending_hook_profile(self, **overrides):
+        user = self.users['alice-test-key']
+        token = access_store.current_user.set(user)
+        try:
+            profile = hook_login.user_settings()
+            profile.update(pid='123', **overrides)
+            access_store.save_profile(profile)
+            hook_login.REGISTRY_PATH.write_text(json.dumps([{**profile, 'mode': config.LOGIN_MODE, 'host': config.HOOK_HOST}]), encoding='utf-8')
+            return profile
+        finally:
+            access_store.current_user.reset(token)
+
+    async def test_logout_removes_never_logged_in_instance_and_revokes_qrcode_access(self):
+        profile = self.pending_hook_profile()
+        response = httpx.Response(200, json={'onlinestatus': '0'})
+        with patch.object(hook_login, 'post', AsyncMock(return_value=response)), \
+             patch.object(hook_login, '_process_for', AsyncMock(return_value={'PID': 123})), \
+             patch.object(hook_login, '_stop_process', AsyncMock()) as stop:
+            result = await self.client.post(f'/api/accounts/{profile["id"]}/logout', headers=self.headers())
+        self.assertEqual(200, result.status_code, result.text)
+        self.assertTrue(result.json()['deleted'])
+        self.assertFalse(result.json()['ever_logged_in'])
+        self.assertIn(profile['id'], result.json()['removed_account_ids'])
+        self.assertIsNone(access_store.profile(profile['id'], self.users['alice-test-key']))
+        self.assertIsNone(access_store.owner(profile['id']))
+        self.assertEqual([], hook_login.instances())
+        stop.assert_awaited_once()
+        qr = await self.client.post(f'/api/hook/instances/{profile["id"]}/qrcode', json={}, headers=self.headers())
+        self.assertEqual(403, qr.status_code)
+
+    async def test_logout_preserves_confirmed_login_history_even_without_cached_wxid(self):
+        profile = self.pending_hook_profile(ever_logged_in=True)
+        with patch.object(hook_login, 'post', AsyncMock()) as native, \
+             patch.object(hook_login, '_process_for', AsyncMock(return_value={'PID': 123})), \
+             patch.object(hook_login, '_stop_process', AsyncMock()):
+            result = await self.client.post(f'/api/accounts/{profile["id"]}/logout', headers=self.headers())
+        self.assertEqual(200, result.status_code, result.text)
+        self.assertFalse(result.json()['deleted'])
+        self.assertTrue(result.json()['ever_logged_in'])
+        saved = access_store.profile(profile['id'], self.users['alice-test-key'])
+        self.assertEqual(profile['rdv'], saved['rdv'])
+        self.assertEqual('', saved['pid'])
+        self.assertTrue(access_store.owns(profile['id'], self.users['alice-test-key']))
+        native.assert_not_awaited()
+
+    async def test_login_completed_since_last_poll_is_remembered_before_logout(self):
+        profile = self.pending_hook_profile()
+        responses = [httpx.Response(200, json={'onlinestatus': '3', 'selfwxid': 'wxid_recent'}),
+                     httpx.Response(200, json={'wxid': 'wxid_recent', 'nickname': 'Recent login'})]
+        with patch.object(hook_login, 'post', AsyncMock(side_effect=responses)), \
+             patch.object(hook_login, '_process_for', AsyncMock(return_value={'PID': 123})), \
+             patch.object(hook_login, '_stop_process', AsyncMock()):
+            result = await self.client.post(f'/api/accounts/{profile["id"]}/logout', headers=self.headers())
+        self.assertEqual(200, result.status_code, result.text)
+        self.assertFalse(result.json()['deleted'])
+        self.assertTrue(result.json()['ever_logged_in'])
+        saved = access_store.profile(profile['id'], self.users['alice-test-key'])
+        self.assertTrue(saved['ever_logged_in'])
+        self.assertEqual('wxid_recent', saved['wxid'])
+
+    async def test_failed_process_termination_keeps_pending_instance_and_ownership(self):
+        profile = self.pending_hook_profile()
+        response = httpx.Response(200, json={'onlinestatus': '0'})
+        with patch.object(hook_login, 'post', AsyncMock(return_value=response)), \
+             patch.object(hook_login, '_process_for', AsyncMock(return_value={'PID': 123})), \
+             patch.object(hook_login, '_stop_process', AsyncMock(side_effect=ValueError('原微信尚未关闭'))):
+            result = await self.client.post(f'/api/accounts/{profile["id"]}/logout', headers=self.headers())
+        self.assertEqual(400, result.status_code)
+        self.assertIsNotNone(access_store.profile(profile['id'], self.users['alice-test-key']))
+        self.assertTrue(access_store.owns(profile['id'], self.users['alice-test-key']))
+        self.assertEqual(1, len(hook_login.instances()))
+
 
 if __name__ == '__main__':
     unittest.main()

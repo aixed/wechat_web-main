@@ -141,6 +141,28 @@ class LocalHookAccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("本地 Hook 接口不可用", account["login_message"])
         self.assertEqual(30001, account["start_port"])
 
+    async def test_offline_account_keeps_saved_avatar_without_becoming_logged_in(self):
+        saved = {'wxid': 'wxid_saved', 'nickname': 'Saved User', 'avatar': 'https://example.test/saved.jpg'}
+        with (
+            patch.object(main.wechat_api, 'is_login_status', AsyncMock(side_effect=ConnectionError('offline'))),
+            patch.object(main.wechat_api, 'get_self_info', AsyncMock()) as get_profile,
+            patch.object(main.access_store, 'owner', return_value='saved-owner'),
+            patch.object(main.access_store, 'profile', return_value=saved),
+            patch.object(main.access_store, 'claim', return_value=True),
+            patch.object(main, '_remember_hook_identity') as remember,
+        ):
+            account = await main._probe_local_hook_account()
+
+        self.assertEqual(saved['avatar'], account['avatar'])
+        self.assertEqual(saved['nickname'], account['nickname'])
+        self.assertEqual(saved['wxid'], account['wxid'])
+        self.assertFalse(account['connected'])
+        self.assertFalse(account['port_alive'])
+        self.assertFalse(account['initialized'])
+        self.assertNotEqual('3', account['login_status'])
+        self.assertFalse(remember.call_args.kwargs['logged_in'])
+        get_profile.assert_not_awaited()
+
     async def test_accounts_endpoint_returns_local_http_probe(self):
         account = {
             "id": main._LOCAL_HOOK_ACCOUNT_ID,

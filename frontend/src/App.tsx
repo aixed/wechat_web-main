@@ -4208,12 +4208,11 @@ function accountStatusMeta(account: WeChatAccount, dark: boolean): { text: strin
 
   if (status === "5") return { text: message || "点击进入微信", className: warning };
   if (status === "2") return { text: message || "正在登录中...", className: warning };
-  if (status === "3") {
+  if (isLoggedInAccount(account)) {
     return account.initialized
       ? { text: "已就绪", className: success }
       : { text: "已登录", className: success };
   }
-  if (account.initialized) return { text: "已就绪", className: success };
   return { text: message || "等待登录", className: neutral };
 }
 
@@ -4228,12 +4227,12 @@ function isProtocolAccountTabVisible(account: WeChatAccount): boolean {
 }
 
 function isLoggedInAccount(account: WeChatAccount): boolean {
+  if (account.connected === false || account.port_alive === false) return false;
   if (account.source === "protocol") {
-    return account.initialized
-      || String(account.login_status || "") === "3"
+    return String(account.login_status || "") === "3"
       || String(account.protocol_state || "").trim().toLowerCase() === "logged_in";
   }
-  return account.initialized || String(account.login_status || "") === "3" || Boolean(account.wxid);
+  return String(account.login_status || "") === "3";
 }
 
 function protocolSessionId(account: WeChatAccount | null | undefined): string {
@@ -4562,7 +4561,9 @@ function AccountPortal({
       window.removeEventListener("keydown", closeOnEscape);
     };
   }, [contextMenu]);
-  const portalAccounts = accounts;
+  const [removedHookAccountIds, setRemovedHookAccountIds] = useState<Set<string>>(new Set());
+  const [autoSelectHookAccount, setAutoSelectHookAccount] = useState(true);
+  const portalAccounts = accounts.filter((item) => !removedHookAccountIds.has(item.id));
   const protocolAccounts = portalAccounts.filter(isProtocolAccountTabVisible);
   const displayedLoginAccount = source === 'hook'
     ? portalAccounts.find((item) => item.id === loginAccount?.id) || loginAccount
@@ -4570,6 +4571,7 @@ function AccountPortal({
   const [hookStartRequested, setHookStartRequested] = useState(false);
   const handleToolChange = (nextTool: AccountPortalTool) => {
     if (nextTool === 'hook-start') {
+      setAutoSelectHookAccount(false);
       setLoginAccount(null); setLoginPanelNonce((value) => value + 1); setHookStartRequested(true);
     }
     setTool(nextTool);
@@ -4586,6 +4588,7 @@ function AccountPortal({
     }
     setLoginAccount(account);
     setHookStartRequested(false);
+    setAutoSelectHookAccount(false);
     setTool(source === "hook" ? "hook-start" : hasProtocolSession(account) ? "qr-login" : "old-login");
   };
   const handleProtocolSessionStarted = (account: WeChatAccount, previousSessionId = "") => {
@@ -4611,7 +4614,11 @@ function AccountPortal({
       const data = await (action === 'delete' ? deleteHookAccount(account.id) : logoutHookAccount(account.id));
       if (!data.ok) throw new Error(data.error || data.detail || '操作失败');
       if (getActiveAgentId() === account.id) clearActiveAgentId();
-      setLoginAccount(null); setHookStartRequested(false); setLoginPanelNonce((value) => value + 1);
+      if (data.deleted) setRemovedHookAccountIds((prev) => new Set([...prev, account.id, ...(data.removed_account_ids || [])]));
+      if (!displayedLoginAccount || displayedLoginAccount.id === account.id) {
+        setLoginAccount(data.deleted ? null : { ...account, connected: false, port_alive: false, initialized: false, login_status: '0', login_message: '微信已退出，点击卡片重新启动' });
+        setHookStartRequested(false); setAutoSelectHookAccount(false); setLoginPanelNonce((value) => value + 1);
+      }
       onRefresh();
     } catch (err) { window.alert(err instanceof Error ? err.message : '操作失败'); }
     finally { setTerminatingSessionIds((prev) => { const next = new Set(prev); next.delete(account.id); return next; }); }
@@ -4874,8 +4881,9 @@ function AccountPortal({
           <AccountPortalToolTabs active={tool} dark={dark} source={source} onChange={handleToolChange} onAdd={handleAddProtocolLogin} />
           <div className="flex-1 min-h-0 overflow-hidden">
             {tool === "broadcast" && <MultiAccountBroadcastPanel accounts={portalAccounts} theme={theme} />}
-            {tool === "hook-start" && source === "hook" && <HookLoginPanel key={`hook:${displayedLoginAccount?.id || loginPanelNonce}`} theme={theme} onRefresh={onRefresh} onEnterAccount={onSelectAccount} account={displayedLoginAccount || undefined} autoStartNew={hookStartRequested} onInstanceSelected={(id) => {
+            {tool === "hook-start" && source === "hook" && <HookLoginPanel key={`hook:${displayedLoginAccount?.id || 'none'}:${loginPanelNonce}`} theme={theme} onRefresh={onRefresh} onEnterAccount={onSelectAccount} account={displayedLoginAccount || undefined} autoStartNew={hookStartRequested} autoSelectExisting={autoSelectHookAccount} onInstanceSelected={(id) => {
               setHookStartRequested(false);
+              setRemovedHookAccountIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
               const owned = portalAccounts.find((item) => item.id === id);
               if (owned) setLoginAccount(owned);
               else { setLoginAccount({ id, source: 'hook', login_status: '0', connected: true } as WeChatAccount); onRefresh(); }
@@ -5900,7 +5908,8 @@ function AccountAvatar({ account }: { account: WeChatAccount }) {
     <img
       src={avatarUrl && failedUrl !== avatarUrl ? avatarUrl : DEFAULT_AVATAR_URL}
       alt={account.nickname || account.wxid || ""}
-      className="w-[54px] h-[54px] rounded-[5px] object-cover bg-[#333] shrink-0"
+      className={`w-[54px] h-[54px] rounded-[5px] object-cover bg-[#333] shrink-0 transition-[filter,opacity] ${isLoggedInAccount(account) ? '' : 'grayscale opacity-50'}`}
+      title={isLoggedInAccount(account) ? '已登录' : '未登录'}
       onError={() => setFailedUrl(avatarUrl)}
     />
   );
