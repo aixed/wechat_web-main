@@ -1,1 +1,5 @@
 *.sh text eol=lf
+# Preserve CRLF in Git blobs so GitHub source ZIP downloads work in cmd.exe.
+# text eol=crlf alone converts Git blobs to LF, which leaves ZIP downloads broken.
+*.bat -text whitespace=cr-at-eol
+*.cmd -text whitespace=cr-at-eol
