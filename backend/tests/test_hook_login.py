@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from PIL import Image
@@ -32,6 +32,8 @@ class HookLoginTests(unittest.IsolatedAsyncioTestCase):
             self.requests.append(request)
             if request.url.path == "/Get_PortOccupiedInfo":
                 return httpx.Response(200, json={"Occupied": self.occupied})
+            if request.url.path == "/Get_WeChatProcessNumber":
+                return httpx.Response(200, json={"List": []})
             if request.url.path == "/StartWechat":
                 return httpx.Response(200, json=self.start_result)
             if request.url.path == "/IsLoginStatus":
@@ -77,14 +79,78 @@ class HookLoginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_occupied_port_stops_before_start_and_bad_pid_is_not_registered(self):
         self.occupied = "1"
-        with self.assertRaisesRegex(ValueError, "占用"):
+        with patch.object(hook_login, '_tcp_port_is_listening', AsyncMock(return_value=True)), self.assertRaisesRegex(ValueError, "占用"):
             await self.start()
-        self.assertEqual(["/Get_PortOccupiedInfo"], [r.url.path for r in self.requests])
+        self.assertNotIn('/StartWechat', [r.url.path for r in self.requests])
         self.occupied = "0"
         self.start_result = {"success": "1", "session_id": "protocol-only"}
         with self.assertRaisesRegex(ValueError, "进程"):
             await self.start()
         self.assertEqual([], hook_login.instances())
+
+    async def test_manager_time_wait_residue_does_not_block_launch(self):
+        self.occupied = '1'
+        with patch.object(hook_login, '_tcp_port_is_listening', AsyncMock(return_value=False)) as listening:
+            record = await self.start()
+        self.assertEqual('20152', record['pid'])
+        listening.assert_awaited_once_with(30002)
+        self.assertEqual('/StartWechat', self.requests[-1].url.path)
+
+    async def test_live_wechat_port_cannot_be_overridden_by_failed_tcp_probe(self):
+        self.occupied = '1'
+        processes = [{'PID': 99, 'Port': 0, 'Par': 'StartPort=30002&RDV=127f78ad'}]
+        with patch.object(hook_login, '_wechat_processes', AsyncMock(return_value=processes)), \
+             patch.object(hook_login, '_tcp_port_is_listening', AsyncMock(return_value=False)) as listening:
+            with self.assertRaisesRegex(ValueError, '占用'):
+                await self.start()
+        listening.assert_not_awaited()
+        self.assertNotIn('/StartWechat', [r.url.path for r in self.requests])
+
+    async def test_unconfirmed_manager_status_never_starts_a_process(self):
+        self.occupied = 'unknown'
+        with self.assertRaisesRegex(ValueError, '端口状态'):
+            await self.start()
+        self.occupied = '1'
+        with patch.object(hook_login, '_wechat_processes', AsyncMock(side_effect=ValueError('进程列表无效'))):
+            with self.assertRaisesRegex(ValueError, '进程列表'):
+                await self.start()
+        self.assertNotIn('/StartWechat', [r.url.path for r in self.requests])
+
+    async def test_tcp_probe_requires_explicit_refusal_to_ignore_manager_occupancy(self):
+        for error in (ConnectionRefusedError(), TimeoutError(), OSError('network unreachable')):
+            with self.subTest(error=type(error).__name__), \
+                 patch.object(hook_login.asyncio, 'open_connection', AsyncMock(side_effect=error)):
+                if isinstance(error, ConnectionRefusedError):
+                    self.assertFalse(await hook_login._tcp_port_is_listening(30002))
+                else:
+                    with self.assertRaisesRegex(ValueError, '网络'):
+                        await hook_login._tcp_port_is_listening(30002)
+        writer = AsyncMock()
+        writer.close = Mock()
+        with patch.object(hook_login.asyncio, 'open_connection', AsyncMock(return_value=(None, writer))):
+            self.assertTrue(await hook_login._tcp_port_is_listening(30002))
+        writer.close.assert_called_once()
+        writer.wait_closed.assert_awaited_once()
+
+    async def test_termination_confirms_process_exit_despite_port_residue_and_connection_reset(self):
+        profile = {'port': 30002, 'host': '127.0.0.1', 'transport': 'http'}
+        self.occupied = '1'
+        with patch.object(hook_login, 'post', AsyncMock(side_effect=httpx.ReadError('instance closed connection'))) as terminate:
+            await hook_login._stop_process(profile, {'PID': 99})
+        terminate.assert_awaited_once_with(profile, '/TerminateThisWeChat')
+        self.assertEqual(['/Get_WeChatProcessNumber'], [r.url.path for r in self.requests])
+
+    async def test_live_process_or_malformed_list_is_not_reported_as_stopped(self):
+        profile = {'port': 30002, 'host': '127.0.0.1', 'transport': 'http'}
+        with patch.object(hook_login, '_wechat_processes', AsyncMock(return_value=[{'PID': 99}])) as processes, \
+             patch.object(hook_login.asyncio, 'sleep', AsyncMock()):
+            with self.assertRaisesRegex(ValueError, '尚未关闭'):
+                await hook_login._stop_process(profile, {'PID': 99})
+        self.assertEqual(20, processes.await_count)
+        with patch.object(hook_login.client, 'post', AsyncMock(return_value=httpx.Response(200,
+                request=httpx.Request('POST', 'http://test'), json={'List': [{}]}))):
+            with self.assertRaisesRegex(ValueError, '进程列表'):
+                await hook_login._stop_process(profile, {'PID': 99})
 
     async def test_invalid_rdv_and_mixed_remote_ws_never_start_a_process(self):
         for arguments in ({"rdv": "not-hex"}, {"rdv": "ffffffff"}, {"remote_ws": "ws://example.test/agent"}):
@@ -163,7 +229,9 @@ class HookLoginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_closed_instance_can_reuse_rdv_without_keeping_two_stale_records(self):
         await self.start()
-        replacement = await self.start(start_port=30003)
+        self.occupied = '1'
+        with patch.object(hook_login, '_tcp_port_is_listening', AsyncMock(return_value=False)):
+            replacement = await self.start(start_port=30003)
         self.assertEqual([replacement], hook_login.instances())
 
     async def test_manager_timeout_is_not_retried_or_recorded_as_success(self):

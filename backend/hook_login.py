@@ -79,16 +79,11 @@ async def start(*, start_port, rdv, wechat_path="", remote_ws="", proxy=None):
     else:
         body["CallBackURL"] = config.CALLBACK_URL
     async with _start_lock:
-        occupied = await client.post(config.MGR_BASE_URL + "/Get_PortOccupiedInfo", json={"CheckPort": str(start_port)})
-        occupied.raise_for_status()
-        occupancy = occupied.json()
-        if str(occupancy.get("Occupied")) != "0":
+        if await _port_is_occupied(start_port):
             raise ValueError("该接口端口已被占用或无法确认，请选择其他端口，或刷新已有微信账号")
         for previous in instances():
             if previous["rdv"] == rdv and previous["port"] != int(start_port):
-                old_port = await client.post(config.MGR_BASE_URL + "/Get_PortOccupiedInfo", json={"CheckPort": str(previous["port"])})
-                old_port.raise_for_status()
-                if str(old_port.json().get("Occupied")) != "0":
+                if await _port_is_occupied(previous["port"]):
                     raise ValueError("该 RDV 已用于运行中的微信实例，请为新实例填写不同 RDV")
         response = await client.post(config.MGR_BASE_URL + "/StartWechat", json=body, timeout=30)
         response.raise_for_status()
@@ -154,14 +149,58 @@ def user_settings(instance_id='', *, new=False):
     return result
 
 
-async def _process_for(profile):
+async def _wechat_processes():
     response = await client.post(config.MGR_BASE_URL + '/Get_WeChatProcessNumber', json={})
     response.raise_for_status()
-    processes = response.json().get('List')
-    if not isinstance(processes, list):
+    payload = response.json()
+    processes = payload.get('List') if isinstance(payload, dict) else None
+    if not isinstance(processes, list) or any(
+        not isinstance(p, dict) or not str(p.get('PID', '')).isdigit() or int(p['PID']) <= 0 for p in processes
+    ):
         raise ValueError('管理器未返回微信进程列表，无法安全确认原实例')
-    matches = [p for p in processes if str(p.get('Port')) == str(profile['port']) or re.search(
-        r'(?:^|[&\s])StartPort=' + re.escape(str(profile['port'])) + r'(?:[&\s]|$)', str(p.get('Par') or ''), re.I)]
+    return processes
+
+
+def _process_uses_port(process, port):
+    return str(process.get('Port')) == str(port) or bool(re.search(
+        r'(?:^|[&\s])StartPort=' + re.escape(str(port)) + r'(?:[&\s]|$)', str(process.get('Par') or ''), re.I))
+
+
+async def _tcp_port_is_listening(port):
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(config.HOOK_HOST, int(port)), timeout=4)
+    except ConnectionRefusedError:
+        return False
+    except (OSError, asyncio.TimeoutError) as exc:
+        raise ValueError('无法确认微信接口端口是否已释放，请检查 Hook 主机网络后重试') from exc
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return True
+
+
+async def _port_is_occupied(port):
+    response = await client.post(config.MGR_BASE_URL + '/Get_PortOccupiedInfo', json={'CheckPort': str(port)})
+    response.raise_for_status()
+    payload = response.json()
+    occupied = str(payload.get('Occupied')) if isinstance(payload, dict) else ''
+    if occupied == '0':
+        return False
+    if occupied != '1':
+        raise ValueError('管理器未返回有效端口状态，无法确认接口端口是否可用')
+    if any(_process_uses_port(p, port) for p in await _wechat_processes()):
+        return True
+    # Older managers count closed TCP connections (TIME_WAIT) as occupied.
+    # Ignore that residue only when no WeChat uses the port and TCP explicitly
+    # refuses a connection; a timeout or another listening service still blocks launch.
+    return await _tcp_port_is_listening(port)
+
+
+async def _process_for(profile):
+    processes = await _wechat_processes()
+    matches = [p for p in processes if _process_uses_port(p, profile['port'])]
     if not matches:
         return None
     if len(matches) != 1:
@@ -214,15 +253,10 @@ async def _stop_process(profile, process):
         await post(profile, '/TerminateThisWeChat')
     except (httpx.HTTPError, ConnectionError, TimeoutError):
         # The instance may close its HTTP/WS connection before it can return a response.
-        # Only the subsequent port AND process checks establish successful termination.
+        # Confirm termination from the manager's process list, even if TCP retains TIME_WAIT.
         pass
     for _ in range(20):
-        check = await client.post(config.MGR_BASE_URL + '/Get_PortOccupiedInfo', json={'CheckPort': str(profile['port'])})
-        check.raise_for_status()
-        remaining = await client.post(config.MGR_BASE_URL + '/Get_WeChatProcessNumber', json={})
-        remaining.raise_for_status()
-        if str(check.json().get('Occupied')) == '0' and not any(
-            str(p.get('PID')) == str(process['PID']) for p in remaining.json().get('List', [])):
+        if not any(str(p['PID']) == str(process['PID']) for p in await _wechat_processes()):
             return
         await asyncio.sleep(.2)
     raise ValueError('原微信尚未关闭，请稍后重试')

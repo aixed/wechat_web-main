@@ -150,6 +150,43 @@ class AccessUsersTests(unittest.IsolatedAsyncioTestCase):
         paths = [path for path, _ in calls]
         self.assertLess(paths.index('/TerminateThisWeChat'), len(paths) - 1)
 
+    async def test_restart_with_time_wait_residue_still_launches_with_saved_user_settings(self):
+        access_store.current_user.set(self.users['alice-test-key'])
+        profile = hook_login.user_settings()
+        profile.update(pid='100')
+        access_store.save_profile(profile)
+        running = True
+        calls = []
+        def handler(request):
+            nonlocal running
+            calls.append(request)
+            if request.url.path == '/Get_WeChatProcessNumber':
+                return httpx.Response(200, json={'List': [{'PID': 100, 'Port': profile['port'],
+                    'Par': f'StartPort={profile["port"]}&RDV={profile["rdv"]}'}] if running else []})
+            if request.url.path == '/Get_PortOccupiedInfo':
+                return httpx.Response(200, json={'Occupied': '1'})
+            if request.url.path == '/TerminateThisWeChat':
+                self.assertEqual(profile['port'], request.url.port)
+                running = False
+                raise httpx.ReadError('WeChat closed the connection', request=request)
+            if request.url.path == '/StartWechat':
+                return httpx.Response(200, json={'success': '1', '进程ID': '101'})
+            return httpx.Response(404)
+        proxy = {'enabled': True, 'ip': '127.0.0.1', 'port': '7897'}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with patch.object(hook_login, 'client', client), \
+                 patch.object(hook_login, '_tcp_port_is_listening', AsyncMock(return_value=False)):
+                result = await self.client.post('/api/hook/start-wechat', json={
+                    'instance_id': profile['id'], 'restart': True, 'rdv': '4718a91f', 'proxy': proxy}, headers=self.headers())
+        self.assertEqual(200, result.status_code, result.text)
+        self.assertEqual('101', result.json()['process_id'])
+        saved = access_store.profile(profile['id'])
+        self.assertEqual('4718a91f', saved['rdv'])
+        self.assertEqual('7897', saved['proxy']['port'])
+        starts = [r for r in calls if r.url.path == '/StartWechat']
+        self.assertEqual(1, len(starts))
+        self.assertEqual('4718a91f', json.loads(starts[0].content)['RDV'])
+
     async def test_mismatched_process_is_never_terminated_and_foreign_profiles_cannot_be_changed(self):
         access_store.current_user.set(self.users['alice-test-key'])
         profile = hook_login.user_settings()
