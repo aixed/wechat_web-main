@@ -230,8 +230,7 @@ class FilehelperOfflineTests(unittest.IsolatedAsyncioTestCase):
         await self.process("是", "unmentioned")
         self.workflow.assert_not_awaited()
         await self.process("@空气 改为日喀则市", "change-city")
-        self.workflow.assert_not_awaited()
-        await self.process("@空气 是", "confirmed")
+        self.workflow.assert_awaited_once()
         args = self.workflow.call_args.kwargs["arguments"]
         self.assertEqual("日喀则市", args["city"])
         self.assertEqual(request_id, args["request_id"])

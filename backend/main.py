@@ -46,7 +46,7 @@ from ai_service import AiService, AiServiceError
 from mcp_service import McpService, McpServiceError, requires_bearer_token
 from domp_bridge import SQL_START, WORKFLOW_TOOL, workflow_arguments, workflow_reply, split_reply, strip_chat_mentions
 from domp_quote import sql_quote
-from domp_offline_bridge import OfflineConfirmationStore, CITY_PROMPT, city_input, confirmation_message, offline_analysis_task, is_offline_confirmation_prompt
+from domp_offline_bridge import OfflineConfirmationStore, CITY_PROMPT, city_input, confirmation_message, offline_analysis_task, is_offline_confirmation_prompt, offline_reply_chunks
 from domp_city_selection import (CITY_SELECTION_PREFIX, city_selection_failure, selection_options,
     selection_number, selection_message)
 from domp_query_bridge import QUERY_TOOL, QUERY_REPLY_PREFIX, PROBLEM_QUERY_REPLY_PREFIX, query_candidate, query_followup, query_export_followup, query_analysis_content, query_arguments, query_tool_call, query_reply, query_reply_chunks, query_memory_turn, owner_query_config, execution_details_requested, explicit_pending_analysis, explicit_problem_range_analysis, query_clarification_candidate
@@ -4326,7 +4326,7 @@ async def _mcp_task_reply(
             return ("数据运维连接未启用，未启动流程。",)
         if len(arguments["identifier"]) == 4 and not arguments["dry_run"]:
             try:
-                return (await _prepare_offline_city_confirmation(task, arguments),)
+                return offline_reply_chunks(await _prepare_offline_city_confirmation(task, arguments))
             except ValueError as exc:
                 return (f"线下单 {arguments['identifier']}：{exc}；未填报、审核或执行。",)
         context = task.get("_source_context") or {}
@@ -4699,7 +4699,8 @@ async def _prepare_offline_city_confirmation(task, arguments):
         owner_wxid=context["owner_wxid"], agent_id=str(context.get("agent_id") or ""))
     pending["owner_mention"] = "Aixed" if "aixed" in owner_names else next((name for name in sorted(owner_names)
         if name != str(context["owner_wxid"]).casefold() and not name.startswith("wxid_")), "Aixed")
-    pending = await _match_offline_city(pending, department)
+    pending = await _match_offline_city(pending, department) if department else {
+        **pending, 'candidate_text': '', 'matched_city': '', 'matched_area_display': '', 'city_match': {}}
     store.save(context, pending)
     return confirmation_message(pending)
 
@@ -4762,8 +4763,8 @@ async def _resume_offline_city_confirmation(source, context, pending, tasks):
         return f"已取消线下单 {pending['arguments']['identifier']}，未填报、审核或执行。"
     if not action:
         return confirmation_message(pending)
-    if pending.get("confirmed_city") and action == "input":
-        return "本单已经按 " + pending["confirmed_city"] + " 发起处理，不能改区划后重新提交。请先查询原流程结果。"
+    if pending.get("confirmed_city"):
+        return confirmation_message(pending)
     connection_id = pending["connection_id"]
     if not any(task.get("mcp_connection_id") == connection_id and task.get("mcp_enabled") and (
         is_unified_task(task) or task.get("mcp_tool_name") == WORKFLOW_TOOL) for task in tasks):
@@ -4779,14 +4780,17 @@ async def _resume_offline_city_confirmation(source, context, pending, tasks):
         return confirmation_message(pending)
     if action == "input" or not (pending.get("city_match") or {}).get("matched"):
         pending = await _match_offline_city(pending, city_text if action == "input" else pending.get("candidate_text") or pending.get("department") or "")
+        if action == 'input':
+            pending['city_input_provided'] = True
         store.save(context, pending)
-        return confirmation_message(pending)
+        if action != 'input' or not (pending.get('city_match') or {}).get('matched'):
+            return confirmation_message(pending)
     if "supported_areas" not in pending["city_match"] and not pending.get("confirmed_city"):
         # Old waiting records may have collapsed a county to its parent city.
         previous_code = pending["city_match"].get("area_code")
         pending = await _match_offline_city(pending, pending.get("candidate_text") or pending.get("department") or pending["matched_city"])
         store.save(context, pending)
-        if not pending["city_match"].get("matched") or pending["city_match"].get("area_code") != previous_code:
+        if not pending["city_match"].get("matched") or (action != 'input' and pending["city_match"].get("area_code") != previous_code):
             return confirmation_message(pending)
     city = pending["matched_city"]
     arguments = {**pending["arguments"], "city": city}
@@ -5284,7 +5288,7 @@ async def _evaluate_ai_tasks_impl(
     ):
         pending_context, pending = _offline_confirmation_for(source_context, content)
         if pending and source_context.get("agent_mentioned") and not SQL_START.search(content) and not re.search(r"查询|查一下|结果|详情|履历", content):
-            return split_reply(await _resume_offline_city_confirmation(content, pending_context, pending, enabled_tasks))
+            return offline_reply_chunks(await _resume_offline_city_confirmation(content, pending_context, pending, enabled_tasks))
     combined_identifier = submission_workflow_identifier(content)
     if combined_identifier and any(is_unified_task(task) for task in enabled_tasks):
         content, reason = await _recent_sql_workflow_content(content, source_context or {})

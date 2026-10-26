@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, patch
 import main
 import config
 from domp_bridge import WORKFLOW_TOOL, workflow_arguments
-from domp_offline_bridge import OfflineConfirmationStore, city_input, confirmation_message, offline_analysis_task
+from domp_offline_bridge import OfflineConfirmationStore, city_input, confirmation_message, offline_analysis_task, offline_reply_chunks
+from mcp_service import McpServiceError
 from domp_quote import sql_quote
 from domp_unified_bridge import UNIFIED_SKILL_ID
 from smart_reply import SmartReplyEngine
@@ -51,6 +52,42 @@ class OfflineBridgeTests(unittest.TestCase):
                      prompt.split("：", 1)[1]):
             self.assertEqual(("", ""), city_input(text, "2751"))
 
+    def test_missing_city_prompt_uses_current_account_mention(self):
+        pending = {'arguments': {'identifier': '2774'}, 'owner_mention': 'Aixed'}
+        self.assertEqual('线下单 2774 未识别到城市或县区\n请输入城市或县区(示例：@Aixed 拉萨市 或 @Aixed 边坝县)', confirmation_message(pending))
+        for owner_only, name in ((False, '测试昵称'), (True, '空气')):
+            prompt = confirmation_message({**pending, 'owner_only': owner_only, 'owner_mention': '测试昵称'})
+            self.assertIn(f'@{name} 拉萨市 或 @{name} 边坝县', prompt)
+            self.assertEqual(('', ''), city_input('@杨宇\u2005' + prompt, '2774'))
+
+    def test_failed_input_lists_supported_cities_and_counties_in_the_relevant_province(self):
+        areas = [{'area_name': '四川省.成都市', 'area_code': 'sichuan', 'area_path': ['四川省', '成都市']},
+            {'area_name': '西藏自治区.拉萨市', 'area_code': 'lhasa', 'area_path': ['西藏自治区', '拉萨市']},
+            {'area_name': '西藏自治区.昌都市.类乌齐县', 'area_code': 'county', 'area_path': ['西藏自治区', '昌都市', '类乌齐县']},
+            {'area_name': '未核对县'},
+            {'area_name': '西藏自治区', 'area_code': 'province', 'area_path': ['西藏自治区']}]
+        pending = {'arguments': {'identifier': '2774'}, 'candidate_text': '西藏未支持县', 'city_input_provided': True,
+            'city_match': {'matched': False, 'supported_areas': areas}}
+        reply = confirmation_message(pending)
+        self.assertIn('系统支持的西藏自治区市/县：', reply)
+        self.assertIn('拉萨市、昌都市.类乌齐县', reply)
+        self.assertNotIn('四川', reply)
+        self.assertNotIn('成都市', reply)
+        self.assertNotIn('未核对县', reply)
+        self.assertNotIn('是否确认', reply)
+        self.assertEqual(('', ''), city_input(reply, '2774'))
+
+    def test_long_supported_list_keeps_ticket_header_in_every_reply_chunk(self):
+        areas = [{'area_name': '测试市.' + '测试县' * 5 + str(index), 'area_code': str(index),
+            'area_path': ['西藏自治区', '测试市', '测试县' + str(index)]} for index in range(200)]
+        reply = confirmation_message({'arguments': {'identifier': '2774'}, 'candidate_text': '错误县',
+            'city_input_provided': True, 'city_match': {'matched': False, 'supported_areas': areas}})
+        chunks = offline_reply_chunks(reply)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(part.startswith('线下单 2774 ') and len(part) <= 1800 for part in chunks))
+        self.assertEqual(reply.partition('\n')[2], ''.join(part.partition('\n')[2] for part in chunks))
+        self.assertTrue(all(city_input(part, '2774') == ('', '') for part in chunks))
+
     def test_quote_reader_preserves_nested_xml_and_does_not_promote_reference_text(self):
         quote = sql_quote({"msgtype": "49", "msg": "<msg><appmsg><type>57</type><title>当前 SQL</title><refermsg><type>3</type><svrid>900</svrid><content><msg><img aeskey='key'/></msg></content></refermsg></appmsg></msg>"})
         self.assertEqual("当前 SQL", quote["text"])
@@ -64,7 +101,8 @@ class OfflineConversationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.cache = SqliteMessageCache(str(Path(self.temp.name) / "cache.sqlite3"))
         self.context = {"owner_wxid": "owner", "chat_id": "room@chatroom", "sender": "sender"}
-        self.cache.upsert_group_members(self.context["chat_id"], [{"wxid": "owner", "name": "Aixed"}], owner_wxid="owner")
+        self.cache.upsert_group_members(self.context["chat_id"], [{"wxid": "owner", "name": "Aixed"},
+            {"wxid": "sender", "name": "杨宇"}], owner_wxid="owner")
         task = {"id": UNIFIED_SKILL_ID + "_text", "skill_id": UNIFIED_SKILL_ID, "name": "数据运维", "enabled": True,
                 "message_type": "text", "mcp_enabled": True, "mcp_connection_id": "test", "confidence": 90}
         self.cache.upsert_smart_reply_config({"chat_id": self.context["chat_id"], "enabled": True, "message_types": ["text"],
@@ -76,9 +114,12 @@ class OfflineConversationTests(unittest.IsolatedAsyncioTestCase):
         async def call(**kwargs):
             if kwargs["tool_name"] == "match_data_maintenance_city":
                 cities = ["拉萨市", "日喀则市", "林芝市", "山南市"]
+                areas = [{'area_name': city, 'area_code': f'test-city-{index}', 'area_path': ['西藏自治区', city]}
+                    for index, city in enumerate(cities)]
                 matches = [city for city in cities if city.removesuffix("市") in kwargs["arguments"]["city_text"]]
                 return {"structured": {"matched": len(matches) == 1, "city": matches[0] if len(matches) == 1 else "",
-                    "area_code": "540100" if len(matches) == 1 else "", "supported_cities": cities}}
+                    "area_code": next((a['area_code'] for a in areas if len(matches) == 1 and a['area_name'] == matches[0]), ''),
+                    "supported_cities": cities, 'supported_areas': areas}}
             return await self.workflow(**kwargs)
         self.mcp = AsyncMock(side_effect=call)
         self.vision = AsyncMock(return_value={"result": json.dumps({"department": "拉萨市社会保险事业管理局", "city": "拉萨市"})})
@@ -117,15 +158,15 @@ class OfflineConversationTests(unittest.IsolatedAsyncioTestCase):
         # Confirmation survives a backend/cache restart.
         with patch.object(main, "sqlite_cache", SqliteMessageCache(self.cache.db_path)):
             await self.process("改为日喀则市", identifier="101")
-            self.workflow.assert_not_awaited()
-            self.assertIn("匹配区划：日喀则市", self.send.call_args.args[3])
-            await self.process("是", identifier="102")
+            self.workflow.assert_awaited_once()
         args = self.mcp.call_args.kwargs["arguments"]
         self.assertEqual("日喀则市", args["city"])
         self.assertEqual(SOURCE, args["sql_text"])
         self.assertEqual(original_request, args["request_id"])
         self.assertEqual(base64.b64encode(b"original-image").decode(), args["attachment_base64"])
         self.assertIn("执行成功", self.send.call_args.args[3])
+        await self.process("是", identifier="102")
+        self.workflow.assert_awaited_once()
 
     async def test_send_at_callback_during_send_cannot_overwrite_matched_area(self):
         async def send_at(chat, sender, nickname, reply):
@@ -152,19 +193,18 @@ class OfflineConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending, OfflineConfirmationStore(self.cache.db_path).get(self.context))
         self.assertEqual(2, self.send.await_count)
 
-    async def test_repeated_genuine_confirmation_after_area_input_is_not_suppressed(self):
+    async def test_explicit_area_input_runs_immediately_even_with_reply_cooldown(self):
         self.quote_image.return_value = ""
         with patch.object(main, "smart_reply_engine", SmartReplyEngine(cooldown=60)):
             await self.process()
             await self.process("是", identifier="first-confirm", sender="owner")
             self.workflow.assert_not_awaited()
             await self.process("林芝市", identifier="area-input", sender="owner")
-            self.assertIn("匹配区划：林芝市", self.send.call_args.args[3])
-            await self.process("是", identifier="second-confirm", sender="owner")
+            self.assertIn("执行成功", self.send.call_args.args[3])
         self.workflow.assert_awaited_once()
         self.assertEqual("林芝市", self.workflow.call_args.kwargs["arguments"]["city"])
         self.assertIn("执行成功", self.send.call_args.args[3])
-        self.assertEqual(5, self.send.await_count)
+        self.assertEqual(4, self.send.await_count)
 
     async def test_duplicate_callback_cannot_reset_area_after_new_input(self):
         await self.process(quoted=True)
@@ -198,14 +238,64 @@ class OfflineConversationTests(unittest.IsolatedAsyncioTestCase):
         self.quote_image.return_value = ""
         await self.process()
         self.vision.assert_not_awaited(); self.workflow.assert_not_awaited()
-        self.assertIn("请输入城市", self.send.call_args.args[3])
+        self.mcp.assert_not_awaited()
+        self.assertEqual((self.context['chat_id'], 'sender', '杨宇'), self.send.call_args.args[:3])
+        self.assertEqual("线下单 2750 未识别到城市或县区\n请输入城市或县区(示例：@Aixed 拉萨市 或 @Aixed 边坝县)", self.send.call_args.args[3])
         await self.process("确认", identifier="101")
         self.workflow.assert_not_awaited()
         await self.process("林芝市", identifier="102")
-        self.workflow.assert_not_awaited()
-        await self.process("是", identifier="103")
+        self.workflow.assert_awaited_once()
         self.assertEqual("林芝市", self.mcp.call_args.kwargs["arguments"]["city"])
         self.assertNotIn("attachment_base64", self.mcp.call_args.kwargs["arguments"])
+        self.assertIn('执行成功', self.send.call_args.args[3])
+
+    async def test_failed_city_input_lists_platform_counties_then_retries_without_confirmation(self):
+        self.quote_image.return_value = ''
+        await self.process()
+        saved_args = OfflineConfirmationStore(self.cache.db_path).get(self.context)['arguments']
+        areas = [{'area_name': '西藏自治区.昌都市.类乌齐县', 'area_code': 'verified-county',
+            'area_path': ['西藏自治区', '昌都市', '类乌齐县']},
+            {'area_name': '西藏自治区.拉萨市', 'area_code': 'verified-city', 'area_path': ['西藏自治区', '拉萨市']}]
+        async def call(**kwargs):
+            if kwargs['tool_name'] == 'match_data_maintenance_city':
+                found = kwargs['arguments']['city_text'] == '类乌齐县'
+                return {'structured': {'matched': found, **(areas[0] if found else {}), 'supported_areas': areas}}
+            return await self.workflow(**kwargs)
+        self.mcp.side_effect = call
+        await self.process('错误县', identifier='bad-city')
+        self.workflow.assert_not_awaited()
+        self.assertIn('系统支持的西藏自治区市/县：', self.send.call_args.args[3])
+        self.assertIn('昌都市.类乌齐县', self.send.call_args.args[3])
+        with patch.object(main, 'sqlite_cache', SqliteMessageCache(self.cache.db_path)):
+            await self.process('类乌齐县', identifier='valid-city')
+        self.workflow.assert_awaited_once()
+        self.assertEqual({**saved_args, 'city': areas[0]['area_name']}, self.workflow.call_args.kwargs['arguments'])
+        self.assertIn('执行成功', self.send.call_args.args[3])
+        self.assertIsNone(OfflineConfirmationStore(self.cache.db_path).get(self.context))
+        await self.process('类乌齐县', identifier='valid-city')
+        await self.process('类乌齐县', identifier='repeated-city')
+        self.workflow.assert_awaited_once()
+
+    async def test_explicit_city_still_requires_original_sender_and_correct_mention(self):
+        self.quote_image.return_value = ''
+        await self.process()
+        for index, kwargs in enumerate(({'mention': False}, {'sender': 'other'}, {'targets': ['someone_else']})):
+            await self.process('林芝市', identifier=f'unauthorized-{index}', **kwargs)
+        self.workflow.assert_not_awaited()
+        await self.process('林芝市', identifier='authorized')
+        self.workflow.assert_awaited_once()
+
+    async def test_timeout_after_explicit_city_input_never_replays_on_yes_or_another_city(self):
+        self.quote_image.return_value = ''
+        await self.process()
+        self.workflow.side_effect = McpServiceError('响应超时')
+        await self.process('林芝市', identifier='first-city')
+        self.assertIn('结果待核对', self.send.call_args.args[3])
+        for index, text in enumerate(('是', '林芝市', '日喀则市')):
+            await self.process(text, identifier=f'after-timeout-{index}')
+        self.workflow.assert_awaited_once()
+        self.assertIn('勿重复提交', self.send.call_args.args[3])
+        self.assertEqual('林芝市', OfflineConfirmationStore(self.cache.db_path).get(self.context)['confirmed_city'])
 
     async def test_other_sender_cannot_confirm_and_cancel_never_submits(self):
         await self.process(quoted=True)
@@ -225,15 +315,14 @@ class OfflineConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_department_does_not_accept_model_guessed_city(self):
         self.vision.return_value = {"result": json.dumps({"department": "社会保险事业管理局", "city": "拉萨市"})}
         await self.process(quoted=True)
-        self.assertIn("尚未匹配到系统支持的行政区划", self.send.call_args.args[3])
+        self.assertIn("未识别到城市或县区", self.send.call_args.args[3])
         await self.process("确认", identifier="101")
         self.workflow.assert_not_awaited()
 
     async def test_logged_in_owner_can_confirm_incoming_ticket(self):
         await self.process(quoted=True)
         await self.process("2750 日喀则市", identifier="101", sender="owner")
-        self.workflow.assert_not_awaited()
-        await self.process("2750 是", identifier="102", sender="owner")
+        self.workflow.assert_awaited_once()
         self.assertEqual("日喀则市", self.mcp.call_args.kwargs["arguments"]["city"])
         self.assertIsNone(OfflineConfirmationStore(self.cache.db_path).get(self.context))
 
@@ -306,12 +395,12 @@ class OfflineConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("昌都市.边坝县", self.workflow.call_args.kwargs["arguments"]["city"])
         self.assertEqual(SOURCE, self.workflow.call_args.kwargs["arguments"]["sql_text"])
 
-    async def test_unmatched_message_shows_recognition_and_examples_without_city_list(self):
+    async def test_unmatched_image_prompts_for_input_and_explicit_county_runs_immediately(self):
         self.vision.return_value = {"result": json.dumps({"department": "未支持县人社局"})}
         await self.process(quoted=True)
         reply = self.send.call_args.args[3]
         self.assertIn("当前识别/输入：未支持县", reply)
-        self.assertIn("请输入城市或县区（示例：", reply)
+        self.assertIn("请输入城市或县区(示例：@Aixed", reply)
         self.assertNotIn("系统支持：", reply)
         self.assertNotIn("回复“@空气 拉萨市”", reply)
         async def call(**kwargs):
@@ -322,7 +411,7 @@ class OfflineConversationTests(unittest.IsolatedAsyncioTestCase):
         self.mcp.side_effect = call
         await self.process("县区：边坝县", identifier="101", sender="owner")
         self.assertIn("昌都市 / 边坝县", self.send.call_args.args[3])
-        self.workflow.assert_not_awaited()
+        self.workflow.assert_awaited_once()
 
     async def test_unverified_county_code_is_rejected_before_confirmation(self):
         response = self.county_response()
@@ -337,6 +426,7 @@ class OfflineConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.process(quoted=True)
         pending = OfflineConfirmationStore(self.cache.db_path).get(self.context)
         pending["candidate_text"] = "边坝县人社局"
+        pending['city_match'].pop('supported_areas')
         OfflineConfirmationStore(self.cache.db_path).save(self.context, pending)
         async def call(**kwargs):
             if kwargs["tool_name"] == "match_data_maintenance_city":
