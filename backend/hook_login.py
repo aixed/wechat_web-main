@@ -6,7 +6,6 @@ import base64
 import io
 import json
 import os
-from pathlib import Path
 import re
 import time
 
@@ -16,8 +15,9 @@ from PIL import Image
 import config
 import access_store
 from agent_ws import agent_manager
+from database import database_path
 
-REGISTRY_PATH = Path(__file__).with_name(".sqlite_cache") / "hook_instances.json"
+REGISTRY_PATH = database_path("hook_instances.json")
 client = httpx.AsyncClient(timeout=10, trust_env=False)
 _start_lock = asyncio.Lock()
 _profile_lock = asyncio.Lock()

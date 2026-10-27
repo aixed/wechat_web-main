@@ -68,7 +68,7 @@ MCP 地址示例统一使用 `http://127.0.0.1:5222/mcp`。实际部署的内外
 backend\.venv\Scripts\python.exe scripts\configure_domp_skill.py --owner "登录账号wxid" --chat "目标群id@chatroom" --unify-agent
 ```
 
-迁移会删除本群配置中的旧 SQL、查询、填报、审核和执行 Skill 项，创建文本和 TXT 两个消息类型下同名、同 `skill_id` 的统一 Skill；因此每个消息类型页面只显示一个 Agent。原配置先备份到 `backend/.sqlite_cache/domp_skill_before_时间.json`，原发送人名单、群开关和 MCP 连接保留。重复运行命令只更新同一统一 Agent，不会重复创建。MCP 当前默认地址为 `http://127.0.0.1:5222/mcp`，可在 `config.yaml` 的 `mcp_connections` 中修改对应连接的 `url`，保留原 `id`；重启后端或打开「AI 与 MCP 设置」重新加载后生效。完整流程超时设置为 600 秒；数据运维助手必须运行且三个角色连接配置齐全。
+迁移会删除本群配置中的旧 SQL、查询、填报、审核和执行 Skill 项，创建文本和 TXT 两个消息类型下同名、同 `skill_id` 的统一 Skill；因此每个消息类型页面只显示一个 Agent。原配置先备份到 `backend/db/domp_skill_before_时间.json`，原发送人名单、群开关和 MCP 连接保留。重复运行命令只更新同一统一 Agent，不会重复创建。MCP 当前默认地址为 `http://127.0.0.1:5222/mcp`，可在 `config.yaml` 的 `mcp_connections` 中修改对应连接的 `url`，保留原 `id`；重启后端或打开「AI 与 MCP 设置」重新加载后生效。完整流程超时设置为 600 秒；数据运维助手必须运行且三个角色连接配置齐全。
 
 返回需求编号、用途、风险、填报/审核/执行状态、逐条影响条数、合计、耗时和异常。0 保留、未知明确写“未知”，不使用分析回复冒充成功。长异常分段按顺序 @ 发送人回复。超时回复流程标识，使用查询接口核对，不能重新创建请求绕过防重。
 

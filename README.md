@@ -95,7 +95,7 @@ npm run dev
 
 Windows Server 2012 R2 不在当前 Node.js 的官方支持范围内。`start-all.bat` 会在检测到该系统时自动设置 `NODE_SKIP_PLATFORM_CHECK=1` 并验证 Node/npm 是否能够实际运行；如果仍出现系统 API 或 DLL 缺失错误，需要升级到 Windows Server 2016 或更高版本。
 
-Windows 批处理文件以 CRLF 换行直接存入 Git，保证从 GitHub 下载 ZIP 后也可以正常调用子程序标签。如果旧下载包提示 `The system cannot find the batch label specified - ensure_web_access_key`，请重新下载最新版本并替换 `start-all.bat`、`stop-all.bat` 和 `scripts/start-frontend-dev.bat`，保留已有的 `config.yaml` 和 `backend/.sqlite_cache/`。该标签错误与上面的 Node.js 兼容性警告是不同问题。
+Windows 批处理文件以 CRLF 换行直接存入 Git，保证从 GitHub 下载 ZIP 后也可以正常调用子程序标签。如果旧下载包提示 `The system cannot find the batch label specified - ensure_web_access_key`，请重新下载最新版本并替换 `start-all.bat`、`stop-all.bat` 和 `scripts/start-frontend-dev.bat`，保留已有的 `config.yaml` 和 `backend/db/`。该标签错误与上面的 Node.js 兼容性警告是不同问题。
 
 Windows 启动时会先清理当前项目遗留的后端、Vite 和 npm 进程，并等待 `server_port` 确认可用后再启动；`stop-all.bat` 也使用相同的进程识别和端口复检逻辑。若后端端口被其他项目占用，脚本会显示占用 PID 并停止，不会误杀无关进程。
 
@@ -119,6 +119,15 @@ npm run lint
 `config.yaml` 不会被提交到仓库。公开部署或提交代码前，请确认没有把真实 IP、Token、账号信息、日志、缓存文件或聊天媒体数据提交到 Git。
 
 配置示例和公开文档中的服务地址统一使用 `127.0.0.1`，实际部署地址只保存在本地 `config.yaml`。首次克隆后运行 `git config core.hooksPath .githooks`，启用提交和推送检查：禁止跟踪 `config.yaml`，禁止在配置示例或公开 URL 中写入真实 IP。也可运行 `python scripts/check-public-config.py --staged` 手动检查暂存内容。
+
+应用数据库统一使用标准 SQLite，默认无数据库密码，无需单独部署数据库服务。所有数据库及相关记录、迁移备份放在 `backend/db/`，该目录的运行数据不会提交到 Git：
+
+- `access_users.sqlite3`：用户、访问密钥摘要及微信归属。
+- `wechat_cache.sqlite3` / `wechat_protocol_cache.sqlite3`：Hook / 协议模式的聊天和智能回复数据。
+- `users/<用户ID>.sqlite3`：独立用户的聊天缓存。
+- `hook_instances.json`、`rdv_wxid_mapping.json` 及配置迁移备份：相关运行记录。
+
+从旧版本升级时，先停止旧后端，再启动新后端；程序自动将 `backend/.sqlite_cache/` 和旧位置的 RDV 映射迁入 `backend/db/`。若新目录已有同名文件则保留新文件，将冲突的旧文件及其 SQLite 日志保存在 `backend/db/legacy/`（重名时添加序号），不会覆盖现有数据。备份时请先停止后端，再完整复制 `backend/db/`。
 
 ### 远程 Hook DLL 启动参数
 

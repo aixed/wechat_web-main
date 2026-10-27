@@ -38,6 +38,8 @@ backend/.voice_cache/
 backend/.avatar_cache/
 backend/.sticker_cache/
 backend/.sqlite_cache/
+backend/db/*
+!backend/db/.gitkeep
 
 # Frontend
 frontend/node_modules/

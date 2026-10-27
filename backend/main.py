@@ -40,6 +40,7 @@ from agent_ws import agent_manager
 from ws_manager import manager
 from message_store import MessageStore
 from sqlite_cache import SqliteMessageCache
+from database import database_directory, database_path
 from pb_parser import parse_raw_pb
 from smart_reply import SmartReplyEngine, _mention_targets
 from ai_service import AiService, AiServiceError
@@ -254,7 +255,7 @@ app_state = {
 }
 
 message_store = MessageStore()
-_SQLITE_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".sqlite_cache")
+_SQLITE_CACHE_DIR = str(database_directory())
 _SQLITE_CACHE_FILENAME = "wechat_protocol_cache.sqlite3" if config.IS_PROTOCOL else "wechat_cache.sqlite3"
 sqlite_cache = SqliteMessageCache(os.path.join(_SQLITE_CACHE_DIR, _SQLITE_CACHE_FILENAME))
 smart_reply_engine = SmartReplyEngine()
@@ -283,7 +284,7 @@ _CONTACT_INIT_LOCKS: dict[str, asyncio.Lock] = {}
 _CONTACT_HYDRATING_OWNERS: set[str] = set()
 _SESSION_CONTACT_HYDRATING_OWNERS: set[str] = set()
 _CONTACT_HYDRATION_PROGRESS: dict[str, dict] = {}
-_RDV_MAPPING_PATH = os.path.join(os.path.dirname(__file__), "rdv_wxid_mapping.json")
+_RDV_MAPPING_PATH = str(database_path("rdv_wxid_mapping.json"))
 _OLD_RDV_MAPPING_PATH = r"D:\xweixin\前端\backend\rdv_wxid_mapping.json"
 _RDV_MIN = int("01000000", 16)
 _RDV_MAX = int("7fffffff", 16)
@@ -12925,6 +12926,8 @@ if __name__ == "__main__":
             "backend/logs/*",
             "backend/logs/**/*",
             "backend/_uploads/*",
+            "db/*",
+            "db/**/*",
             ".img_cache/*",
             ".avatar_cache/*",
             ".sticker_cache/*",

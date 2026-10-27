@@ -2,20 +2,19 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from pathlib import Path
 import hashlib
 import json
 import secrets
 import sqlite3
 import time
 import uuid
-import os
 from functools import lru_cache
 from contextlib import contextmanager
 
 import config
+from database import database_path
 
-DB_PATH = Path(os.environ['WECHAT_ACCESS_DB']) if os.environ.get('WECHAT_ACCESS_DB') else Path(__file__).with_name('.sqlite_cache') / 'access_users.sqlite3'
+DB_PATH = database_path('access_users.sqlite3')
 current_user: ContextVar[str] = ContextVar('access_user', default='')
 current_account: ContextVar[str] = ContextVar('access_account', default='')
 

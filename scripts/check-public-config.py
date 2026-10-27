@@ -42,6 +42,8 @@ def check(revision: str | None) -> list[str]:
         path = raw_path.decode("utf-8")
         if PurePosixPath(path).name.lower() == "config.yaml":
             errors.append(f"{label}: {path}: local config.yaml must never be tracked")
+        if path.startswith("backend/db/") and path != "backend/db/.gitkeep":
+            errors.append(f"{label}: {path}: local database data must never be tracked")
         if PurePosixPath(path).name.lower() == "config.example.yaml":
             content = git("show", f"{revision or ''}:{path}")
             for number, line in enumerate(content.splitlines(), 1):

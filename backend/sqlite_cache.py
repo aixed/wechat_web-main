@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from threading import RLock
 from typing import Any, Iterator
 
+from database import database_path
+
 
 class SqliteMessageCache:
     """Small synchronous SQLite cache keyed by wxid.
@@ -21,10 +23,8 @@ class SqliteMessageCache:
     """
 
     def __init__(self, db_path: str | None = None) -> None:
-        base_dir = os.path.dirname(__file__)
-        cache_dir = os.path.join(base_dir, ".sqlite_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        self.db_path = db_path or os.path.join(cache_dir, "wechat_cache.sqlite3")
+        self.db_path = os.fspath(db_path or database_path("wechat_cache.sqlite3"))
+        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         self.existed_before_init = os.path.isfile(self.db_path)
         self._lock = RLock()
         self._history_owners: set[str] = set()
