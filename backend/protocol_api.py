@@ -14,9 +14,10 @@ from urllib.parse import urlparse
 import httpx
 
 import config
+from runtime_settings import setting
 
 
-SESSION_LIST_KEY = "admin@123"
+SESSION_LIST_KEY = str(setting('protocol_session_list_key') or '')
 _DEFAULT_TIMEOUT = 30.0
 client = httpx.AsyncClient(base_url=config.HOOK_BASE_URL, timeout=_DEFAULT_TIMEOUT)
 _req_id = 0
@@ -41,16 +42,12 @@ def _candidate_base_urls() -> list[str]:
     primary = config.HOOK_BASE_URL.rstrip("/")
     parsed = urlparse(primary)
     host = (parsed.hostname or "").lower()
-    if host not in {"127.0.0.1", "localhost", "::1"}:
+    aliases = list(setting('network_local_aliases', default=[]))
+    if host not in aliases:
         return [primary]
     scheme = parsed.scheme or "http"
     port = parsed.port or config.HOOK_PORT
-    candidates = [
-        primary,
-        f"{scheme}://localhost:{port}",
-        f"{scheme}://[::1]:{port}",
-        f"{scheme}://127.0.0.1:{port}",
-    ]
+    candidates = [primary, *(f"{scheme}://{'[' + alias + ']' if ':' in alias else alias}:{port}" for alias in aliases)]
     result: list[str] = []
     for item in candidates:
         if item not in result:

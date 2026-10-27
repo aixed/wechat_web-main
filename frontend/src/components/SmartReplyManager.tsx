@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type MouseEvent as ReactMous
 import { analyzeAiMessage, deleteSmartReply, getAiSettings, getGroupMemberDetails, getMcpTools, getSmartReplies, saveAiSettings, saveSmartReply, validateAiSettings, validateMcpConnection } from "../api";
 import type { AiAnalysisResult, AiProfile, AiSettings, McpConnection, McpTool, SmartReplyAiOutputMode, SmartReplyAiTask, SmartReplyConfig, SmartReplyMessageType, SmartReplyRule, SmartReplyTarget } from "../types";
 import { DEFAULT_AVATAR_URL } from "../avatar";
+import { useClientSettings } from "../clientSettings";
 
 interface GroupMember {
   wxid: string;
@@ -165,11 +166,8 @@ function defaultMcpArguments(tool?: McpTool): string {
   return JSON.stringify(values, null, 2);
 }
 
-function defaultMcpReplyTemplate(toolName: string): string {
-  if (toolName === "submit_data_maintenance") {
-    return "需求 {{identifier}} 保存并提交成功，需求编号：{{work_num}}";
-  }
-  return "{{mcp_text}}";
+function defaultMcpReplyTemplate(toolName: string, settings: AiSettings | null): string {
+  return settings?.mcp_defaults?.reply_templates?.[toolName] || "{{mcp_text}}";
 }
 
 function makeDraft(target: SmartReplyTarget, selfWxid = ""): SmartReplyConfig {
@@ -396,6 +394,9 @@ export default function SmartReplyManager({
   const [activeMessageType, setActiveMessageType] = useState<SmartReplyMessageType>("text");
   const [textReplyMode, setTextReplyMode] = useState<TextReplyMode>("rules");
   const [aiSettings, setAiSettings] = useState<AiSettings | null>(null);
+  const clientSettings = useClientSettings();
+  const commandMention = clientSettings?.workflow.self_mention_names?.[0]
+    ? `@${clientSettings.workflow.self_mention_names[0]}` : "配置的助手昵称";
   const [aiSettingsOpen, setAiSettingsOpen] = useState(false);
   const [mcpToolsByConnection, setMcpToolsByConnection] = useState<Record<string, McpTool[]>>({});
   const [mcpToolsLoading, setMcpToolsLoading] = useState<Record<string, boolean>>({});
@@ -839,7 +840,7 @@ export default function SmartReplyManager({
     updateAiTask(task.id, {
       mcp_tool_name: toolName,
       mcp_arguments_template: defaultMcpArguments(tool),
-      mcp_reply_template: defaultMcpReplyTemplate(toolName),
+      mcp_reply_template: defaultMcpReplyTemplate(toolName, aiSettings),
     });
   };
 
@@ -1337,10 +1338,10 @@ export default function SmartReplyManager({
 
           {draft.chat_id === "filehelper" && (
             <section className={`py-[20px] border-b ${dark ? "border-[#292929]" : "border-[#ddd]"}`}>
-              <h2 className="text-[15px] font-medium">本人 @空气 数据运维任务</h2>
+              <h2 className="text-[15px] font-medium">本人 {commandMention} 数据运维任务</h2>
               <p className={`mt-[7px] text-[13px] leading-[21px] ${dark ? "text-[#aaa]" : "text-[#666]"}`}>
-                当前账号向文件传输助手发送 @空气、单号和 SQL 后，系统按用途及风险检查、填报、审核、执行的顺序处理，并在这里返回结果。
-                四位线下单会先匹配并确认市、县或区，确认和修改时也需要 @空气。
+                当前账号向文件传输助手发送 {commandMention}、单号和 SQL 后，系统按用途及风险检查、填报、审核、执行的顺序处理，并在这里返回结果。
+                四位线下单会先匹配并确认市、县或区，确认和修改时也需要 {commandMention}。
               </p>
               <select aria-label="复制数据运维任务配置" value="" onChange={(event) => copyFilehelperWorkflow(event.target.value)}
                 className={`mt-[12px] max-w-full h-[36px] rounded-[5px] px-[10px] text-[13px] ${dark ? "bg-[#262626] text-[#ddd]" : "bg-[#eee] text-[#333]"}`}>
@@ -1348,7 +1349,7 @@ export default function SmartReplyManager({
                 {sqlWorkflowSources.map((source) => <option key={source.chat_id} value={source.chat_id}>{source.chat_name}</option>)}
               </select>
               {sqlWorkflowSources.length === 0 && <p className="mt-[7px] text-[12px] text-[#888]">可在下方添加数据运维 Agent 并选择 MCP 连接。</p>}
-              <p className={`mt-[8px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>仅处理本人明确 @空气 的指令，结果消息不会继续触发任务。保存后生效。</p>
+              <p className={`mt-[8px] text-[12px] ${dark ? "text-[#777]" : "text-[#888]"}`}>仅处理本人明确 {commandMention} 的指令，结果消息不会继续触发任务。保存后生效。</p>
             </section>
           )}
 
@@ -1557,7 +1558,7 @@ export default function SmartReplyManager({
                 </div>
                 {selfSelected && (
                   <div className={`mt-[5px] text-[12px] ${dark ? "text-[#999]" : "text-[#777]"}`}>
-                    本人的数据运维指令仍需明确 @空气，普通消息不触发。
+                    本人的数据运维指令仍需明确 {commandMention}，普通消息不触发。
                   </div>
                 )}
               </div>
@@ -2263,17 +2264,17 @@ function normalizeMcpConnections(settings: AiSettings | null): McpConnection[] {
   }));
 }
 
-function mcpTokenRequired(connection: McpConnection): boolean {
+function mcpTokenRequired(connection: McpConnection, ports: number[] = []): boolean {
   try {
     const url = new URL(connection.url.trim());
-    return Boolean(url.hostname) && url.port === "5222";
+    return Boolean(url.hostname) && ports.includes(Number(url.port));
   } catch {
     return false;
   }
 }
 
-function mcpTokenMissing(connection: McpConnection): boolean {
-  return mcpTokenRequired(connection) && !connection.token?.trim() && !connection.token_configured;
+function mcpTokenMissing(connection: McpConnection, ports: number[]): boolean {
+  return mcpTokenRequired(connection, ports) && !connection.token?.trim() && !connection.token_configured;
 }
 
 function AiSettingsDialog({
@@ -2359,7 +2360,7 @@ function AiSettingsDialog({
       setMcpFeedback((prev) => ({ ...prev, [connection.id]: { kind: "error", message: "请填写连接名称和 MCP 地址" } }));
       return;
     }
-    if (mcpTokenMissing(connection)) {
+    if (mcpTokenMissing(connection, settings?.mcp_defaults?.required_token_ports || [])) {
       setMcpFeedback((prev) => ({ ...prev, [connection.id]: { kind: "error", message: "请填写与服务器 api_token 一致的 Bearer Token" } }));
       return;
     }
@@ -2435,7 +2436,7 @@ function AiSettingsDialog({
       setMcpFeedback((prev) => ({ ...prev, [incompleteConnection.id]: { kind: "error", message: "请完整填写该 MCP 连接后再保存" } }));
       return;
     }
-    const unauthenticatedConnection = mcpConnections.find((connection) => connection.enabled && mcpTokenMissing(connection));
+    const unauthenticatedConnection = mcpConnections.find((connection) => connection.enabled && mcpTokenMissing(connection, settings?.mcp_defaults?.required_token_ports || []));
     if (unauthenticatedConnection) {
       setMcpFeedback((prev) => ({ ...prev, [unauthenticatedConnection.id]: { kind: "error", message: "请填写与服务器 api_token 一致的 Bearer Token 后再保存" } }));
       return;
@@ -2600,7 +2601,7 @@ function AiSettingsDialog({
                             id={`ai-profile-name-${profile.id}`}
                             value={profile.name}
                             onChange={(event) => updateProfile(profile.id, { name: event.target.value })}
-                            placeholder="例如 DeepSeek / 灵算 / OpenAI"
+                            placeholder="模型配置名称"
                             autoComplete="off"
                             className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
                           />
@@ -2611,7 +2612,7 @@ function AiSettingsDialog({
                             id={`ai-model-${profile.id}`}
                             value={profile.model}
                             onChange={(event) => updateProfile(profile.id, { model: event.target.value })}
-                            placeholder="例如 gpt-5.6-sol / deepseek-v4-flash"
+                            placeholder="填写模型标识"
                             autoComplete="off"
                             className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
                           />
@@ -2624,7 +2625,7 @@ function AiSettingsDialog({
                           id={`ai-base-url-${profile.id}`}
                           value={profile.base_url}
                           onChange={(event) => updateProfile(profile.id, { base_url: event.target.value })}
-                          placeholder="https://example.com/v1"
+                          placeholder="填写模型 API 地址"
                           autoComplete="off"
                           className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
                         />
@@ -2772,7 +2773,7 @@ function AiSettingsDialog({
                           <input
                             value={connection.url}
                             onChange={(event) => updateMcpConnection(connection.id, { url: event.target.value })}
-                            placeholder="http://127.0.0.1:5222/mcp"
+                            placeholder={settings?.mcp_defaults?.url || "填写 MCP 服务地址"}
                             autoComplete="off"
                             className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
                           />
@@ -2783,7 +2784,7 @@ function AiSettingsDialog({
                             type="password"
                             value={connection.token || ""}
                             onChange={(event) => updateMcpConnection(connection.id, { token: event.target.value })}
-                            placeholder={connection.token_configured ? "已配置，留空保留" : (mcpTokenRequired(connection) ? "请输入服务器 api_token" : "可选")}
+                            placeholder={connection.token_configured ? "已配置，留空保留" : (mcpTokenRequired(connection, settings?.mcp_defaults?.required_token_ports || []) ? "请输入服务器 api_token" : "可选")}
                             autoComplete="new-password"
                             className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
                           />

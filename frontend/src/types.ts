@@ -92,6 +92,12 @@ export interface AiSettings {
   active_profile_id: string;
   profiles: AiProfile[];
   mcp_connections: McpConnection[];
+  mcp_defaults?: {
+    name: string;
+    url: string;
+    required_token_ports: number[];
+    reply_templates: Record<string, string>;
+  };
 }
 
 export interface AiAnalysisResult {

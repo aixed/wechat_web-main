@@ -8,6 +8,7 @@ import uuid
 from typing import Any
 
 import httpx
+from runtime_settings import setting
 
 
 class McpServiceError(RuntimeError):
@@ -20,7 +21,8 @@ def requires_bearer_token(url: str) -> bool:
     except (httpx.InvalidURL, ValueError):
         return False
     # Data-maintenance MCP deployments require a token regardless of their host.
-    return bool(parsed.host) and parsed.port == 5222
+    ports = setting('mcp_defaults', 'required_token_ports', default=[])
+    return bool(parsed.host) and parsed.port in ports
 
 
 def _sse_payloads(text: str) -> list[dict[str, Any]]:

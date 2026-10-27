@@ -52,6 +52,8 @@ wechat_web/
 ├── backend/              # FastAPI 后端与微信接口封装
 ├── frontend/             # React + Vite 前端
 ├── config.example.yaml   # 脱敏配置模板
+├── prompts.example.yaml  # 通用提示词模板
+├── prompts.yaml          # 本地提示词（不会提交到 Git）
 ├── config.yaml           # 本地运行配置（不会提交到 Git）
 └── README.md
 ```
@@ -118,7 +120,11 @@ npm run lint
 
 `config.yaml` 不会被提交到仓库。公开部署或提交代码前，请确认没有把真实 IP、Token、账号信息、日志、缓存文件或聊天媒体数据提交到 Git。
 
-配置示例和公开文档中的服务地址统一使用 `127.0.0.1`，实际部署地址只保存在本地 `config.yaml`。首次克隆后运行 `git config core.hooksPath .githooks`，启用提交和推送检查：禁止跟踪 `config.yaml`，禁止在配置示例或公开 URL 中写入真实 IP。也可运行 `python scripts/check-public-config.py --staged` 手动检查暂存内容。
+配置示例和公开文档中的服务地址统一使用 `127.0.0.1`，MCP 系统名称统一使用 `mcp系统名称`。实际部署地址、名称和密钥只保存在本地 `config.yaml`。首次克隆后运行 `git config core.hooksPath .githooks`，启用提交和推送检查：禁止跟踪 `config.yaml`、`prompts.yaml` 和数据库，阻止提交真实 IP、实际系统名称、源码中的服务地址和提示词。也可运行 `python scripts/check-public-config.py --staged` 手动检查暂存内容。
+
+AI 提示词统一放在 YAML 配置中：复制 `prompts.example.yaml` 为本地 `prompts.yaml` 后修改；`config.yaml` 的 `prompt_config_file` 指向本地文件，缺少本地文件或对应条目时读取 `prompt_example_file` 指定的公开模板。明确配置为空的提示词会报错，防止执行不完整的指令。修改后重启后端即可更新桥接任务使用的提示词。
+
+网络默认值使用 `network_*` 配置；MCP 默认名称、地址、Token 检查端口及默认回复模板使用 `mcp_defaults`；触发昵称、显示昵称和报表作者使用 `workflow`；业务任务标题及回复前缀使用 `labels`。协议会话列表密钥使用 `protocol_session_list_key`，公开模板留空。前端从后端读取所需配置，构建时不打包本地 YAML 或完整提示词。`/api/client-settings` 仅向已登录用户返回配置允许的公开资源和触发名称字段。
 
 应用数据库统一使用标准 SQLite，默认无数据库密码，无需单独部署数据库服务。所有数据库及相关记录、迁移备份放在 `backend/db/`，该目录的运行数据不会提交到 Git：
 

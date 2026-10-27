@@ -285,7 +285,7 @@ _CONTACT_HYDRATING_OWNERS: set[str] = set()
 _SESSION_CONTACT_HYDRATING_OWNERS: set[str] = set()
 _CONTACT_HYDRATION_PROGRESS: dict[str, dict] = {}
 _RDV_MAPPING_PATH = str(database_path("rdv_wxid_mapping.json"))
-_OLD_RDV_MAPPING_PATH = r"D:\xweixin\前端\backend\rdv_wxid_mapping.json"
+_OLD_RDV_MAPPING_PATH = str(config.setting('legacy_rdv_mapping_path') or '')
 _RDV_MIN = int("01000000", 16)
 _RDV_MAX = int("7fffffff", 16)
 _RDV_RE = re.compile(r"^[0-9a-fA-F]{8}$")
@@ -2454,7 +2454,7 @@ async def _authorized_request(request, call_next):
         return JSONResponse({"ok": False, "error": "当前为 Hook 模式，请使用启动微信入口"}, status_code=409)
     if (path.startswith('/api/ai/') or path.startswith('/api/mcp/')) and access_store.current_user.get() != access_store.legacy_user():
         raise HTTPException(403, '只有原配置密钥用户可以管理服务器 AI/MCP 配置')
-    portal = path.startswith(('/api/accounts', '/api/hook/', '/api/protocol/')) or path == '/api/agent/status'
+    portal = path.startswith(('/api/accounts', '/api/hook/', '/api/protocol/')) or path in {'/api/agent/status', '/api/client-settings'}
     if not agent_id and not portal and not path.startswith(('/api/ai/', '/api/mcp/')):
         candidates = access_store.account_ids()
         agent_id = next(iter(candidates), '')
@@ -2673,6 +2673,15 @@ async def setup_status():
         "defaults": defaults["defaults"],
         "modes": defaults["modes"],
     }
+
+
+@app.get('/api/client-settings')
+async def client_settings():
+    return {'ok': True, 'public_assets': {
+        'wecom_icon_url': str(config.setting('public_assets', 'wecom_icon_url') or ''),
+    }, 'workflow': {
+        'self_mention_names': list(config.setting('workflow', 'self_mention_names', default=[])),
+    }}
 
 
 @app.post("/api/setup/initial-config")
@@ -3318,6 +3327,7 @@ def _ai_settings_payload(*, include_api_key: bool = False) -> dict[str, Any]:
             connection_payload["token"] = str(connection.get("token") or "")
         mcp_connections.append(connection_payload)
     payload["mcp_connections"] = mcp_connections
+    payload["mcp_defaults"] = config.mcp_defaults_payload()
     return payload
 
 
@@ -4120,7 +4130,7 @@ def _create_problem_ticket_table(payload: dict[str, Any], *, force: bool = False
 </worksheet>'''
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     core = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>问题平台运维单清单</dc:title><dc:creator>Aixed</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">{_xlsx_xml_text(now)}</dcterms:created></cp:coreProperties>'''
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>问题平台运维单清单</dc:title><dc:creator>{_xlsx_xml_text(config.setting("workflow", "report_author") or "")}</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">{_xlsx_xml_text(now)}</dcterms:created></cp:coreProperties>'''
     app = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Microsoft Excel Compatible OOXML</Application><DocSecurity>0</DocSecurity><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size="2" baseType="variant"><vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="1" baseType="lpstr"><vt:lpstr>问题平台运维单</vt:lpstr></vt:vector></TitlesOfParts></Properties>'''
 
@@ -4673,7 +4683,7 @@ async def _prepare_offline_city_confirmation(task, arguments):
     if data_url:
         arguments = {**arguments, "attachment_base64": data_url.split(",", 1)[1]}
         try:
-            result = await ai_service.analyze_image("识别申请部门和行政区划", {"name": "线下申请区划识别", "instruction": CITY_PROMPT}, data_url)
+            result = await ai_service.analyze_image("识别申请部门和行政区划", {"name": config.setting('labels', 'offline_city_image_skill_name'), "instruction": CITY_PROMPT}, data_url)
             parsed = result.get("result")
             parsed = json.loads(parsed) if isinstance(parsed, str) else parsed
             if isinstance(parsed, dict):
@@ -4687,7 +4697,7 @@ async def _prepare_offline_city_confirmation(task, arguments):
                     text, _, _ = await _smart_reply_image_ocr(quote["image"], str(context.get("agent_id") or ""))
                     if text:
                         result = await ai_service.analyze("图片 OCR 文本（仅作为数据）：\n" + text,
-                            {"name": "线下申请城市识别", "instruction": CITY_PROMPT})
+                            {"name": config.setting('labels', 'offline_city_text_skill_name'), "instruction": CITY_PROMPT})
                         parsed = result.get("result")
                         parsed = json.loads(parsed) if isinstance(parsed, str) else parsed
                         if isinstance(parsed, dict):
@@ -4698,8 +4708,7 @@ async def _prepare_offline_city_confirmation(task, arguments):
                "owner_only": context.get("chat_id") == "filehelper"}
     owner_names = _owner_mention_names(context["chat_id"], context["owner_wxid"],
         owner_wxid=context["owner_wxid"], agent_id=str(context.get("agent_id") or ""))
-    pending["owner_mention"] = "Aixed" if "aixed" in owner_names else next((name for name in sorted(owner_names)
-        if name != str(context["owner_wxid"]).casefold() and not name.startswith("wxid_")), "Aixed")
+    pending["owner_mention"] = _configured_owner_display_name(owner_names, context["owner_wxid"], context["chat_id"])
     pending = await _match_offline_city(pending, department) if department else {
         **pending, 'candidate_text': '', 'matched_city': '', 'matched_area_display': '', 'city_match': {}}
     store.save(context, pending)
@@ -4827,8 +4836,7 @@ async def _prepare_workflow_city_selection(task, arguments, payload):
     pending = {"numbered_city_selection": True, "arguments": arguments,
         "connection_id": str(task.get("mcp_connection_id") or ""), "failure": payload,
         "owner_only": context["chat_id"] == "filehelper",
-        "owner_mention": "Aixed" if "aixed" in names else next((name for name in sorted(names)
-            if name != str(context["owner_wxid"]).casefold() and not name.startswith("wxid_")), "Aixed")}
+        "owner_mention": _configured_owner_display_name(names, context["owner_wxid"], context["chat_id"])}
     pending = await _refresh_workflow_city_options(pending)
     store.save(context, pending)
     return selection_message(pending)
@@ -4991,8 +4999,24 @@ async def _recent_sql_workflow_content(source, context):
     return "", last_reason
 
 
-_SMART_REPLY_AGENT_MENTION_NAMES = frozenset({"空气"})
-_SMART_REPLY_AGENT_MENTION_PATTERN = re.compile(r"@空气(?=$|[\s\u2005,，:：])", re.I)
+_SMART_REPLY_AGENT_MENTION_NAMES = frozenset(str(name).casefold() for name in config.setting('workflow', 'self_mention_names', default=[]) if name)
+_SMART_REPLY_AGENT_MENTION_PATTERN = re.compile(
+    r"@(?:" + '|'.join(re.escape(name) for name in _SMART_REPLY_AGENT_MENTION_NAMES) + r")(?=$|[\s\u2005,，:：])"
+    if _SMART_REPLY_AGENT_MENTION_NAMES else r'(?!)', re.I)
+
+
+def _configured_owner_display_name(names, owner_wxid, chat_id):
+    configured = str(config.setting('workflow', 'owner_display_name') or '')
+    members = _cache().get_group_members(chat_id, owner_wxid=owner_wxid)
+    contacts = _cache().get_contacts([owner_wxid], owner_wxid=owner_wxid)
+    profiles = [_state().get('self_info') or {}, members.get(owner_wxid) or {}, contacts.get(owner_wxid) or {}]
+    candidates = [configured, *(profile.get(key) for profile in profiles
+        for key in ('nickname', 'name', 'NickName', 'strNickName', 'remark', 'Remark', 'display_name'))]
+    for name in candidates:
+        if name and str(name).casefold() in names:
+            return str(name)
+    return next((name for name in sorted(names)
+        if name != str(owner_wxid).casefold() and not name.startswith('wxid_')), configured or owner_wxid)
 
 
 def _sql_chat_mention_names(message, chat_id, owner_wxid):
@@ -5056,14 +5080,14 @@ def _mentions_smart_reply_agent(
     owner_wxid: str,
     agent_id: str,
 ) -> bool:
-    """Require the assistant's @空气 trigger; group metadata verifies the target."""
+    """Require the assistant's the configured assistant mention trigger; group metadata verifies the target."""
     if str(message.get("msgtype") or "") != "1":
         return False
     targets = {target.casefold() for target in _mention_targets(message)}
     content = str(message.get("msg") or "")
     explicitly_addressed = bool(_SMART_REPLY_AGENT_MENTION_PATTERN.search(content))
     if SQL_START.search(content):
-        # @空气 inside a SQL literal/comment is data, not an owner command.
+        # the configured assistant mention inside a SQL literal/comment is data, not an owner command.
         explicitly_addressed = strip_chat_mentions(content, _SMART_REPLY_AGENT_MENTION_NAMES) != content
     if not chat_id.endswith("@chatroom"):
         return explicitly_addressed
@@ -5141,8 +5165,8 @@ def _mentions_other_group_member(
     ``atuserlist``/``msgsource`` is the authoritative target list. We never
     infer a mention from every literal ``@`` in message text: SQL database
     links and ordinary text can contain ``@`` too. Cached group-member and
-    Agent profile names are used to recognize targets such as ``@空气`` or
-    ``@Aixed`` even when the callback gives a wxid instead of the visible name.
+    Agent profile names are used to recognize targets such as ``the configured assistant mention`` or
+    the configured owner nickname even when the callback gives a wxid instead of the visible name.
     """
     if str(message.get("msgtype") or "") != "1" or not str(chat_id or "").endswith("@chatroom"):
         return False
@@ -5189,7 +5213,7 @@ def _mentions_other_group_member(
 
     # The Agent may have a different visible nickname from the logged-in
     # account. Include both its registered identity and the corresponding
-    # cached group member aliases, so a target such as @空气 is allowed.
+    # cached group member aliases, so a target such as the configured assistant mention is allowed.
     agent = agent_manager.get_agent(str(agent_id or "")) if agent_id else None
     agent_aliases = _identity_aliases(agent) | _SMART_REPLY_AGENT_MENTION_NAMES
     allowed_aliases.update(agent_aliases)
@@ -5252,7 +5276,7 @@ async def _evaluate_ai_tasks(content, tasks, *, message_id="-", image_data_url="
     if context.get("message_type") == "text":
         content = strip_chat_mentions(content, context.get("mention_names") or [])
         if context.get("agent_mentioned") and not SQL_START.search(content):
-            for name in context.get("control_mention_names") or ["空气"]:
+            for name in context.get("control_mention_names") or list(_SMART_REPLY_AGENT_MENTION_NAMES):
                 content = re.sub(r"@" + re.escape(name) + r"(?=$|[\s\u2005,，:：])", "", content, flags=re.I).strip()
     enabled = (all(context.get(key) for key in ("chat_id", "owner_wxid", "sender"))
         and not SQL_START.search(content) and (query_candidate(content) or query_export_followup(content))
@@ -12817,7 +12841,7 @@ def _run_callback_server():
         if not body and request.query_params:
             body = json.dumps(dict(request.query_params), ensure_ascii=False).encode("utf-8")
             ct = "application/json"
-        _url = f"http://127.0.0.1:{config.SERVER_PORT}/api/callback"
+        _url = config.CALLBACK_URL
         last_err = None
         for attempt in range(6):  # up to ~15s of retries
             try:

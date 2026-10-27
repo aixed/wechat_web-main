@@ -303,7 +303,7 @@ async def _post(endpoint: str, json: dict = None, timeout: float = None,
                     status_code=agent_response.status,
                     content=agent_response.body,
                     headers={"content-type": agent_response.content_type},
-                    request=httpx.Request("POST", f"http://agent.local/{route}"),
+                    request=httpx.Request("POST", f"{config.setting('network_http_scheme')}://{config.setting('network_agent_host')}/{route}"),
                 )
             else:
                 r = await client.post(full_url if hook_instance else endpoint, json=request_json, timeout=timeout)

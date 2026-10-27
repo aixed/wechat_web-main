@@ -20,6 +20,7 @@ class AccessUsersTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         for p in [patch.object(access_store, 'DB_PATH', self.root / 'access.sqlite3'),
+                  patch.object(config, 'config_file_exists', return_value=True),
                   patch.object(hook_login, 'REGISTRY_PATH', self.root / 'instances.json'),
                   patch.object(main, '_SQLITE_CACHE_DIR', str(self.root)),
                   patch.object(main, '_user_caches', {}), patch.object(main, '_account_runtimes', {}),
@@ -62,6 +63,19 @@ class AccessUsersTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual('alice-test-key', row['access_key'])
         again = await self.client.post('/api/auth/login', json={'key': 'alice-test-key'})
         self.assertEqual(self.users['alice-test-key'], again.json()['user_id'])
+
+    async def test_client_settings_allow_authenticated_user_without_an_account_and_exclude_private_config(self):
+        self.assertEqual(401, (await self.client.get('/api/client-settings')).status_code)
+        response = await self.client.get('/api/client-settings', headers=self.headers())
+        self.assertEqual(200, response.status_code)
+        self.assertEqual({'ok', 'public_assets', 'workflow'}, set(response.json()))
+        self.assertEqual({'wecom_icon_url'}, set(response.json()['public_assets']))
+        self.assertEqual({'self_mention_names'}, set(response.json()['workflow']))
+
+    async def test_ai_settings_expose_configured_defaults_used_by_frontend(self):
+        response = await self.client.get('/api/ai/settings', headers={'X-Access-Key': config.WEB_ACCESS_KEY})
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(config.mcp_defaults_payload(), response.json()['mcp_defaults'])
 
     async def test_new_key_cannot_see_default_or_use_foreign_ids_in_headers_body_or_routes(self):
         with patch.object(main, '_probe_local_hook_account', AsyncMock()) as probe:

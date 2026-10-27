@@ -4,6 +4,7 @@ import { sendText, getMessages, getOlderMessages, sendImageUpload, sendFileUploa
 import MessageBubble from "./MessageBubble";
 import { DEFAULT_AVATAR_URL } from "../avatar";
 import { deleteChatBackground, getChatBackground, saveChatBackground } from "../chatBackgroundStore";
+import { useClientSettings } from "../clientSettings";
 
 interface ChatAreaProps {
   session: Session;
@@ -1852,9 +1853,10 @@ function OpenIMContactProfileCard({
   const avatar = profile?.avatar || raw.SmallHeadImgUrl || raw.small_head_img_url || raw.small_head_url || raw.BigHeadImgUrl || raw.big_head_img_url || raw.big_head_url || raw.avatar || fallbackAvatar || "";
   const sex = Number(raw.Sex || 0);
   const rows = openimInfoRows(raw);
+  const clientSettings = useClientSettings();
   const sourceRow = rows.find((row) => row.title === "来自") || {
     title: "来自",
-    icon: "https://wwcdn.weixin.qq.com/node/wework/images/glyph_wecom_colored_16.png",
+    icon: clientSettings?.public_assets.wecom_icon_url || "",
     desc: profileField(raw, ["SourceText"]) || "企业微信",
     url: "",
   };

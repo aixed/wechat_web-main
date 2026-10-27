@@ -11,6 +11,7 @@ import sys
 from typing import Any
 
 import yaml
+from runtime_settings import example, setting
 
 # Windows redirects stdout/stderr with the system code page by default.
 # The backend logs Chinese text and status symbols, so force UTF-8 early.
@@ -93,14 +94,14 @@ IS_PROTOCOL = IS_REMOTE_PROTOCOL
 
 _prefix = LOGIN_MODE  # e.g. "local_hook", "remote_hook", "remote_protocol"
 
-HOOK_HOST = str(_cfg.get(f"{_prefix}_host", "127.0.0.1"))
+HOOK_HOST = str(_cfg.get(f"{_prefix}_host", str(setting('network_loopback_host'))))
 HOOK_PORT = int(_cfg.get(f"{_prefix}_api_port", 30001))
 MGR_PORT = int(_cfg.get(f"{_prefix}_mgr_port", 29999))
 HOOK_WECHAT_PATH = str(_cfg.get(f"{_prefix}_wechat_path", _cfg.get("wechat_path", "")) or "")
 
 # ─── Public IP & RDV ──────────────────────────────────────────────
 
-PUBLIC_IP = str(_cfg.get("ip", "127.0.0.1"))
+PUBLIC_IP = str(_cfg.get("ip", str(setting('network_loopback_host'))))
 RDV = str(_cfg.get("RDV", ""))
 
 # ─── Derived URLs ──────────────────────────────────────────────────
@@ -108,12 +109,10 @@ RDV = str(_cfg.get("RDV", ""))
 HOOK_BASE_URL = f"http://{HOOK_HOST}:{HOOK_PORT}"
 MGR_BASE_URL = f"http://{HOOK_HOST}:{MGR_PORT}"
 
-# Backend server. Keep this on 127.0.0.1 when the frontend runs on the same
-# machine and proxies /api + /agent; set to 0.0.0.0 only when exposing backend
-# ports directly is intentional.
-SERVER_HOST = str(_cfg.get("server_host", "0.0.0.0") or "0.0.0.0")
+# Backend binding and network defaults are read from YAML configuration.
+SERVER_HOST = str(_cfg.get("server_host", str(setting('network_bind_all_host'))) or str(setting('network_bind_all_host')))
 SERVER_PORT = int(_cfg.get("server_port", 5000))
-DEFAULT_WEB_ACCESS_KEY = "admin"
+DEFAULT_WEB_ACCESS_KEY = str(example('web_access_key'))
 
 
 def _resolve_web_access_key(document: dict[str, Any]) -> tuple[str, bool]:
@@ -139,7 +138,7 @@ AI_API_KEY = ""
 AI_MODEL = ""
 AI_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("ai_timeout_seconds", 60)))
 AI_MAX_CONCURRENCY = max(1, min(20, int(_cfg.get("ai_max_concurrency", 3))))
-DEFAULT_MCP_URL = "http://127.0.0.1:5222/mcp"
+DEFAULT_MCP_URL = str(setting('mcp_defaults', 'url') or '')
 MCP_CONNECTIONS: list[dict[str, Any]] = []
 MCP_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("mcp_timeout_seconds", 600)))
 
@@ -230,12 +229,21 @@ def _resolve_mcp_connections(document: dict[str, Any]) -> list[dict[str, Any]]:
         default_url = str(os.environ.get("MCP_URL") or DEFAULT_MCP_URL).strip().rstrip("/")
         connections.append({
             "id": "local_mcp",
-            "name": "远程 MCP",
+            "name": str(setting('mcp_defaults', 'name') or ''),
             "url": default_url,
             "token": str(os.environ.get("MCP_TOKEN") or "").strip(),
             "enabled": True,
         })
     return connections
+
+
+def mcp_defaults_payload() -> dict[str, Any]:
+    return {
+        "name": str(setting('mcp_defaults', 'name') or ''),
+        "url": str(setting('mcp_defaults', 'url') or ''),
+        "required_token_ports": list(setting('mcp_defaults', 'required_token_ports', default=[])),
+        "reply_templates": dict(setting('mcp_defaults', 'reply_templates', default={})),
+    }
 
 
 def _apply_ai_settings(document: dict[str, Any]) -> dict:
@@ -274,6 +282,7 @@ def _apply_ai_settings(document: dict[str, Any]) -> dict:
             }
             for connection in MCP_CONNECTIONS
         ],
+        "mcp_defaults": mcp_defaults_payload(),
     }
 
 
@@ -418,7 +427,7 @@ if not AGENT_WS_PATH.startswith("/"):
     AGENT_WS_PATH = "/" + AGENT_WS_PATH
 CLIENT_WSS_PORT = int(_cfg.get("client_wss_port", 443))
 CLIENT_WSS_SCHEME = str(_cfg.get("client_wss_scheme", "wss") or "wss").lower()
-CLIENT_WSS_HOST = str(_cfg.get("client_wss_host", _cfg.get("ip", "127.0.0.1")) or "127.0.0.1")
+CLIENT_WSS_HOST = str(_cfg.get("client_wss_host", _cfg.get("ip", str(setting('network_loopback_host')))) or str(setting('network_loopback_host')))
 AGENT_WS_REQUEST_TIMEOUT = float(_cfg.get("agent_ws_request_timeout", 30.0))
 
 _client_wss_default_port = 443 if CLIENT_WSS_SCHEME == "wss" else 80
@@ -430,7 +439,7 @@ CLIENT_WSS_URL = f"{CLIENT_WSS_SCHEME}://{CLIENT_WSS_HOST}{_client_wss_port_part
 CALLBACK_HOST = SERVER_HOST
 CALLBACK_PORT = SERVER_PORT
 CALLBACK_PATH = "/api/callback"
-CALLBACK_URL = f"http://127.0.0.1:{SERVER_PORT}{CALLBACK_PATH}"
+CALLBACK_URL = f"{setting('network_http_scheme')}://{setting('network_callback_host')}:{SERVER_PORT}{CALLBACK_PATH}"
 RECV_TYPE = int(_cfg.get("recvtype", _cfg.get("recv_type", 2)))
 if RECV_TYPE not in (1, 2):
     print(f"[CONFIG] ⚠ invalid recv_type={RECV_TYPE!r}, using 2", flush=True)
@@ -446,7 +455,7 @@ def _mode_defaults(mode_number: int) -> dict[str, Any]:
     host_key = f"{mode_name}_host"
     api_key = f"{mode_name}_api_port"
     mgr_key = f"{mode_name}_mgr_port"
-    host = "127.0.0.1"
+    host = str(setting('network_loopback_host'))
     return {
         "wechat_mode": mode_number,
         "mode": mode_name,
@@ -475,14 +484,14 @@ def initial_setup_defaults() -> dict[str, Any]:
             "local_hook": _mode_defaults(1),
             "remote_hook": {
                 **_mode_defaults(2),
-                "public_host": str(_cfg.get("client_wss_host", _cfg.get("ip", "127.0.0.1")) or "127.0.0.1"),
+                "public_host": str(_cfg.get("client_wss_host", _cfg.get("ip", str(setting('network_loopback_host')))) or str(setting('network_loopback_host'))),
             },
             "remote_protocol": _mode_defaults(3),
         },
     }
 
 
-def _clean_host(value: Any, *, default: str = "127.0.0.1") -> str:
+def _clean_host(value: Any, *, default: str = str(setting('network_loopback_host'))) -> str:
     text = str(value or "").strip()
     if not text:
         return default
@@ -510,51 +519,7 @@ def _load_initial_config_template() -> Any:
     if os.path.exists(_CONFIG_EXAMPLE_PATH):
         with open(_CONFIG_EXAMPLE_PATH, "r", encoding="utf-8") as stream:
             return parser, parser.load(stream) or {}
-    return parser, {
-        "ip": "127.0.0.1",
-        "wechat_mode": 1,
-        "local_hook_host": "127.0.0.1",
-        "local_hook_api_port": 30001,
-        "local_hook_mgr_port": 29999,
-        "remote_hook_host": "127.0.0.1",
-        "remote_hook_api_port": 30001,
-        "remote_hook_mgr_port": 29999,
-        "remote_protocol_host": "127.0.0.1",
-        "remote_protocol_api_port": 30001,
-        "remote_protocol_mgr_port": 29999,
-        "server_host": "0.0.0.0",
-        "server_port": 5000,
-        "web_access_key": DEFAULT_WEB_ACCESS_KEY,
-        "hook_api_concurrency": 20,
-        "frontend_host": "0.0.0.0",
-        "frontend_port": 80,
-        "agent_ws_enabled": True,
-        "agent_ws_path": "/agent",
-        "client_wss_scheme": "ws",
-        "client_wss_host": "127.0.0.1",
-        "client_wss_port": 5000,
-        "agent_ws_request_timeout": 30,
-        "recvtype": 1,
-        "restart_on_button_login_fail": True,
-        "max_restarts_after_button_login_fail": 1,
-        "ai_base_url": "",
-        "ai_api_key": "",
-        "ai_model": "",
-        "ai_active_profile_id": "",
-        "ai_profiles": [],
-        "ai_timeout_seconds": 60,
-        "ai_max_concurrency": 3,
-        "mcp_connections": [
-            {
-                "id": "local_mcp",
-                "name": "远程 MCP",
-                "url": DEFAULT_MCP_URL,
-                "token": "",
-                "enabled": True,
-            }
-        ],
-        "mcp_timeout_seconds": 600,
-    }
+    raise FileNotFoundError('config.example.yaml is required for initial setup')
 
 
 def save_initial_setup_config(
@@ -578,7 +543,7 @@ def save_initial_setup_config(
 
     access_key = str(web_access_key or "").strip() or DEFAULT_WEB_ACCESS_KEY
     mode_name = _MODE_BY_NUMBER[mode_number]
-    selected_host = "127.0.0.1" if mode_number == 1 else _clean_host(host)
+    selected_host = str(setting('network_loopback_host')) if mode_number == 1 else _clean_host(host)
     selected_api_port = _clean_port(api_port, default=30001, field="API 端口")
     selected_mgr_port = _clean_port(mgr_port, default=29999, field="管理端口")
     selected_public_host = _clean_host(public_host or selected_host)
@@ -586,9 +551,9 @@ def save_initial_setup_config(
     parser, document = _load_initial_config_template()
     document["wechat_mode"] = mode_number
     document["web_access_key"] = access_key
-    document["server_host"] = str(document.get("server_host") or "0.0.0.0")
+    document["server_host"] = str(document.get("server_host") or str(setting('network_bind_all_host')))
     document["server_port"] = _clean_port(document.get("server_port"), default=5000, field="server_port")
-    document["frontend_host"] = str(document.get("frontend_host") or "0.0.0.0")
+    document["frontend_host"] = str(document.get("frontend_host") or str(setting('network_bind_all_host')))
     document["frontend_port"] = _clean_port(document.get("frontend_port"), default=80, field="frontend_port")
     document["hook_api_concurrency"] = 20 if mode_number == 1 else 10
     document["recvtype"] = _clean_port(document.get("recvtype"), default=1, field="recvtype")
@@ -598,9 +563,9 @@ def save_initial_setup_config(
     document[f"{mode_name}_mgr_port"] = selected_mgr_port
 
     if mode_number == 1:
-        document["ip"] = "127.0.0.1"
+        document["ip"] = str(setting('network_loopback_host'))
         document["agent_ws_enabled"] = False
-        document["client_wss_host"] = "127.0.0.1"
+        document["client_wss_host"] = str(setting('network_loopback_host'))
     elif mode_number == 2:
         document["ip"] = selected_public_host
         document["agent_ws_enabled"] = True

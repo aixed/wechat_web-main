@@ -1,6 +1,8 @@
 """Read-only operation-ticket and DOMP query Agent routing and replies."""
 from __future__ import annotations
 
+from runtime_settings import prompt, setting
+
 import json
 import re
 from collections import Counter
@@ -13,32 +15,11 @@ QUERY_TOOL = "query_data_maintenance"
 TASK_QUERY_TOOL = "query_operation_ticket"
 TASK_SUMMARY_TOOL = "query_task_processing"
 RANGE_QUERY_TOOL = "query_operation_tickets"
-QUERY_REPLY_PREFIX = "数据运维查询结果"
-PROBLEM_QUERY_REPLY_PREFIX = "问题平台查询结果"
-EXECUTION_REPLY_PREFIX = "数据运维执行结果"
+QUERY_REPLY_PREFIX = setting('labels', 'domp_query_bridge.query_reply_prefix')
+PROBLEM_QUERY_REPLY_PREFIX = setting('labels', 'domp_query_bridge.problem_query_reply_prefix')
+EXECUTION_REPLY_PREFIX = setting('labels', 'domp_query_bridge.execution_reply_prefix')
 QUERY_TYPES = {"task_processing", "problem_tickets", "execution", "pending_approvals", "pending_executions", "pending_maintenance", "pending_tasks", "today_assignments"}
-QUERY_PROMPT = """你是只读查询意图解析器。只分析消息，不执行写操作，不编造查询结果。
-
-query_type 只能是：
-- task_processing：问题平台单号的处理情况、受理人或履历；
-- problem_tickets：问题平台按时间范围查询运维单；
-- execution：数据运维 SQL 的执行结果、影响条数、耗时或异常；
-- pending_approvals / pending_executions / pending_maintenance：待审核、待执行，或两者同时查询；
-- pending_tasks / today_assignments：问题平台待处理任务，或今日分配统计。
-
-规则：
-1. 未明确提到“数据、数据运维、填报、审核、审批、SQL”时，运维单范围查询默认 problem_tickets；明确提到这些词时，不得改路由到问题平台。
-2. 从当前消息提取唯一编号；不得纠正、补全或猜测编号。task_processing 使用五位编号，execution 可使用四位线下编号、五位需求名或完整工作编号；数量查询 identifier 为空。
-3. 日期词和“从 A 到 B”由程序解析，模型不要生成日期；“未完成/未处理/未完结”也由程序统一过滤。
-4. 查询执行详情、SQL 原文、影响条数属于只读 execution，不是再次执行。
-5. 明确要求填报、审核、执行、删除、派发或改派时不匹配本 Agent；模糊且无法判断时返回 needs_clarification=true。
-6. 可使用同一会话最近的查询上下文承接“待执行呢”“详情呢”“那 41199 呢”等省略表达；当前消息的新编号和新意图优先，不能从历史猜编号。
-7. “整理为表格发我”“导出 Excel”等只改变输出格式，沿用当前发送人最近查询的类型、日期与筛选条件，不得改为写操作。
-8. 允许口语、错别字和空格变化，但数字必须保持原样；普通聊天、SQL 原文或无关内容不匹配。
-
-匹配时 matched=true、confidence>=90。result 必须是 JSON 字符串，格式为：
-{"query_type":"...","identifier":"","needs_clarification":false}
-不匹配时 matched=false。reply 只简述识别结果，不编造数量、状态、执行成功或影响条数。"""
+QUERY_PROMPT = prompt('domp_query_bridge.query_prompt')
 
 
 QUERY_PROMPT += BATCH_IDENTIFIER_PROMPT

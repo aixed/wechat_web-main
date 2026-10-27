@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from runtime_settings import setting
+
 from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
@@ -214,9 +216,11 @@ class SmartReplyEngine:
         candidates = [str(content or "").strip()]
         if str(chat_id).endswith("@chatroom"):
             # SendAtMsg prepends the recipient's visible nickname. Do not strip
-            # the owner's actual @空气 command when comparing callback bodies.
+            # the owner's actual the configured assistant mention command when comparing callback bodies.
             prefix = re.match(r"^@([^\r\n]+?)\u2005[ \t]*|^@([^\s]+)[ \t]+", candidates[0])
-            if prefix and (prefix.group(1) or prefix.group(2)).strip() != "空气":
+            if prefix and (prefix.group(1) or prefix.group(2)).strip().casefold() not in {
+                str(name).casefold() for name in setting('workflow', 'self_mention_names', default=[])
+            }:
                 candidates.append(candidates[0][prefix.end():])
         with self._lock:
             while self._reply_echoes and timestamp - next(iter(self._reply_echoes.values())) > self.dedup_ttl:

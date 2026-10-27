@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import ipaddress
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -17,6 +18,50 @@ URL_IPV4 = re.compile(
     re.IGNORECASE,
 )
 ZERO_OID = "0" * 40
+PUBLIC_SYSTEM_NAME = 'mcp系统名称'
+SOURCE_URL = re.compile(rb'(?:https?|wss?)://([a-zA-Z0-9][a-zA-Z0-9.:-]*)(?:/[^\s\x22\x27<>]*)?')
+NAMESPACE_HOSTS = {b'schemas.openxmlformats.org', b'purl.org', b'www.w3.org'}
+
+
+def configured_system_names() -> set[bytes]:
+    path = Path(git('rev-parse', '--show-toplevel').decode().strip()) / 'config.yaml'
+    if not path.exists():
+        return set()
+    names = set()
+    section = ''
+    for line in path.read_text(encoding='utf-8').splitlines():
+        if re.match(r'^[A-Za-z_][\w-]*\s*:', line):
+            section = line.split(':', 1)[0]
+        if section == 'mcp_connections':
+            match = re.match(r'\s+name:\s*(.*?)\s*$', line)
+            if match:
+                name = match[1].strip('\"\x27')
+                if name and name != PUBLIC_SYSTEM_NAME:
+                    names.add(name.encode())
+    return names
+
+
+def check_source(path: str, content: bytes, label: str) -> list[str]:
+    errors = []
+    for number, line in enumerate(content.splitlines(), 1):
+        if any(match.group(1) not in NAMESPACE_HOSTS for match in SOURCE_URL.finditer(line)):
+            errors.append(f'{label}: {path}:{number}: service addresses belong in YAML configuration')
+    if path.endswith('.py'):
+        try:
+            tree = ast.parse(content.decode('utf-8-sig'))
+        except SyntaxError as exc:
+            return [*errors, f'{label}: {path}:{exc.lineno}: invalid Python source']
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+            value = node.value
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute) and value.func.attr == 'strip':
+                value = value.func.value
+            if any('PROMPT' in name or name == 'instructions' for name in names) and isinstance(value, (ast.Constant, ast.JoinedStr)):
+                if isinstance(value, ast.JoinedStr) or isinstance(value.value, str) and value.value.strip():
+                    errors.append(f'{label}: {path}:{node.lineno}: prompt templates belong in YAML configuration')
+    return errors
 
 
 def git(*args: str) -> bytes:
@@ -38,17 +83,37 @@ def check(revision: str | None) -> list[str]:
         if revision else git("ls-files", "-z")
     ).split(b"\0")
     errors = []
+    system_names = configured_system_names()
     for raw_path in filter(None, paths):
         path = raw_path.decode("utf-8")
-        if PurePosixPath(path).name.lower() == "config.yaml":
-            errors.append(f"{label}: {path}: local config.yaml must never be tracked")
+        if PurePosixPath(path).name.lower() in {"config.yaml", "prompts.yaml"}:
+            errors.append(f"{label}: {path}: local runtime configuration must never be tracked")
         if path.startswith("backend/db/") and path != "backend/db/.gitkeep":
             errors.append(f"{label}: {path}: local database data must never be tracked")
         if PurePosixPath(path).name.lower() == "config.example.yaml":
             content = git("show", f"{revision or ''}:{path}")
+            section = ''
+            for number, line in enumerate(content.decode('utf-8').splitlines(), 1):
+                if re.match(r'^[A-Za-z_][\w-]*\s*:', line):
+                    section = line.split(':', 1)[0]
+                if section in {'mcp_connections', 'mcp_defaults'} and re.match(r'\s+name:', line):
+                    name = line.split(':', 1)[1].strip().strip('\"\x27')
+                    if name != PUBLIC_SYSTEM_NAME:
+                        errors.append(f'{label}: {path}:{number}: use the public placeholder for the MCP system name')
+                credential = re.match(r'\s*(token|ai_api_key|api_key|protocol_session_list_key):\s*(.*?)\s*$', line)
+                if credential and credential[2].split('#', 1)[0].strip() not in {'', '\"\"', "''", 'null', '~'}:
+                    errors.append(f'{label}: {path}:{number}: credentials in public examples must be empty')
             for number, line in enumerate(content.splitlines(), 1):
                 if any(real_address(m.group()) for m in IPV4.finditer(line)):
                     errors.append(f"{label}: {path}:{number}: replace real IP with 127.0.0.1")
+        is_source = path.endswith(('.py', '.ts', '.tsx')) and not path.startswith('backend/tests/')
+        if is_source or system_names:
+            content = git('show', f"{revision or ''}:{path}")
+            if b'\0' not in content:
+                if any(name in content for name in system_names):
+                    errors.append(f'{label}: {path}: replace the deployment system name with a public placeholder')
+                if is_source:
+                    errors.extend(check_source(path, content, label))
 
     args = ["git", "grep", "-I", "-n", "-E"]
     if revision is None:

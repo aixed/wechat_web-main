@@ -16,6 +16,7 @@ from domp_approval_bridge import APPROVAL_PROMPT, APPROVAL_TOOL
 from domp_submission_bridge import SUBMISSION_PROMPT, SUBMISSION_TOOL
 from domp_unified_bridge import UNIFIED_PROMPT, UNIFIED_SKILL_ID, UNIFIED_SKILL_NAME, is_unified_task
 from sqlite_cache import SqliteMessageCache
+from runtime_settings import setting
 
 
 MANAGED_TOOLS = {WORKFLOW_TOOL, QUERY_TOOL, APPROVAL_TOOL, EXECUTION_TOOL, SUBMISSION_TOOL}
@@ -71,7 +72,7 @@ def configure(owner, chat, db_path=None, *, add_query_agent=False, add_approval_
     if not legacy_sql_tasks:
         raise ValueError("目标群已使用统一数据运维 Agent；请使用 --unify-agent 更新统一配置")
     for task in legacy_sql_tasks:
-        task.update(name="SQL 风险分析及数据运维填报审核执行", instruction=PROMPT,
+        task.update(name=setting('labels', 'workflow_skill_name'), instruction=PROMPT,
                     mcp_tool_name=WORKFLOW_TOOL, mcp_arguments_template="{}", mcp_reply_template="{{mcp_text}}",
                     output_mode="result", preserve_formatting=True, send_items_separately=False, max_parallel=1)
     if add_query_agent:
@@ -81,7 +82,7 @@ def configure(owner, chat, db_path=None, *, add_query_agent=False, add_approval_
             row["ai_tasks"].append(query_task)
             query_tasks = [query_task]
         for task in query_tasks:
-            task.update(name="任务与数据运维查询 Agent", instruction=QUERY_PROMPT, mcp_tool_name=QUERY_TOOL,
+            task.update(name=setting('labels', 'query_skill_name'), instruction=QUERY_PROMPT, mcp_tool_name=QUERY_TOOL,
                         mcp_arguments_template="{}", mcp_reply_template="{{mcp_text}}", max_parallel=1)
     if add_execution_agent:
         execution_tasks = [x for x in row.get("ai_tasks") or [] if x.get("mcp_tool_name") == EXECUTION_TOOL]
@@ -91,7 +92,7 @@ def configure(owner, chat, db_path=None, *, add_query_agent=False, add_approval_
             row["ai_tasks"].append(execution_task)
             execution_tasks = [execution_task]
         for task in execution_tasks:
-            task.update(name="数据运维执行 Agent", instruction=EXECUTION_PROMPT, mcp_tool_name=EXECUTION_TOOL,
+            task.update(name=setting('labels', 'execution_skill_name'), instruction=EXECUTION_PROMPT, mcp_tool_name=EXECUTION_TOOL,
                         mcp_arguments_template="{}", mcp_reply_template="{{mcp_text}}", max_parallel=1)
     if add_approval_agent:
         approval_tasks = [task for task in row.get("ai_tasks") or [] if task.get("mcp_tool_name") == APPROVAL_TOOL]
@@ -102,7 +103,7 @@ def configure(owner, chat, db_path=None, *, add_query_agent=False, add_approval_
             row["ai_tasks"].append(approval_task)
             approval_tasks = [approval_task]
         for task in approval_tasks:
-            task.update(name="数据运维审核 Agent", instruction=APPROVAL_PROMPT, mcp_tool_name=APPROVAL_TOOL,
+            task.update(name=setting('labels', 'approval_skill_name'), instruction=APPROVAL_PROMPT, mcp_tool_name=APPROVAL_TOOL,
                         mcp_arguments_template="{}", mcp_reply_template="{{mcp_text}}", max_parallel=1)
     if add_submission_agent:
         submission_tasks = [task for task in row.get("ai_tasks") or [] if task.get("mcp_tool_name") == SUBMISSION_TOOL]
@@ -112,7 +113,7 @@ def configure(owner, chat, db_path=None, *, add_query_agent=False, add_approval_
             row["ai_tasks"].append(submission_task)
             submission_tasks = [submission_task]
         for task in submission_tasks:
-            task.update(name="数据运维填报 Agent", instruction=SUBMISSION_PROMPT, mcp_tool_name=SUBMISSION_TOOL,
+            task.update(name=setting('labels', 'submission_skill_name'), instruction=SUBMISSION_PROMPT, mcp_tool_name=SUBMISSION_TOOL,
                 mcp_arguments_template="{}", mcp_reply_template="{{mcp_text}}", max_parallel=1)
     # An authorized sender's text/TXT is the trigger; preserve per-type lists.
     row.update(mention_only=False, mention_message_types=[])

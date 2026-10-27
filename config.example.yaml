@@ -89,15 +89,15 @@ ai_profiles: []
 # ai_active_profile_id: "deepseek"
 # ai_profiles:
 #   - id: "deepseek"
-#     name: "DeepSeek"
-#     base_url: "https://api.deepseek.com"
+#     name: "模型配置一"
+#     base_url: "https://example.invalid/v1"
 #     api_key: ""
-#     model: "deepseek-v4-flash"
+#     model: "model-name"
 #   - id: "lingsuan"
-#     name: "灵算"
-#     base_url: "https://lingsuan.top"
+#     name: "模型配置二"
+#     base_url: "https://example.invalid/v1"
 #     api_key: ""
-#     model: "gpt-5.6-sol"
+#     model: "model-name"
 ai_timeout_seconds: 60
 ai_max_concurrency: 3
 
@@ -107,8 +107,51 @@ mcp_timeout_seconds: 600
 # 修改 config.yaml 后重启后端，或打开「AI 与 MCP 设置」重新加载即可生效。
 # id 是智能回复任务引用的连接标识，修改地址时保留原 id。
 mcp_connections:
-  - id: local_mcp
-    name: 养老保险全国统筹数据安全运维管理
-    url: http://127.0.0.1:5222/mcp
-    token: "" # 数据运维 MCP 必填，与服务器 settings.local.json 的 api_token 一致；不会打包进浏览器 JS。
-    enabled: true
+- id: local_mcp
+  name: mcp系统名称
+  url: http://127.0.0.1:5222/mcp
+  token: ""   # 数据运维 MCP 必填，与服务器 settings.local.json 的 api_token 一致；不会打包进浏览器 JS。
+  enabled: true
+# 本地配置和提示词不会提交到 Git；公开示例统一使用占位名称和回环地址。
+prompt_config_file: prompts.yaml
+prompt_example_file: prompts.example.yaml
+network_loopback_host: 127.0.0.1
+network_bind_all_host: 0.0.0.0
+network_local_aliases:
+- 127.0.0.1
+- localhost
+- ::1
+network_agent_host: agent.local
+network_http_scheme: http
+network_callback_host: 127.0.0.1
+protocol_session_list_key: ''
+legacy_rdv_mapping_path: ''
+mcp_defaults:
+  name: mcp系统名称
+  url: http://127.0.0.1:5222/mcp
+  required_token_ports:
+  - 5222
+  reply_templates:
+    submit_data_maintenance: 需求 {{identifier}} 保存并提交成功，需求编号：{{work_num}}
+workflow:
+  self_mention_names:
+  - 空气
+  owner_display_name: ''
+  report_author: ''
+public_assets:
+  wecom_icon_url: ''
+labels:
+  domp_approval_bridge.approval_reply_prefix: 数据运维审核结果
+  domp_city_selection.city_selection_prefix: 数据运维区划选择
+  domp_query_bridge.query_reply_prefix: 数据运维查询结果
+  domp_query_bridge.problem_query_reply_prefix: 问题平台查询结果
+  domp_query_bridge.execution_reply_prefix: 数据运维执行结果
+  domp_submission_bridge.submission_reply_prefix: 数据运维填报结果
+  domp_unified_bridge.unified_skill_name: 数据运维智能 Agent
+  workflow_skill_name: SQL 风险分析及数据运维填报审核执行
+  query_skill_name: 任务与数据运维查询 Agent
+  execution_skill_name: 数据运维执行 Agent
+  approval_skill_name: 数据运维审核 Agent
+  submission_skill_name: 数据运维填报 Agent
+  offline_city_image_skill_name: 线下申请区划识别
+  offline_city_text_skill_name: 线下申请城市识别

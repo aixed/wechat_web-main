@@ -1,6 +1,8 @@
 """Ticket names preserve explicit supplementary batch suffixes."""
 from __future__ import annotations
 
+from runtime_settings import prompt, setting
+
 import re
 
 TICKET_PATTERN = r"(?:\d{4}|\d{5}(?:-[1-9]\d*)?)"
@@ -37,4 +39,4 @@ def resubmission_hint(identifier, used_identifiers):
         "message": f"该编号已有填报记录。如需重新填报，请将消息首行改为：\n--- xzsb-{next_identifier}\n并附上本批次完整 SQL 后重新发送；后续使用新的递增批次编号（-1、-2、-3 等）。"}
 
 
-BATCH_IDENTIFIER_PROMPT = "\n编号规则：数据运维的五位需求编号支持客户明确写出的 -1、-2、-3 等正整数补充批次，例如 --- xzsb-42157-1 必须完整提取 identifier=42157-1，不能截成基础编号或末尾数字。程序用基础编号读取旧需求，以完整批次编号创建、查询、审核和执行独立申请。不得自动添加、更换后缀或猜测批次；重复填报时提示客户自行使用新的补充批次编号并重新发送完整 SQL。四位线下编号保持原规则。"
+BATCH_IDENTIFIER_PROMPT = prompt('domp_identifier.batch_identifier_prompt')

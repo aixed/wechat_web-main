@@ -7,29 +7,38 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const configPath = path.join(repoRoot, 'config.yaml')
+const configPaths = ['config.yaml', 'config.example.yaml'].map((name) => path.join(repoRoot, name))
 
 function readConfigValue(key: string): string | undefined {
-  if (!fs.existsSync(configPath)) return undefined
   const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const pattern = new RegExp(`^\\s*${escapedKey}\\s*:\\s*(.*?)\\s*$`)
-  for (const line of fs.readFileSync(configPath, 'utf8').split(/\r?\n/)) {
-    const match = line.match(pattern)
-    if (!match) continue
-    const raw = match[1].trim()
-    if ((raw.startsWith('"') || raw.startsWith("'")) && raw.length >= 2) {
-      const quote = raw[0]
-      const end = raw.indexOf(quote, 1)
-      return end >= 0 ? raw.slice(1, end) : raw.slice(1)
+  const pattern = new RegExp(`^${escapedKey}\\s*:\\s*(.*?)\\s*$`)
+  for (const configPath of configPaths) {
+    if (!fs.existsSync(configPath)) continue
+    for (const line of fs.readFileSync(configPath, 'utf8').split(/\r?\n/)) {
+      const match = line.match(pattern)
+      if (!match) continue
+      const raw = match[1].trim()
+      if ((raw.startsWith('"') || raw.startsWith("'")) && raw.length >= 2) {
+        const quote = raw[0]
+        const end = raw.indexOf(quote, 1)
+        return end >= 0 ? raw.slice(1, end) : raw.slice(1)
+      }
+      return raw.replace(/\s+#.*$/, '').trim()
     }
-    return raw.replace(/\s+#.*$/, '').trim()
   }
   return undefined
 }
 
-function readConfigNumber(key: string, fallback: number): number {
-  const value = Number(readConfigValue(key))
-  return Number.isFinite(value) ? value : fallback
+function readConfigNumber(key: string): number {
+  const value = Number(requireConfigValue(key))
+  if (!Number.isFinite(value)) throw new Error(`Invalid configured number: ${key}`)
+  return value
+}
+
+function requireConfigValue(key: string): string {
+  const value = readConfigValue(key)
+  if (!value) throw new Error(`Missing configuration: ${key}`)
+  return value
 }
 
 function readEnvNumber(key: string, fallback: number): number {
@@ -37,11 +46,11 @@ function readEnvNumber(key: string, fallback: number): number {
   return Number.isFinite(value) ? value : fallback
 }
 
-const frontendHost = readConfigValue('frontend_host') || '0.0.0.0'
-const frontendPort = readEnvNumber('FRONTEND_PORT', readConfigNumber('frontend_port', 80))
-const configuredBackendHost = readConfigValue('server_host') || '127.0.0.1'
+const frontendHost = requireConfigValue('frontend_host')
+const frontendPort = readEnvNumber('FRONTEND_PORT', readConfigNumber('frontend_port'))
+const configuredBackendHost = requireConfigValue('server_host')
 const backendHost = normalizeProxyHost(configuredBackendHost)
-const backendPort = readConfigNumber('server_port', 5000)
+const backendPort = readConfigNumber('server_port')
 const backendHttpTarget = `http://${backendHost}:${backendPort}`
 const backendWsTarget = `ws://${backendHost}:${backendPort}`
 const proxyUnavailableMessage = '后端服务正在启动或暂时不可用，请稍后重试。'
@@ -56,7 +65,7 @@ logger.error = (message: string, options?: LogErrorOptions) => {
 
 function normalizeProxyHost(host: string): string {
   const value = host.trim().toLowerCase()
-  if (value === '0.0.0.0' || value === '::' || value === '[::]') return '127.0.0.1'
+  if (value === readConfigValue('network_bind_all_host') || !value.replace(/[\[\]:]/g, '')) return requireConfigValue('network_loopback_host')
   return host
 }
 

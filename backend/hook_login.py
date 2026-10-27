@@ -300,7 +300,7 @@ async def post(record, endpoint, body=None):
         result = await agent_manager.request(endpoint.strip("/"), body or {}, agent_id=agent["id"], timeout=10,
             inject_agent_id=False, include_method=False)
         response = httpx.Response(result.status, content=result.body, headers={"content-type": result.content_type},
-            request=httpx.Request("POST", "http://agent.local" + endpoint))
+            request=httpx.Request("POST", f"{config.setting('network_http_scheme')}://{config.setting('network_agent_host')}" + endpoint))
     else:
         response = await client.post(f"http://{record['host']}:{record['port']}{endpoint}", json=body or {})
     response.raise_for_status()

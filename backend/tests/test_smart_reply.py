@@ -1132,7 +1132,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
             with open(utf8_path, "wb") as output:
                 output.write("\ufeff需求 40386".encode("utf-8"))
             with open(gb_path, "wb") as output:
-                output.write("全国统筹 SQL40387".encode("gb18030"))
+                output.write("中文内容 SQL40387".encode("gb18030"))
             with open(empty_path, "wb"):
                 pass
             with open(invalid_path, "wb") as output:
@@ -1141,7 +1141,7 @@ class SmartReplyProcessTests(unittest.IsolatedAsyncioTestCase):
                 output.write(b"x" * (main._SMART_REPLY_TXT_MAX_BYTES + 1))
 
             self.assertEqual(("需求 40386", "ok"), main._read_smart_reply_txt(utf8_path))
-            self.assertEqual(("全国统筹 SQL40387", "ok"), main._read_smart_reply_txt(gb_path))
+            self.assertEqual(("中文内容 SQL40387", "ok"), main._read_smart_reply_txt(gb_path))
             self.assertEqual(("", "empty_file"), main._read_smart_reply_txt(empty_path))
             self.assertEqual(("", "decode_failed"), main._read_smart_reply_txt(invalid_path))
             self.assertEqual(("", "oversized_file"), main._read_smart_reply_txt(oversized_path))

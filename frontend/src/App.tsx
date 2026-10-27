@@ -1851,7 +1851,7 @@ export default function App() {
         key: setupAccessKey,
         web_access_key: form.webAccessKey.trim() || "admin",
         wechat_mode: form.wechatMode,
-        host: form.wechatMode === 1 ? "127.0.0.1" : form.host.trim(),
+        host: form.host.trim(),
         api_port: apiPort,
         mgr_port: mgrPort,
         public_host: form.publicHost.trim(),
@@ -3953,15 +3953,15 @@ function setupDefaultsFor(defaults: any, mode: InitialSetupMode): any {
 
 function setupFormFromDefaults(defaults: any, mode: InitialSetupMode): InitialSetupForm {
   const modeDefaults = setupDefaultsFor(defaults, mode);
-  const browserHost = window.location.hostname || "127.0.0.1";
-  const host = mode === 1 ? "127.0.0.1" : String(modeDefaults.host || "127.0.0.1");
+  const browserHost = window.location.hostname;
+  const host = String(modeDefaults.host || browserHost || "");
   return {
     webAccessKey: "admin",
     wechatMode: mode,
     host,
-    apiPort: String(modeDefaults.api_port || 30001),
-    mgrPort: String(modeDefaults.mgr_port || 29999),
-    publicHost: String(modeDefaults.public_host || browserHost || "127.0.0.1"),
+    apiPort: String(modeDefaults.api_port || ""),
+    mgrPort: String(modeDefaults.mgr_port || ""),
+    publicHost: String(modeDefaults.public_host || browserHost || ""),
   };
 }
 
@@ -4107,16 +4107,16 @@ function InitialSetupGate({
               label="DLL 回连 IP/域名"
               value={form.publicHost}
               onChange={(value) => updateField("publicHost", value)}
-              placeholder={String(modeDefaults.public_host || "127.0.0.1")}
+              placeholder={String(modeDefaults.public_host || "IP/域名")}
             />
           )}
 
           <SetupInput
             label={hostLabel}
-            value={isLocalHook ? "127.0.0.1" : form.host}
+            value={form.host}
             onChange={(value) => updateField("host", value)}
             readOnly={isLocalHook}
-            placeholder="127.0.0.1"
+            placeholder={String(modeDefaults.host || "IP/域名")}
           />
 
           <div className="grid grid-cols-2 gap-[12px]">
@@ -5244,7 +5244,7 @@ function ProtocolLoginPanel({
       wxid: "",
       nickname: nextSessionId,
       avatar: "",
-      peer: startPort ? `127.0.0.1:${startPort}` : "protocol",
+      peer: String(payload?.peer || (startPort ? `端口 ${startPort}` : "protocol")),
       initialized: false,
       login_status: "2",
       login_message: mode === "qr" ? "二维码等待确认" : "等待手机确认",

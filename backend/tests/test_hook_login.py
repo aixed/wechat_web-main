@@ -44,6 +44,7 @@ class HookLoginTests(unittest.IsolatedAsyncioTestCase):
         self.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         self.addAsyncCleanup(self.client.aclose)
         for p in (patch.object(hook_login, "client", self.client),
+            patch.object(config, 'config_file_exists', return_value=True),
             patch.object(hook_login, "REGISTRY_PATH", Path(self.temp.name) / "instances.json"),
             patch.object(config, "IS_HOOK", True), patch.object(config, "IS_PROTOCOL", False),
             patch.object(config, "IS_LOCAL_HOOK", True), patch.object(config, "AGENT_WS_ENABLED", False),

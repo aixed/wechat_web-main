@@ -1,5 +1,6 @@
 # Local configuration
 config.yaml
+prompts.yaml
 .env
 .env.*
 

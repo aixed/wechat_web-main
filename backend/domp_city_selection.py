@@ -1,9 +1,11 @@
 """Numbered, server-verified city choices for a stopped SQL workflow."""
 from __future__ import annotations
 
+from runtime_settings import prompt, setting
+
 import re
 
-CITY_SELECTION_PREFIX = "数据运维区划选择"
+CITY_SELECTION_PREFIX = setting('labels', 'domp_city_selection.city_selection_prefix')
 
 
 def city_selection_failure(payload):
@@ -57,7 +59,7 @@ def selection_message(pending):
         return f"{CITY_SELECTION_PREFIX}：已按 {pending['confirmed_city']} 发起处理，请查询需求 {pending['arguments']['identifier']} 的结果，勿重复提交。"
     lines = [f"{CITY_SELECTION_PREFIX}：需求 {pending['arguments']['identifier']}，尚未填报。", "请选择城市："]
     lines.extend(f"{index}. {area['area_name']}" for index, area in enumerate(pending.get("city_options") or [], 1))
-    mention = "空气" if pending.get("owner_only") else pending.get("owner_mention") or "Aixed"
+    mention = next(iter(setting('workflow', 'self_mention_names', default=[])), '') if pending.get("owner_only") else pending.get("owner_mention") or setting('workflow', 'owner_display_name') or ''
     if pending.get("city_options"):
         lines.append(f"请 @{mention} 回复数字（例如：@{mention} 3），程序将按所选区划直接填报、审核、执行。")
     else:
