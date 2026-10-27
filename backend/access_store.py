@@ -1,4 +1,4 @@
-"""SQLite identities and account ownership. Access keys are never stored in plain text."""
+"""SQLite identities and ownership, with readable access keys on Hook profiles."""
 from __future__ import annotations
 
 from contextvars import ContextVar
@@ -17,6 +17,7 @@ from database import database_path
 DB_PATH = database_path('access_users.sqlite3')
 current_user: ContextVar[str] = ContextVar('access_user', default='')
 current_account: ContextVar[str] = ContextVar('access_account', default='')
+_known_access_keys: dict[tuple[str, str], str] = {}
 
 
 def scope():
@@ -28,7 +29,8 @@ def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB_PATH, timeout=15)
     db.row_factory = sqlite3.Row
-    db.executescript('''
+    try:
+        db.executescript('''
         CREATE TABLE IF NOT EXISTS access_users (
             id TEXT PRIMARY KEY, key_hash TEXT UNIQUE NOT NULL,
             created_at REAL NOT NULL, last_login_at REAL NOT NULL);
@@ -38,11 +40,24 @@ def connect():
         CREATE TABLE IF NOT EXISTS hook_profiles (
             scope TEXT NOT NULL, user_id TEXT NOT NULL, profile_id TEXT NOT NULL,
             settings TEXT NOT NULL, updated_at REAL NOT NULL,
+            access_key TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(scope, user_id, profile_id));
         CREATE TABLE IF NOT EXISTS access_metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL);
-    ''')
-    try:
+        ''')
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(hook_profiles)')}
+        if 'access_key' not in columns:
+            try:
+                db.execute("ALTER TABLE hook_profiles ADD COLUMN access_key TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                if 'access_key' not in {row['name'] for row in db.execute('PRAGMA table_info(hook_profiles)')}:
+                    raise
+        db.execute('CREATE INDEX IF NOT EXISTS idx_hook_profiles_access_key ON hook_profiles(access_key, user_id)')
         with db:
+            key = str(config.WEB_ACCESS_KEY or '')
+            if key and db.execute('''SELECT 1 FROM hook_profiles WHERE access_key=''
+                    AND user_id IN (SELECT id FROM access_users WHERE key_hash=?) LIMIT 1''', (digest(key),)).fetchone():
+                db.execute('''UPDATE hook_profiles SET access_key=? WHERE access_key=''
+                    AND user_id IN (SELECT id FROM access_users WHERE key_hash=?)''', (key, digest(key)))
             yield db
     finally:
         db.close()
@@ -57,13 +72,62 @@ def login(key, *, create=False):
     if not key.strip() or len(key) > 256:
         return None
     with connect() as db:
+        key_hash = digest(key)
+        row = db.execute('SELECT id FROM access_users WHERE key_hash=?', (key_hash,)).fetchone()
+        if row is None:
+            # Keep the original user ID/cache directory if its identity row was lost.
+            owners = db.execute('SELECT DISTINCT user_id FROM hook_profiles WHERE access_key=?', (key,)).fetchall()
+            if len(owners) > 1:
+                return None
+            if owners:
+                user_id = owners[0]['user_id']
+                previous = db.execute('SELECT key_hash FROM access_users WHERE id=?', (user_id,)).fetchone()
+                if previous and previous['key_hash'] != key_hash:
+                    return None
+                db.execute('INSERT OR IGNORE INTO access_users (id,key_hash,created_at,last_login_at) VALUES(?,?,?,?)',
+                           (user_id, key_hash, time.time(), time.time()))
         if create:
-            db.execute('INSERT OR IGNORE INTO access_users VALUES(?,?,?,?)',
-                       (uuid.uuid4().hex, digest(key), time.time(), time.time()))
-        row = db.execute('SELECT id FROM access_users WHERE key_hash=?', (digest(key),)).fetchone()
+            db.execute('INSERT OR IGNORE INTO access_users (id,key_hash,created_at,last_login_at) VALUES(?,?,?,?)',
+                       (uuid.uuid4().hex, key_hash, time.time(), time.time()))
+        row = db.execute('SELECT id FROM access_users WHERE key_hash=?', (key_hash,)).fetchone()
+        if not row:
+            return None
+        user_id = row['id']
+        _known_access_keys[(str(DB_PATH), user_id)] = key
+        if db.execute('SELECT 1 FROM hook_profiles WHERE user_id=? AND access_key<>? LIMIT 1', (user_id, key)).fetchone():
+            db.execute('UPDATE hook_profiles SET access_key=? WHERE user_id=? AND access_key<>?', (key, user_id, key))
+        _restore_profile_accounts(db, user_id, key)
         if row and create:
             db.execute('UPDATE access_users SET last_login_at=? WHERE id=?', (time.time(), row['id']))
-        return row['id'] if row else None
+        return user_id
+
+
+def _restore_profile_accounts(db, user_id, key):
+    for row in db.execute('SELECT scope,profile_id,settings FROM hook_profiles WHERE user_id=? AND access_key=?',
+                          (user_id, key)).fetchall():
+        settings = json.loads(row['settings'])
+        account_ids = {str(settings.get('id') or row['profile_id'])}
+        wxids = [settings.get('wxid'), *(settings.get('wxids') or [])]
+        account_ids.update('wxid:' + str(wxid) for wxid in wxids if wxid)
+        if settings.get('rdv'):
+            account_ids.add('rdv:' + str(settings['rdv']).lower())
+        for account_id in account_ids:
+            marker = 'deleted:' + row['scope'] + ':' + account_id
+            bound = db.execute('SELECT 1 FROM user_accounts WHERE scope=? AND account_id=?',
+                               (row['scope'], account_id)).fetchone()
+            if not bound and not db.execute('SELECT 1 FROM access_metadata WHERE name=?', (marker,)).fetchone():
+                db.execute('INSERT OR IGNORE INTO user_accounts (scope,account_id,user_id,created_at) VALUES(?,?,?,?)',
+                           (row['scope'], account_id, user_id, time.time()))
+
+
+def _profile_access_key(db, user_id):
+    identity = db.execute('SELECT key_hash FROM access_users WHERE id=?', (user_id,)).fetchone()
+    if not identity:
+        return ''
+    candidates = [_known_access_keys.get((str(DB_PATH), user_id), ''), config.WEB_ACCESS_KEY]
+    candidates.extend(row['access_key'] for row in db.execute(
+        "SELECT DISTINCT access_key FROM hook_profiles WHERE user_id=? AND access_key<>''", (user_id,)))
+    return next((str(key) for key in candidates if key and digest(key) == identity['key_hash']), '')
 
 
 def legacy_user():
@@ -146,8 +210,10 @@ def profile(profile_id='', user_id=None):
 def save_profile(settings, user_id=None):
     user_id = user_id or current_user.get()
     with connect() as db:
-        db.execute('INSERT OR REPLACE INTO hook_profiles VALUES(?,?,?,?,?)',
-            (scope(), user_id, settings['profile_id'], json.dumps(settings, ensure_ascii=False), time.time()))
+        db.execute('''INSERT OR REPLACE INTO hook_profiles
+            (scope,user_id,profile_id,settings,updated_at,access_key) VALUES(?,?,?,?,?,?)''',
+            (scope(), user_id, settings['profile_id'], json.dumps(settings, ensure_ascii=False), time.time(),
+             _profile_access_key(db, user_id)))
 
 
 def retired(account_id):

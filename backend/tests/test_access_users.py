@@ -52,6 +52,17 @@ class AccessUsersTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await self.client.post('/api/auth/login', json={'key': '  '})).json()['ok'])
         self.assertEqual(401, (await self.client.get('/api/accounts', headers={'X-Access-Key': 'unregistered'})).status_code)
 
+    async def test_hook_settings_persist_owner_key_without_returning_it_in_api(self):
+        response = await self.client.get('/api/hook/login-settings', headers=self.headers())
+        self.assertEqual(200, response.status_code)
+        self.assertNotIn('alice-test-key', response.text)
+        with access_store.connect() as db:
+            row = db.execute('SELECT access_key FROM hook_profiles WHERE user_id=?',
+                             (self.users['alice-test-key'],)).fetchone()
+        self.assertEqual('alice-test-key', row['access_key'])
+        again = await self.client.post('/api/auth/login', json={'key': 'alice-test-key'})
+        self.assertEqual(self.users['alice-test-key'], again.json()['user_id'])
+
     async def test_new_key_cannot_see_default_or_use_foreign_ids_in_headers_body_or_routes(self):
         with patch.object(main, '_probe_local_hook_account', AsyncMock()) as probe:
             response = await self.client.get('/api/accounts', headers=self.headers())

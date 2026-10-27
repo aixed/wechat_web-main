@@ -122,7 +122,7 @@ npm run lint
 
 应用数据库统一使用标准 SQLite，默认无数据库密码，无需单独部署数据库服务。所有数据库及相关记录、迁移备份放在 `backend/db/`，该目录的运行数据不会提交到 Git：
 
-- `access_users.sqlite3`：用户、访问密钥摘要及微信归属。
+- `access_users.sqlite3`：用户、访问密钥摘要及微信归属；`hook_profiles.access_key` 明文记录每条 Hook 配置所属的密钥，登录时可据此恢复原账号关联。
 - `wechat_cache.sqlite3` / `wechat_protocol_cache.sqlite3`：Hook / 协议模式的聊天和智能回复数据。
 - `users/<用户ID>.sqlite3`：独立用户的聊天缓存。
 - `hook_instances.json`、`rdv_wxid_mapping.json` 及配置迁移备份：相关运行记录。
