@@ -139,7 +139,7 @@ AI_API_KEY = ""
 AI_MODEL = ""
 AI_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("ai_timeout_seconds", 60)))
 AI_MAX_CONCURRENCY = max(1, min(20, int(_cfg.get("ai_max_concurrency", 3))))
-DEFAULT_MCP_URL = "http://59.217.45.7:5222/mcp"
+DEFAULT_MCP_URL = "http://127.0.0.1:5222/mcp"
 MCP_CONNECTIONS: list[dict[str, Any]] = []
 MCP_TIMEOUT_SECONDS = max(5.0, float(_cfg.get("mcp_timeout_seconds", 600)))
 

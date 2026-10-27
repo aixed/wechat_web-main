@@ -19,7 +19,8 @@ def requires_bearer_token(url: str) -> bool:
         parsed = httpx.URL(str(url or "").strip())
     except (httpx.InvalidURL, ValueError):
         return False
-    return parsed.host in {"59.217.45.7", "10.11.0.37"} and parsed.port == 5222
+    # Data-maintenance MCP deployments require a token regardless of their host.
+    return bool(parsed.host) and parsed.port == 5222
 
 
 def _sse_payloads(text: str) -> list[dict[str, Any]]:

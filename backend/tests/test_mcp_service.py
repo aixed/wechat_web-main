@@ -21,7 +21,7 @@ class McpServiceTests(unittest.IsolatedAsyncioTestCase):
             lambda request: requests.append(request) or httpx.Response(500)
         ))
         try:
-            for host in ("59.217.45.7", "10.11.0.37"):
+            for host in ("127.0.0.1", "localhost", "mcp.test"):
                 with self.assertRaisesRegex(McpServiceError, "需要 Bearer Token"):
                     await service.discover(url=f"http://{host}:5222/mcp")
         finally:
@@ -36,7 +36,7 @@ class McpServiceTests(unittest.IsolatedAsyncioTestCase):
         ))
         try:
             with self.assertRaisesRegex(McpServiceError, "调用令牌缺失或无效") as caught:
-                await service.discover(url="http://59.217.45.7:5222/mcp", token="private-test-token")
+                await service.discover(url="http://127.0.0.1:5222/mcp", token="private-test-token")
             self.assertNotIn("private-test-token", str(caught.exception))
         finally:
             await service.close()

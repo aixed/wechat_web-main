@@ -2266,7 +2266,7 @@ function normalizeMcpConnections(settings: AiSettings | null): McpConnection[] {
 function mcpTokenRequired(connection: McpConnection): boolean {
   try {
     const url = new URL(connection.url.trim());
-    return ["59.217.45.7", "10.11.0.37"].includes(url.hostname) && url.port === "5222";
+    return Boolean(url.hostname) && url.port === "5222";
   } catch {
     return false;
   }
@@ -2772,7 +2772,7 @@ function AiSettingsDialog({
                           <input
                             value={connection.url}
                             onChange={(event) => updateMcpConnection(connection.id, { url: event.target.value })}
-                            placeholder="http://59.217.45.7:5222/mcp"
+                            placeholder="http://127.0.0.1:5222/mcp"
                             autoComplete="off"
                             className={`w-full h-[38px] rounded-[5px] border px-[10px] outline-none focus:border-[#07c160] ${dark ? "border-[#393939] bg-[#111] placeholder:text-[#555]" : "border-[#d8d8d8] bg-[#fafafa] placeholder:text-[#aaa]"}`}
                           />

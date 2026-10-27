@@ -118,6 +118,8 @@ npm run lint
 
 `config.yaml` 不会被提交到仓库。公开部署或提交代码前，请确认没有把真实 IP、Token、账号信息、日志、缓存文件或聊天媒体数据提交到 Git。
 
+配置示例和公开文档中的服务地址统一使用 `127.0.0.1`，实际部署地址只保存在本地 `config.yaml`。首次克隆后运行 `git config core.hooksPath .githooks`，启用提交和推送检查：禁止跟踪 `config.yaml`，禁止在配置示例或公开 URL 中写入真实 IP。也可运行 `python scripts/check-public-config.py --staged` 手动检查暂存内容。
+
 ### 远程 Hook DLL 启动参数
 
 使用远程 Hook 模式时，DLL 启动微信的参数必须带 `RemoteWS`。该参数用于让远程微信客户端主动建立到 Web 后端的 WebSocket 长连接。后端的 Hook API 调用和 DLL 的实时消息回调都会复用这条连接，不再需要配置 `CallBackURL`。
@@ -125,7 +127,7 @@ npm run lint
 示例：
 
 ```text
-"C:\Program Files (x86)\Tencent\WeChat391016\WeChat\WeChat.exe" RecvType=1&ConnectType=http&RemoteWS="ws://1.14.149.2:5000/agent"&StartPort=30001&RDV=<客户端自己的RDV>
+"C:\Program Files (x86)\Tencent\WeChat391016\WeChat\WeChat.exe" RecvType=1&ConnectType=http&RemoteWS="ws://127.0.0.1:5000/agent"&StartPort=30001&RDV=<客户端自己的RDV>
 ```
 
 `RemoteWS` 支持两种形式：
@@ -144,12 +146,12 @@ npm run lint
 - `server_host` / `server_port`：后端主服务监听地址和端口；DLL 直连 `ws://公网IP:5000/agent` 时用 `server_host: "0.0.0.0"`，只走前端或 Nginx 代理时可用 `127.0.0.1`。
 - `web_access_key`：Web 前端和 `/api/*` 接口访问密钥；首次启动未配置时默认使用 `admin`，建议在本地 `config.yaml` 中改成自己的值。不要提交真实值，也可通过环境变量 `WECHAT_WEB_ACCESS_KEY` 配置。
 - `hook_api_concurrency`：Hook/API 并发数；本地 Hook 默认 `20`，使同一条消息命中的多条规则回复可并发提交；远程 Hook/远程协议默认 `10`。修改后需重启后端。
-- `mcp_connections[].url`：MCP 服务完整地址，默认 `http://59.217.45.7:5222/mcp`。可直接修改 `config.yaml` 中该连接的 `url`，保留原 `id`；重启后端或打开「AI 与 MCP 设置」重新加载后生效。未配置 `mcp_connections` 时，使用环境变量 `MCP_URL` 或默认地址；显式配置 `mcp_connections: []` 可关闭全部连接。
+- `mcp_connections[].url`：MCP 服务完整地址，默认 `http://127.0.0.1:5222/mcp`。可直接修改 `config.yaml` 中该连接的 `url`，保留原 `id`；重启后端或打开「AI 与 MCP 设置」重新加载后生效。未配置 `mcp_connections` 时，使用环境变量 `MCP_URL` 或默认地址；显式配置 `mcp_connections: []` 可关闭全部连接。
 - `QueryDB` 历史查询：不再使用旧的全局查询锁；同一账号的同一个数据库文件最多并发 `4` 路，第 5 个请求最多等待 `10` 秒，超时返回空结果并在日志中记录 `pooled connection unavailable`。
 - `frontend_host` / `frontend_port`：前端开发服务器监听地址和端口，由 Vite 直接读取 `config.yaml`。Windows 的 `start-all.bat` 会从 `frontend_port` 开始检查最多 10 个连续端口，将首个空闲端口回写到 `config.yaml`，并在页面可访问后自动打开 `http://127.0.0.1:<frontend_port>`。
 - `agent_ws_enabled`：仅远程 Hook（`wechat_mode: 2`）使用。启用后，远程客户端 DLL 主动连接本后端的 `/agent` WebSocket，Hook API 调用通过该长连接发送；本地 Hook（`wechat_mode: 1`）始终直连本机 HTTP 接口，不使用 RemoteWS。
 - `agent_ws_path`：DLL 连接路径，默认 `/agent`。
-- `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；无证书直连后端可用 `client_wss_scheme: "ws"`、`client_wss_port: 5000`，DLL 配置 `RemoteWS="ws://1.14.149.2:5000/agent"`；正式 TLS 部署用 `client_wss_scheme: "wss"`、`client_wss_port: 443`，DLL 配置 `RemoteWS="wss://1.14.149.2/agent"`。
+- `client_wss_host` / `client_wss_port` / `client_wss_scheme`：生成 DLL 侧 `RemoteWS` 地址用的公网主机、端口和协议；无证书直连后端可用 `client_wss_scheme: "ws"`、`client_wss_port: 5000`，DLL 配置 `RemoteWS="ws://127.0.0.1:5000/agent"`；正式 TLS 部署用 `client_wss_scheme: "wss"`、`client_wss_port: 443`，DLL 配置 `RemoteWS="wss://127.0.0.1/agent"`。
 - 使用前端端口代理 `/agent` 时，后端 `server_port` 不需要暴露公网；直连 `server_port` 时，需要云服务器安全组放行该端口。若使用 Nginx/Caddy，也需要保留 WebSocket Upgrade 头。
 - `recvtype`：Hook 消息接收类型，默认 `1`；`1` 为 Hook 直接返回 `msglist`，`2` 为 protobuf/raw `pb_msg`。旧配置 `recv_type` 仍兼容。
 - `WECHAT_FILES_BASE`：可选环境变量，用于指定本机微信文件目录；不设置时会按默认微信文件目录推导。
