@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
 import main
@@ -6,6 +8,11 @@ import main
 
 class LocalHookAccountTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = patch.object(main.access_store, 'DB_PATH', Path(temporary.name) / 'access.sqlite3')
+        database.start()
+        self.addCleanup(database.stop)
         registry = patch.object(main.hook_login, 'instances', return_value=[])
         registry.start()
         self.addCleanup(registry.stop)

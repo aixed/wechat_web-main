@@ -464,6 +464,8 @@ def _self_identity_from_response(data: dict, *, agent_id: str = "", current_wxid
         nickname = ""
     avatar = str(
         source.get("head_big")
+        or source.get("avatar")
+        or source.get("headImgUrl")
         or source.get("headimgurl")
         or source.get("head_img")
         or source.get("big_head_url")
@@ -1005,11 +1007,15 @@ def _login_status_from_response(data: dict) -> dict[str, str]:
         data = {}
     nested = data.get("data") if isinstance(data.get("data"), dict) else {}
     source = nested or data
+    status = next((source[key] for key in ('onlinestatus', 'onlineStatus', 'status')
+                   if source.get(key) is not None and source[key] != ''), '')
+    identity = _self_identity_from_response(data)
     return {
-        "status": str(source.get("onlinestatus") or source.get("onlineStatus") or source.get("status") or "").strip(),
+        "status": str(status).strip(),
         "message": str(source.get("msg") or source.get("message") or source.get("retmsg") or "").strip(),
-        "wxid": str(source.get("selfwxid") or source.get("selfWxid") or source.get("wxid") or "").strip(),
-        "nickname": str(source.get("nickname") or source.get("NickName") or "").strip(),
+        "wxid": identity['wxid'],
+        "nickname": identity['nickname'],
+        "avatar": identity['avatar'],
     }
 
 
@@ -1085,11 +1091,18 @@ async def _probe_local_hook_account() -> dict[str, Any]:
             agent_id=_LOCAL_HOOK_ACCOUNT_ID,
             current_wxid=parsed["wxid"],
         )
+        if port_alive and parsed['status'] in {'5', '2'}:
+            if parsed['wxid'] and identity.get('wxid') != parsed['wxid']:
+                identity = {key: {} if key == 'profile' else '' for key in identity}
+            for field in ('wxid', 'nickname', 'avatar'):
+                if parsed.get(field):
+                    identity[field] = parsed[field]
         if not port_alive or parsed['status'] != '3':
             local_owner = access_store.owner(_LOCAL_HOOK_ACCOUNT_ID)
             remembered = access_store.profile(_LOCAL_HOOK_ACCOUNT_ID, local_owner) if local_owner else None
+            same_identity = not parsed['wxid'] or not (remembered or {}).get('wxid') or remembered['wxid'] == parsed['wxid']
             for field in ('wxid', 'nickname', 'avatar'):
-                if not identity.get(field) and (remembered or {}).get(field):
+                if same_identity and not identity.get(field) and (remembered or {}).get(field):
                     identity[field] = remembered[field]
         wxid = str(identity.get("wxid") or parsed["wxid"] or "").strip()
         nickname = str(identity.get("nickname") or parsed["nickname"] or ("" if wxid else "本地微信")).strip()
@@ -2856,6 +2869,9 @@ def _remember_hook_identity(record, account_id, wxid, user_id, identity=None, *,
     if not user_id or not wxid:
         return
     saved = access_store.profile(record['id'], user_id) or {**hook_login.defaults(), **record, 'profile_id': record['id']}
+    if saved.get('wxid') and saved['wxid'] != wxid:
+        saved.pop('nickname', None)
+        saved.pop('avatar', None)
     saved.update(wxid=wxid, wxids=sorted({*saved.get('wxids', []), wxid}),
                  aliases=sorted({*saved.get('aliases', []), record['id'], account_id}))
     if logged_in:
@@ -2881,6 +2897,7 @@ async def _probe_started_hook_account(record):
         response = await hook_login.post(record, "/IsLoginStatus")
         parsed = _login_status_from_response(response.json())
         connected = True
+        identity = {**parsed, 'profile': {}}
         if parsed["status"] == "3":
             profile = state.get("self_info")
             if not profile:
@@ -2905,7 +2922,9 @@ async def _probe_started_hook_account(record):
     remembered = access_store.profile(record['id'], record_owner) if record_owner else {}
     return {"id": account_id, "account_id": wxid or account_id, "source": "hook", "wxid": wxid,
         "nickname": identity.get("nickname") or parsed.get("nickname") or (remembered or {}).get('nickname') or "微信待登录",
-        "avatar": identity.get("avatar") or (remembered or {}).get('avatar') or "", "profile": identity.get("profile") or {},
+        "avatar": identity.get("avatar") or parsed.get('avatar') or (
+            (remembered or {}).get('avatar') if not parsed['wxid'] or (remembered or {}).get('wxid') == parsed['wxid'] else ''
+        ) or "", "profile": identity.get("profile") or {},
         "connected": connected, "port_alive": connected, "login_status": parsed["status"],
         "login_message": '微信已退出，点击卡片重新启动' if not connected and (remembered or {}).get('stopped_at') else parsed["message"], "initialized": bool(state.get("initialized")),
         "transport": record["transport"], "api_host": record["host"], "api_port": record["port"],
@@ -2963,10 +2982,32 @@ async def hook_login_status(instance_id: str):
     return {"ok": True, "account": await _probe_started_hook_account(record)}
 
 
+@app.post('/api/hook/instances/{instance_id}/click-login')
+async def hook_click_login(instance_id: str):
+    record = _hook_login_instance(instance_id)
+    try:
+        response = await hook_login.post(record, '/ClickLoginButton', {})
+        result = response.json()
+        if isinstance(result, dict) and (
+            result.get('error') or ('success' in result and result['success'] in (False, 0, '0', 'false'))
+        ):
+            return {'ok': False, 'error': str(result.get('error') or result.get('msg') or '微信未接受登录请求，请重试')}
+    except (httpx.HTTPError, OSError, ValueError, ConnectionError, TimeoutError) as exc:
+        raise HTTPException(502, '微信登录请求未确认成功，请查看登录状态后重试') from exc
+    return {'ok': True, 'account': await _probe_started_hook_account(record)}
+
+
 @app.post("/api/hook/instances/{instance_id}/qrcode")
 async def hook_login_qrcode(instance_id: str, req: HookQRCodeRequest):
     record = _hook_login_instance(instance_id)
     try:
+        account = await _probe_started_hook_account(record)
+        if account['login_status'] in {'5', '2', '3'}:
+            return {'ok': True, 'qrcode': '', 'account': account}
+        if not account['connected']:
+            return {'ok': False, 'error': '等待微信 Hook 接口就绪'}
+        if account['login_status'] not in {'0', '1', '4'}:
+            return {'ok': False, 'error': '微信登录状态尚未确认，请稍后重试'}
         if req.refresh:
             await hook_login.post(record, "/RefreshLoginQRCode")
         response = await hook_login.post(record, "/GetLoginQRCode")

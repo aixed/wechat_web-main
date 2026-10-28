@@ -86,6 +86,7 @@ class AccessUsersTests(unittest.IsolatedAsyncioTestCase):
             ('GET', '/api/self', None, 'default'),
             ('POST', '/api/accounts/activate', {'agent_id': 'default'}, ''),
             ('GET', '/api/hook/instances/default/status', None, ''),
+            ('POST', '/api/hook/instances/default/click-login', {}, ''),
             ('POST', '/api/hook/start-wechat', {'instance_id': 'default'}, ''),
             ('POST', '/api/accounts/broadcast/targets', {'agent_ids': ['default']}, ''),
         ]:

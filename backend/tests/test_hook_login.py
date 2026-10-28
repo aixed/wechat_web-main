@@ -11,6 +11,7 @@ import httpx
 from PIL import Image
 
 import config
+import access_store
 import hook_login
 import main
 import wechat_api
@@ -26,6 +27,8 @@ class HookLoginTests(unittest.IsolatedAsyncioTestCase):
         self.requests = []
         self.occupied = "0"
         self.start_result = {"success": "1", "进程ID": "20152"}
+        self.login_status = {"onlinestatus": "0", "msg": "等待扫码"}
+        self.click_result = {"success": "1"}
         self.image = io.BytesIO()
         Image.new("RGB", (8, 8), "white").save(self.image, format="PNG")
         def handler(request):
@@ -37,13 +40,16 @@ class HookLoginTests(unittest.IsolatedAsyncioTestCase):
             if request.url.path == "/StartWechat":
                 return httpx.Response(200, json=self.start_result)
             if request.url.path == "/IsLoginStatus":
-                return httpx.Response(200, json={"onlinestatus": "0", "msg": "等待扫码"})
+                return httpx.Response(200, json=self.login_status)
+            if request.url.path == "/ClickLoginButton":
+                return httpx.Response(200, json=self.click_result)
             if request.url.path == "/GetLoginQRCode":
                 return httpx.Response(200, content=self.image.getvalue(), headers={"content-type": "image/png"})
             return httpx.Response(200, json={})
         self.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         self.addAsyncCleanup(self.client.aclose)
         for p in (patch.object(hook_login, "client", self.client),
+            patch.object(access_store, 'DB_PATH', Path(self.temp.name) / 'access.sqlite3'),
             patch.object(config, 'config_file_exists', return_value=True),
             patch.object(hook_login, "REGISTRY_PATH", Path(self.temp.name) / "instances.json"),
             patch.object(config, "IS_HOOK", True), patch.object(config, "IS_PROTOCOL", False),
@@ -169,6 +175,100 @@ class HookLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["/IsLoginStatus", "/RefreshLoginQRCode", "/GetLoginQRCode"], [r.url.path for r in self.requests[-3:]])
         self.assertTrue(all(r.url.port == 30002 for r in self.requests[-3:]))
         self.assertTrue(all("session_id" not in json.loads(r.content) for r in self.requests))
+
+    async def test_saved_account_status_returns_identity_without_requesting_a_qrcode_or_logged_in_profile(self):
+        record = await self.start()
+        self.login_status = {'onlinestatus': '5', 'msg': '点击进入微信', 'selfwxid': 'wxid_saved',
+                             'nickname': 'Saved User', 'avatar': 'https://avatar.test/saved.png'}
+        self.requests.clear()
+        result = await main.hook_login_status(record['id'])
+        self.assertEqual('5', result['account']['login_status'])
+        self.assertEqual('Saved User', result['account']['nickname'])
+        self.assertEqual('https://avatar.test/saved.png', result['account']['avatar'])
+        self.assertFalse(result['account']['initialized'])
+        self.assertEqual(['/IsLoginStatus'], [r.url.path for r in self.requests])
+
+    async def test_click_login_uses_selected_instance_empty_body_then_polls_status_two_and_three(self):
+        record = await self.start()
+        self.login_status = {'onlinestatus': '2', 'msg': '正在登录中...', 'selfwxid': 'wxid_saved', 'nickname': 'Saved User'}
+        self.requests.clear()
+        result = await main.hook_click_login(record['id'])
+        self.assertTrue(result['ok'])
+        self.assertEqual('2', result['account']['login_status'])
+        self.assertFalse(result['account']['initialized'])
+        self.assertEqual(['/ClickLoginButton', '/IsLoginStatus'], [r.url.path for r in self.requests])
+        self.assertTrue(all(r.url.port == 30002 and json.loads(r.content) == {} for r in self.requests))
+        self.login_status['onlinestatus'] = '3'
+        status = await main.hook_login_status(record['id'])
+        self.assertEqual('3', status['account']['login_status'])
+        self.assertEqual(1, sum(r.url.path == '/ClickLoginButton' for r in self.requests))
+
+    async def test_qrcode_refresh_never_touches_saved_logging_in_or_logged_in_accounts(self):
+        record = await self.start()
+        for status in ('5', '2', '3'):
+            with self.subTest(status=status):
+                self.login_status = {'onlinestatus': status, 'selfwxid': 'wxid_saved', 'nickname': 'Saved User'}
+                self.requests.clear()
+                result = await main.hook_login_qrcode(record['id'], main.HookQRCodeRequest(refresh=True))
+                self.assertTrue(result['ok'])
+                self.assertEqual('', result['qrcode'])
+                self.assertEqual(status, result['account']['login_status'])
+                self.assertNotIn('/GetLoginQRCode', [r.url.path for r in self.requests])
+                self.assertNotIn('/RefreshLoginQRCode', [r.url.path for r in self.requests])
+
+    async def test_unconfirmed_login_status_does_not_force_a_qrcode_refresh(self):
+        record = await self.start()
+        self.login_status = {}
+        self.requests.clear()
+        result = await main.hook_login_qrcode(record['id'], main.HookQRCodeRequest(refresh=True))
+        self.assertFalse(result['ok'])
+        self.assertEqual(['/IsLoginStatus'], [r.url.path for r in self.requests])
+
+    async def test_saved_avatar_is_reused_only_for_the_same_wechat_identity(self):
+        record = await self.start()
+        user = access_store.login(config.WEB_ACCESS_KEY, create=True)
+        access_store.claim(record['id'], user)
+        for wxid, expected in [('wxid_saved', 'https://avatar.test/saved.png'), ('wxid_other', '')]:
+            with self.subTest(wxid=wxid):
+                access_store.save_profile({**record, 'profile_id': record['id'], 'wxid': 'wxid_saved',
+                                           'nickname': 'Saved User', 'avatar': 'https://avatar.test/saved.png'}, user)
+                self.login_status = {'onlinestatus': '5', 'selfwxid': wxid, 'nickname': 'Current User'}
+                result = await main.hook_login_status(record['id'])
+                self.assertEqual('Current User', result['account']['nickname'])
+                self.assertEqual(expected, result['account']['avatar'])
+
+    async def test_click_login_reports_explicit_failure_without_repeating_the_request(self):
+        record = await self.start()
+        self.click_result = {'success': '0', 'msg': '登录按钮不可用'}
+        self.requests.clear()
+        result = await main.hook_click_login(record['id'])
+        self.assertFalse(result['ok'])
+        self.assertIn('登录按钮不可用', result['error'])
+        self.assertEqual(['/ClickLoginButton'], [r.url.path for r in self.requests])
+
+    async def test_click_login_timeout_is_not_automatically_replayed(self):
+        record = await self.start()
+        with patch.object(hook_login, 'post', AsyncMock(side_effect=httpx.ReadTimeout('not confirmed'))) as post:
+            with self.assertRaises(main.HTTPException) as failure:
+                await main.hook_click_login(record['id'])
+        self.assertEqual(502, failure.exception.status_code)
+        post.assert_awaited_once_with(record, '/ClickLoginButton', {})
+
+    async def test_click_login_supports_the_selected_remote_hook_agent(self):
+        record = {'id': 'hook_30002', 'port': 30002, 'transport': 'ws'}
+        result = SimpleNamespace(status=200, body=b'{"success":"1"}', content_type='application/json')
+        with patch.object(hook_login, 'connected_agent', return_value={'id': 'selected-agent'}), \
+             patch.object(hook_login.agent_manager, 'request', AsyncMock(return_value=result)) as request:
+            await hook_login.post(record, '/ClickLoginButton', {})
+        request.assert_awaited_once_with('ClickLoginButton', {}, agent_id='selected-agent', timeout=10,
+                                       inject_agent_id=False, include_method=False)
+
+    def test_login_status_preserves_numeric_zero_and_extracts_nested_avatar(self):
+        self.assertEqual('0', main._login_status_from_response({'onlinestatus': 0})['status'])
+        result = main._login_status_from_response({'data': {'onlinestatus': '5', 'nickname': 'Saved User',
+                                                          'selfwxid': 'wxid_saved', 'headimgurl': 'avatar'}})
+        self.assertEqual('5', result['status'])
+        self.assertEqual('avatar', result['avatar'])
 
     def test_qrcode_accepts_binary_base64_and_hex_and_rejects_non_images(self):
         raw = self.image.getvalue()

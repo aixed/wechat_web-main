@@ -142,6 +142,10 @@ export const startHookWechat = (payload: HookStartWechatPayload) => fetchJSON("/
 }, 60_000);
 export const getHookLoginStatus = (instanceId: string) =>
   fetchJSON(`/api/hook/instances/${encodeURIComponent(instanceId)}/status`);
+export const clickHookLoginButton = (instanceId: string) =>
+  fetchJSON(`/api/hook/instances/${encodeURIComponent(instanceId)}/click-login`, {
+    method: "POST", body: JSON.stringify({}),
+  });
 export const getHookLoginQRCode = (instanceId: string, refresh = false) =>
   fetchJSON(`/api/hook/instances/${encodeURIComponent(instanceId)}/qrcode`, {
     method: "POST", body: JSON.stringify({ refresh }),
