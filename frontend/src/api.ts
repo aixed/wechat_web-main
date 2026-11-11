@@ -103,6 +103,10 @@ export type InitialSetupPayload = {
   api_port: number;
   mgr_port: number;
   public_host?: string;
+  api_scheme?: string;
+  protocol_session_list_key?: string;
+  callback_url?: string;
+  remote_ws?: string;
 };
 
 export const getSetupStatus = () => fetchJSON("/api/setup/status");
@@ -176,6 +180,7 @@ export type ProtocolRdvMappingEntry = {
 export type ProtocolStartWechatPayload = {
   rdv: string;
   callback_url?: string;
+  remote_ws?: string;
   proxy_type?: string;
   proxy_ip?: string;
   proxy_port?: string;

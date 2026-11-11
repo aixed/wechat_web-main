@@ -6,6 +6,26 @@ from agent_ws import AgentConnection, AgentWebSocketManager
 
 
 class AgentWebSocketCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_go_callback_keeps_protocol_session_separate_from_agent_id(self):
+        manager = AgentWebSocketManager()
+        received = []
+
+        async def callback_handler(payload):
+            received.append(payload)
+
+        manager.set_callback_handler(callback_handler)
+        conn = AgentConnection(id='device_30001_session-1', websocket=object(), peer='test', connected_at=0,
+                               last_seen_at=0, pending={}, send_lock=asyncio.Lock(), registered=True)
+        await manager._handle_message(conn, json.dumps({
+            'type': 'callback', 'route': 'receiveChatBotMsg',
+            'body': {'session_id': 'session-1', 'selfwxid': 'wxid_protocol', 'ServerPort': '30001',
+                     'msglist': [{'msgtype': '1', 'msg': 'hello'}]},
+        }))
+        await asyncio.gather(*list(manager._callback_tasks))
+        self.assertEqual('session-1', received[0]['session_id'])
+        self.assertEqual('device_30001_session-1', received[0]['agent_id'])
+        self.assertEqual('wxid_protocol', received[0]['selfwxid'])
+
     async def test_callback_is_dispatched_without_blocking_receive_loop(self):
         manager = AgentWebSocketManager()
         started = asyncio.Event()

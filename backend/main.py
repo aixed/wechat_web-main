@@ -2506,6 +2506,10 @@ class InitialSetupRequest(BaseModel):
     api_port: int = Field(default=30001, ge=1, le=65535)
     mgr_port: int = Field(default=29999, ge=1, le=65535)
     public_host: str = ""
+    api_scheme: str = "http"
+    protocol_session_list_key: str = ""
+    callback_url: str = ""
+    remote_ws: str = ""
 
 
 class ActivateAccountRequest(BaseModel):
@@ -2519,6 +2523,7 @@ class DeleteAccountRequest(BaseModel):
 class ProtocolStartWechatRequest(BaseModel):
     rdv: str
     callback_url: str = ""
+    remote_ws: str | None = None
     proxy_type: str = ""
     proxy_ip: str = ""
     proxy_port: str = ""
@@ -2699,10 +2704,10 @@ async def client_settings():
 
 @app.post("/api/setup/initial-config")
 async def setup_initial_config(req: InitialSetupRequest):
-    if str(req.key or "") != config.WEB_ACCESS_KEY:
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     if config.config_file_exists():
         return {"ok": False, "error": "already_configured"}
+    if not access_store.login(req.key):
+        return JSONResponse({"ok": False, "error": "请先使用访问密钥登录，再提交初始配置"}, status_code=401)
     try:
         saved = config.save_initial_setup_config(
             wechat_mode=req.wechat_mode,
@@ -2711,6 +2716,10 @@ async def setup_initial_config(req: InitialSetupRequest):
             api_port=req.api_port,
             mgr_port=req.mgr_port,
             public_host=req.public_host,
+            api_scheme=req.api_scheme,
+            protocol_session_list_key=req.protocol_session_list_key,
+            callback_url=req.callback_url,
+            remote_ws=req.remote_ws,
         )
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -3115,7 +3124,8 @@ async def _migrate_protocol_ownership():
                 return
         response = await protocol_api.get_session_list()
         if not isinstance(response, dict) or response.get('ok') is False:
-            raise HTTPException(502, '协议服务不可用，尚未完成原微信账号归属迁移')
+            reason = str(response.get('error') or '') if isinstance(response, dict) else ''
+            raise HTTPException(502, reason or '协议服务不可用，尚未完成原微信账号归属迁移')
         user = access_store.legacy_user()
         for item in response.get('sessions', []):
             if isinstance(item, dict) and item.get('session_id'):
@@ -3167,10 +3177,16 @@ async def start_protocol_wechat(req: ProtocolStartWechatRequest):
     rdv = _validate_protocol_rdv(req.rdv)
     if access_store.current_user.get() and not access_store.claim('rdv:' + rdv):
         raise HTTPException(403, '此 RDV 已属于其他密钥用户')
-    callback_url = str(req.callback_url or "").strip() or config.CALLBACK_URL
+    try:
+        callback_url = config.clean_callback_url(req.callback_url or config.PROTOCOL_CALLBACK_URL)
+        remote_ws = config.clean_callback_url(config.PROTOCOL_REMOTE_WS if req.remote_ws is None else req.remote_ws, websocket=True)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     data = await protocol_api.start_wechat(
         rdv=rdv,
         callback_url=callback_url,
+        remote_ws=remote_ws,
+        recv_type=config.RECV_TYPE,
         proxy_type=str(req.proxy_type or "").strip(),
         proxy_ip=str(req.proxy_ip or "").strip(),
         proxy_port=str(req.proxy_port or "").strip(),

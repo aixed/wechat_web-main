@@ -34,6 +34,12 @@ remote_hook_wechat_path: ""
 remote_protocol_host: "127.0.0.1"
 remote_protocol_api_port: 30001
 remote_protocol_mgr_port: 29999
+remote_protocol_api_scheme: "http"
+# 协议服务器主动回连本 Web 服务的公网地址；与上面的协议 API 地址方向相反。
+# 可使用前端同源的 /agent（WS/WSS）和 /api/callback（HTTP/HTTPS）。
+# 与 agent_ws_enabled 无关，协议业务 API 仍通过 HTTP/HTTPS 调用。
+protocol_remote_ws: ""
+protocol_callback_url: ""
 
 # --- 后端服务 ---
 # 后端监听地址。DLL 使用 RemoteWS 直连 server_port 时需要监听 0.0.0.0；
@@ -124,6 +130,7 @@ network_local_aliases:
 network_agent_host: agent.local
 network_http_scheme: http
 network_callback_host: 127.0.0.1
+# Go 协议 /GetSessionList 的管理密钥，与 web_access_key 无关；只在本地配置填写。
 protocol_session_list_key: ''
 legacy_rdv_mapping_path: ''
 mcp_defaults:

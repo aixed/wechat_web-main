@@ -124,6 +124,16 @@ npm run lint
 
 AI 提示词统一放在 YAML 配置中：复制 `prompts.example.yaml` 为本地 `prompts.yaml` 后修改；`config.yaml` 的 `prompt_config_file` 指向本地文件，缺少本地文件或对应条目时读取 `prompt_example_file` 指定的公开模板。明确配置为空的提示词会报错，防止执行不完整的指令。修改后重启后端即可更新桥接任务使用的提示词。
 
+### Web 与远程 Go 协议分开部署
+
+首次初始化使用已经登录验证的访问密钥，可设置自定义 `web_access_key`。该密钥只用于 Web 用户身份；`protocol_session_list_key` 是 Go 协议 `/GetSessionList` 的独立管理密钥，两者不能混用。初始配置页面支持填写协议管理密钥以及回连地址。
+
+`remote_protocol_host` 填协议服务器的 IP/域名，`remote_protocol_api_port` 填 API 端口，`remote_protocol_api_scheme` 选择 `http` 或 `https`。Go 协议的登录、会话列表和业务调用使用 API 端口，不使用 Hook 管理器端口。健康检查兼容仅支持 POST 的旧版本。
+
+`protocol_remote_ws` 填本 Web 服务的公网 WS/WSS 地址（路径 `/agent`），`protocol_callback_url` 填本 Web 服务的 HTTP/HTTPS 回调地址（路径 `/api/callback`）；初始配置页按当前浏览器地址生成，支持手动修改。两者的方向都是**协议服务器 → Web 后端**，不能填成协议服务器自身或另一台机器的本地回环地址。Web 调用 `/StartWechat` 时会传入 `RemoteWS`、`RecvType` 和 `CallBackURL`；Go 优先通过 WebSocket 推送消息，HTTP 作为备用。`agent_ws_enabled` 仍只控制远程 Hook 的业务传输，协议业务 API 继续使用 HTTP/HTTPS。回调中的 `session_id` 用来隔离协议账号，不能用 Go WebSocket 的设备 `agent_id` 替代。
+
+Nginx 需要将 `/api/`、`/agent`、`/uploads/` 和 `/receiveChatBotMsg` 转发到 Web 后端，并为 WebSocket 转发 `Upgrade`、`Connection` 请求头，设置较长的 `proxy_read_timeout`。云安全组须允许协议服务器访问实际使用的 Web 公网端口。Go 端需使用支持 `RemoteWS` 的构建；仅 `/StartWechat` 成功还不能证明消息推送已连接，应检查返回的 `remote_ws` 和 Go/Web 两端的连接日志。
+
 网络默认值使用 `network_*` 配置；MCP 默认名称、地址、Token 检查端口及默认回复模板使用 `mcp_defaults`；触发昵称、显示昵称和报表作者使用 `workflow`；业务任务标题及回复前缀使用 `labels`。协议会话列表密钥使用 `protocol_session_list_key`，公开模板留空。前端从后端读取所需配置，构建时不打包本地 YAML 或完整提示词。`/api/client-settings` 仅向已登录用户返回配置允许的公开资源和触发名称字段。
 
 应用数据库统一使用标准 SQLite，默认无数据库密码，无需单独部署数据库服务。所有数据库及相关记录、迁移备份放在 `backend/db/`，该目录的运行数据不会提交到 Git：

@@ -31,6 +31,8 @@ def safe_json(response: httpx.Response) -> dict[str, Any]:
 
 
 def _preview(payload: Any, limit: int = 1200) -> str:
+    if isinstance(payload, dict):
+        payload = {key: ("***" if str(key).lower() in {"key", "proxy_pwd", "password", "token"} else value) for key, value in payload.items()}
     try:
         text = json.dumps(payload, ensure_ascii=False)
     except Exception:
@@ -92,6 +94,10 @@ async def _post(path: str, payload: dict[str, Any] | None = None, timeout: float
             flush=True,
         )
         data = safe_json(response)
+        if not isinstance(data, dict):
+            data = {"ok": False, "error": "协议服务返回了非对象 JSON，请检查 API 地址", "status_code": response.status_code}
+        if 300 <= response.status_code < 400:
+            data.update(ok=False, error="协议服务返回重定向，请检查 API 协议、域名和端口", status_code=response.status_code)
         if response.status_code >= 400 and "status_code" not in data:
             data["status_code"] = response.status_code
         last_data = data
@@ -105,6 +111,8 @@ async def _post(path: str, payload: dict[str, Any] | None = None, timeout: float
 async def health() -> dict[str, Any]:
     try:
         response = await client.get("/health", timeout=5.0)
+        if response.status_code == 405:
+            response = await client.post("/health", json={}, timeout=5.0)
         data = safe_json(response)
         if response.status_code >= 400 and "status_code" not in data:
             data["status_code"] = response.status_code
@@ -114,7 +122,7 @@ async def health() -> dict[str, Any]:
 
 
 async def get_session_list(not_started_after_seconds: int = 300) -> dict[str, Any]:
-    return await _post(
+    data = await _post(
         "/GetSessionList",
         {
             "key": SESSION_LIST_KEY,
@@ -122,31 +130,37 @@ async def get_session_list(not_started_after_seconds: int = 300) -> dict[str, An
         },
         timeout=10.0,
     )
+    if data.get("status_code") in (401, 403) or data.get("error") == "invalid key":
+        return {**data, "ok": False, "error": "协议 GetSessionList 管理密钥不正确，请检查 protocol_session_list_key；它不是 Web 登录密钥"}
+    return data
 
 
 async def start_wechat(
     *,
     rdv: str,
     callback_url: str = "",
+    remote_ws: str | None = None,
+    recv_type: int | None = None,
     proxy_type: str = "",
     proxy_ip: str = "",
     proxy_port: str | int = "",
     proxy_usr: str = "",
     proxy_pwd: str = "",
 ) -> dict[str, Any]:
-    return await _post(
-        "/StartWechat",
-        {
-            "RDV": rdv,
-            "CallBackURL": callback_url,
-            "Proxy_Type": proxy_type,
-            "Proxy_IP": proxy_ip,
-            "Proxy_Port": str(proxy_port or ""),
-            "Proxy_Usr": proxy_usr,
-            "Proxy_Pwd": proxy_pwd,
-        },
-        timeout=35.0,
-    )
+    payload = {
+        "RDV": rdv,
+        "CallBackURL": callback_url,
+        "Proxy_Type": proxy_type,
+        "Proxy_IP": proxy_ip,
+        "Proxy_Port": str(proxy_port or ""),
+        "Proxy_Usr": proxy_usr,
+        "Proxy_Pwd": proxy_pwd,
+    }
+    if remote_ws is not None:
+        payload["RemoteWS"] = remote_ws
+    if recv_type is not None:
+        payload["RecvType"] = recv_type
+    return await _post("/StartWechat", payload, timeout=35.0)
 
 
 async def get_login_qrcode(session_id: str) -> dict[str, Any]:

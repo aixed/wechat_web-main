@@ -8,6 +8,7 @@ Reads from ../config.yaml and exposes settings for three modes:
 
 import os
 import sys
+from urllib.parse import urlsplit
 from typing import Any
 
 import yaml
@@ -106,7 +107,10 @@ RDV = str(_cfg.get("RDV", ""))
 
 # ─── Derived URLs ──────────────────────────────────────────────────
 
-HOOK_BASE_URL = f"http://{HOOK_HOST}:{HOOK_PORT}"
+PROTOCOL_API_SCHEME = str(_cfg.get("remote_protocol_api_scheme", "http") or "http").lower()
+_api_scheme = PROTOCOL_API_SCHEME if IS_PROTOCOL else "http"
+_api_host = f"[{HOOK_HOST}]" if ":" in HOOK_HOST and not HOOK_HOST.startswith("[") else HOOK_HOST
+HOOK_BASE_URL = f"{_api_scheme}://{_api_host}:{HOOK_PORT}"
 MGR_BASE_URL = f"http://{HOOK_HOST}:{MGR_PORT}"
 
 # Backend binding and network defaults are read from YAML configuration.
@@ -440,6 +444,8 @@ CALLBACK_HOST = SERVER_HOST
 CALLBACK_PORT = SERVER_PORT
 CALLBACK_PATH = "/api/callback"
 CALLBACK_URL = f"{setting('network_http_scheme')}://{setting('network_callback_host')}:{SERVER_PORT}{CALLBACK_PATH}"
+PROTOCOL_CALLBACK_URL = str(_cfg.get("protocol_callback_url") or CALLBACK_URL).strip()
+PROTOCOL_REMOTE_WS = str(_cfg.get("protocol_remote_ws") or "").strip()
 RECV_TYPE = int(_cfg.get("recvtype", _cfg.get("recv_type", 2)))
 if RECV_TYPE not in (1, 2):
     print(f"[CONFIG] ⚠ invalid recv_type={RECV_TYPE!r}, using 2", flush=True)
@@ -486,7 +492,7 @@ def initial_setup_defaults() -> dict[str, Any]:
                 **_mode_defaults(2),
                 "public_host": str(_cfg.get("client_wss_host", _cfg.get("ip", str(setting('network_loopback_host')))) or str(setting('network_loopback_host'))),
             },
-            "remote_protocol": _mode_defaults(3),
+            "remote_protocol": {**_mode_defaults(3), "api_scheme": PROTOCOL_API_SCHEME},
         },
     }
 
@@ -522,6 +528,22 @@ def _load_initial_config_template() -> Any:
     raise FileNotFoundError('config.example.yaml is required for initial setup')
 
 
+def clean_callback_url(value: Any, *, websocket: bool = False) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    schemes = ("ws", "wss") if websocket else ("http", "https")
+    label = "RemoteWS" if websocket else "HTTP 回调地址"
+    try:
+        parsed = urlsplit(text)
+        valid_port = parsed.port is None or 1 <= parsed.port <= 65535
+        if parsed.scheme not in schemes or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.fragment or not valid_port:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"{label} 必须是有效的 {'/'.join(schemes)} 公网地址，不能包含用户名、密码或片段") from None
+    return text
+
+
 def save_initial_setup_config(
     *,
     wechat_mode: Any,
@@ -530,6 +552,10 @@ def save_initial_setup_config(
     api_port: Any = 30001,
     mgr_port: Any = 29999,
     public_host: Any = "",
+    api_scheme: Any = "http",
+    protocol_session_list_key: Any = "",
+    callback_url: Any = "",
+    remote_ws: Any = "",
 ) -> dict[str, Any]:
     if config_file_exists():
         raise FileExistsError("config.yaml 已存在")
@@ -547,6 +573,18 @@ def save_initial_setup_config(
     selected_api_port = _clean_port(api_port, default=30001, field="API 端口")
     selected_mgr_port = _clean_port(mgr_port, default=29999, field="管理端口")
     selected_public_host = _clean_host(public_host or selected_host)
+    selected_scheme = str(api_scheme or "http").strip().lower()
+    if mode_number == 3:
+        if selected_scheme not in {"http", "https"}:
+            raise ValueError("协议 API 协议必须是 http 或 https")
+        if "://" in selected_host or any(char in selected_host for char in "/?#@"):
+            raise ValueError("协议主机只填写 IP 或域名，协议和端口请使用对应字段")
+        callback_url = clean_callback_url(callback_url)
+        remote_ws = clean_callback_url(remote_ws, websocket=True)
+        if not callback_url and not remote_ws:
+            raise ValueError("远程协议需要可从协议服务器访问的 HTTP 回调地址或 RemoteWS 地址")
+        if not str(protocol_session_list_key or "").strip():
+            raise ValueError("请输入协议 GetSessionList 管理密钥，它与 Web 访问密钥相互独立")
 
     parser, document = _load_initial_config_template()
     document["wechat_mode"] = mode_number
@@ -561,6 +599,11 @@ def save_initial_setup_config(
     document[f"{mode_name}_host"] = selected_host
     document[f"{mode_name}_api_port"] = selected_api_port
     document[f"{mode_name}_mgr_port"] = selected_mgr_port
+    if mode_number == 3:
+        document["remote_protocol_api_scheme"] = selected_scheme
+        document["protocol_session_list_key"] = str(protocol_session_list_key).strip()
+        document["protocol_callback_url"] = callback_url
+        document["protocol_remote_ws"] = remote_ws
 
     if mode_number == 1:
         document["ip"] = str(setting('network_loopback_host'))

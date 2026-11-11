@@ -83,6 +83,10 @@ type InitialSetupForm = {
   apiPort: string;
   mgrPort: string;
   publicHost: string;
+  apiScheme: string;
+  protocolSessionListKey: string;
+  callbackUrl: string;
+  remoteWs: string;
 };
 type ProtocolCachedQr = {
   qrSrc: string;
@@ -1855,6 +1859,10 @@ export default function App() {
         api_port: apiPort,
         mgr_port: mgrPort,
         public_host: form.publicHost.trim(),
+        api_scheme: form.apiScheme,
+        protocol_session_list_key: form.protocolSessionListKey.trim(),
+        callback_url: form.callbackUrl.trim(),
+        remote_ws: form.remoteWs.trim(),
       });
       const unavailableMessage = backendUnavailableText(data);
       if (unavailableMessage) {
@@ -1867,6 +1875,7 @@ export default function App() {
       }
       const nextKey = String(data?.web_access_key || data?.config?.web_access_key || form.webAccessKey || "admin").trim();
       setAccessKey(nextKey || "admin");
+      await loginWithKey(nextKey || "admin");
       setSetupAccessKey("");
       setSetupRequired(false);
       setSetupError("");
@@ -3962,6 +3971,10 @@ function setupFormFromDefaults(defaults: any, mode: InitialSetupMode): InitialSe
     apiPort: String(modeDefaults.api_port || ""),
     mgrPort: String(modeDefaults.mgr_port || ""),
     publicHost: String(modeDefaults.public_host || browserHost || ""),
+    apiScheme: String(modeDefaults.api_scheme || "http"),
+    protocolSessionListKey: "",
+    callbackUrl: `${window.location.origin}/api/callback`,
+    remoteWs: `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/agent`,
   };
 }
 
@@ -4018,12 +4031,13 @@ function InitialSetupGate({
   error: string;
   onSubmit: (form: InitialSetupForm) => Promise<boolean>;
 }) {
-  const [form, setForm] = useState<InitialSetupForm>(() => setupFormFromDefaults(defaults, 1));
+  const [form, setForm] = useState<InitialSetupForm>(() => ({ ...setupFormFromDefaults(defaults, 1), webAccessKey: accessKey || "admin" }));
   const [submitting, setSubmitting] = useState(false);
   const accessKeyVerified = Boolean(accessKey);
   const modeDefaults = setupDefaultsFor(defaults, form.wechatMode);
   const isLocalHook = form.wechatMode === 1;
   const isRemoteHook = form.wechatMode === 2;
+  const isProtocol = form.wechatMode === 3;
   const hostLabel = isLocalHook ? "Hook IP" : form.wechatMode === 2 ? "远程 Hook API IP/域名" : "协议服务 IP/域名";
 
   useEffect(() => {
@@ -4056,8 +4070,8 @@ function InitialSetupGate({
   };
 
   return (
-    <div className="h-dvh w-screen bg-[#111111] text-[#e8e8e8] flex items-center justify-center px-[20px]">
-      <form onSubmit={submit} className="w-[520px] max-w-full">
+    <div className="h-dvh w-screen bg-[#111111] text-[#e8e8e8] overflow-y-auto px-[20px] py-[28px]">
+      <form onSubmit={submit} className="w-[520px] max-w-full mx-auto my-auto">
         <div className="flex items-start justify-between gap-[16px] mb-[22px]">
           <div>
             <div className="text-[24px] font-medium">初始配置</div>
@@ -4119,6 +4133,16 @@ function InitialSetupGate({
             placeholder={String(modeDefaults.host || "IP/域名")}
           />
 
+          {isProtocol && (
+            <label className="block">
+              <span className="block mb-[7px] text-[13px] text-[#b8b8b8]">协议 API 协议</span>
+              <select value={form.apiScheme} onChange={(event) => updateField("apiScheme", event.target.value)} className="w-full h-[42px] rounded-[4px] border px-[12px] bg-[#222] border-[#3a3a3a] text-[#e8e8e8]">
+                <option value="http">HTTP</option>
+                <option value="https">HTTPS</option>
+              </select>
+            </label>
+          )}
+
           <div className="grid grid-cols-2 gap-[12px]">
             <SetupInput
               label="API 端口"
@@ -4135,6 +4159,15 @@ function InitialSetupGate({
               placeholder="29999"
             />
           </div>
+          {isProtocol && (
+            <>
+              <SetupInput label="协议管理密钥（GetSessionList）" value={form.protocolSessionListKey} onChange={(value) => updateField("protocolSessionListKey", value)} type="password" />
+              <p className="text-[12px] text-[#999]">填写协议服务器的管理密钥，与上方 Web 访问密钥相互独立。</p>
+              <SetupInput label="协议 RemoteWS 回连地址" value={form.remoteWs} onChange={(value) => updateField("remoteWs", value)} />
+              <SetupInput label="HTTP 回调地址（备用）" value={form.callbackUrl} onChange={(value) => updateField("callbackUrl", value)} />
+              <p className="text-[12px] text-[#999]">已按当前页面地址生成。这里应指向本 Web 服务，协议服务器需要能够访问。</p>
+            </>
+          )}
         </div>
 
         {error && <div className="mt-[12px] text-[13px] text-[#f56c6c]">{error}</div>}
@@ -5143,7 +5176,6 @@ function ProtocolLoginPanel({
   }`;
   const labelClass = `text-[13px] ${dark ? "text-[#d0d0d0]" : "text-[#555]"}`;
   const mutedClass = dark ? "text-[#9b9b9b]" : "text-[#777]";
-  const disabledInputClass = !proxyDraft.proxyEnabled ? "opacity-50 pointer-events-none" : "";
   const statusClass = phase === "success"
     ? "text-[#07c160]"
     : phase === "error"
@@ -5688,12 +5720,15 @@ function ProtocolLoginPanel({
               onClick={() => updateProxyDraft("proxyEnabled", !proxyDraft.proxyEnabled)}
               className={`relative w-[42px] h-[24px] shrink-0 rounded-full transition-colors ${proxyDraft.proxyEnabled ? "bg-[#07c160]" : dark ? "bg-[#555]" : "bg-[#c9c9c9]"}`}
               aria-label="Use proxy"
+              role="switch"
+              aria-checked={proxyDraft.proxyEnabled}
             >
               <span className={`absolute left-[3px] top-[3px] w-[18px] h-[18px] rounded-full bg-white transition-transform ${proxyDraft.proxyEnabled ? "translate-x-[18px]" : "translate-x-0"}`} />
             </button>
           </div>
 
-          <div className={`mt-[26px] rounded-[10px] border overflow-hidden ${dark ? "border-[#444] bg-[#292929]" : "border-[#d8d8d8] bg-[#f7f7f7]"} ${disabledInputClass}`}>
+          {proxyDraft.proxyEnabled && (
+          <div className={`mt-[26px] rounded-[10px] border overflow-hidden ${dark ? "border-[#444] bg-[#292929]" : "border-[#d8d8d8] bg-[#f7f7f7]"}`}>
             {[
               ["Address", "proxyIP", ""] as const,
               ["Port", "proxyPort", ""] as const,
@@ -5710,11 +5745,11 @@ function ProtocolLoginPanel({
                   value={String(proxyDraft[key] || "")}
                   onChange={(e) => updateProxyDraft(key, e.target.value)}
                   className={`h-[34px] min-w-0 flex-1 rounded-[6px] px-[10px] outline-none ${dark ? "bg-[#383838] text-[#eee]" : "bg-white text-[#111]"}`}
-                  disabled={!proxyDraft.proxyEnabled}
                 />
               </label>
             ))}
           </div>
+          )}
 
           <button
             type="button"
