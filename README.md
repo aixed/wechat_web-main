@@ -132,6 +132,16 @@ AI 提示词统一放在 YAML 配置中：复制 `prompts.example.yaml` 为本�
 
 `protocol_remote_ws` 填本 Web 服务的公网 WS/WSS 地址（路径 `/agent`），`protocol_callback_url` 填本 Web 服务的 HTTP/HTTPS 回调地址（路径 `/api/callback`）；初始配置页按当前浏览器地址生成，支持手动修改。两者的方向都是**协议服务器 → Web 后端**，不能填成协议服务器自身或另一台机器的本地回环地址。Web 调用 `/StartWechat` 时会传入 `RemoteWS`、`RecvType` 和 `CallBackURL`；Go 优先通过 WebSocket 推送消息，HTTP 作为备用。`agent_ws_enabled` 仍只控制远程 Hook 的业务传输，协议业务 API 继续使用 HTTP/HTTPS。回调中的 `session_id` 用来隔离协议账号，不能用 Go WebSocket 的设备 `agent_id` 替代。
 
+不同 Web 密钥对应独立用户，可以使用相同 RDV。保存的 RDV、微信身份和代理配置只在当前用户下读取、修改和删除；在线协议实例按 `session_id` 校验所属用户。没有保存记录的用户显示空记录，不读取其他用户的数据。旧版未标注用户的 RDV 记录仅保留给原配置密钥用户。
+
+协议登录页左侧展示当前密钥使用过的全部 RDV 卡片，包含已关闭实例和还未扫码的记录。同一微信使用多个 RDV 时分别展示，点击卡片切换登录信息，右键可删除卡片；删除仍有运行实例的卡片时会先确认关闭实例，不清除聊天数据。仅关闭实例会保留 RDV 历史记录。
+
+选择左侧 RDV 卡片只更新右侧详情；已在线的账号、扫码登录成功的账号都保留在登录页，点击右侧“进入微信”后才进入聊天页。
+
+新生成的 RDV、修改后在当前用户下没有微信身份记录的 RDV，都自动显示二维码；历史里仅有启动记录也使用二维码。只有精确匹配当前用户和 RDV 的微信身份才显示老号头像、昵称，保存设置不会沿用上一个 RDV 的 WXID。协议老号登录独立调用 `/pushloginurl`，请求体仅包含 `session_id` 和 `wxid`。
+
+登录成功后，Web 后端将 WXID、头像、昵称及资料保存到 `backend/db/access_users.sqlite3` 的 `protocol_rdv_profiles` 表，按服务、用户和 RDV 联合区分。再次打开页面、切换卡片时读取这些记录，原有 JSON 历史会按当前用户迁入 SQLite 并保留兼容副本。
+
 Nginx 需要将 `/api/`、`/agent`、`/uploads/` 和 `/receiveChatBotMsg` 转发到 Web 后端，并为 WebSocket 转发 `Upgrade`、`Connection` 请求头，设置较长的 `proxy_read_timeout`。云安全组须允许协议服务器访问实际使用的 Web 公网端口。Go 端需使用支持 `RemoteWS` 的构建；仅 `/StartWechat` 成功还不能证明消息推送已连接，应检查返回的 `remote_ws` 和 Go/Web 两端的连接日志。
 
 网络默认值使用 `network_*` 配置；MCP 默认名称、地址、Token 检查端口及默认回复模板使用 `mcp_defaults`；触发昵称、显示昵称和报表作者使用 `workflow`；业务任务标题及回复前缀使用 `labels`。协议会话列表密钥使用 `protocol_session_list_key`，公开模板留空。前端从后端读取所需配置，构建时不打包本地 YAML 或完整提示词。`/api/client-settings` 仅向已登录用户返回配置允许的公开资源和触发名称字段。

@@ -43,6 +43,10 @@ def connect():
             access_key TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(scope, user_id, profile_id));
         CREATE TABLE IF NOT EXISTS access_metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS protocol_rdv_profiles (
+            scope TEXT NOT NULL, user_id TEXT NOT NULL, rdv TEXT NOT NULL,
+            settings TEXT NOT NULL, updated_at REAL NOT NULL,
+            PRIMARY KEY(scope, user_id, rdv));
         ''')
         columns = {row['name'] for row in db.execute('PRAGMA table_info(hook_profiles)')}
         if 'access_key' not in columns:
@@ -65,6 +69,32 @@ def connect():
 
 def digest(key):
     return hashlib.sha256(str(key).encode('utf-8')).hexdigest()
+
+
+def protocol_rdvs():
+    user = current_user.get()
+    if not user:
+        return {}
+    with connect() as db:
+        return {row['rdv']: json.loads(row['settings']) for row in db.execute(
+            'SELECT rdv,settings FROM protocol_rdv_profiles WHERE scope=? AND user_id=?', (scope(), user))}
+
+
+def save_protocol_rdv(rdv, settings):
+    user = current_user.get()
+    if not user:
+        return
+    with connect() as db:
+        db.execute('INSERT OR REPLACE INTO protocol_rdv_profiles VALUES(?,?,?,?,?)',
+                   (scope(), user, rdv, json.dumps(settings, ensure_ascii=False), time.time()))
+
+
+def delete_protocol_rdv(rdv):
+    user = current_user.get()
+    if not user:
+        return
+    with connect() as db:
+        db.execute('DELETE FROM protocol_rdv_profiles WHERE scope=? AND user_id=? AND rdv=?', (scope(), user, rdv))
 
 
 def login(key, *, create=False):

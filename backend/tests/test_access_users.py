@@ -23,6 +23,8 @@ class AccessUsersTests(unittest.IsolatedAsyncioTestCase):
                   patch.object(config, 'config_file_exists', return_value=True),
                   patch.object(hook_login, 'REGISTRY_PATH', self.root / 'instances.json'),
                   patch.object(main, '_SQLITE_CACHE_DIR', str(self.root)),
+                  patch.object(main, '_RDV_MAPPING_PATH', str(self.root / 'rdv_mapping.json')),
+                  patch.object(main, '_OLD_RDV_MAPPING_PATH', ''),
                   patch.object(main, '_user_caches', {}), patch.object(main, '_account_runtimes', {}),
                   patch.object(config, 'IS_HOOK', True), patch.object(config, 'IS_LOCAL_HOOK', True),
                   patch.object(config, 'IS_PROTOCOL', False), patch.object(config, 'AGENT_WS_ENABLED', False),
@@ -43,6 +45,101 @@ class AccessUsersTests(unittest.IsolatedAsyncioTestCase):
     def headers(self, key='alice-test-key', account=''):
         return {'X-Access-Key': key, **({'X-Agent-Id': account} if account else {})}
 
+    async def test_empty_protocol_mapping_never_inherits_another_users_saved_accounts(self):
+        base = f'{config.HOOK_HOST}:{config.HOOK_PORT}'
+        document = {'version': 2, 'scopes': {
+            base: {'127f78ac': {'wxid': 'legacy-account', 'proxy': {'Proxy_Pwd': 'private-proxy-test-value'}}},
+            base + ':user:' + self.users['alice-test-key']: {'127f78ac': {'wxid': 'alice-account'}},
+        }}
+        Path(main._RDV_MAPPING_PATH).write_text(json.dumps(document), encoding='utf-8')
+        with patch.object(config, 'IS_PROTOCOL', True), patch.object(config, 'IS_HOOK', False), \
+             patch.object(main.protocol_api, 'get_session_list', AsyncMock(return_value={'ok': True, 'sessions': []})):
+            bob = await self.client.get('/api/protocol/rdv-mapping', headers=self.headers('bob-test-key'))
+            alice = await self.client.get('/api/protocol/rdv-mapping', headers=self.headers())
+            legacy = await self.client.get('/api/protocol/rdv-mapping', headers=self.headers(config.WEB_ACCESS_KEY))
+        self.assertEqual({}, bob.json()['mapping'])
+        self.assertNotIn('private-proxy-test-value', bob.text)
+        self.assertEqual('alice-account', alice.json()['mapping']['127f78ac']['wxid'])
+        self.assertEqual('legacy-account', legacy.json()['mapping']['127f78ac']['wxid'])
+
+    async def test_flat_legacy_mapping_is_only_visible_to_the_original_key(self):
+        Path(main._RDV_MAPPING_PATH).write_text(json.dumps({'127f78ac': {'wxid': 'legacy-account'}}), encoding='utf-8')
+        with patch.object(config, 'IS_PROTOCOL', True), patch.object(config, 'IS_HOOK', False), \
+             patch.object(main.protocol_api, 'get_session_list', AsyncMock(return_value={'ok': True, 'sessions': []})):
+            bob = await self.client.get('/api/protocol/rdv-mapping', headers=self.headers('bob-test-key'))
+            legacy = await self.client.get('/api/protocol/rdv-mapping', headers=self.headers(config.WEB_ACCESS_KEY))
+        self.assertEqual({}, bob.json()['mapping'])
+        self.assertEqual('legacy-account', legacy.json()['mapping']['127f78ac']['wxid'])
+
+    async def test_same_rdv_can_be_saved_and_deleted_independently_by_different_keys(self):
+        with patch.object(config, 'IS_PROTOCOL', True), patch.object(config, 'IS_HOOK', False), \
+             patch.object(main.protocol_api, 'get_session_list', AsyncMock(return_value={'ok': True, 'sessions': []})):
+            for key, wxid in [('alice-test-key', 'alice-account'), ('bob-test-key', 'bob-account')]:
+                response = await self.client.post('/api/protocol/rdv-mapping', headers=self.headers(key),
+                    json={'rdv': '127f78ac', 'wxid': wxid})
+                self.assertEqual(200, response.status_code)
+                self.assertEqual(wxid, response.json()['mapping']['127f78ac']['wxid'])
+            deleted = await self.client.delete('/api/protocol/rdv-mapping/127f78ac', headers=self.headers('bob-test-key'))
+            alice = await self.client.get('/api/protocol/rdv-mapping', headers=self.headers())
+        self.assertEqual({}, deleted.json()['mapping'])
+        self.assertEqual('alice-account', alice.json()['mapping']['127f78ac']['wxid'])
+
+    async def test_same_rdv_starts_distinct_sessions_owned_by_each_key(self):
+        with patch.object(config, 'IS_PROTOCOL', True), patch.object(config, 'IS_HOOK', False), \
+             patch.object(main.protocol_api, 'get_session_list', AsyncMock(return_value={'ok': True, 'sessions': []})), \
+             patch.object(main.protocol_api, 'start_wechat', AsyncMock(side_effect=[
+                 {'ok': True, 'session_id': 'alice-session'}, {'ok': True, 'session_id': 'bob-session'},
+             ])) as start:
+            for key in ('alice-test-key', 'bob-test-key'):
+                response = await self.client.post('/api/protocol/start-wechat', headers=self.headers(key), json={'rdv': '127f78ac'})
+                self.assertEqual(200, response.status_code, response.text)
+            denied = await self.client.post('/api/protocol/get-login-status', headers=self.headers('bob-test-key'),
+                                            json={'session_id': 'alice-session'})
+        self.assertEqual(2, start.await_count)
+        self.assertEqual(self.users['alice-test-key'], access_store.owner('alice-session'))
+        self.assertEqual(self.users['bob-test-key'], access_store.owner('bob-session'))
+        self.assertEqual(403, denied.status_code)
+
+    async def test_account_list_contains_all_saved_rdvs_even_for_the_same_wechat(self):
+        with patch.object(config, 'IS_PROTOCOL', True), patch.object(config, 'IS_HOOK', False), \
+             patch.object(main.protocol_api, 'get_session_list', AsyncMock(return_value={'ok': True, 'sessions': []})):
+            for rdv in ('127f78ac', '12787fac'):
+                saved = await self.client.post('/api/protocol/rdv-mapping', headers=self.headers(), json={'rdv': rdv, 'wxid': 'same-wechat'})
+                self.assertTrue(saved.json()['ok'])
+            response = await self.client.get('/api/accounts', headers=self.headers())
+            bob = await self.client.get('/api/accounts', headers=self.headers('bob-test-key'))
+        self.assertEqual({'127f78ac', '12787fac'}, {row['rdv'] for row in response.json()['accounts']})
+        self.assertTrue(all(row['saved_mapping'] for row in response.json()['accounts']))
+        self.assertEqual([], bob.json()['accounts'])
+
+    async def test_start_records_rdv_history_before_the_wechat_identity_is_available(self):
+        with patch.object(config, 'IS_PROTOCOL', True), patch.object(config, 'IS_HOOK', False), \
+             patch.object(main.protocol_api, 'get_session_list', AsyncMock(return_value={'ok': True, 'sessions': []})), \
+             patch.object(main.protocol_api, 'start_wechat', AsyncMock(return_value={'ok': True, 'session_id': 'history-session'})):
+            started = await self.client.post('/api/protocol/start-wechat', headers=self.headers(), json={'rdv': '127f78ac'})
+            self.assertTrue(started.json()['ok'])
+            response = await self.client.get('/api/accounts', headers=self.headers())
+        rows = response.json()['accounts']
+        self.assertEqual(['127f78ac'], [row['rdv'] for row in rows])
+        self.assertTrue(rows[0]['saved_mapping'])
+        self.assertEqual('', rows[0]['wxid'])
+
+    async def test_active_session_replaces_its_history_card_without_hiding_other_rdvs(self):
+        access_store.current_user.set(self.users['alice-test-key'])
+        main._upsert_rdv_mapping('127f78ac', 'same-wechat')
+        main._upsert_rdv_mapping('12787fac', 'same-wechat')
+        access_store.current_user.set('')
+        access_store.claim('alice-session', self.users['alice-test-key'])
+        with patch.object(config, 'IS_PROTOCOL', True), patch.object(config, 'IS_HOOK', False), \
+             patch.object(main.protocol_api, 'get_session_list', AsyncMock(return_value={'ok': True, 'sessions': [
+                 {'session_id': 'alice-session', 'state': 'waiting_scan', 'rdv': '127f78ac'},
+             ]})):
+            response = await self.client.get('/api/accounts', headers=self.headers())
+        rows = response.json()['accounts']
+        self.assertEqual(2, len(rows))
+        self.assertEqual({'127f78ac', '12787fac'}, {row['rdv'] for row in rows})
+        self.assertEqual(1, sum(bool(row['session_id']) for row in rows))
+
     async def test_arbitrary_keys_create_stable_distinct_sqlite_users_without_plaintext_keys(self):
         again = await self.client.post('/api/auth/login', json={'key': 'alice-test-key'})
         self.assertEqual(self.users['alice-test-key'], again.json()['user_id'])
@@ -52,6 +149,50 @@ class AccessUsersTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any('alice-test-key' in str(dict(row)) for row in rows))
         self.assertFalse((await self.client.post('/api/auth/login', json={'key': '  '})).json()['ok'])
         self.assertEqual(401, (await self.client.get('/api/accounts', headers={'X-Access-Key': 'unregistered'})).status_code)
+
+    async def test_login_status_persists_identity_in_sqlite_for_exact_user_and_rdv(self):
+        profile = {'ok': True, 'state': 'logged_in', 'profile': {
+            'user_name': 'wxid_alice', 'nick_name': 'Alice', 'head_big': 'https://example.test/avatar',
+            'base_response': {'ret': 0},
+        }}
+        with patch.object(config, 'IS_PROTOCOL', True), patch.object(config, 'IS_HOOK', False), \
+             patch.object(main.protocol_api, 'get_session_list', AsyncMock(return_value={'ok': True, 'sessions': []})), \
+             patch.object(main.protocol_api, 'start_wechat', AsyncMock(side_effect=[
+                 {'ok': True, 'session_id': 'alice-sqlite'}, {'ok': True, 'session_id': 'bob-sqlite'}])), \
+             patch.object(main.protocol_api, 'get_login_status', AsyncMock(return_value={'ok': True, 'state': 'logged_in'})), \
+             patch.object(main, '_protocol_profile_for_session', AsyncMock(return_value=profile)):
+            for key in ('alice-test-key', 'bob-test-key'):
+                await self.client.post('/api/protocol/start-wechat', headers=self.headers(key), json={'rdv': '127f78ac'})
+            response = await self.client.post('/api/protocol/get-login-status', headers=self.headers(), json={'session_id': 'alice-sqlite'})
+            self.assertEqual(200, response.status_code)
+            self.assertNotIn('profile_error', response.json())
+            Path(main._RDV_MAPPING_PATH).unlink()
+            alice = await self.client.get('/api/accounts', headers=self.headers())
+            bob = await self.client.get('/api/accounts', headers=self.headers('bob-test-key'))
+        self.assertEqual('Alice', alice.json()['accounts'][0]['nickname'])
+        self.assertEqual('https://example.test/avatar', alice.json()['accounts'][0]['avatar'])
+        self.assertEqual('', bob.json()['accounts'][0]['wxid'])
+        with access_store.connect() as db:
+            rows = db.execute('SELECT user_id,rdv,settings FROM protocol_rdv_profiles').fetchall()
+        alice_row = next(row for row in rows if row['user_id'] == self.users['alice-test-key'])
+        self.assertEqual('127f78ac', alice_row['rdv'])
+        self.assertEqual('Alice', json.loads(alice_row['settings'])['nickname'])
+
+    async def test_old_login_rejects_a_wxid_not_saved_for_this_users_rdv(self):
+        access_store.claim('alice-known', self.users['alice-test-key'])
+        access_store.current_user.set(self.users['alice-test-key'])
+        main._upsert_rdv_mapping('127f78ac', 'wxid_alice', identity={'session_id': 'alice-known'})
+        access_store.current_user.set('')
+        with patch.object(config, 'IS_PROTOCOL', True), patch.object(config, 'IS_HOOK', False), \
+             patch.object(main.protocol_api, 'get_session_list', AsyncMock(return_value={'ok': True, 'sessions': []})), \
+             patch.object(main.protocol_api, 'push_login_url', AsyncMock(return_value={'ok': True})) as push:
+            rejected = await self.client.post('/api/protocol/push-login-url', headers=self.headers(),
+                json={'session_id': 'alice-known', 'wxid': 'wxid_other'})
+            accepted = await self.client.post('/api/protocol/push-login-url', headers=self.headers(),
+                json={'session_id': 'alice-known', 'wxid': 'wxid_alice'})
+        self.assertEqual(409, rejected.status_code)
+        self.assertEqual(200, accepted.status_code)
+        push.assert_awaited_once_with('alice-known', 'wxid_alice')
 
     async def test_hook_settings_persist_owner_key_without_returning_it_in_api(self):
         response = await self.client.get('/api/hook/login-settings', headers=self.headers())

@@ -587,7 +587,7 @@ def _load_rdv_mapping_doc() -> dict:
                 data = json.load(f)
             if isinstance(data, dict):
                 if not isinstance(data.get("scopes"), dict):
-                    data = {"version": 2, "scopes": {_protocol_scope_key(): data}}
+                    data = {"version": 2, "scopes": {f"{config.HOOK_HOST}:{config.HOOK_PORT}": data}}
                 data.setdefault("version", 2)
                 data.setdefault("scopes", {})
                 return data
@@ -621,6 +621,8 @@ def _normalize_rdv_mapping_entry(entry: Any) -> dict:
         wxid = _stable_protocol_wxid(entry.get("wxid") or entry.get("userName"))
         return {
             "wxid": wxid,
+            "last_used_at": _parse_protocol_time(entry.get("last_used_at")),
+            "session_id": str(entry.get("session_id") or ""),
             "port": str(entry.get("port") or entry.get("StartPort") or entry.get("startPort") or ""),
             "nickname": str(entry.get("nickname") or entry.get("NickName") or ""),
             "avatar": str(entry.get("avatar") or entry.get("head_big") or entry.get("headimgurl") or ""),
@@ -644,11 +646,8 @@ def _current_rdv_mapping() -> dict[str, dict]:
     data = _load_rdv_mapping_doc()
     scopes = data.get("scopes") if isinstance(data.get("scopes"), dict) else {}
     scoped = dict(scopes.get(_protocol_scope_key(), {}) or {})
-    if not scoped:
-        for value in scopes.values():
-            if isinstance(value, dict):
-                for rdv, entry in value.items():
-                    scoped.setdefault(str(rdv), entry)
+    stored = access_store.protocol_rdvs()
+    scoped.update(stored)
     mapping: dict[str, dict] = {}
     for raw_rdv, raw_entry in scoped.items():
         try:
@@ -656,9 +655,11 @@ def _current_rdv_mapping() -> dict[str, dict]:
         except HTTPException:
             continue
         entry = _normalize_rdv_mapping_entry(raw_entry)
-        if not entry.get("wxid"):
+        if not entry.get("wxid") and not entry.get("last_used_at"):
             continue
         mapping[rdv] = entry
+        if rdv not in stored:
+            access_store.save_protocol_rdv(rdv, entry)
     return mapping
 
 
@@ -668,18 +669,22 @@ def _upsert_rdv_mapping(
     port: str = "",
     proxy: dict | None = None,
     identity: dict | None = None,
+    *,
+    allow_empty: bool = False,
 ) -> dict[str, dict]:
     rdv = _validate_protocol_rdv(rdv)
     raw_wxid = str(wxid or "").strip()
     wxid = _stable_protocol_wxid(raw_wxid)
-    if not wxid:
+    if not wxid and not allow_empty:
         detail = "wxid 不能使用每次启动都会变化的 session_id" if raw_wxid else "wxid 不能为空"
         raise HTTPException(status_code=400, detail=detail)
     identity = identity or {}
     data = _load_rdv_mapping_doc()
     scopes = data.setdefault("scopes", {})
     scoped = scopes.setdefault(_protocol_scope_key(), {})
-    existing = _normalize_rdv_mapping_entry(scoped.get(rdv, {}))
+    existing = _normalize_rdv_mapping_entry(_current_rdv_mapping().get(rdv, scoped.get(rdv, {})))
+    if allow_empty and not wxid:
+        wxid = existing.get("wxid", "")
     same_account = existing.get("wxid") == wxid
     previous = existing if same_account else {}
     profile = (
@@ -689,6 +694,8 @@ def _upsert_rdv_mapping(
     )
     scoped[rdv] = {
         "wxid": wxid,
+        "last_used_at": time.time(),
+        "session_id": str(identity.get("session_id") or previous.get("session_id") or ""),
         "port": str(port or ""),
         "nickname": str(identity.get("nickname") or previous.get("nickname") or ""),
         "avatar": str(identity.get("avatar") or previous.get("avatar") or ""),
@@ -700,6 +707,7 @@ def _upsert_rdv_mapping(
         "proxy": _normalize_rdv_mapping_entry({"proxy": proxy or {}})["proxy"],
     }
     _save_rdv_mapping_doc(data)
+    access_store.save_protocol_rdv(rdv, scoped[rdv])
     return _current_rdv_mapping()
 
 
@@ -707,11 +715,26 @@ def _delete_rdv_mapping(rdv: str) -> dict[str, dict]:
     rdv = _validate_protocol_rdv(rdv)
     data = _load_rdv_mapping_doc()
     scopes = data.setdefault("scopes", {})
-    for scoped in scopes.values():
-        if isinstance(scoped, dict):
-            scoped.pop(rdv, None)
+    scoped = scopes.get(_protocol_scope_key())
+    if isinstance(scoped, dict):
+        scoped.pop(rdv, None)
     _save_rdv_mapping_doc(data)
+    access_store.delete_protocol_rdv(rdv)
     return _current_rdv_mapping()
+
+
+def _remember_protocol_identity(session_id: str, identity: dict, rdv: str = "") -> None:
+    if not access_store.current_user.get():
+        return
+    access_store.require_account(session_id)
+    wxid = _stable_protocol_wxid(identity.get('wxid'), session_id)
+    mapping = _current_rdv_mapping()
+    rdv = str(rdv or next((key for key, value in mapping.items() if value.get('session_id') == session_id), '')).lower()
+    if not wxid or not rdv:
+        return
+    previous = mapping.get(rdv, {})
+    _upsert_rdv_mapping(rdv, wxid, previous.get('port', ''), previous.get('proxy', {}),
+                        {**identity, 'session_id': session_id})
 
 
 def _parse_protocol_time(value: Any) -> float:
@@ -872,6 +895,8 @@ async def _protocol_session_to_account(item: dict, rdv_mapping: dict[str, dict] 
     live_wxid = _stable_protocol_wxid(identity.get("wxid"), session_id)
     mapped_wxid = _stable_protocol_wxid(mapped.get("wxid"))
     identity["wxid"] = live_wxid
+    if live_wxid and rdv:
+        _remember_protocol_identity(session_id, identity, rdv)
     if not live_wxid and mapped_wxid:
         for key in ("wxid", "nickname", "avatar", "account", "phone", "region", "signature"):
             if not identity.get(key) and mapped.get(key):
@@ -912,7 +937,7 @@ def _protocol_account_from_mapping(rdv: str, entry: dict) -> dict:
         "server_port": str(normalized.get("port") or config.HOOK_PORT),
         "peer": "saved rdv",
         "connected_at": 0,
-        "last_seen_at": 0,
+        "last_seen_at": normalized.get("last_used_at", 0),
         "pending": 0,
         "initialized": False,
         "login_status": "",
@@ -950,6 +975,8 @@ async def _list_protocol_accounts() -> dict:
         _protocol_session_to_account(item, rdv_mapping)
         for item in visible_items
     )) if visible_items else []
+    active_rdvs = {str(item.get('rdv') or '').strip().lower() for item in visible_items}
+    accounts.extend(_protocol_account_from_mapping(rdv, entry) for rdv, entry in rdv_mapping.items() if rdv not in active_rdvs)
     accounts.sort(key=lambda row: (row.get("login_status") != "3", row.get("connected_at") or 0), reverse=False)
     active_id = _current_agent_id() if any(row.get("id") == _current_agent_id() for row in accounts) else ""
     return {
@@ -3130,8 +3157,6 @@ async def _migrate_protocol_ownership():
         for item in response.get('sessions', []):
             if isinstance(item, dict) and item.get('session_id'):
                 access_store.claim(item['session_id'], user)
-                if item.get('rdv'):
-                    access_store.claim('rdv:' + str(item['rdv']).lower(), user)
         with access_store.connect() as db:
             db.execute('INSERT OR IGNORE INTO access_metadata VALUES(?,?)', (marker, '1'))
 
@@ -3175,8 +3200,6 @@ async def delete_protocol_rdv_mapping(rdv: str):
 @app.post("/api/protocol/start-wechat")
 async def start_protocol_wechat(req: ProtocolStartWechatRequest):
     rdv = _validate_protocol_rdv(req.rdv)
-    if access_store.current_user.get() and not access_store.claim('rdv:' + rdv):
-        raise HTTPException(403, '此 RDV 已属于其他密钥用户')
     try:
         callback_url = config.clean_callback_url(req.callback_url or config.PROTOCOL_CALLBACK_URL)
         remote_ws = config.clean_callback_url(config.PROTOCOL_REMOTE_WS if req.remote_ws is None else req.remote_ws, websocket=True)
@@ -3197,13 +3220,18 @@ async def start_protocol_wechat(req: ProtocolStartWechatRequest):
         session_id = _protocol_session_id_from_payload(data)
         start_port = _protocol_start_port_from_payload(data)
         if session_id:
-            access_store.claim(session_id)
+            if access_store.current_user.get() and not access_store.claim(session_id):
+                raise HTTPException(403, '此协议实例不属于当前密钥用户')
             data["session_id"] = session_id
         if start_port not in (None, ""):
             data["start_port"] = start_port
         if data.get("ok") and session_id:
             data["rdv"] = str(data.get("rdv") or rdv)
             data["callback_url"] = str(data.get("callback_url") or callback_url)
+            _upsert_rdv_mapping(rdv, "", str(start_port or ""), {
+                "Proxy_Type": req.proxy_type, "Proxy_IP": req.proxy_ip, "Proxy_Port": req.proxy_port,
+                "Proxy_Usr": req.proxy_usr, "Proxy_Pwd": req.proxy_pwd,
+            }, {"session_id": session_id}, allow_empty=True)
     return data
 
 
@@ -3230,6 +3258,7 @@ async def get_protocol_login_status(req: ProtocolSessionRequest):
             data["profile_result"] = profile
             if _protocol_profile_logged_in(profile):
                 identity = _self_identity_from_response(profile, agent_id=session_id)
+                _remember_protocol_identity(session_id, identity)
                 data["account"] = _protocol_account_from_identity(
                     session_id,
                     {
@@ -3255,6 +3284,9 @@ async def push_protocol_login_url(req: ProtocolPushLoginRequest):
         raise HTTPException(status_code=400, detail="session_id 不能为空")
     if not wxid:
         raise HTTPException(status_code=400, detail="wxid 不能为空")
+    record = next((entry for entry in _current_rdv_mapping().values() if entry.get('session_id') == session_id), {})
+    if _stable_protocol_wxid(record.get('wxid')) != wxid:
+        raise HTTPException(409, '当前密钥下此 RDV 没有匹配的微信身份，请使用二维码登录')
     return await protocol_api.push_login_url(session_id, wxid)
 
 
@@ -3269,6 +3301,7 @@ async def get_protocol_profile(req: ProtocolSessionRequest):
         _activate_runtime(session_id)
         _state()["self_info"] = data
         identity = _self_identity_from_response(data, agent_id=session_id)
+        _remember_protocol_identity(session_id, identity)
         wxid = identity["wxid"]
         if wxid:
             _self_wxid_to_agent_id[wxid] = session_id

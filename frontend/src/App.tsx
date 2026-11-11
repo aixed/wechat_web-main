@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef, type FormEvent, type MouseEvent, type ReactNode, type TouchEvent } from "react";
 import { useWebSocket } from "./useWebSocket";
+import { resolveProtocolLogin } from "./protocolLogin";
 import SessionList, { type SessionMenuAction } from "./components/SessionList";
 import ChatArea from "./components/ChatArea";
 import SmartReplyManager from "./components/SmartReplyManager";
@@ -11,9 +12,11 @@ import {
   clearActiveAgentId,
   clearAccessKey,
   deleteHookAccount,
+  deleteProtocolRdvMapping,
   getActiveAgentId,
   getAccessKey,
   getAccounts,
+  getAuthVersion,
   getContacts,
   getSetupStatus,
   getLocalContacts,
@@ -1741,9 +1744,11 @@ export default function App() {
   }, [resetChatState]);
 
   const loadAccounts = useCallback(async () => {
+    const requestAuthVersion = getAuthVersion();
     setAccountsLoading(true);
     try {
       const data = await getAccounts();
+      if (requestAuthVersion !== getAuthVersion() || data?.error === "auth_changed") return [];
       if (data?.error === "unauthorized") {
         clearActiveAgentId();
         clearAccessKey();
@@ -1752,6 +1757,9 @@ export default function App() {
         setAccounts([]);
         setAccountPortalSource("hook");
         setAccountManagerOpen(false);
+        setProtocolLoginAccount(null);
+        setLocalProtocolAccounts([]);
+        setHiddenProtocolSessionIds(new Set());
         resetChatState();
         return [];
       }
@@ -1800,15 +1808,17 @@ export default function App() {
       console.error("[ACCOUNTS] load failed:", err);
       return [];
     } finally {
-      setAccountsLoading(false);
+      if (requestAuthVersion === getAuthVersion()) setAccountsLoading(false);
     }
   }, [resetChatState, setRouteAccount]);
 
   const handleLogin = useCallback(async (key: string) => {
     setAuthError("");
+    setAccessKey(key);
+    const requestAuthVersion = getAuthVersion();
     try {
-      setAccessKey(key);
       const data = await loginWithKey(key);
+      if (requestAuthVersion !== getAuthVersion() || data?.error === "auth_changed") return false;
       const unavailableMessage = backendUnavailableText(data);
       if (unavailableMessage) {
         clearAccessKey();
@@ -1832,6 +1842,7 @@ export default function App() {
       await loadAccounts();
       return true;
     } catch {
+      if (requestAuthVersion !== getAuthVersion()) return false;
       clearAccessKey();
       setAuthError("登录失败");
       return false;
@@ -2023,12 +2034,21 @@ export default function App() {
     }
   }, [loadAccounts]);
 
-  useEffect(() => {
-    if (!authenticated || selectedAccountId || accountManagerOpen || accountPortalSource !== "protocol") return;
-    const readyAccount = accounts.find(isLoggedInAccount);
-    if (!readyAccount) return;
-    handleSelectAccount(readyAccount, { route: "chat", replace: true });
-  }, [accountManagerOpen, accountPortalSource, accounts, authenticated, handleSelectAccount, selectedAccountId]);
+  const handleDeleteProtocolRdv = useCallback(async (account: WeChatAccount) => {
+    const rdv = normalizeProtocolRdv(account.rdv || "");
+    if (!rdv) return;
+    const sessions = [...accounts, ...localProtocolAccounts].filter((item) => normalizeProtocolRdv(item.rdv || "") === rdv && hasProtocolSession(item));
+    if (sessions.length && !window.confirm(`删除 RDV ${rdv} 的卡片将关闭此密钥下该 RDV 的微信实例，并移除保存的登录记录。确定删除吗？`)) return;
+    for (const sessionId of new Set(sessions.map(protocolSessionId))) {
+      const result = await terminateProtocolSession(sessionId);
+      if (result?.ok === false || Number(result?.status_code || 0) >= 400) throw new Error(result?.error || "关闭实例失败");
+    }
+    const result = await deleteProtocolRdvMapping(rdv);
+    if (!result?.ok) throw new Error(result?.error || "删除 RDV 卡片失败");
+    setLocalProtocolAccounts((current) => current.filter((item) => normalizeProtocolRdv(item.rdv || "") !== rdv));
+    setProtocolLoginAccount((current) => normalizeProtocolRdv(current?.rdv || "") === rdv ? null : current);
+    await loadAccounts();
+  }, [accounts, localProtocolAccounts, loadAccounts]);
 
   const setPortalTheme = useCallback((theme: PortalTheme) => {
     setPortalThemeState(theme);
@@ -3579,6 +3599,7 @@ export default function App() {
           onSelectAccount={handleSelectAccount}
           onSessionStarted={handleProtocolSessionStarted}
           onTerminateProtocolAccount={handleTerminateProtocolAccount}
+          onDeleteProtocolRdv={handleDeleteProtocolRdv}
         />
       );
     }
@@ -3609,6 +3630,7 @@ export default function App() {
         onLogout={handleLogout}
         onSessionStarted={handleProtocolSessionStarted}
         onTerminateProtocolAccount={handleTerminateProtocolAccount}
+        onDeleteProtocolRdv={handleDeleteProtocolRdv}
       />
     );
   }
@@ -4255,7 +4277,7 @@ function hasProtocolSession(account: WeChatAccount | null | undefined): boolean 
 
 function isProtocolAccountTabVisible(account: WeChatAccount): boolean {
   return account.source === "protocol"
-    && hasProtocolSession(account)
+    && (hasProtocolSession(account) || Boolean(account.saved_mapping && account.rdv))
     && !PROTOCOL_ACCOUNT_TAB_EXCLUDED_STATES.has(String(account.protocol_state || "").trim().toLowerCase());
 }
 
@@ -4364,6 +4386,7 @@ function ProtocolLoginOnlyPortal({
   onSelectAccount,
   onSessionStarted,
   onTerminateProtocolAccount,
+  onDeleteProtocolRdv,
 }: {
   accounts: WeChatAccount[];
   account?: WeChatAccount;
@@ -4375,6 +4398,7 @@ function ProtocolLoginOnlyPortal({
   onSelectAccount: (account: WeChatAccount) => void;
   onSessionStarted: (account: WeChatAccount, previousSessionId?: string) => void;
   onTerminateProtocolAccount: (account: WeChatAccount) => void | Promise<void>;
+  onDeleteProtocolRdv: (account: WeChatAccount) => Promise<void>;
 }) {
   const dark = theme === "dark";
   const [mode, setMode] = useState<"qr" | "old">("old");
@@ -4394,13 +4418,9 @@ function ProtocolLoginOnlyPortal({
     };
   }, [contextMenu]);
   const protocolAccounts = accounts.filter(isProtocolAccountTabVisible);
-  const displayedSelectedAccount = refreshedProtocolAccount(selectedAccount, protocolAccounts) || selectedAccount;
+  const displayedSelectedAccount = refreshedProtocolAccount(selectedAccount, protocolAccounts) || protocolAccounts[0] || null;
   const activeTabKey = protocolAccountTabKey(displayedSelectedAccount);
   const handleAccountTab = (target: WeChatAccount) => {
-    if (isLoggedInAccount(target)) {
-      onSelectAccount(target);
-      return;
-    }
     setSelectedAccount(target);
     setMode(hasProtocolSession(target) ? "qr" : "old");
   };
@@ -4453,19 +4473,17 @@ function ProtocolLoginOnlyPortal({
           </button>
         </div>
       </div>
-      {protocolAccounts.length > 0 && (
-        <ProtocolAccountTabStrip
+      <div className="flex flex-1 min-h-0">
+        <ProtocolRdvSidebar
           accounts={protocolAccounts}
           activeKey={activeTabKey}
           dark={dark}
           onSelect={handleAccountTab}
           onContextMenu={(target, event) => {
-            if (!hasProtocolSession(target)) return;
             event.preventDefault();
             setContextMenu({ account: target, x: event.clientX, y: event.clientY });
           }}
         />
-      )}
       <div className="flex-1 min-h-0 overflow-hidden">
         <ProtocolLoginPanel
           key={`${mode}:${activeTabKey || "new"}`}
@@ -4478,6 +4496,7 @@ function ProtocolLoginOnlyPortal({
           onModeChange={setMode}
         />
       </div>
+      </div>
       {contextMenu && (
         <div
           role="menu"
@@ -4485,14 +4504,21 @@ function ProtocolLoginOnlyPortal({
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(event) => event.stopPropagation()}
         >
-          <button
+          {hasProtocolSession(contextMenu.account) && <button
             type="button"
             role="menuitem"
             onClick={() => handleTerminateAccount(contextMenu.account)}
             className={`w-full h-[34px] px-[12px] text-left text-[13px] ${dark ? "hover:bg-[#2c2c2c] text-[#ff9a9a]" : "hover:bg-[#f6f6f6] text-[#c53030]"}`}
           >
             关闭实例
-          </button>
+          </button>}
+          <button type="button" role="menuitem" className="w-full h-[34px] px-[12px] text-left text-[13px] text-[#e36a6a] hover:bg-black/10"
+            onClick={async () => {
+              const target = contextMenu.account;
+              setContextMenu(null);
+              try { await onDeleteProtocolRdv(target); setSelectedAccount(null); setMode("old"); }
+              catch (error) { window.alert(error instanceof Error ? error.message : "删除 RDV 卡片失败"); }
+            }}>删除 RDV 卡片</button>
         </div>
       )}
     </div>
@@ -4552,6 +4578,7 @@ function AccountPortal({
   onLogout,
   onSessionStarted,
   onTerminateProtocolAccount,
+  onDeleteProtocolRdv,
 }: {
   accounts: WeChatAccount[];
   account?: WeChatAccount;
@@ -4564,6 +4591,7 @@ function AccountPortal({
   onLogout: () => void;
   onSessionStarted: (account: WeChatAccount, previousSessionId?: string) => void;
   onTerminateProtocolAccount: (account: WeChatAccount) => Promise<void>;
+  onDeleteProtocolRdv: (account: WeChatAccount) => Promise<void>;
 }) {
   const dark = theme === "dark";
   const [tool, setTool] = useState<AccountPortalTool>(() => defaultAccountPortalTool(source));
@@ -4615,7 +4643,7 @@ function AccountPortal({
     setLoginPanelNonce((value) => value + 1);
   };
   const handleAccountForLogin = (account: WeChatAccount) => {
-    if (isLoggedInAccount(account)) {
+    if (account.source === "hook" && isLoggedInAccount(account)) {
       onSelectAccount(account);
       return;
     }
@@ -4629,7 +4657,6 @@ function AccountPortal({
     onSessionStarted(account, previousSessionId);
   };
   const openProtocolContextMenu = (account: WeChatAccount, event: MouseEvent<HTMLButtonElement>) => {
-    if (account.source !== 'hook' && !hasProtocolSession(account)) return;
     event.preventDefault();
     const menuWidth = 210;
     const menuHeight = account.source === 'hook' ? 132 : 92;
@@ -4708,7 +4735,7 @@ function AccountPortal({
       {tool === "broadcast" && <MultiAccountBroadcastPanel accounts={portalAccounts} theme={theme} />}
       {tool === "qr-login" && (
         <ProtocolLoginPanel
-          key={`qr:${accountStableKey(displayedLoginAccount) || loginPanelNonce}`}
+          key={`qr:${protocolAccountTabKey(displayedLoginAccount) || loginPanelNonce}`}
           mode="qr"
           theme={theme}
           onRefresh={onRefresh}
@@ -4720,12 +4747,13 @@ function AccountPortal({
       )}
       {tool === "old-login" && (
         <ProtocolLoginPanel
-          key={`old:${accountStableKey(displayedLoginAccount) || loginPanelNonce}`}
+          key={`old:${protocolAccountTabKey(displayedLoginAccount) || loginPanelNonce}`}
           mode="old"
           theme={theme}
           onRefresh={onRefresh}
           account={displayedLoginAccount || undefined}
           onSessionStarted={handleProtocolSessionStarted}
+          onEnterAccount={onSelectAccount}
           onModeChange={(nextMode) => setTool(nextMode === "qr" ? "qr-login" : "old-login")}
         />
       )}
@@ -4743,15 +4771,20 @@ function AccountPortal({
         <div className="truncate">{contextMenu.account.rdv ? `RDV ${contextMenu.account.rdv}` : "微信实例"}</div>
         <div className="font-mono truncate" title={contextSessionId}>{contextMenu.account.source === 'hook' ? `Port ${contextMenu.account.start_port || contextMenu.account.api_port || contextMenu.account.server_port}` : `Session ${contextSessionId.slice(0, 12)}`}</div>
       </div>
-      <button
+      {(contextMenu.account.source === 'hook' || hasProtocolSession(contextMenu.account)) && <button
         type="button"
         disabled={contextTerminating}
         onClick={() => contextMenu.account.source === 'hook' ? void handleHookAction(contextMenu.account, 'logout') : void handleTerminateAccount(contextMenu.account)}
         className={`w-full h-[34px] px-[12px] text-left text-[13px] disabled:opacity-60 disabled:cursor-not-allowed ${dark ? "hover:bg-[#2c2c2c] text-[#ff9a9a]" : "hover:bg-[#f6f6f6] text-[#c53030]"}`}
       >
         {contextTerminating ? "正在处理…" : contextMenu.account.source === 'hook' ? '退出登录' : "结束微信实例"}
-      </button>
+      </button>}
       {contextMenu.account.source === 'hook' && <button type="button" disabled={contextTerminating} onClick={() => void handleHookAction(contextMenu.account, 'delete')} className={`w-full h-[34px] px-[12px] text-left text-[13px] text-[#ef7777] disabled:opacity-60 ${dark ? 'hover:bg-[#2c2c2c]' : 'hover:bg-[#f6f6f6]'}`}>删除</button>}
+      {contextMenu.account.source === 'protocol' && <button type="button" role="menuitem" className="w-full h-[34px] px-[12px] text-left text-[13px] text-[#e36a6a] hover:bg-black/10" onClick={async () => {
+        const target = contextMenu.account; setContextMenu(null);
+        try { await onDeleteProtocolRdv(target); setLoginAccount(null); setLoginPanelNonce((value) => value + 1); }
+        catch (error) { window.alert(error instanceof Error ? error.message : "删除 RDV 卡片失败"); }
+      }}>删除 RDV 卡片</button>}
     </div>
   );
 
@@ -4789,8 +4822,8 @@ function AccountPortal({
             刷新
           </button>
         </div>
-        {protocolAccounts.length > 0 && (
-          <ProtocolAccountTabStrip
+        <div className="flex flex-1 min-h-0">
+          <ProtocolRdvSidebar
             accounts={protocolAccounts}
             activeKey={protocolAccountTabKey(displayedLoginAccount)}
             dark={dark}
@@ -4801,13 +4834,15 @@ function AccountPortal({
               openProtocolContextMenu(account, event);
             }}
           />
-        )}
+        <div className="flex flex-col flex-1 min-w-0 min-h-0">
         {loading && protocolAccounts.length === 0 && (
           <div className={`h-[38px] px-[20px] border-b flex items-center text-[13px] ${dark ? "border-[#242424] text-[#777]" : "border-[#dedede] text-[#888]"}`}>
             正在读取微信连接...
           </div>
         )}
         {protocolPanel}
+        </div>
+        </div>
         {contextMenuNode}
       </div>
     );
@@ -4990,7 +5025,7 @@ function AccountPortalToolTabs({
   );
 }
 
-function ProtocolAccountTabStrip({
+function ProtocolRdvSidebar({
   accounts,
   activeKey,
   dark,
@@ -5004,61 +5039,67 @@ function ProtocolAccountTabStrip({
   onContextMenu?: (account: WeChatAccount, event: MouseEvent<HTMLButtonElement>) => void;
 }) {
   const tabAccounts = dedupeProtocolAccountTabs(accounts);
-  if (tabAccounts.length === 0) return null;
   return (
-    <div className={`max-h-[104px] min-h-[46px] border-b px-[20px] py-[7px] overflow-y-auto overflow-x-hidden ${dark ? "border-[#242424] bg-[#111111]" : "border-[#dedede] bg-[#ededed]"}`}>
-      <div className="grid grid-cols-[repeat(auto-fill,minmax(128px,148px))] gap-[6px]">
+    <aside aria-label="RDV 登录记录" className={`w-[164px] sm:w-[280px] shrink-0 min-h-0 border-r flex flex-col ${dark ? "border-[#2b2b2b] bg-[#181818]" : "border-[#dedede] bg-[#f7f9fc]"}`}>
+      <div className={`px-[16px] py-[16px] border-b ${dark ? "border-[#2b2b2b]" : "border-[#dedede]"}`}>
+        <div className="font-medium text-[16px]">RDV 登录记录</div>
+        <div className={`mt-[6px] text-[12px] ${dark ? "text-[#999]" : "text-[#777]"}`}>总：{tabAccounts.length}　在线：{tabAccounts.filter(isLoggedInAccount).length}</div>
+      </div>
+      <div className="pane-scroll flex-1 min-h-0 overflow-y-auto p-[12px] space-y-[10px]">
+      {tabAccounts.length === 0 && <div className={`py-[16px] text-[12px] ${dark ? "text-[#888]" : "text-[#999]"}`}>暂无使用记录</div>}
       {tabAccounts.map((account) => {
         const key = protocolAccountTabKey(account);
         const selected = Boolean(activeKey && key === activeKey);
         const rdv = account.rdv || String(account.session_id || account.id || "").slice(0, 8);
         const loggedIn = isLoggedInAccount(account);
-        const nickname = loggedIn && account.nickname && account.nickname !== account.id
+        const nickname = account.nickname && account.nickname !== account.id
           ? account.nickname
           : "";
-        const avatar = loggedIn ? String(account.avatar || "") : "";
+        const avatar = String(account.avatar || "");
         return (
           <button
             key={key || account.id}
             type="button"
             onClick={() => onSelect(account)}
             onContextMenu={(event) => onContextMenu?.(account, event)}
-            className={`h-[32px] rounded-[6px] border px-[8px] text-left active:opacity-85 ${
+            aria-label={`RDV ${rdv} ${nickname || account.wxid || "未登录"}`}
+            aria-pressed={selected}
+            className={`w-full rounded-[12px] border border-l-[4px] px-[12px] py-[14px] text-left active:opacity-85 ${
               selected
-                ? "border-[#07c160] bg-[#123d27] text-[#eafff1]"
+                ? dark ? "border-[#07c160] bg-[#173628] text-[#eafff1]" : "border-[#07c160] bg-[#eaf8f0] text-[#153c2b]"
                 : dark
-                  ? "border-[#303030] bg-[#1b1b1b] text-[#d6d6d6]"
-                  : "border-[#d8d8d8] bg-white text-[#222]"
+                  ? "border-[#663d3d] bg-[#262121] text-[#ddd]"
+                  : "border-[#e88a8a] bg-white text-[#222]"
             }`}
             title={`${nickname || `RDV ${rdv}`} ${account.rdv || ""}`}
           >
             <span className="flex min-w-0 items-center gap-[6px]">
+              <span className="min-w-0 flex-1">
+                <span className="block truncate font-medium text-[15px]">{nickname || account.wxid || `RDV ${rdv}`}</span>
+                <span className={`mt-[5px] block font-mono text-[12px] break-all ${dark ? "text-[#aaa]" : "text-[#777]"}`}>{rdv}</span>
+                <span className={`mt-[8px] inline-block rounded-full px-[7px] py-[2px] text-[11px] ${loggedIn ? "bg-[#124c31] text-[#60db95]" : dark ? "bg-[#3a3030] text-[#cbb0b0]" : "bg-[#f8eeee] text-[#a06565]"}`}>{loggedIn ? "在线" : hasProtocolSession(account) ? "等待登录" : "已保存"}</span>
+              </span>
               {loggedIn && (
                 <span className="relative h-[20px] w-[20px] shrink-0">
                   <img src={avatar || DEFAULT_AVATAR_URL} alt="" className="h-[20px] w-[20px] rounded-[4px] object-cover" />
                   <span className={`absolute -bottom-[2px] -right-[2px] h-[7px] w-[7px] rounded-full bg-[#20d56b] ring-2 ${dark ? "ring-[#1b1b1b]" : "ring-white"}`} />
                 </span>
               )}
-              <span className={`min-w-0 flex-1 truncate text-[12px] leading-[16px] ${nickname ? "" : "font-mono"}`}>
-                {nickname || `RDV ${rdv}`}
-              </span>
             </span>
           </button>
         );
       })}
       </div>
-    </div>
+    </aside>
   );
 }
 
 function ProtocolLoginPanel({
-  mode,
   theme,
   onRefresh,
   account,
   onSessionStarted,
   onEnterAccount,
-  onModeChange,
 }: {
   mode: "qr" | "old";
   theme: PortalTheme;
@@ -5069,8 +5110,11 @@ function ProtocolLoginPanel({
   onModeChange: (mode: "qr" | "old") => void;
 }) {
   const dark = theme === "dark";
+  const [mode, setMode] = useState<"qr" | "old">("qr");
+  const [mappingReady, setMappingReady] = useState(false);
   const [form, setForm] = useState<ProtocolLoginForm>(() => {
     const formFromSaved = (saved: ProtocolLoginStorage): ProtocolLoginForm => {
+      if (account?.rdv) saved = {};
       const accountProxy = account?.proxy && typeof account.proxy === "object" ? account.proxy : {};
       const accountProxyEnabled = Object.values(accountProxy).some(Boolean);
       const hasProxy = Boolean(
@@ -5152,10 +5196,10 @@ function ProtocolLoginPanel({
   const proxySummary = proxyEnabled
     ? [proxy.Proxy_IP, proxy.Proxy_Port].filter(Boolean).join(":") || "已启用代理"
     : "未使用代理";
-  const selectedLoggedInAccount = Boolean(account && isLoggedInAccount(account));
+  const selectedLoggedInAccount = Boolean(account && normalizeProtocolRdv(account.rdv || "") === form.rdv && isLoggedInAccount(account));
   const oldAccountEntry = mapping[normalizeProtocolRdv(form.rdv)];
   const oldAccountDisplayIdentity = protocolMappingDisplayIdentity(oldAccountEntry);
-  const oldAccountWxid = protocolMappingWxid(oldAccountEntry) || protocolStableWxid(form.wxid);
+  const oldAccountWxid = protocolMappingWxid(oldAccountEntry);
   const oldAccountName = oldAccountDisplayIdentity.nickname || oldAccountWxid || "老号登录";
   const oldAccountAvatar = oldAccountDisplayIdentity.avatar;
   const showingLoginIdentity = selectedLoggedInAccount || phase === "scanned" || phase === "success";
@@ -5222,6 +5266,7 @@ function ProtocolLoginPanel({
   };
 
   const saveProxySettings = async () => {
+    try {
     const rdv = normalizeProtocolRdv(proxyDraft.rdv);
     const rdvValidation = validateProtocolRdv(rdv);
     if (rdvValidation) {
@@ -5229,30 +5274,71 @@ function ProtocolLoginPanel({
       setErrorText(rdvValidation);
       return;
     }
+    const rows = await loadMapping();
+    const resolved = resolveProtocolLogin(rdv, rows);
+    const previousSessionId = sessionIdRef.current;
     const nextForm = {
       ...formRef.current,
       ...proxyDraft,
       rdv,
+      wxid: resolved.wxid,
       proxyType: proxyDraft.proxyEnabled ? (proxyDraft.proxyType || formRef.current.proxyType || "socks5h") : "",
     };
+    if (previousSessionId && !selectedLoggedInAccount && rdv !== formRef.current.rdv) {
+      const stopped = await terminateProtocolSession(previousSessionId);
+      if (stopped?.ok === false) throw new Error(stopped.error || "关闭旧登录实例失败");
+    }
+    autoStartedRef.current = true;
+    formRef.current = nextForm;
+    sessionIdRef.current = "";
     setForm(nextForm);
+    setMode(resolved.mode);
+    setSessionId(""); setQrSrc(""); setExpiresAt(0);
+    setScannedInfo({ nick: "", avatar: "" });
+    setSuccessInfo({ wxid: "", nickname: "", avatar: "" });
+    setErrorText(""); setPhase("idle");
     saveForm(nextForm, true);
     setSettingsOpen(false);
-    await runProtocolLogin(nextForm);
+    if (resolved.mode === "qr") {
+      await runProtocolLogin(nextForm, "qr");
+    } else {
+      setStatusText("等待推送登录");
+      onSessionStarted?.({
+        id: `rdv:${rdv}`, source: "protocol", rdv, session_id: "", saved_mapping: true,
+        wxid: resolved.wxid, nickname: resolved.entry?.nickname || resolved.wxid,
+        avatar: resolved.entry?.avatar || "", proxy: resolved.entry?.proxy,
+      }, previousSessionId);
+    }
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "保存登录设置失败");
+      setPhase("error");
+    }
   };
 
   const loadMapping = useCallback(async () => {
     try {
       const data = await getProtocolRdvMapping();
-      const rows = (data?.mapping || data || {}) as Record<string, ProtocolRdvMappingEntry>;
+      if (!data?.ok) throw new Error(data?.error || "读取当前用户 RDV 记录失败");
+      const rows = (data.mapping || {}) as Record<string, ProtocolRdvMappingEntry>;
       setMapping(rows && typeof rows === "object" ? rows : {});
+      return rows;
     } catch (err) {
       console.error("[PROTO_LOGIN] load mapping failed:", err);
+      throw err;
     }
   }, []);
 
   useEffect(() => {
-    loadMapping();
+    let cancelled = false;
+    loadMapping().then((rows) => {
+      if (cancelled) return;
+      const resolved = resolveProtocolLogin(formRef.current.rdv, rows);
+      setMode(resolved.mode);
+      setForm((current) => ({ ...current, wxid: resolved.wxid }));
+      setStatusText(account && isLoggedInAccount(account) ? "账号已登录" : resolved.mode === "qr" ? "等待启动实例" : "等待推送登录");
+      setMappingReady(true);
+    }).catch((error) => { if (!cancelled) setErrorText(error instanceof Error ? error.message : "读取登录记录失败"); });
+    return () => { cancelled = true; };
   }, [loadMapping]);
 
   useEffect(() => {
@@ -5267,7 +5353,7 @@ function ProtocolLoginPanel({
     return String(payload?.error || payload?.message || fallback);
   };
 
-  const accountFromStartedSession = (payload: any, targetForm: ProtocolLoginForm): WeChatAccount => {
+  const accountFromStartedSession = (payload: any, targetForm: ProtocolLoginForm, targetMode = mode): WeChatAccount => {
     const nextSessionId = protocolSessionIdFromPayload(payload);
     const startPort = protocolStartPortFromPayload(payload);
     return {
@@ -5279,13 +5365,13 @@ function ProtocolLoginPanel({
       peer: String(payload?.peer || (startPort ? `端口 ${startPort}` : "protocol")),
       initialized: false,
       login_status: "2",
-      login_message: mode === "qr" ? "二维码等待确认" : "等待手机确认",
+      login_message: targetMode === "qr" ? "二维码等待确认" : "等待手机确认",
       source: "protocol",
       session_id: nextSessionId,
       protocol_state: "not_started",
       rdv: normalizeProtocolRdv(targetForm.rdv),
       start_port: startPort,
-      qrcode_ready: mode === "qr",
+      qrcode_ready: targetMode === "qr",
     };
   };
 
@@ -5307,6 +5393,7 @@ function ProtocolLoginPanel({
     fetchingQrRef.current = true;
     try {
       const data = await getProtocolLoginQRCode(targetSessionId);
+      if (targetSessionId !== sessionIdRef.current) return;
       if (data?.detail || data?.error || data?.ok === false) throw new Error(errorMessage(data, "获取二维码失败"));
       const qrcode = data?.qrcode || data?.data || {};
       const nextQr = pngHexToDataUrl(String(qrcode.qrcode_png_hex || ""));
@@ -5361,11 +5448,12 @@ function ProtocolLoginPanel({
   }, [account?.account_id, account?.avatar, account?.id, account?.login_status, account?.nickname, account?.session_id, account?.wxid]);
 
   useEffect(() => {
-    if (mode !== "qr" || !account?.id) return;
+    if (!mappingReady || mode !== "qr" || !account?.id) return;
     if (isLoggedInAccount(account)) return;
     const targetSessionId = protocolSessionId(account);
     if (!targetSessionId || targetSessionId === sessionId) return;
     autoStartedRef.current = true;
+    sessionIdRef.current = targetSessionId;
     setSessionId(targetSessionId);
     setQrSrc("");
     setExpiresAt(0);
@@ -5378,7 +5466,7 @@ function ProtocolLoginPanel({
       setStatusText("流程失败");
       setErrorText(err instanceof Error ? err.message : "切换二维码失败");
     });
-  }, [account?.id, account?.rdv, account?.session_id, fetchQRCode, mode, sessionId]);
+  }, [account?.id, account?.rdv, account?.session_id, fetchQRCode, mappingReady, mode, sessionId]);
 
   const saveMappingFromProfile = useCallback(async (profilePayload: any, fallbackWxid = "") => {
     const current = formRef.current;
@@ -5407,7 +5495,9 @@ function ProtocolLoginPanel({
 
   const completeLogin = useCallback(async (payload: any) => {
     const targetSessionId = sessionId || protocolSessionIdFromPayload(payload);
+    const targetRdv = formRef.current.rdv;
     const profilePayload = payload?.profile_result || (targetSessionId ? await getProtocolProfile(targetSessionId) : payload);
+    if (sessionIdRef.current !== targetSessionId || formRef.current.rdv !== targetRdv) return;
     const identity = await saveMappingFromProfile(profilePayload, protocolProfileIdentity(payload).wxid);
     setSuccessInfo({
       wxid: identity.wxid,
@@ -5421,17 +5511,18 @@ function ProtocolLoginPanel({
   }, [onRefresh, saveMappingFromProfile, scannedInfo.avatar, scannedInfo.nick, sessionId]);
 
   const fallbackToQRCode = useCallback(() => {
+    setMode("qr");
     setPhase("starting");
     setStatusText("老号登录失败，正在获取二维码");
     setErrorText("");
-    onModeChange("qr");
-  }, [onModeChange]);
+  }, []);
 
   useEffect(() => {
     if (!sessionId || phase === "idle" || phase === "success" || phase === "error") return;
     const timer = window.setInterval(async () => {
       try {
         const data = await getProtocolLoginStatus(sessionId);
+        if (sessionIdRef.current !== sessionId) return;
         if (data?.error && data?.ok === false) {
           if (mode === "old") {
             window.clearInterval(timer);
@@ -5521,17 +5612,9 @@ function ProtocolLoginPanel({
   useEffect(() => {
     if (mode !== "old") return;
     const rdv = normalizeProtocolRdv(form.rdv);
-    let targetRdv = rdv;
-    let entry = mapping[targetRdv];
-    let wxid = protocolMappingWxid(entry);
-    if (!wxid) {
-      const first = Object.entries(mapping).find(([, item]) => Boolean(protocolMappingWxid(item)));
-      if (first) {
-        targetRdv = first[0];
-        entry = first[1];
-        wxid = protocolMappingWxid(entry);
-      }
-    }
+    const targetRdv = rdv;
+    const entry = mapping[targetRdv];
+    const wxid = protocolMappingWxid(entry);
     if (entry && wxid && form.wxid !== wxid) {
       const proxyEntry = protocolMappingProxy(entry);
       const hasProxy = Object.values(proxyEntry).some(Boolean);
@@ -5550,10 +5633,11 @@ function ProtocolLoginPanel({
         return next;
       });
     }
-  }, [form.rdv, form.wxid, mapping, mode]);
+  }, [account?.rdv, form.rdv, form.wxid, mapping, mode]);
 
   const runProtocolLogin = useCallback(async (
     targetForm: ProtocolLoginForm = formRef.current,
+    targetMode: "qr" | "old" = mode,
   ) => {
     setErrorText("");
     const rdvValidation = validateProtocolRdv(targetForm.rdv);
@@ -5565,7 +5649,7 @@ function ProtocolLoginPanel({
     const rdv = normalizeProtocolRdv(targetForm.rdv);
     const rawWxid = String(targetForm.wxid || "").trim();
     const wxid = protocolStableWxid(rawWxid, sessionIdRef.current);
-    if (mode === "old" && !wxid) {
+    if (targetMode === "old" && !wxid) {
       setPhase("error");
       setErrorText(rawWxid ? "WXID 不能使用每次启动都会变化的 session_id" : "老号登录必须填写 WXID");
       return;
@@ -5595,15 +5679,15 @@ function ProtocolLoginPanel({
       const nextSessionId = protocolSessionIdFromPayload(start);
       if (!nextSessionId) throw new Error("未获取到 session_id");
       startedSessionId = nextSessionId;
+      sessionIdRef.current = nextSessionId;
       setSessionId(nextSessionId);
-      onSessionStarted?.(accountFromStartedSession(start, targetForm), previousSessionId);
+      onSessionStarted?.(accountFromStartedSession(start, targetForm, targetMode), previousSessionId);
 
-      if (mode === "qr") {
+      if (targetMode === "qr") {
         setStatusText("正在获取登录二维码");
         await fetchQRCode(nextSessionId);
       } else {
         setStatusText("正在推送老号登录请求");
-        await saveProtocolRdvMapping(rdv, wxid, "", targetProxy).catch(() => null);
         const pushed = await pushProtocolLoginUrl(nextSessionId, wxid);
         if (pushed?.detail || pushed?.error || pushed?.ok === false) throw new Error(errorMessage(pushed, "推送登录失败"));
         const info = pushed?.qrcode || pushed?.pushloginurl || pushed?.data || pushed;
@@ -5615,7 +5699,7 @@ function ProtocolLoginPanel({
         await loadMapping();
       }
     } catch (err) {
-      if (mode === "old" && startedSessionId) {
+      if (targetMode === "old" && startedSessionId) {
         console.warn("[PROTO_LOGIN] old login failed, falling back to QR code:", err);
         fallbackToQRCode();
         return;
@@ -5628,7 +5712,7 @@ function ProtocolLoginPanel({
 
   const startLogin = async (event: FormEvent) => {
     event.preventDefault();
-    if (account && isLoggedInAccount(account)) {
+    if (selectedLoggedInAccount && account) {
       onEnterAccount?.(account);
       return;
     }
@@ -5639,7 +5723,7 @@ function ProtocolLoginPanel({
   };
 
   useEffect(() => {
-    if (mode !== "qr" || settingsOpen || autoStartedRef.current || sessionId || phase !== "idle") return;
+    if (!mappingReady || mode !== "qr" || settingsOpen || autoStartedRef.current || sessionId || phase !== "idle") return;
     if (protocolSessionId(account)) return;
     autoStartedRef.current = true;
     const current = formRef.current;
@@ -5654,7 +5738,7 @@ function ProtocolLoginPanel({
       setStatusText("流程失败");
       setErrorText(err instanceof Error ? err.message : "自动启动微信失败");
     });
-  }, [mode, phase, runProtocolLogin, sessionId, settingsOpen]);
+  }, [mappingReady, mode, phase, runProtocolLogin, sessionId, settingsOpen]);
 
   const refreshCurrentQRCode = async () => {
     if (!canRefreshQRCode) return;
@@ -5669,6 +5753,10 @@ function ProtocolLoginPanel({
       setErrorText(err instanceof Error ? err.message : "刷新二维码失败");
     }
   };
+
+  if (!mappingReady) {
+    return <div className={`${pageClass} flex items-center justify-center text-[14px]`}>{errorText || "正在读取当前用户的 RDV 记录…"}</div>;
+  }
 
   if (settingsOpen) {
     return (
@@ -5751,6 +5839,7 @@ function ProtocolLoginPanel({
           </div>
           )}
 
+          {errorText && <div className="mt-[12px] text-[13px] text-[#ff8a8a]">{errorText}</div>}
           <button
             type="button"
             onClick={saveProxySettings}

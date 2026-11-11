@@ -11,6 +11,12 @@ import wechat_api
 
 
 class ProtocolTextSendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_old_login_uses_protocol_pushloginurl_with_exact_session_and_wxid_contract(self):
+        post = AsyncMock(return_value={'ok': True})
+        with patch.object(protocol_api, '_post', post):
+            await protocol_api.push_login_url(' session-1 ', ' wxid_owner ')
+        post.assert_awaited_once_with('/pushloginurl', {'session_id': 'session-1', 'wxid': 'wxid_owner'}, timeout=25.0)
+
     async def test_hook_api_slot_allows_twenty_in_flight_requests(self):
         old_lock = wechat_api._hook_lock
         release_requests = asyncio.Event()

@@ -7,15 +7,17 @@ const USER_ID_STORAGE = 'wechat_web_user_id';
 // Each tab keeps its credential; logging into another key in a second tab cannot switch this tab's API requests.
 if (window.sessionStorage.getItem(ACCESS_KEY_STORAGE) === null && window.localStorage.getItem(ACCESS_KEY_STORAGE)) {
   window.sessionStorage.setItem(ACCESS_KEY_STORAGE, window.localStorage.getItem(ACCESS_KEY_STORAGE)!);
-  window.sessionStorage.setItem(USER_ID_STORAGE, window.localStorage.getItem(USER_ID_STORAGE) || '');
 }
 export const userStorageKey = (name: string) => `${name}:${window.sessionStorage.getItem(USER_ID_STORAGE) || 'unverified'}`;
 
 let activeAgentIdOverride = "";
+let authVersion = 0;
+export const getAuthVersion = () => authVersion;
 
 export const getAccessKey = () => window.sessionStorage.getItem(ACCESS_KEY_STORAGE) || "";
 export const setAccessKey = (key: string) => {
   if (key !== getAccessKey()) {
+    authVersion += 1;
     activeAgentIdOverride = "";
     window.localStorage.removeItem('wechat_web_user_id');
     window.sessionStorage.removeItem(USER_ID_STORAGE);
@@ -24,6 +26,7 @@ export const setAccessKey = (key: string) => {
   window.sessionStorage.setItem(ACCESS_KEY_STORAGE, key);
 };
 export const clearAccessKey = () => {
+  authVersion += 1;
   window.localStorage.removeItem(ACCESS_KEY_STORAGE);
   window.localStorage.removeItem('wechat_web_user_id');
   window.sessionStorage.setItem(ACCESS_KEY_STORAGE, '');
@@ -73,11 +76,13 @@ async function fetchWithTimeout(url: string, options?: RequestInit, timeoutMs = 
 }
 
 export async function fetchJSON(url: string, options?: RequestInit, timeoutMs = 30_000) {
+  const requestAuthVersion = authVersion;
   const res = await fetchWithTimeout(BASE + url, {
     ...options,
     headers: authHeaders({ "Content-Type": "application/json", ...(options?.headers || {}) }),
   }, timeoutMs);
-  return res.json();
+  const data = await res.json();
+  return requestAuthVersion === authVersion ? data : { ok: false, error: 'auth_changed' };
 }
 
 export const loginWithKey = async (key: string) => {
@@ -86,8 +91,10 @@ export const loginWithKey = async (key: string) => {
     body: JSON.stringify({ key }),
     headers: { "Content-Type": "application/json" },
   });
-  if (result.ok && result.user_id) {
-    window.localStorage.setItem(USER_ID_STORAGE, result.user_id);
+  if (result.ok && result.user_id && key === getAccessKey()) {
+    if (window.localStorage.getItem(ACCESS_KEY_STORAGE) === key) {
+      window.localStorage.setItem(USER_ID_STORAGE, result.user_id);
+    }
     window.sessionStorage.setItem(USER_ID_STORAGE, result.user_id);
   }
   return result;
@@ -118,7 +125,9 @@ export const saveInitialSetup = (payload: InitialSetupPayload) =>
   });
 
 export const getAccounts = async () => {
+  const requestAuthVersion = authVersion;
   if (!window.sessionStorage.getItem(USER_ID_STORAGE) && getAccessKey()) await loginWithKey(getAccessKey());
+  if (requestAuthVersion !== authVersion) return { ok: false, error: 'auth_changed' };
   return fetchJSON("/api/accounts");
 };
 export const activateAccount = (agentId: string) =>

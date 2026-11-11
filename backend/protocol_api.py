@@ -183,7 +183,7 @@ async def push_login_url(session_id: str, wxid: str) -> dict[str, Any]:
     target = str(wxid or "").strip()
     return await _post(
         "/pushloginurl",
-        {"session_id": str(session_id or "").strip(), "wxid": target, "userName": target},
+        {"session_id": str(session_id or "").strip(), "wxid": target},
         timeout=25.0,
     )
 
