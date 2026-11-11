@@ -55,7 +55,7 @@ from domp_execution_bridge import EXECUTION_TOOL, EXECUTION_REPLY_PREFIX, execut
 from domp_approval_bridge import APPROVAL_TOOL, APPROVAL_REPLY_PREFIX, approval_candidate, approval_target, approve_target, approval_reply_chunks, owner_approval_config
 from domp_submission_bridge import SUBMISSION_TOOL, SUBMISSION_REPLY_PREFIX, SUBMISSION_PROMPT, submission_candidate, submission_arguments, submission_reply, submission_reply_chunks, owner_submission_config
 from domp_unified_bridge import UNIFIED_SKILL_NAME, is_unified_task, submission_workflow_identifier, unified_candidate, unified_route, owner_unified_config, owner_filehelper_config
-from domp_identifier import identifiers_in
+from domp_identifier import identifiers_in, base_identifier
 from query_progress import progress_text, update_progress
 from daily_log import append_daily_log
 
@@ -4376,7 +4376,7 @@ async def _mcp_task_reply(
         connection = _mcp_connection(str(task.get("mcp_connection_id") or ""))
         if not connection or not bool(connection.get("enabled", True)):
             return ("数据运维连接未启用，未启动流程。",)
-        if len(arguments["identifier"]) == 4 and not arguments["dry_run"]:
+        if len(base_identifier(arguments["identifier"])) == 4 and not arguments["dry_run"]:
             try:
                 return offline_reply_chunks(await _prepare_offline_city_confirmation(task, arguments))
             except ValueError as exc:
@@ -4780,11 +4780,25 @@ async def _match_offline_city(pending, city_text):
         pending["match_error"] = "数据运维连接未启用，请恢复后输入城市或县区"
         return pending
     try:
-        called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""),
-            tool_name="match_data_maintenance_city", arguments={"city_text": city_text})
-        matched = called.get("structured")
-        if not isinstance(matched, dict) or not any(isinstance(matched.get(key), list) for key in ("supported_areas", "supported_cities")):
-            raise ValueError("未取得系统支持的行政区划，请确认 MCP 服务已更新")
+        last_error = None
+        matched = None
+        for attempt in range(2):
+            try:
+                called = await mcp_service.call_tool(url=str(connection.get("url") or ""), token=str(connection.get("token") or ""),
+                    tool_name="match_data_maintenance_city", arguments={"city_text": city_text})
+                matched = called.get("structured")
+                if not isinstance(matched, dict) or not any(isinstance(matched.get(key), list) for key in ("supported_areas", "supported_cities")):
+                    raise ValueError("未取得系统支持的行政区划，请确认 MCP 服务已更新")
+                last_error = None
+                break
+            except McpServiceError as exc:
+                last_error = exc
+                if attempt == 0 and str(exc).startswith("MCP connection failed:"):
+                    await asyncio.sleep(0.4)
+                    continue
+                raise
+        if last_error:
+            raise last_error
         area = str(matched.get("area_name") or matched.get("city") or "")
         if matched.get("matched") is True:
             if isinstance(matched.get("supported_areas"), list):

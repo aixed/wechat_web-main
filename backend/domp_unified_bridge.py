@@ -14,6 +14,7 @@ from domp_bridge import (SQL_START, WORKFLOW_TOOL, write_capability_question,
 from domp_execution_bridge import EXECUTION_TOOL, execution_candidate
 from domp_query_bridge import QUERY_TOOL, QUERY_TYPES, query_candidate
 from domp_submission_bridge import SUBMISSION_TOOL, submission_candidate
+from domp_sql_extraction import SQL_EXTRACTION_PROMPT
 
 
 UNIFIED_SKILL_ID = "domp_unified_agent"
@@ -31,7 +32,7 @@ UNIFIED_INTENTS = {
 UNIFIED_PROMPT = prompt('domp_unified_bridge.unified_prompt')
 
 
-UNIFIED_PROMPT += BATCH_IDENTIFIER_PROMPT
+UNIFIED_PROMPT += BATCH_IDENTIFIER_PROMPT + "\n\n" + SQL_EXTRACTION_PROMPT
 
 
 def submission_workflow_identifier(source: str) -> str:
@@ -118,6 +119,8 @@ def unified_route(source: str, analysis: dict[str, Any]) -> tuple[str, dict[str,
             "risk_level": str(parsed.get("risk_level") or "unknown"),
             "risk_notes": [str(item) for item in (parsed.get("risk_notes") or [])],
         }
+        if "sql_blocks" in parsed:
+            routed["sql_blocks"] = parsed["sql_blocks"]
         return WORKFLOW_TOOL, {**common, "result": json.dumps(routed, ensure_ascii=False)}
     if intent == "submit":
         routed = {"action": "submit", "identifier": identifier}

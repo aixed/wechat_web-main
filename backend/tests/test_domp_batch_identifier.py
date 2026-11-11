@@ -19,7 +19,7 @@ def analysis(identifier, **extra):
 
 class BatchIdentifierTests(unittest.TestCase):
     def test_sql_headers_and_txt_names_preserve_full_batch_identifier(self):
-        for identifier in ("42157-1", "42157-2", "42157-3", "42157-12"):
+        for identifier in ("2800-1", "2800-2", "42157-1", "42157-2", "42157-3", "42157-12"):
             for header in ("--- xzsb-" + identifier, "文件名：需求" + identifier + ".txt\n文件内容："):
                 with self.subTest(header=header):
                     source = header + "\n" + fixtures.SQL
@@ -30,7 +30,7 @@ class BatchIdentifierTests(unittest.TestCase):
                         workflow_arguments(source, analysis("42157"), {})
 
     def test_invalid_or_multiple_batch_identifiers_cannot_be_truncated(self):
-        for identifier in ("42157-0", "42157-01", "42157-1-2", "2750-1", "42157-", "42157-1 42157-2"):
+        for identifier in ("2800-0", "2800-01", "2800-1-2", "42157-0", "42157-01", "42157-1-2", "42157-", "42157-1 42157-2"):
             with self.subTest(identifier=identifier), self.assertRaises(ValueError):
                 workflow_arguments("--- xzsb-" + identifier + "\n" + fixtures.SQL, analysis("42157"), {})
         self.assertEqual({"42157-12345"}, identifiers_in("--- xzsb-42157-12345", strict=True))

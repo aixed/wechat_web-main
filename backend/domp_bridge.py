@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from domp_identifier import identifiers_in
+from domp_sql_extraction import SQL_EXTRACTION_PROMPT, extracted_sql_source
 
 WORKFLOW_TOOL = "process_data_maintenance"
 SQL_START = re.compile(r"\b(?:UPDATE|SELECT|INSERT|DELETE|MERGE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|BEGIN|DECLARE|CALL|EXECUTE)\b", re.I)
@@ -97,7 +98,7 @@ def strip_chat_mentions(source, mention_names):
     return source
 
 
-PROMPT = prompt('domp_bridge.prompt')
+PROMPT = prompt('domp_bridge.prompt') + "\n\n" + SQL_EXTRACTION_PROMPT
 
 
 def workflow_arguments(source, analysis, task):
@@ -132,7 +133,8 @@ def workflow_arguments(source, analysis, task):
     if not context.get("message_id"):
         context_key += "|" + source
     request_id = "wechat:" + hashlib.sha256(context_key.encode("utf-8")).hexdigest()
-    return {"identifier": identifier, "sql_text": source, "sql_purpose": purpose,
+    sql_text = extracted_sql_source(source, parsed.get("sql_blocks"))
+    return {"identifier": identifier, "sql_text": sql_text, "sql_purpose": purpose,
             "risk_level": level, "request_id": request_id, "dry_run": not bool(context)}
 
 

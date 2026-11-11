@@ -8,6 +8,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
+from domp_sql_extraction import SQL_COMMAND, SQL_EXTRACTION_PROMPT
 
 CITY_PROMPT = prompt('domp_offline_bridge.city_prompt')
 OFFLINE_PROMPT_EXTENSION = prompt('domp_offline_bridge.offline_prompt_extension')
@@ -15,8 +16,12 @@ OFFLINE_PROMPT_EXTENSION = prompt('domp_offline_bridge.offline_prompt_extension'
 
 def offline_analysis_task(task, source):
     """Extend saved prompts for existing installations without discarding custom rules."""
+    from domp_unified_bridge import is_unified_task
+    if SQL_COMMAND.search(str(source)) and (is_unified_task(task) or task.get("mcp_tool_name") == "process_data_maintenance"):
+        instruction = str(task.get("instruction") or "")
+        if SQL_EXTRACTION_PROMPT not in instruction:
+            task = {**task, "instruction": instruction + "\n\n" + SQL_EXTRACTION_PROMPT}
     if re.search(r"(?<!\d)\d{4}(?!\d)", str(source)):
-        from domp_unified_bridge import is_unified_task
         if is_unified_task(task) or task.get("mcp_tool_name") in {"process_data_maintenance", "query_data_maintenance", "approve_data_maintenance", "execute_data_maintenance"}:
             return {**task, "instruction": str(task.get("instruction") or "") + "\n\n" + OFFLINE_PROMPT_EXTENSION}
     return task
@@ -27,9 +32,9 @@ def is_offline_confirmation_prompt(source):
     text = str(source or "")
     if "数据运维区划选择：需求 " in text and "请选择城市：" in text:
         return True
-    if re.search(r"线下单\s+\d{4}\s+未(?:识别|匹配)到城市或县区", text):
+    if re.search(r"线下单\s+\d{4}(?:-[1-9]\d*)?\s+未(?:识别|匹配)到城市或县区", text):
         return True
-    return bool(re.search(r"(?:^|\s)(?:线下单\s+\d{4}\s*[:：]\s*)?待确认(?:区划|城市)[，,]", text)
+    return bool(re.search(r"(?:^|\s)(?:线下单\s+\d{4}(?:-[1-9]\d*)?\s*[:：]\s*)?待确认(?:区划|城市)[，,]", text)
         and re.search(r"匹配区划|尚未匹配|当前匹配到城市|当前识别/输入", text))
 
 

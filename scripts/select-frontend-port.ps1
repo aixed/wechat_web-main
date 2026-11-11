@@ -29,7 +29,7 @@ if ($portMatch.Success) {
 } elseif ($portKeyPattern.IsMatch($configText)) {
     throw "frontend_port in config.yaml must be an integer between 1 and 65535."
 } else {
-    $startPort = 80
+    $startPort = 8080
 }
 
 if ($startPort -lt 1 -or $startPort -gt 65535) {

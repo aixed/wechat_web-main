@@ -474,7 +474,7 @@ def initial_setup_defaults() -> dict[str, Any]:
         "default_web_access_key": DEFAULT_WEB_ACCESS_KEY,
         "web_access_key": WEB_ACCESS_KEY if config_file_exists() else DEFAULT_WEB_ACCESS_KEY,
         "server_port": SERVER_PORT,
-        "frontend_port": 80,
+        "frontend_port": 8080,
         "modes": [
             {"value": 1, "label": "本地 Hook", "mode": "local_hook"},
             {"value": 2, "label": "远程 Hook", "mode": "remote_hook"},
@@ -554,7 +554,7 @@ def save_initial_setup_config(
     document["server_host"] = str(document.get("server_host") or str(setting('network_bind_all_host')))
     document["server_port"] = _clean_port(document.get("server_port"), default=5000, field="server_port")
     document["frontend_host"] = str(document.get("frontend_host") or str(setting('network_bind_all_host')))
-    document["frontend_port"] = _clean_port(document.get("frontend_port"), default=80, field="frontend_port")
+    document["frontend_port"] = _clean_port(document.get("frontend_port"), default=8080, field="frontend_port")
     document["hook_api_concurrency"] = 20 if mode_number == 1 else 10
     document["recvtype"] = _clean_port(document.get("recvtype"), default=1, field="recvtype")
 

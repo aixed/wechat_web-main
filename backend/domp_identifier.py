@@ -5,7 +5,7 @@ from runtime_settings import prompt, setting
 
 import re
 
-TICKET_PATTERN = r"(?:\d{4}|\d{5}(?:-[1-9]\d*)?)"
+TICKET_PATTERN = r"(?:\d{4}(?:-[1-9]\d*)?|\d{5}(?:-[1-9]\d*)?)"
 WORK_PATTERN = r"\d{6,32}"
 
 
@@ -30,13 +30,12 @@ def base_identifier(value):
 
 def resubmission_hint(identifier, used_identifiers):
     base = base_identifier(identifier)
-    if len(base) == 4:
-        return {"next_identifier": "", "message": f"线下单 {identifier} 已有填报记录，请核对原流程；新的线下申请请使用新的四位线下编号。"}
     suffixes = [int(value[len(base) + 1:]) for value in used_identifiers
                 if re.fullmatch(re.escape(base) + r"-[1-9]\d*", value)]
     next_identifier = base + "-" + str(max(suffixes, default=0) + 1)
+    ticket_type = "线下单" if len(base) == 4 else "需求"
     return {"next_identifier": next_identifier,
-        "message": f"该编号已有填报记录。如需重新填报，请将消息首行改为：\n--- xzsb-{next_identifier}\n并附上本批次完整 SQL 后重新发送；后续使用新的递增批次编号（-1、-2、-3 等）。"}
+        "message": f"该{ticket_type}编号已有填报记录。如需重新填报，请将消息首行改为：\n--- xzsb-{next_identifier}\n并附上本批次完整 SQL 后重新发送；后续使用新的递增批次编号（-1、-2、-3 等）。"}
 
 
 BATCH_IDENTIFIER_PROMPT = prompt('domp_identifier.batch_identifier_prompt')
